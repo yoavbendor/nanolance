@@ -12,8 +12,15 @@
 
 #include "lance_minimal.pb.hpp"
 
+#include "commit_conflicts.hpp"
+#include "dataset_operation.hpp"
+#include "transaction_file.hpp"
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <random>
 #include <set>
@@ -174,7 +181,110 @@ void back_off(int attempt) {
 
 constexpr int kCommitAttempts = 20;  // Lance's default conflict_retries
 
+std::atomic<std::uint64_t> g_rebased{0};
+std::atomic<std::uint64_t> g_retried{0};
+std::atomic<std::uint64_t> g_refused{0};
+
+enum class Outcome { Compatible, Refused, Failed };
+
+/// "commit conflict: ..." for a retryable verdict: the operation runs again on the newer version.
+std::string retryable_error(std::uint64_t version, const std::string& ours, const std::string& theirs) {
+    return "commit conflict: Retryable commit conflict for version " + std::to_string(version) + ": This " + ours +
+           " transaction was preempted by concurrent transaction " + theirs + " at version " +
+           std::to_string(version) + ". Please retry.";
+}
+
+/// The operation a version committed, from its transaction file. False with `reason` when it has none,
+/// or the file cannot be read or decoded.
+bool concurrent_operation(const std::filesystem::path& dataset_path, const pb::Manifest& manifest, Operation& op,
+                          std::string& reason) {
+    if (manifest.transaction_file.empty()) {
+        reason = "no transaction file";
+        return false;
+    }
+    std::ifstream in(dataset_path / "_transactions" / manifest.transaction_file, std::ios::binary);
+    if (!in) {
+        reason = "an unreadable transaction file";
+        return false;
+    }
+    const OpBytes bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::uint32_t field = 0;
+    OpBytes message;
+    std::string why;
+    if (!transaction_file_operation(bytes, field, message, why)) {
+        reason = "an unreadable transaction file";
+        return false;
+    }
+    if (field == kCloneField) {
+        op.kind = kCloneField;  // compatible with everything: no decoder needed
+        return true;
+    }
+    if (!decode_operation(field, message, op, why)) {
+        reason = "an operation nanolance cannot read";
+        return false;
+    }
+    return true;
+}
+
+/// Lance's verdict on `ours`, the change made from `base` (read at `read_version`), against each version
+/// committed after it up to `latest`, in order; the first verdict that is not compatible decides.
+Outcome classify_concurrent(const std::filesystem::path& dataset_path, const pb::Manifest& base,
+                            const pb::Manifest& ours, std::uint64_t read_version, std::uint64_t latest,
+                            std::string& error) {
+    const auto [ours_field, ours_message] = derive_transaction_operation(base, ours);
+    Operation mine;
+    std::string why;
+    if (!decode_operation(ours_field, ours_message, mine, why)) {
+        error = retryable_error(read_version + 1U, operation_name(ours_field), "an operation");
+        return Outcome::Refused;
+    }
+    const std::string ours_name = operation_name(mine.kind);
+    for (std::uint64_t version = read_version + 1U; version <= latest; ++version) {
+        pb::Manifest committed;
+        if (!load_manifest_version(dataset_path, version, committed, error)) {
+            return Outcome::Failed;
+        }
+        Operation theirs;
+        std::string reason;
+        if (!concurrent_operation(dataset_path, committed, theirs, reason)) {
+            error = retryable_error(version, ours_name, "an operation (" + reason + ")");
+            return Outcome::Refused;
+        }
+        const std::string theirs_name = theirs.kind == kCloneField ? "Clone" : operation_name(theirs.kind);
+        switch (check_txn(mine, theirs)) {
+            case Verdict::Compatible:
+                break;
+            case Verdict::Retryable:
+                error = retryable_error(version, ours_name, theirs_name);
+                return Outcome::Refused;
+            case Verdict::Incompatible:
+                error = "Incompatible transaction: This " + ours_name + " transaction is incompatible with concurrent "
+                        "transaction " + theirs_name + " at version " + std::to_string(version) + ".";
+                return Outcome::Refused;
+        }
+    }
+    return Outcome::Compatible;
+}
+
 }  // namespace
+
+CommitConflictStats commit_conflict_stats() {
+    CommitConflictStats out;
+    out.rebased = g_rebased.load(std::memory_order_relaxed);
+    out.retried = g_retried.load(std::memory_order_relaxed);
+    out.refused = g_refused.load(std::memory_order_relaxed);
+    return out;
+}
+
+void reset_commit_conflict_stats() {
+    g_rebased.store(0, std::memory_order_relaxed);
+    g_retried.store(0, std::memory_order_relaxed);
+    g_refused.store(0, std::memory_order_relaxed);
+}
+
+void count_commit_retry() {
+    g_retried.fetch_add(1, std::memory_order_relaxed);
+}
 
 /// Publish `manifest` as the version after the one it was read at, stamped now and by nanolance.
 /// Committing as the version after the one it was READ at -- not after whatever is latest by now -- is
@@ -237,6 +347,15 @@ bool commit_next_version(const std::filesystem::path& dataset_path, pb::Manifest
         if (!check_manifest_writable(latest, WriteKind::Commit, error)) {
             return false;
         }
+        // Lance's verdict on every version committed since: a refusal (incompatible, or retryable with the
+        // operation run again) is the error; compatible versions are rebased below.
+        if (classify_concurrent(dataset_path, base, manifest, read_version, latest_version, error) !=
+            Outcome::Compatible) {
+            if (error.rfind("Incompatible transaction:", 0) == 0) {
+                g_refused.fetch_add(1, std::memory_order_relaxed);
+            }
+            return false;
+        }
         pb::Manifest rebased = manifest;
         if (!rebase(base, latest, rebased)) {
             error = first_error;
@@ -245,6 +364,7 @@ bool commit_next_version(const std::filesystem::path& dataset_path, pb::Manifest
         rebased.version = latest_version + 1U;
         new_version = rebased.version;
         if (publish_manifest(dataset_path, rebased, error)) {
+            g_rebased.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
         if (!is_conflict(error)) {
@@ -253,6 +373,23 @@ bool commit_next_version(const std::filesystem::path& dataset_path, pb::Manifest
         back_off(attempt);
     }
     return false;
+}
+
+bool load_read_version(const std::filesystem::path& dataset_path, ReadVersion read_version, pb::Manifest& manifest,
+                       std::uint64_t& version, std::string& error) {
+    if (!read_version) {
+        return load_latest_manifest(dataset_path, manifest, version, error);
+    }
+    version = *read_version;
+    if (load_manifest_version(dataset_path, version, manifest, error)) {
+        return true;
+    }
+    // Cleaned up since the handle was opened (auto cleanup removes old versions): the change is made from
+    // the latest, as it was before read versions, instead of failing on a version that no longer exists.
+    if (error.find("not found") == std::string::npos) {
+        return false;
+    }
+    return load_latest_manifest(dataset_path, manifest, version, error);
 }
 
 bool dataset_latest_version(const std::filesystem::path& dataset_path, std::uint64_t& out, std::string& error) {
@@ -384,53 +521,69 @@ bool dataset_restore(const std::filesystem::path& dataset_path, std::uint64_t ve
 
 bool dataset_update_config(const std::filesystem::path& dataset_path,
                            const std::map<std::string, std::string>& upsert, const std::vector<std::string>& remove,
-                           std::uint64_t& new_version, std::string& error) {
-    pb::Manifest manifest;
-    std::uint64_t latest = 0;
-    if (!load_latest_manifest(dataset_path, manifest, latest, error)) {
-        return false;
-    }
-    for (const auto& kv : upsert) {
-        manifest.config[kv.first] = kv.second;
-    }
-    for (const auto& key : remove) {
-        manifest.config.erase(key);
-    }
-    return commit_next_version(dataset_path, std::move(manifest), new_version, error);
+                           std::uint64_t& new_version, std::string& error, ReadVersion read_version) {
+    // Re-run from the latest after a retryable conflict, as Lance's retries do (C2 rebases instead).
+    ReadVersion from = read_version;
+    return retry_on_conflict(
+        [&] {
+            pb::Manifest manifest;
+            std::uint64_t version = 0;
+            if (!load_read_version(dataset_path, std::exchange(from, std::nullopt), manifest, version, error)) {
+                return false;
+            }
+            for (const auto& kv : upsert) {
+                manifest.config[kv.first] = kv.second;
+            }
+            for (const auto& key : remove) {
+                manifest.config.erase(key);
+            }
+            return commit_next_version(dataset_path, std::move(manifest), new_version, error);
+        },
+        error);
 }
 
 bool dataset_update_table_metadata(const std::filesystem::path& dataset_path,
                                    const std::map<std::string, std::string>& values, bool replace,
-                                   std::uint64_t& new_version, std::string& error) {
-    pb::Manifest manifest;
-    std::uint64_t latest = 0;
-    if (!load_latest_manifest(dataset_path, manifest, latest, error)) {
-        return false;
-    }
-    if (replace) {
-        manifest.table_metadata.clear();
-    }
-    for (const auto& kv : values) {
-        manifest.table_metadata[kv.first] = kv.second;
-    }
-    return commit_next_version(dataset_path, std::move(manifest), new_version, error);
+                                   std::uint64_t& new_version, std::string& error, ReadVersion read_version) {
+    ReadVersion from = read_version;
+    return retry_on_conflict(
+        [&] {
+            pb::Manifest manifest;
+            std::uint64_t version = 0;
+            if (!load_read_version(dataset_path, std::exchange(from, std::nullopt), manifest, version, error)) {
+                return false;
+            }
+            if (replace) {
+                manifest.table_metadata.clear();
+            }
+            for (const auto& kv : values) {
+                manifest.table_metadata[kv.first] = kv.second;
+            }
+            return commit_next_version(dataset_path, std::move(manifest), new_version, error);
+        },
+        error);
 }
 
 bool dataset_update_schema_metadata(const std::filesystem::path& dataset_path,
                                     const std::map<std::string, std::string>& values, bool replace,
-                                    std::uint64_t& new_version, std::string& error) {
-    pb::Manifest manifest;
-    std::uint64_t latest = 0;
-    if (!load_latest_manifest(dataset_path, manifest, latest, error)) {
-        return false;
-    }
-    if (replace) {
-        manifest.schema_metadata.clear();
-    }
-    for (const auto& kv : values) {
-        manifest.schema_metadata[kv.first] = std::vector<std::uint8_t>(kv.second.begin(), kv.second.end());
-    }
-    return commit_next_version(dataset_path, std::move(manifest), new_version, error);
+                                    std::uint64_t& new_version, std::string& error, ReadVersion read_version) {
+    ReadVersion from = read_version;
+    return retry_on_conflict(
+        [&] {
+            pb::Manifest manifest;
+            std::uint64_t version = 0;
+            if (!load_read_version(dataset_path, std::exchange(from, std::nullopt), manifest, version, error)) {
+                return false;
+            }
+            if (replace) {
+                manifest.schema_metadata.clear();
+            }
+            for (const auto& kv : values) {
+                manifest.schema_metadata[kv.first] = std::vector<std::uint8_t>(kv.second.begin(), kv.second.end());
+            }
+            return commit_next_version(dataset_path, std::move(manifest), new_version, error);
+        },
+        error);
 }
 
 bool dataset_fields(const std::filesystem::path& dataset_path, bool has_version, std::uint64_t version,

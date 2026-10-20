@@ -47,6 +47,8 @@ def translate(message: str) -> Exception:
     for marker, kind in _FEATURE_FLAG_ERRORS:
         if marker in text:
             return kind(text[text.index(marker):])
+    if "Incompatible transaction:" in text:  # refused, not retried: pylance raises it as an OSError too
+        return OSError(text[text.index("Incompatible transaction:"):])
     # Filter errors, as pylance words them (DataFusion's planner behind "Invalid user input").
     import re
 

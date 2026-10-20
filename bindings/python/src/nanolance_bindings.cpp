@@ -1453,21 +1453,23 @@ NB_MODULE(_nanolance, m) {
         });
     });
     m.def("_ds_update_config", [](const std::filesystem::path& path, const std::map<std::string, std::string>& upsert,
-                                  const std::vector<std::string>& remove) {
+                                  const std::vector<std::string>& remove, std::optional<std::uint64_t> read_version) {
         return new_version_or_throw([&](std::uint64_t& v, std::string& e) {
-            return nano_lance::dataset_update_config(path, upsert, remove, v, e);
+            return nano_lance::dataset_update_config(path, upsert, remove, v, e, read_version);
         });
     });
     m.def("_ds_update_table_metadata", [](const std::filesystem::path& path,
-                                          const std::map<std::string, std::string>& values, bool replace) {
+                                          const std::map<std::string, std::string>& values, bool replace,
+                                          std::optional<std::uint64_t> read_version) {
         return new_version_or_throw([&](std::uint64_t& v, std::string& e) {
-            return nano_lance::dataset_update_table_metadata(path, values, replace, v, e);
+            return nano_lance::dataset_update_table_metadata(path, values, replace, v, e, read_version);
         });
     });
     m.def("_ds_update_schema_metadata", [](const std::filesystem::path& path,
-                                           const std::map<std::string, std::string>& values, bool replace) {
+                                           const std::map<std::string, std::string>& values, bool replace,
+                                           std::optional<std::uint64_t> read_version) {
         return new_version_or_throw([&](std::uint64_t& v, std::string& e) {
-            return nano_lance::dataset_update_schema_metadata(path, values, replace, v, e);
+            return nano_lance::dataset_update_schema_metadata(path, values, replace, v, e, read_version);
         });
     });
     m.def("_file_read", &file_read, nb::arg("path"), nb::arg("columns").none(), nb::arg("offset"),
@@ -1493,25 +1495,29 @@ NB_MODULE(_nanolance, m) {
     m.attr("COMMIT_CREATE") = static_cast<int>(NANO_LANCE_COMMIT_CREATE);
     m.attr("COMMIT_APPEND") = static_cast<int>(NANO_LANCE_COMMIT_APPEND);
     m.attr("COMMIT_OVERWRITE") = static_cast<int>(NANO_LANCE_COMMIT_OVERWRITE);
-    m.def("_ds_delete", [](const std::filesystem::path& path, const std::string& predicate) {
+    m.def("_ds_delete", [](const std::filesystem::path& path, const std::string& predicate,
+                           std::optional<std::uint64_t> read_version) {
         std::uint64_t deleted = 0;
         std::uint64_t version = 0;
-        run_op([&](std::string& e) { return nano_lance::dataset_delete(path, predicate, deleted, version, e); });
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_delete(path, predicate, deleted, version, e, read_version);
+        });
         return nb::make_tuple(deleted, version);
     });
     m.def("_ds_update", [](const std::filesystem::path& path, std::optional<std::string> where,
                            const std::vector<std::pair<std::string, std::string>>& assignments,
-                           const std::optional<nb::bytes>& row_addr_allowlist) {
+                           const std::optional<nb::bytes>& row_addr_allowlist,
+                           std::optional<std::uint64_t> read_version) {
         std::uint64_t updated = 0;
         std::uint64_t version = 0;
         const auto mask = row_addr_mask(row_addr_allowlist, std::nullopt);
         run_op([&](std::string& e) {
             return nano_lance::dataset_update(path, where ? &*where : nullptr, assignments, updated, version, e,
-                                              mask ? &*mask : nullptr);
+                                              mask ? &*mask : nullptr, read_version);
         });
         return nb::make_tuple(updated, version);
     }, nb::arg("path"), nb::arg("where").none(), nb::arg("assignments"),
-       nb::arg("row_addr_allowlist").none() = nb::none());
+       nb::arg("row_addr_allowlist").none() = nb::none(), nb::arg("read_version").none() = nb::none());
     // JSON columns: arrow.json text <-> Lance's JSONB (jsonb.hpp), a whole array at a time. Each
     // returns (schema capsule, array capsule): large_binary for _json_encode, utf8 for _json_decode.
     auto convert_json = [](nb::handle array, bool encode) {
@@ -1646,7 +1652,8 @@ NB_MODULE(_nanolance, m) {
                                  const std::string& delete_condition, nb::handle data,
                                  const std::string& update_condition, const std::string& when_matched,
                                  bool uncommitted, const std::vector<std::string>& target_dirs,
-                                 const std::vector<std::uint32_t>& target_base_ids) {
+                                 const std::vector<std::uint32_t>& target_base_ids,
+                                 std::optional<std::uint64_t> read_version) {
         nano_lance::MergeInsertSpec spec;
         nano_lance::MergeInsertSpec::Uncommitted transaction;
         if (uncommitted) {
@@ -1670,7 +1677,9 @@ NB_MODULE(_nanolance, m) {
         ArrowArrayStream stream = stream_of(data);
         nano_lance::MergeInsertStats stats;
         std::uint64_t version = 0;
-        run_op([&](std::string& e) { return nano_lance::dataset_merge_insert(path, spec, stream, stats, version, e); });
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_merge_insert(path, spec, stream, stats, version, e, read_version);
+        });
         nb::dict d;
         d["num_inserted_rows"] = stats.inserted;
         d["num_updated_rows"] = stats.updated;
@@ -1810,22 +1819,31 @@ NB_MODULE(_nanolance, m) {
         return nb::make_tuple(bytes_of(fragment.data(), fragment.size()), field_list, written);
     });
     m.def("_ds_add_columns_sql", [](const std::filesystem::path& path,
-                                    const std::vector<std::pair<std::string, std::string>>& columns) {
+                                    const std::vector<std::pair<std::string, std::string>>& columns,
+                                    std::optional<std::uint64_t> read_version) {
         std::uint64_t version = 0;
-        run_op([&](std::string& e) { return nano_lance::dataset_add_columns_sql(path, columns, version, e); });
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_add_columns_sql(path, columns, version, e, read_version);
+        });
         return version;
     });
-    m.def("_ds_add_columns_nulls", [](const std::filesystem::path& path, nb::handle schema) {
+    m.def("_ds_add_columns_nulls", [](const std::filesystem::path& path, nb::handle schema,
+                                      std::optional<std::uint64_t> read_version) {
         SchemaHolder holder;
         schema_of(schema, holder);
         std::uint64_t version = 0;
-        run_op([&](std::string& e) { return nano_lance::dataset_add_columns_nulls(path, holder.schema, version, e); });
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_add_columns_nulls(path, holder.schema, version, e, read_version);
+        });
         return version;
     });
-    m.def("_ds_add_columns_stream", [](const std::filesystem::path& path, nb::handle data) {
+    m.def("_ds_add_columns_stream", [](const std::filesystem::path& path, nb::handle data,
+                                       std::optional<std::uint64_t> read_version) {
         ArrowArrayStream stream = stream_of(data);
         std::uint64_t version = 0;
-        run_op([&](std::string& e) { return nano_lance::dataset_add_columns_stream(path, stream, version, e); });
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_add_columns_stream(path, stream, version, e, read_version);
+        });
         return version;
     });
     m.def("_ds_create_scalar_index", [](const std::filesystem::path& path, const std::string& column,
@@ -2305,12 +2323,16 @@ NB_MODULE(_nanolance, m) {
        nb::arg("max_iters"), nb::arg("sample_rate"), nb::arg("seed"), nb::arg("hnsw_m"),
        nb::arg("ef_construction"), nb::arg("max_level"), nb::arg("ivf_centroids") = nb::none(),
        nb::arg("pq_codebook") = nb::none(), nb::arg("skip_transpose") = false, nb::arg("progress") = nb::none());
-    m.def("_ds_drop_columns", [](const std::filesystem::path& path, const std::vector<std::string>& columns) {
+    m.def("_ds_drop_columns", [](const std::filesystem::path& path, const std::vector<std::string>& columns,
+                                 std::optional<std::uint64_t> read_version) {
         std::uint64_t version = 0;
-        run_op([&](std::string& e) { return nano_lance::dataset_drop_columns(path, columns, version, e); });
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_drop_columns(path, columns, version, e, read_version);
+        });
         return version;
     });
-    m.def("_ds_alter_columns", [](const std::filesystem::path& path, nb::list alterations) {
+    m.def("_ds_alter_columns", [](const std::filesystem::path& path, nb::list alterations,
+                                  std::optional<std::uint64_t> read_version) {
         std::vector<nano_lance::ColumnAlteration> alts;
         std::vector<std::unique_ptr<SchemaHolder>> types;
         for (auto item : alterations) {
@@ -2331,7 +2353,7 @@ NB_MODULE(_nanolance, m) {
             alts.push_back(std::move(alt));
         }
         std::uint64_t version = 0;
-        run_op([&](std::string& e) { return nano_lance::dataset_alter_columns(path, alts, version, e); });
+        run_op([&](std::string& e) { return nano_lance::dataset_alter_columns(path, alts, version, e, read_version); });
         return version;
     });
     m.def("_ds_compact_files", [](const std::filesystem::path& path, std::uint64_t target_rows,
@@ -2341,7 +2363,7 @@ NB_MODULE(_nanolance, m) {
                                   std::optional<std::uint64_t> max_source_bytes,
                                   const std::vector<std::uint64_t>& excluded_fragment_ids,
                                   std::uint64_t max_bytes_per_file, std::uint64_t batch_size,
-                                  bool defer_index_remap) {
+                                  bool defer_index_remap, std::optional<std::uint64_t> read_version) {
         nano_lance::CompactionOptions options;
         options.reindex = reindex;
         options.defer_index_remap = defer_index_remap;
@@ -2356,7 +2378,9 @@ NB_MODULE(_nanolance, m) {
         options.materialize_deletions_threshold = threshold;
         nano_lance::CompactionMetrics metrics;
         std::uint64_t version = 0;
-        run_op([&](std::string& e) { return nano_lance::dataset_compact_files(path, options, metrics, version, e); });
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_compact_files(path, options, metrics, version, e, read_version);
+        });
         nb::dict d;
         d["fragments_removed"] = metrics.fragments_removed;
         d["fragments_added"] = metrics.fragments_added;

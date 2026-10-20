@@ -141,10 +141,6 @@ bool matching_rows(const std::filesystem::path& path, std::uint64_t version, con
     return true;
 }
 
-bool load_latest(const std::filesystem::path& path, pb::Manifest& manifest, std::uint64_t& version, std::string& error) {
-    return load_latest_manifest(path, manifest, version, error);
-}
-
 /// Mark `deleted` rows of `manifest`'s fragments deleted: each touched fragment gets a new deletion
 /// file with its old deletions and the new ones; a fragment left with no rows is removed.
 bool apply_deletions(const std::filesystem::path& path, pb::Manifest& manifest, std::uint64_t read_version,
@@ -710,35 +706,42 @@ pb::Field* find_field(pb::Manifest& manifest, const std::string& path) {
 
 // One attempt of each, defined below.
 bool delete_once(const std::filesystem::path& dataset_path, const std::string& predicate, std::uint64_t& deleted,
-                 std::uint64_t& new_version, std::string& error);
+                 std::uint64_t& new_version, std::string& error, ReadVersion read_version);
 bool update_once(const std::filesystem::path& dataset_path, const std::string* predicate,
                  const std::vector<std::pair<std::string, std::string>>& assignments, std::uint64_t& updated,
-                 std::uint64_t& new_version, std::string& error, const RowAddrMask* row_mask);
+                 std::uint64_t& new_version, std::string& error, const RowAddrMask* row_mask, ReadVersion read_version);
 bool merge_insert_once(const std::filesystem::path& dataset_path, const MergeInsertSpec& spec,
                        ArrowArrayStream& source, MergeInsertStats& stats, std::uint64_t& new_version,
-                       std::string& error);
+                       std::string& error, ReadVersion read_version);
 
 bool dataset_delete(const std::filesystem::path& dataset_path, const std::string& predicate, std::uint64_t& deleted,
-                    std::uint64_t& new_version, std::string& error) {
-    return retry_on_conflict([&] { return delete_once(dataset_path, predicate, deleted, new_version, error); }, error);
+                    std::uint64_t& new_version, std::string& error, ReadVersion read_version) {
+    return retry_from_read_version(
+        read_version,
+        [&](ReadVersion from) { return delete_once(dataset_path, predicate, deleted, new_version, error, from); },
+        error);
 }
 
 bool dataset_update(const std::filesystem::path& dataset_path, const std::string* predicate,
                     const std::vector<std::pair<std::string, std::string>>& assignments, std::uint64_t& updated,
-                    std::uint64_t& new_version, std::string& error, const RowAddrMask* row_mask) {
+                    std::uint64_t& new_version, std::string& error, const RowAddrMask* row_mask,
+                    ReadVersion read_version) {
     if (row_mask != nullptr) {
         // Row addresses name rows of the version they were resolved against: a retry over a newer
         // version could update other rows, so a conflict is reported instead of retried.
-        return update_once(dataset_path, predicate, assignments, updated, new_version, error, row_mask);
+        return update_once(dataset_path, predicate, assignments, updated, new_version, error, row_mask, read_version);
     }
-    return retry_on_conflict(
-        [&] { return update_once(dataset_path, predicate, assignments, updated, new_version, error, row_mask); },
+    return retry_from_read_version(
+        read_version,
+        [&](ReadVersion from) {
+            return update_once(dataset_path, predicate, assignments, updated, new_version, error, row_mask, from);
+        },
         error);
 }
 
 bool dataset_merge_insert(const std::filesystem::path& dataset_path, const MergeInsertSpec& spec,
                           ArrowArrayStream& source, MergeInsertStats& stats, std::uint64_t& new_version,
-                          std::string& error) {
+                          std::string& error, ReadVersion read_version) {
     // The source is read once and replayed to each attempt.
     struct Release {
         ArrowArrayStream* s;
@@ -766,8 +769,9 @@ bool dataset_merge_insert(const std::filesystem::path& dataset_path, const Merge
         }
         batches.push_back(std::make_shared<SharedBatch>(std::move(b)));
     }
-    return retry_on_conflict(
-        [&] {
+    return retry_from_read_version(
+        read_version,
+        [&](ReadVersion from) {
             ArrowSchema copy{};
             ArrowArrayStream replay{};
             if (ArrowSchemaDeepCopy(&schema.s, &copy) != NANOARROW_OK ||
@@ -782,14 +786,13 @@ bool dataset_merge_insert(const std::filesystem::path& dataset_path, const Merge
                 ArrowArray view = slice_batch(batches[i], 0, batches[i]->array.length);
                 ArrowBasicArrayStreamSetArray(&replay, static_cast<int64_t>(i), &view);
             }
-            const bool ok = merge_insert_once(dataset_path, spec, replay, stats, new_version, error);
-            return ok;
+            return merge_insert_once(dataset_path, spec, replay, stats, new_version, error, from);
         },
         error);
 }
 
 bool delete_once(const std::filesystem::path& dataset_path, const std::string& predicate, std::uint64_t& deleted,
-                 std::uint64_t& new_version, std::string& error) {
+                 std::uint64_t& new_version, std::string& error, ReadVersion read_version) {
     error.clear();
     deleted = 0;
     if (predicate.empty()) {
@@ -798,7 +801,7 @@ bool delete_once(const std::filesystem::path& dataset_path, const std::string& p
     }
     pb::Manifest manifest;
     std::uint64_t version = 0;
-    if (!load_latest(dataset_path, manifest, version, error)) {
+    if (!load_read_version(dataset_path, read_version, manifest, version, error)) {
         return false;
     }
     std::map<std::uint64_t, std::vector<std::uint32_t>> rows;
@@ -813,7 +816,8 @@ bool delete_once(const std::filesystem::path& dataset_path, const std::string& p
 
 bool update_once(const std::filesystem::path& dataset_path, const std::string* predicate,
                  const std::vector<std::pair<std::string, std::string>>& assignments, std::uint64_t& updated,
-                 std::uint64_t& new_version, std::string& error, const RowAddrMask* row_mask) {
+                 std::uint64_t& new_version, std::string& error, const RowAddrMask* row_mask,
+                 ReadVersion read_version) {
     error.clear();
     updated = 0;
     if (assignments.empty()) {
@@ -822,7 +826,7 @@ bool update_once(const std::filesystem::path& dataset_path, const std::string* p
     }
     pb::Manifest manifest;
     std::uint64_t version = 0;
-    if (!load_latest(dataset_path, manifest, version, error)) {
+    if (!load_read_version(dataset_path, read_version, manifest, version, error)) {
         return false;
     }
     const bool stable = is_stable(manifest);
@@ -1088,7 +1092,7 @@ bool update_if_passes(const std::filesystem::path& dataset_path, std::uint64_t v
 
 bool merge_insert_once(const std::filesystem::path& dataset_path, const MergeInsertSpec& spec,
                        ArrowArrayStream& source, MergeInsertStats& stats, std::uint64_t& new_version,
-                       std::string& error) {
+                       std::string& error, ReadVersion read_version) {
     struct Release {
         ArrowArrayStream* s;
         ~Release() {
@@ -1105,7 +1109,7 @@ bool merge_insert_once(const std::filesystem::path& dataset_path, const MergeIns
     }
     pb::Manifest manifest;
     std::uint64_t version = 0;
-    if (!load_latest(dataset_path, manifest, version, error)) {
+    if (!load_read_version(dataset_path, read_version, manifest, version, error)) {
         return false;
     }
     const bool stable = is_stable(manifest);
@@ -1453,13 +1457,15 @@ bool write_sql_columns(const std::filesystem::path& dataset_path, const pb::Mani
 
 }  // namespace
 
-bool dataset_add_columns_sql(const std::filesystem::path& dataset_path,
-                             const std::vector<std::pair<std::string, std::string>>& columns,
-                             std::uint64_t& new_version, std::string& error) {
+namespace {
+
+bool dataset_add_columns_sql_once(const std::filesystem::path& dataset_path,
+                                  const std::vector<std::pair<std::string, std::string>>& columns,
+                                  std::uint64_t& new_version, std::string& error, ReadVersion read_version) {
     error.clear();
     pb::Manifest manifest;
     std::uint64_t version = 0;
-    if (!load_latest(dataset_path, manifest, version, error)) {
+    if (!load_read_version(dataset_path, read_version, manifest, version, error)) {
         return false;
     }
     StagedFiles staged;
@@ -1474,8 +1480,21 @@ bool dataset_add_columns_sql(const std::filesystem::path& dataset_path,
     return commit(dataset_path, std::move(manifest), new_version, error);
 }
 
-bool dataset_add_columns_nulls(const std::filesystem::path& dataset_path, const ArrowSchema& schema,
-                               std::uint64_t& new_version, std::string& error) {
+}  // namespace
+
+bool dataset_add_columns_sql(const std::filesystem::path& dataset_path,
+                             const std::vector<std::pair<std::string, std::string>>& columns,
+                             std::uint64_t& new_version, std::string& error, ReadVersion read_version) {
+    return retry_from_read_version(
+        read_version,
+        [&](ReadVersion from) { return dataset_add_columns_sql_once(dataset_path, columns, new_version, error, from); },
+        error);
+}
+
+namespace {
+
+bool dataset_add_columns_nulls_once(const std::filesystem::path& dataset_path, const ArrowSchema& schema,
+                                    std::uint64_t& new_version, std::string& error, ReadVersion read_version) {
     error.clear();
     if (schema.n_children <= 0) {
         error = "no columns to add";
@@ -1483,7 +1502,7 @@ bool dataset_add_columns_nulls(const std::filesystem::path& dataset_path, const 
     }
     pb::Manifest manifest;
     std::uint64_t version = 0;
-    if (!load_latest(dataset_path, manifest, version, error)) {
+    if (!load_read_version(dataset_path, read_version, manifest, version, error)) {
         return false;
     }
     std::vector<std::string> names;
@@ -1511,8 +1530,18 @@ bool dataset_add_columns_nulls(const std::filesystem::path& dataset_path, const 
     return commit(dataset_path, std::move(manifest), new_version, error);
 }
 
+}  // namespace
+
+bool dataset_add_columns_nulls(const std::filesystem::path& dataset_path, const ArrowSchema& schema,
+                               std::uint64_t& new_version, std::string& error, ReadVersion read_version) {
+    return retry_from_read_version(
+        read_version,
+        [&](ReadVersion from) { return dataset_add_columns_nulls_once(dataset_path, schema, new_version, error, from); },
+        error);
+}
+
 bool dataset_add_columns_stream(const std::filesystem::path& dataset_path, ArrowArrayStream& stream,
-                                std::uint64_t& new_version, std::string& error) {
+                                std::uint64_t& new_version, std::string& error, ReadVersion read_version) {
     struct Release {
         ArrowArrayStream* s;
         ~Release() {
@@ -1524,7 +1553,7 @@ bool dataset_add_columns_stream(const std::filesystem::path& dataset_path, Arrow
     error.clear();
     pb::Manifest manifest;
     std::uint64_t version = 0;
-    if (!load_latest(dataset_path, manifest, version, error)) {
+    if (!load_read_version(dataset_path, read_version, manifest, version, error)) {
         return false;
     }
     for (const auto& f : manifest.fragments) {
@@ -1597,8 +1626,10 @@ bool dataset_add_columns_stream(const std::filesystem::path& dataset_path, Arrow
     return commit(dataset_path, std::move(manifest), new_version, error);
 }
 
-bool dataset_drop_columns(const std::filesystem::path& dataset_path, const std::vector<std::string>& columns,
-                          std::uint64_t& new_version, std::string& error) {
+namespace {
+
+bool dataset_drop_columns_once(const std::filesystem::path& dataset_path, const std::vector<std::string>& columns,
+                               std::uint64_t& new_version, std::string& error, ReadVersion read_version) {
     error.clear();
     if (columns.empty()) {
         error = "no columns to drop";
@@ -1606,7 +1637,7 @@ bool dataset_drop_columns(const std::filesystem::path& dataset_path, const std::
     }
     pb::Manifest manifest;
     std::uint64_t version = 0;
-    if (!load_latest(dataset_path, manifest, version, error)) {
+    if (!load_read_version(dataset_path, read_version, manifest, version, error)) {
         return false;
     }
     std::unordered_set<std::int32_t> gone;
@@ -1656,8 +1687,20 @@ bool dataset_drop_columns(const std::filesystem::path& dataset_path, const std::
     return commit(dataset_path, std::move(manifest), new_version, error);
 }
 
-bool dataset_alter_columns(const std::filesystem::path& dataset_path, const std::vector<ColumnAlteration>& alterations,
-                           std::uint64_t& new_version, std::string& error) {
+}  // namespace
+
+bool dataset_drop_columns(const std::filesystem::path& dataset_path, const std::vector<std::string>& columns,
+                          std::uint64_t& new_version, std::string& error, ReadVersion read_version) {
+    return retry_from_read_version(
+        read_version,
+        [&](ReadVersion from) { return dataset_drop_columns_once(dataset_path, columns, new_version, error, from); },
+        error);
+}
+
+namespace {
+
+bool dataset_alter_columns_once(const std::filesystem::path& dataset_path, const std::vector<ColumnAlteration>& alterations,
+                                std::uint64_t& new_version, std::string& error, ReadVersion read_version) {
     error.clear();
     if (alterations.empty()) {
         error = "no alterations";
@@ -1665,7 +1708,7 @@ bool dataset_alter_columns(const std::filesystem::path& dataset_path, const std:
     }
     pb::Manifest manifest;
     std::uint64_t version = 0;
-    if (!load_latest(dataset_path, manifest, version, error)) {
+    if (!load_read_version(dataset_path, read_version, manifest, version, error)) {
         return false;
     }
     for (const auto& a : alterations) {
@@ -1786,16 +1829,29 @@ bool dataset_alter_columns(const std::filesystem::path& dataset_path, const std:
     return commit(dataset_path, std::move(manifest), new_version, error);
 }
 
+}  // namespace
+
+bool dataset_alter_columns(const std::filesystem::path& dataset_path, const std::vector<ColumnAlteration>& alterations,
+                           std::uint64_t& new_version, std::string& error, ReadVersion read_version) {
+    return retry_from_read_version(
+        read_version,
+        [&](ReadVersion from) { return dataset_alter_columns_once(dataset_path, alterations, new_version, error, from); },
+        error);
+}
+
 // ── compaction ──────────────────────────────────────────────────────────────────────────────────
 
 bool compact_once(const std::filesystem::path& dataset_path, const CompactionOptions& options,
-                  CompactionMetrics& metrics, std::uint64_t& new_version, std::string& error);
+                  CompactionMetrics& metrics, std::uint64_t& new_version, std::string& error, ReadVersion from);
 
 bool dataset_compact_files(const std::filesystem::path& dataset_path, const CompactionOptions& options,
-                           CompactionMetrics& metrics, std::uint64_t& new_version, std::string& error) {
+                           CompactionMetrics& metrics, std::uint64_t& new_version, std::string& error,
+                           ReadVersion read_version) {
     // Planned again from the latest version when a delete or update rewrote a fragment meanwhile.
-    return retry_on_conflict([&] { return compact_once(dataset_path, options, metrics, new_version, error); },
-                             error);
+    return retry_from_read_version(
+        read_version,
+        [&](ReadVersion from) { return compact_once(dataset_path, options, metrics, new_version, error, from); },
+        error);
 }
 
 namespace {
@@ -2020,13 +2076,16 @@ void remap_coverage(std::vector<std::uint32_t>& ids,
 
 }  // namespace
 
-bool dataset_compact_plan(const std::filesystem::path& dataset_path, const CompactionOptions& options,
-                          std::uint64_t& read_version, std::vector<std::vector<std::uint64_t>>& tasks,
-                          std::string& error) {
+namespace {
+
+/// The planner's tasks of `read_version` (the latest when none is given).
+bool compact_plan_from(const std::filesystem::path& dataset_path, const CompactionOptions& options,
+                       ReadVersion from, std::uint64_t& read_version, std::vector<std::vector<std::uint64_t>>& tasks,
+                       std::string& error) {
     error.clear();
     tasks.clear();
     pb::Manifest manifest;
-    if (!load_latest(dataset_path, manifest, read_version, error)) {
+    if (!load_read_version(dataset_path, from, manifest, read_version, error)) {
         return false;
     }
     std::vector<std::vector<std::size_t>> bins;
@@ -2041,6 +2100,14 @@ bool dataset_compact_plan(const std::filesystem::path& dataset_path, const Compa
         tasks.push_back(std::move(ids));
     }
     return true;
+}
+
+}  // namespace
+
+bool dataset_compact_plan(const std::filesystem::path& dataset_path, const CompactionOptions& options,
+                          std::uint64_t& read_version, std::vector<std::vector<std::uint64_t>>& tasks,
+                          std::string& error) {
+    return compact_plan_from(dataset_path, options, std::nullopt, read_version, tasks, error);
 }
 
 bool dataset_compact_execute(const std::filesystem::path& dataset_path, const CompactionOptions& options,
@@ -2285,11 +2352,11 @@ bool dataset_compact_commit(const std::filesystem::path& dataset_path, const Com
 }
 
 bool compact_once(const std::filesystem::path& dataset_path, const CompactionOptions& options,
-                  CompactionMetrics& metrics, std::uint64_t& new_version, std::string& error) {
+                  CompactionMetrics& metrics, std::uint64_t& new_version, std::string& error, ReadVersion from) {
     // Eager compaction: the planner's tasks, each rewritten, then all committed as one version.
     std::uint64_t read_version = 0;
     std::vector<std::vector<std::uint64_t>> tasks;
-    if (!dataset_compact_plan(dataset_path, options, read_version, tasks, error)) {
+    if (!compact_plan_from(dataset_path, options, from, read_version, tasks, error)) {
         return false;
     }
     new_version = read_version;

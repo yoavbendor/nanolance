@@ -91,17 +91,20 @@ bool dataset_restore(const std::filesystem::path& dataset_path, std::uint64_t ve
 /// Upsert (and, for `remove`, delete) table config keys in a new version.
 bool dataset_update_config(const std::filesystem::path& dataset_path,
                            const std::map<std::string, std::string>& upsert, const std::vector<std::string>& remove,
-                           std::uint64_t& new_version, std::string& error);
+                           std::uint64_t& new_version, std::string& error,
+                           std::optional<std::uint64_t> read_version = std::nullopt);
 
 /// Replace the table metadata (`replace`) or upsert into it, in a new version.
 bool dataset_update_table_metadata(const std::filesystem::path& dataset_path,
                                    const std::map<std::string, std::string>& values, bool replace,
-                                   std::uint64_t& new_version, std::string& error);
+                                   std::uint64_t& new_version, std::string& error,
+                                   std::optional<std::uint64_t> read_version = std::nullopt);
 
 /// Replace the schema metadata (`replace`) or upsert into it, in a new version.
 bool dataset_update_schema_metadata(const std::filesystem::path& dataset_path,
                                     const std::map<std::string, std::string>& values, bool replace,
-                                    std::uint64_t& new_version, std::string& error);
+                                    std::uint64_t& new_version, std::string& error,
+                                    std::optional<std::uint64_t> read_version = std::nullopt);
 
 /// A field of a dataset's schema, as its manifest holds it (pre-order; a child names its parent).
 struct DatasetField {

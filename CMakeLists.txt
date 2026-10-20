@@ -344,6 +344,8 @@ add_library(nanolance STATIC
     src/arrow_slice.cpp
     src/dataset_ops.cpp
     src/dataset_transaction.cpp
+    src/dataset_operation.cpp
+    src/commit_conflicts.cpp
     src/dataset_stitcher.cpp
     src/schema_mapper.cpp
     src/writer.cpp
@@ -613,6 +615,12 @@ target_compile_features(nano_lance_float_text_test PRIVATE cxx_std_20)
 add_executable(nano_lance_writer_lifecycle_test tests/test_writer_lifecycle.cpp)
 target_compile_features(nano_lance_writer_lifecycle_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_writer_lifecycle_test PRIVATE nanolance)
+
+add_executable(test_commit_conflicts tests/test_commit_conflicts.cpp)
+target_compile_features(test_commit_conflicts PRIVATE cxx_std_23)
+target_include_directories(test_commit_conflicts PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_commit_conflicts PRIVATE nanolance)
+add_test(NAME commit_conflicts COMMAND $<TARGET_FILE:test_commit_conflicts>)
 
 add_executable(nano_lance_int128_test tests/test_int128.cpp)
 target_compile_features(nano_lance_int128_test PRIVATE cxx_std_20)

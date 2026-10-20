@@ -720,14 +720,14 @@ class LanceDataset(pa.dataset.Dataset):
             remove = sorted(set(remove) | (set(current) - set(values)))
         upsert = {k: str(v) for k, v in values.items() if v is not None}
         with native():
-            _nanolance._ds_update_config(self._uri, upsert, remove)
+            _nanolance._ds_update_config(self._uri, upsert, remove, self._version)
         self._refresh_latest("UpdateConfig")
         return self.config()
 
     def delete_config_keys(self, keys: List[str]) -> None:
         refuse_object_store_write(self._uri, "delete config keys")
         with native():
-            _nanolance._ds_update_config(self._uri, {}, list(keys))
+            _nanolance._ds_update_config(self._uri, {}, list(keys), self._version)
         self._refresh_latest("UpdateConfig")
 
     @property
@@ -743,7 +743,7 @@ class LanceDataset(pa.dataset.Dataset):
             else:
                 merged[k] = str(v)
         with native():
-            _nanolance._ds_update_table_metadata(self._uri, merged, True)
+            _nanolance._ds_update_table_metadata(self._uri, merged, True, self._version)
         self._refresh_latest("UpdateConfig")
         return self.metadata
 
@@ -760,7 +760,7 @@ class LanceDataset(pa.dataset.Dataset):
             else:
                 merged[k] = str(v)
         with native():
-            _nanolance._ds_update_schema_metadata(self._uri, merged, True)
+            _nanolance._ds_update_schema_metadata(self._uri, merged, True, self._version)
         self._refresh_latest("UpdateConfig")
         return self.schema_metadata
 
@@ -1116,7 +1116,7 @@ class LanceDataset(pa.dataset.Dataset):
         if sql is None:
             raise ValueError("delete needs a predicate")
         with native():
-            deleted, _ = _nanolance._ds_delete(self._uri, sql)
+            deleted, _ = _nanolance._ds_delete(self._uri, sql, self._version)
         self._refresh_latest("Delete")
         return {"num_deleted_rows": int(deleted)}
 
@@ -1137,7 +1137,7 @@ class LanceDataset(pa.dataset.Dataset):
             addresses = self.to_table(columns=[], filter=sql, with_row_address=True).column("_rowaddr")
             allowlist, sql = serialize_row_addrs(addresses.to_pylist()), None
         with native():
-            updated, _ = _nanolance._ds_update(self._uri, sql, assignments, allowlist)
+            updated, _ = _nanolance._ds_update(self._uri, sql, assignments, allowlist, self._version)
         self._refresh_latest("Update")
         return {"num_rows_updated": int(updated)}
 
@@ -1151,20 +1151,20 @@ class LanceDataset(pa.dataset.Dataset):
         if isinstance(transforms, dict):
             columns = [(str(k), str(v)) for k, v in transforms.items()]
             with native():
-                _nanolance._ds_add_columns_sql(self._uri, columns)
+                _nanolance._ds_add_columns_sql(self._uri, columns, self._version)
         elif isinstance(transforms, (pa.Field, pa.Schema)) or (
             isinstance(transforms, list) and transforms and all(isinstance(f, pa.Field) for f in transforms)
         ):
             fields = [transforms] if isinstance(transforms, pa.Field) else list(transforms)
             with native():
-                _nanolance._ds_add_columns_nulls(self._uri, pa.schema(fields))
+                _nanolance._ds_add_columns_nulls(self._uri, pa.schema(fields), self._version)
         elif callable(transforms):
             self._add_columns_udf(transforms, read_columns, batch_size)
             return
         else:
             reader = _coerce_reader(transforms, reader_schema)
             with native():
-                _nanolance._ds_add_columns_stream(self._uri, reader)
+                _nanolance._ds_add_columns_stream(self._uri, reader, self._version)
         self._refresh_latest("Merge")
 
     def _add_columns_udf(self, transforms, read_columns, batch_size) -> None:
@@ -1224,7 +1224,7 @@ class LanceDataset(pa.dataset.Dataset):
         added = pa.table(added.columns, schema=pa.schema(fields, metadata=added.schema.metadata))
         with native():
             _nanolance._ds_add_columns_stream(self._uri, pa.RecordBatchReader.from_batches(
-                added.schema, added.to_batches()))
+                added.schema, added.to_batches()), self._version)
         self._refresh_latest("Merge")
 
     def drop_columns(self, columns: List[str]) -> None:
@@ -1232,7 +1232,7 @@ class LanceDataset(pa.dataset.Dataset):
         if isinstance(columns, str):
             columns = [columns]
         with native():
-            _nanolance._ds_drop_columns(self._uri, [str(c) for c in columns])
+            _nanolance._ds_drop_columns(self._uri, [str(c) for c in columns], self._version)
         self._refresh_latest("Project")
 
     def alter_columns(self, *alterations) -> None:
@@ -1249,7 +1249,7 @@ class LanceDataset(pa.dataset.Dataset):
                 item["data_type"] = pa.field("x", item["data_type"])
             items.append(item)
         with native():
-            _nanolance._ds_alter_columns(self._uri, items)
+            _nanolance._ds_alter_columns(self._uri, items, self._version)
         self._refresh_latest("Project")
 
     # ── indices ───────────────────────────────────────────────────────────────────────────────────
@@ -3303,7 +3303,7 @@ class MergeInsertBuilder:
                     self._ds.uri, self._on, False, False, self._delete_by_source, self._delete_condition,
                     self._fill_missing_columns(pa.RecordBatchReader.from_batches(keys.schema, keys.to_batches()),
                                                target, read_old=False),
-                    "", "delete", self._uncommitted, *self._targets())
+                    "", "delete", self._uncommitted, *self._targets(), self._ds._version)
             self._ds._refresh_latest("Update")
             return {k: int(v) for k, v in stats.items()}
         _check_append_schema(target, reader.schema, allow_subset=True)
@@ -3334,7 +3334,7 @@ class MergeInsertBuilder:
             stats, _, self._transaction = _nanolance._ds_merge_insert(
                 self._ds.uri, self._on, self._update_all, self._insert_all, self._delete_by_source,
                 self._delete_condition, conformed, self._update_condition, self._when_matched, self._uncommitted,
-                dirs, base_ids)
+                dirs, base_ids, self._ds._version)
         self._ds._refresh_latest("Update")
         return {k: int(v) for k, v in stats.items()}
 
@@ -3447,7 +3447,7 @@ class DatasetOptimizer:
                 bool(reindex), *(None if v is None else int(v)
                                  for v in (max_source_fragments, max_source_rows, max_source_bytes)),
                 sorted({int(i) for i in (excluded_fragment_ids or [])}), int(max_bytes_per_file or 0),
-                int(batch_size or 0), bool(defer_index_remap))
+                int(batch_size or 0), bool(defer_index_remap), self._ds._version)
         self._ds._refresh_latest("Rewrite")
         return CompactionMetrics(**{k: int(v) for k, v in metrics.items() if not k.startswith("indexes_")})
 

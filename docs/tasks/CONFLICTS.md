@@ -199,3 +199,30 @@ Reviewer's answers to the session's questions:
 - Align `_transactions.py` `conflict_with` with Lance on 4a-4d above, and add the C++-vs-Python
   agreement test for the pairs both express.
 - Check the wasm build still compiles the touched sources (`docs/../AGENTS.md`, wasm note).
+
+**C1b outcome (2026-10-20):** mutations commit from the handle's version (`ReadVersion`,
+`retry_from_read_version`; C++ default stays "latest"): delete, update, merge_insert, add / drop / alter
+columns, compaction, update_config and table / schema metadata (the last two now retry too). The probe:
+"delete vs overwrite" and "update_config same key" raise pylance's OSError; the four "re-run: keep" rows
+succeed; all other rows unchanged. `bindings/python/tests/test_commit_conflicts.py` (20),
+`tests/test_commit_conflicts.cpp` two-writer tests. Reviewer: removed `load_latest` (unused; the wasm
+build's clang `-Werror` failed on it). Decisions:
+- A reader-form `add_columns` (stream, not replayable) surfaces a retryable verdict as a commit conflict
+  instead of re-running: accepted (pylance surfaces that pair too).
+- A handle whose version auto-cleanup removed commits from the latest manifest: accepted
+  (`test_enable_disable_auto_cleanup`).
+- "4a-4d" in the C1 answers referred to the first session's report; the list is now spelled out in C2.
+
+**C2 scope, in addition to section 4:**
+- Index builds (`create_index`, `create_scalar_index`, `optimize_indices`, segment commits) and
+  `restore` commit from the handle's version too; with C2's rebase an index build raced by an append /
+  delete / update is published without re-building (counter: `rebased`, not `retried`).
+- `derive_transaction_operation` records `Update.inserted_rows_filter`, `Update.update_mode` and
+  Overwrite's `config_upsert_values` as pylance writes them (measure a pylance .txn for a keyed
+  merge_insert, an update, and an overwrite carrying an unchanged config key first).
+- `_transactions.py` `conflict_with` agrees with Lance (and the C++ port) on: Overwrite vs Overwrite and
+  vs UpdateConfig on one config key (incompatible); UpdateConfig (ours) vs Overwrite on a config key;
+  UpdateConfig vs UpdateConfig both setting schema metadata (Lance's rule, conflict_resolver.rs
+  `check_update_config_txn`); Rewrite (ours) vs CreateIndex on overlapping fragments (retryable);
+  Rewrite / Update (ours) vs DataOverlay on overlapping fragments (retryable); CreateIndex as ours. Add
+  the C++-vs-Python agreement test over the pairs both can express.
