@@ -2,11 +2,13 @@
 the same rows in the same order, distances within the tolerance of ``_same``.
 
 Phase R1a: the default index (L2, fast rotation, 5 bits). Phase R1b: every num_bits pylance accepts (1 to 9),
-cosine and dot, skip_transpose, and index_stats. Building IVF_RQ (R2) is not here.
+cosine and dot, skip_transpose, and index_stats. Phase R2: nanolance builds IVF_RQ indexes that pylance searches
+with nanolance's own answers, the recall bound, seeded and shared-model builds, and the refusals.
 """
 
 from __future__ import annotations
 
+import json
 import shutil
 
 import numpy as np
@@ -252,3 +254,145 @@ def test_other_approx_modes_are_refused(lance, built, mode):
         nl.dataset(path).to_table(nearest={"column": "vec", "q": q, "k": 5, "approx_mode": mode})
     exact = nl.dataset(path).to_table(nearest={"column": "vec", "q": q, "k": 5, "approx_mode": mode, "use_index": False})
     assert exact.num_rows == 5
+
+
+# ── R2: nanolance builds IVF_RQ ─────────────────────────────────────────────────────────────────────────────
+
+BUILD_CASES = ([(bits, "l2", False) for bits in range(1, 10)]
+               + [(bits, metric, False) for metric in ("cosine", "dot") for bits in (1, 5, 9)]
+               + [(1, "l2", True), (5, "dot", True), (9, "cosine", True)])
+
+
+def _nano_build(tmp_path, dim, parts, num_bits=5, metric=None, skip=False, seed=1, name="rq.lance"):
+    v = _vectors(dim, 0)
+    path = str(tmp_path / name)
+    nl.write_dataset(_table(v, dim), path)
+    kwargs = {"num_bits": num_bits, "skip_transpose": skip, "seed": seed}
+    if metric is not None:
+        kwargs["metric"] = metric
+    nl.dataset(path).create_index("vec", "IVF_RQ", num_partitions=parts, **kwargs)
+    return path, v
+
+
+@pytest.mark.parametrize("num_bits,metric,skip", BUILD_CASES)
+def test_nanolance_build_searched_by_pylance_as_nanolance(lance, tmp_path, num_bits, metric, skip):
+    """A nanolance-built index: pylance's search gives the rows and distances nanolance's search gives."""
+    dim, parts = 64, 4
+    path, v = _nano_build(tmp_path, dim, parts, num_bits, None if metric == "l2" else metric, skip)
+    for q in _queries(v, 0):
+        for k in (1, 10):
+            for nprobes in (1, parts):
+                for refine in (None, 4):
+                    nearest = {"column": "vec", "q": q, "k": k, "nprobes": nprobes}
+                    if metric != "l2":
+                        nearest["metric"] = metric
+                    if refine:
+                        nearest["refine_factor"] = refine
+                    ref = lance.dataset(path).to_table(nearest=nearest, columns=["id"])
+                    got = nl.dataset(path).to_table(nearest=nearest, columns=["id"])
+                    _same(ref, got, dim)
+
+
+def test_nanolance_build_index_stats_match_pylance(lance, tmp_path):
+    path, _ = _nano_build(tmp_path, 64, 4, num_bits=9, metric="cosine", skip=True)
+    assert nl.dataset(path).stats.index_stats("vec_idx") == lance.dataset(path).stats.index_stats("vec_idx")
+    sub = nl.dataset(path).stats.index_stats("vec_idx")["indices"][0]["sub_index"]
+    assert sub["num_bits"] == 9 and sub["packed"] is False and sub["query_estimator"] == "raw_query"
+
+
+def test_seeded_build_is_reproducible(tmp_path):
+    """Two builds with one seed write the same index files, byte for byte (as the other kinds' seeded builds)."""
+    import glob
+    import hashlib
+
+    digests = []
+    for name in ("a.lance", "b.lance"):
+        path, _ = _nano_build(tmp_path, 64, 4, seed=7, name=name)
+        files = sorted(glob.glob(path + "/_indices/*/*"))
+        digests.append([(f.rsplit("/", 1)[1], hashlib.sha256(open(f, "rb").read()).hexdigest()) for f in files])
+    assert digests[0] == digests[1]
+    assert len(digests[0]) == 2  # auxiliary.idx and index.idx
+
+
+def test_recall_within_0_03_of_pylance(lance, tmp_path):
+    """20,000 x 128, 64 partitions, mean over 3 builds each: nanolance's index is searched by pylance and its
+    recall@10 is within 0.03 of pylance's own index."""
+    n, dim, parts, nq = 20000, 128, 64, 100
+    rng = np.random.default_rng(0)
+    v = rng.standard_normal((n, dim)).astype(np.float32)
+    qs = v[rng.choice(n, nq, replace=False)] + 0.3 * rng.standard_normal((nq, dim)).astype(np.float32)
+    dist = (qs ** 2).sum(1)[:, None] - 2 * qs @ v.T + (v ** 2).sum(1)[None, :]
+    truth = np.argsort(dist, axis=1)[:, :10]
+    tbl = _table(v, dim)
+
+    def recall(path):
+        hits = 0.0
+        for qi, q in enumerate(qs):
+            got = lance.dataset(path).to_table(nearest={"column": "vec", "q": q, "k": 10}, columns=["id"])
+            hits += len(set(got["id"].to_pylist()) & set(truth[qi].tolist())) / 10
+        return hits / nq
+
+    means = {}
+    for engine, mod in (("pylance", lance), ("nanolance", nl)):
+        values = []
+        for build in range(3):
+            path = str(tmp_path / f"{engine}_{build}.lance")
+            mod.write_dataset(tbl, path)
+            mod.dataset(path).create_index("vec", "IVF_RQ", num_partitions=parts, seed=build + 1)
+            values.append(recall(path))
+        means[engine] = float(np.mean(values))
+    assert means["nanolance"] >= means["pylance"] - 0.03, means
+
+
+def test_build_rq_model_matches_pylance_shape():
+    from lance.lance import indices as pylance_indices
+
+    from nanolance.lance.lance import indices as nanolance_indices
+
+    ref = json.loads(pylance_indices.build_rq_model(dimension=32, num_bits=3))
+    got = json.loads(nanolance_indices.build_rq_model(dimension=32, num_bits=3))
+    assert set(got) == set(ref)
+    assert got["code_dim"] == 32 and got["num_bits"] == 3 and got["rotation_type"] == "fast"
+    assert got["rotate_mat_position"] is None and len(got["fast_rotation_signs"]) == 4 * 32 // 8
+    with pytest.raises(ValueError, match="divisible by 8"):
+        nanolance_indices.build_rq_model(dimension=30)
+
+
+def test_shared_model_segments_merge_and_search_as_pylance(lance, tmp_path):
+    """Two segments built over the two fragments with one shared RaBitQ model merge and commit into one index;
+    pylance searches it with nanolance's own answers."""
+    from nanolance.lance.lance import indices
+
+    dim = 32
+    qs = _queries(_vectors(dim, 3), 3)
+    v = _vectors(dim, 3)[:512]
+    path = str(tmp_path / "seg.lance")
+    nl.write_dataset(_table(v[:256], dim), path)
+    nl.write_dataset(_table(v[256:], dim).set_column(0, "id", pa.array(np.arange(256, 512), pa.int64())),
+                     path, mode="append")
+    ds = nl.dataset(path)
+    frags = ds.get_fragments()
+    assert len(frags) == 2
+    from nanolance.lance.indices import IndicesBuilder
+
+    ivf = IndicesBuilder(ds, "vec").train_ivf(num_partitions=2, distance_type="l2", sample_rate=8, max_iters=2)
+    model = indices.build_rq_model(dimension=dim, num_bits=1)
+    segments = [ds.create_index_uncommitted("vec", "IVF_RQ", num_partitions=2, num_bits=1, rabitq_model=model,
+                                            ivf_centroids=ivf.centroids, fragment_ids=[f.fragment_id])
+                for f in frags]
+    merged = ds.merge_existing_index_segments(segments)
+    ds = ds.commit_existing_index_segments("vec_idx", "vec", [merged])
+    for q in qs:
+        nearest = {"column": "vec", "q": q, "k": 10}
+        _same(lance.dataset(path).to_table(nearest=nearest, columns=["id"]),
+              nl.dataset(path).to_table(nearest=nearest, columns=["id"]), dim)
+    assert ds.to_table(nearest={"column": "vec", "q": qs[0], "k": 10}).num_rows == 10
+
+
+def test_refuses_what_pylance_refuses(tmp_path):
+    path, _ = _nano_build(tmp_path, 64, 4)
+    with pytest.raises(ValueError, match="vector dimension must be divisible by 8 for IVF_RQ"):
+        nl.write_dataset(_table(np.zeros((300, 30), dtype=np.float32), 30), str(tmp_path / "d30.lance"))
+        nl.dataset(str(tmp_path / "d30.lance")).create_index("vec", "IVF_RQ", num_partitions=4, num_bits=1)
+    with pytest.raises(ValueError, match="num_bits must be in 1..=9"):
+        nl.dataset(path).create_index("vec", "IVF_RQ", num_partitions=4, num_bits=10, replace=True)

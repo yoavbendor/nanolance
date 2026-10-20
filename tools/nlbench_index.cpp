@@ -291,6 +291,7 @@ std::string run_vector(const Workload& w, const fs::path& work, const fs::path& 
         options.metric = VectorMetric::L2;
         options.num_partitions = static_cast<std::uint32_t>(w.partitions);
         if (type == "IVF_PQ") options.num_sub_vectors = static_cast<std::uint32_t>(w.dim / 8);
+        if (type == "IVF_RQ") options.num_bits = 5;  // pylance's default: 1 binary bit and 4 extended bits
 
         std::vector<fs::path> copies;
         std::vector<double> build_ms;

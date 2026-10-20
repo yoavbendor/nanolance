@@ -225,13 +225,20 @@ def test_optimize_with_ngram_and_btree(lance, tmp_path):
     assert lance.dataset(path).stats.index_stats("id_idx")["num_unindexed_rows"] == 0
 
 
-def test_index_kind_it_cannot_build(lance, tmp_path):
-    # IVF_RQ (RaBitQ) is a kind nanolance does not build yet: optimizing it is refused, not done wrong.
+def test_ivf_rq_optimized_after_an_append(lance, tmp_path):
+    # A pylance-built IVF_RQ index, rows appended by nanolance, optimize_indices by nanolance: the index
+    # covers every fragment and both engines answer with the same rows.
     path = str(tmp_path / "rq.lance")
     v = np.random.default_rng(0).standard_normal((512, 16)).astype(np.float32)
     table = pa.table({"id": range(512), "v": pa.FixedSizeListArray.from_arrays(pa.array(v.ravel()), 16)})
     lance.write_dataset(table, path)
     lance.dataset(path).create_index("v", index_type="IVF_RQ", num_partitions=2)
     nl.write_dataset(table, path, mode="append")
-    with pytest.raises(Exception, match="not supported"):
-        nl.dataset(path).optimize.optimize_indices()
+    nl.dataset(path).optimize.optimize_indices()
+    (index,) = lance.dataset(path).list_indices()
+    assert index["type"] == "IVF_RQ" and sorted(index["fragment_ids"]) == [0, 1]
+    nearest = {"column": "v", "q": v[3] + 0.05, "k": 10}
+    got = nl.dataset(path).to_table(nearest=nearest, columns=["id"])
+    ref = lance.dataset(path).to_table(nearest=nearest, columns=["id"])
+    assert got["id"].to_pylist() == ref["id"].to_pylist()
+    np.testing.assert_allclose(got["_distance"].to_numpy(), ref["_distance"].to_numpy(), rtol=0, atol=1e-4)

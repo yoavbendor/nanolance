@@ -576,7 +576,7 @@ bool dataset_build_index_segment(const std::filesystem::path& dataset_path, cons
     };
     static const std::set<std::string> types = {"BTREE",    "BITMAP", "LABEL_LIST", "INVERTED", "ZONEMAP",
                                                 "BLOOMFILTER", "NGRAM", "IVF_FLAT", "IVF_SQ", "IVF_PQ", "IVF_HNSW_FLAT",
-                                                "IVF_HNSW_SQ", "IVF_HNSW_PQ"};
+                                                "IVF_HNSW_SQ", "IVF_HNSW_PQ", "IVF_RQ"};
     if (types.count(build.type) == 0U) {
         return fail(error, kind, SegmentErrorKind::Other,
                     "index type '" + build.type + "' is not supported for an index segment");
@@ -637,6 +637,7 @@ bool dataset_build_index_segment(const std::filesystem::path& dataset_path, cons
         m.m = build.type == "IVF_PQ" || build.type == "IVF_HNSW_PQ" ? v.num_sub_vectors : 0U;
         m.has_codebook = !build.pq_codebook.empty();
         m.codebook = build.pq_codebook;
+        m.rq_signs = v.rq_signs;
         m.has_sq = false;
         m.hnsw_m = v.hnsw_m;
         m.hnsw_ef_construction = v.hnsw_ef_construction;
@@ -808,6 +809,11 @@ bool dataset_merge_index_segments(const std::filesystem::path& dataset_path,
             }
             if (!close(m.centroids, first.centroids)) {
                 return mismatch("IVF centroids mismatch across shards");
+            }
+            if (m.type == "IVF_RQ") {  // one rotation for every shard (Lance's shared rabitq_model)
+                if (m.nbits != first.nbits || m.rq_signs != first.rq_signs) {
+                    return mismatch("IVF_RQ merge: the shards do not share one RaBitQ model");
+                }
             }
             if (m.type == "IVF_PQ" || m.type == "IVF_HNSW_PQ") {
                 if (m.m != first.m || m.nbits != first.nbits) {

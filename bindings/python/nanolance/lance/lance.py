@@ -168,7 +168,22 @@ def load_shuffled_vectors(filenames, dir_path, dataset, column, ivf_centroids, p
         _nanolance._index_commit_segments(dataset.uri, name, str(column), [segment])
 
 
+def build_rq_model(dimension: int, num_bits: int = 5) -> str:
+    """pylance's indices.build_rq_model: a RaBitQ model (JSON) for IVF_RQ builds that share one rotation (the
+    rabitq_model of create_index_uncommitted; segments built with the same model merge). Fast rotation only."""
+    import json
+
+    dimension = int(dimension)
+    if dimension <= 0 or dimension % 8:
+        raise ValueError("dimension must be divisible by 8 for IVF_RQ")
+    signs = [int(b) for b in os.urandom(4 * (dimension // 8))]
+    return json.dumps({"rotate_mat_position": None, "fast_rotation_signs": signs, "rotation_type": "fast",
+                       "code_dim": dimension, "num_bits": int(num_bits), "packed": False,
+                       "query_estimator": "raw_query"})
+
+
 indices = types.SimpleNamespace(
+    build_rq_model=build_rq_model,
     train_ivf_model=train_ivf_model,
     train_pq_model=train_pq_model,
     transform_vectors=transform_vectors,

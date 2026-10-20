@@ -105,7 +105,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
                      std::string& error);
 
 struct VectorIndexOptions {
-    std::string type;  // "IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ", ...
+    std::string type;  // "IVF_FLAT", "IVF_PQ", "IVF_RQ", "IVF_HNSW_SQ", ...
     std::string name;  // empty: <column>_idx
     VectorMetric metric = VectorMetric::L2;
     bool replace = false;
@@ -129,6 +129,8 @@ struct VectorIndexOptions {
     std::vector<float> pq_codebook;
     /// IVF_PQ: store the codes row by row rather than transposed (Lance's skip_transpose).
     bool skip_transpose = false;
+    /// IVF_RQ: the fast rotation's sign bytes (a build_rq_model's, 4 rounds of dim / 8); empty: random.
+    std::vector<std::uint8_t> rq_signs;
     /// Where the build reports its stages (Lance's progress events: 0 starts a stage of `total` units,
     /// 1 reports `completed` of them, 2 ends it); nothing when empty. An exception it throws stops the
     /// build, and nothing is committed.

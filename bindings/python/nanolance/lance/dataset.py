@@ -318,6 +318,24 @@ def _is_vector_column(storage) -> bool:
         pa.types.is_list(storage) and pa.types.is_fixed_size_list(storage.value_type))
 
 
+def _rq_signs(model, dim: int, num_bits: int) -> bytes:
+    """The fast rotation's sign bytes of a build_rq_model (JSON text, bytes or a dict), checked against the
+    column's dimension and num_bits. A dense rotation is refused."""
+    import json
+
+    if isinstance(model, dict):
+        spec = model
+    else:
+        spec = json.loads(model.decode() if isinstance(model, (bytes, bytearray)) else str(model))
+    if spec.get("rotation_type") != "fast" or spec.get("rotate_mat_position") is not None:
+        raise unsupported("rabitq_model with a dense rotation")
+    if int(spec.get("code_dim", -1)) != dim:
+        raise ValueError(f"rabitq_model is for dimension {spec.get('code_dim')}, not {dim}")
+    if int(spec.get("num_bits", -1)) != int(num_bits):
+        raise ValueError(f"rabitq_model is for num_bits {spec.get('num_bits')}, not {num_bits}")
+    return bytes(int(b) for b in spec["fast_rotation_signs"])
+
+
 class LanceDataset(pa.dataset.Dataset):
     """A Lance dataset at a version. Mirrors ``lance.LanceDataset``."""
 
@@ -1559,12 +1577,24 @@ class LanceDataset(pa.dataset.Dataset):
                 if centroids is None:
                     raise ValueError("pq_codebook requires ivf_centroids")
                 codebook = _float32_matrix(pq_codebook, dim)
+            rabitq_model = kwargs.pop("rabitq_model", None)
+            if rabitq_model is not None and kind != "IVF_RQ":
+                raise ValueError(f"rabitq_model is for IVF_RQ indexes, not {kind}")
             vector = {"metric": str(metric).lower(), "num_partitions": num_partitions,
                       "target_partition_size": target_partition_size, "num_sub_vectors": num_sub_vectors,
-                      "num_bits": kwargs.pop("num_bits", 8), "max_iters": kwargs.pop("max_iters", 50),
+                      "num_bits": kwargs.pop("num_bits", 5 if kind == "IVF_RQ" else 8),
+                      "max_iters": kwargs.pop("max_iters", 50),
                       "sample_rate": kwargs.pop("sample_rate", 256), "seed": kwargs.pop("seed", None),
                       "m": kwargs.pop("m", 20), "ef_construction": kwargs.pop("ef_construction", 150),
                       "max_level": kwargs.pop("max_level", 7)}
+            if kind == "IVF_RQ":
+                if dim % 8:
+                    raise ValueError("vector dimension must be divisible by 8 for IVF_RQ")
+                vector["skip_transpose"] = bool(kwargs.pop("skip_transpose", False))
+                if not 1 <= int(vector["num_bits"]) <= 9:
+                    raise ValueError(f"Invalid user input: IVF_RQ num_bits must be in 1..=9, got {vector['num_bits']}")
+                if rabitq_model is not None:
+                    vector["rq_signs"] = _rq_signs(rabitq_model, dim, vector["num_bits"])
             for ignored in ("one_pass_ivfpq", "skip_transpose", "streaming_sample_rate", "streaming_coreset_rate",
                             "streaming_refine_passes", "progress", "progress_callback", "kmeans_redos"):
                 kwargs.pop(ignored, None)
@@ -1659,8 +1689,9 @@ class LanceDataset(pa.dataset.Dataset):
         return field
 
     _VECTOR_INDEX_TYPES = ["IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ", "IVF_HNSW_SQ", "IVF_RQ"]
-    # The kinds nanolance builds (create_index, create_index_uncommitted); IVF_RQ is not built yet.
-    _BUILDABLE_VECTOR_INDEX_TYPES = ("IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ", "IVF_HNSW_SQ")
+    # The kinds nanolance builds (create_index, create_index_uncommitted).
+    _BUILDABLE_VECTOR_INDEX_TYPES = ("IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_RQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ",
+                                     "IVF_HNSW_SQ")
 
     @index_build
     def create_index(self, column, index_type: str, name: Optional[str] = None, metric: str = "L2",
@@ -1671,8 +1702,9 @@ class LanceDataset(pa.dataset.Dataset):
                      precomputed_partition_dataset=None, storage_options=None, filter_nan: bool = True,
                      train: bool = True, fragment_ids=None, index_uuid=None, *,
                      target_partition_size: Optional[int] = None, **kwargs) -> "LanceDataset":
-        """Build an index on `column`, in Lance's format. IVF_FLAT, IVF_SQ, IVF_PQ, IVF_HNSW_FLAT, IVF_HNSW_PQ and IVF_HNSW_SQ vector indexes
-        (pylance and LanceDB search them as their own); scalar index types go to create_scalar_index."""
+        """Build an index on `column`, in Lance's format. IVF_FLAT, IVF_SQ, IVF_PQ, IVF_RQ, IVF_HNSW_FLAT, IVF_HNSW_PQ and
+        IVF_HNSW_SQ vector indexes (pylance and LanceDB search them as their own); scalar index types go to
+        create_scalar_index. IVF_RQ takes num_bits (1 to 9, default 5) and skip_transpose."""
         refuse_object_store_write(self._uri, "create index")
         kind = str(index_type).upper()
         if isinstance(column, (list, tuple)):
@@ -1690,7 +1722,7 @@ class LanceDataset(pa.dataset.Dataset):
                               ("fragment_ids", fragment_ids), ("index_uuid", index_uuid)):
             if value is not None:
                 raise unsupported(f"create_index option {option}")
-        if not train:  # pylance refuses an empty vector index too, before writing anything
+        if not train or (kind == "IVF_RQ" and self.count_rows() == 0):  # pylance refuses an empty vector index too
             raise NotImplementedError(
                 f"Not supported: Creating empty vector indices with train=False is not yet implemented. "
                 f"Index '{name or f'{column}_idx'}' for column '{column}' cannot be created without training.")
@@ -1705,7 +1737,11 @@ class LanceDataset(pa.dataset.Dataset):
         skip_transpose = bool(kwargs.pop("skip_transpose", False))
         if kind in ("IVF_PQ", "IVF_HNSW_PQ") and num_sub_vectors is None:
             raise ValueError(f"num_partitions and num_sub_vectors are required for {kind}")
-        num_bits = int(kwargs.pop("num_bits", 8))
+        if kind == "IVF_RQ" and self._vector_dimension(str(column)) % 8:
+            raise ValueError("vector dimension must be divisible by 8 for IVF_RQ")
+        if kind == "IVF_RQ" and not 1 <= int(kwargs.get("num_bits", 5)) <= 9:
+            raise ValueError(f"Invalid user input: IVF_RQ num_bits must be in 1..=9, got {kwargs.get('num_bits')}")
+        num_bits = int(kwargs.pop("num_bits", 5 if kind == "IVF_RQ" else 8))
         max_iters = int(kwargs.pop("max_iters", 50))
         sample_rate = int(kwargs.pop("sample_rate", 256))
         seed = kwargs.pop("seed", None)

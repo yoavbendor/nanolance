@@ -1032,6 +1032,14 @@ std::array<std::uint8_t, 16> uuid_of(const nb::bytes& b) {
 
 nano_lance::VectorIndexOptions vector_options_of(const nb::dict& d) {
     nano_lance::VectorIndexOptions o;
+    if (d.contains("skip_transpose")) {
+        o.skip_transpose = nb::cast<bool>(d["skip_transpose"]);
+    }
+    if (d.contains("rq_signs")) {  // IVF_RQ: the fast rotation's sign bytes (build_rq_model's)
+        const auto signs = nb::cast<nb::bytes>(d["rq_signs"]);
+        const auto* first = reinterpret_cast<const std::uint8_t*>(signs.c_str());
+        o.rq_signs.assign(first, first + signs.size());
+    }
     if (d.contains("metric")) {
         const auto metric = nb::cast<std::string>(d["metric"]);
         if (!nano_lance::parse_vector_metric(metric, o.metric)) {

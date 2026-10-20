@@ -30,7 +30,9 @@ from index_bench_common import (CPP_CMD, RUST_CMD, check_drivers, combine_stats,
                                 write_workload)
 
 ROOT = Path(__file__).resolve().parents[1]
-KINDS = ["IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ"]
+# The kinds the Rust driver (tools/lance_rs_bench) builds. IVF_RQ is nanolance's alone: the Rust driver has no RQ build.
+RUST_KINDS = ["IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ"]
+KINDS = RUST_KINDS + ["IVF_RQ"]
 SEARCHES = [("k=10", 10, None, None), ("k=100", 100, None, None), ("k=10, nprobes=32", 10, 32, None),
             ("k=10, refine_factor=4", 10, None, 4)]
 
@@ -73,29 +75,38 @@ def main() -> None:
         lance.write_dataset(pa.table({"id": pa.array(np.arange(args.rows)), "vec": pa.FixedSizeListArray.from_arrays(
             pa.array(v.ravel()), args.dim)}), str(base))
 
-    lines = [f"vector_config\tvec\t{args.partitions}\t{args.dim}\t{args.builds}"]
-    lines += [f"vector_kind\t{kind}\t{kind}" for kind in KINDS]
-    lines += [f"vector_query\t" + ",".join(f"{x:.7g}" for x in q) for q in queries]
-    for name, k, nprobes, refine in SEARCHES:
-        lines.append(f"vector_search\t{name}\t{k}\t{nprobes or 0}\t{refine or 0}")
-    workload = write_workload(work / "vector.txt", lines, args.min_seconds)
+    def workload_for(kinds, name):
+        lines = [f"vector_config\tvec\t{args.partitions}\t{args.dim}\t{args.builds}"]
+        lines += [f"vector_kind\t{kind}\t{kind}" for kind in kinds]
+        lines += [f"vector_query\t" + ",".join(f"{x:.7g}" for x in q) for q in queries]
+        for search, k, nprobes, refine in SEARCHES:
+            lines.append(f"vector_search\t{search}\t{k}\t{nprobes or 0}\t{refine or 0}")
+        return write_workload(work / name, lines, args.min_seconds)
 
-    rust = run_driver(RUST_CMD, "vector", workload, work / "rust", base, work / "rust_vector.json")["vector"]
-    cpp = run_driver(CPP_CMD, "vector", workload, work / "cpp", base, work / "cpp_vector.json")["vector"]
+    rust = run_driver(RUST_CMD, "vector", workload_for(RUST_KINDS, "vector_rust.txt"), work / "rust", base,
+                      work / "rust_vector.json")["vector"]
+    cpp = run_driver(CPP_CMD, "vector", workload_for(KINDS, "vector.txt"), work / "cpp", base,
+                     work / "cpp_vector.json")["vector"]
 
-    builds = {kind: combine_stats(rust["builds"][kind], cpp["builds"][kind]) for kind in KINDS}
+    builds = {kind: combine_stats(rust["builds"].get(kind), cpp["builds"][kind]) for kind in KINDS}
     searches, recalls = {}, {}
-    for key, rust_stat in rust["searches"].items():
+    for key, cpp_stat in cpp["searches"].items():
         cpp_hits = cpp["hits"][key]
         if any(addr >= 2**32 for build in cpp_hits for hits in build for addr in hits):
             raise SystemExit(f"{key}: nanolance returned a row address outside fragment 0")
-        searches[key] = combine_stats(rust_stat, cpp["searches"][key])
+        searches[key] = combine_stats(rust["searches"].get(key), cpp_stat)
     for kind in KINDS:
         # Recall@10 of the default search against the exact answers, per build, averaged over the builds.
         per = {}
         for engine, result in (("rust", rust), ("nanolance", cpp)):
+            if engine == "rust" and kind not in RUST_KINDS:
+                continue
             values = recalls_by_build(result["hits"]["%s|k=10" % kind], truth)
             per[engine] = values
+        if kind not in RUST_KINDS:
+            recalls[kind] = {"rust": None, "nanolance": float(np.mean(per["nanolance"])), "rust_std": None,
+                             "nanolance_std": float(np.std(per["nanolance"], ddof=1)), "builds": args.builds}
+            continue
         r_rust, r_cpp = float(np.mean(per["rust"])), float(np.mean(per["nanolance"]))
         recalls[kind] = {
             "rust": r_rust, "nanolance": r_cpp,

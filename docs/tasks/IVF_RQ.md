@@ -142,3 +142,15 @@ skip_transpose), so with no oracle they stay refused by name. Reviewer's change:
 'accurate' change pylance's RQ answers (fast: 1-bit scores without the gate; accurate: another distance
 table) and were ignored here; they are now refused by name on an IVF_RQ index (other kinds ignore
 approx_mode, as pylance does). `tests/test_ivf_rq.py`: 73, five clean runs. Next: R2 (build).
+
+**R2 outcome (2026-10-20):** done in one Haiku session; reviewed. nanolance builds IVF_RQ indexes (fast
+rotation; num_bits 1-9; l2, cosine (L2 over normalized rows, as Lance does) and dot; packed and
+skip_transpose; seeded; `lance.indices.build_rq_model` and a shared rotation for distributed builds;
+mostly-null columns; dim not divisible by 8 refused with pylance's message), in pylance's layout: pylance
+searches them with nanolance's answers. Recall@10 (20,000 x 128, 64 partitions, mean of 3 builds): pylance
+0.9280, nanolance 0.9287. Other kinds' index files byte-identical before and after. Six of the seven
+target tests pass. Reviewer's decisions: `test_create_ivf_rq_multi_bit_searches_l2_and_cosine` searches
+with approx_mode 'fast' and 'accurate', which stay refused (answering the normal way would give other
+answers than pylance's); porting those two modes is **R1c**. pylance's build_rq_model has no rotation
+option and never writes the dense one, so a dense model is refused by name. An empty IVF_RQ build raises
+NotImplementedError as pylance does (other kinds unchanged until measured).

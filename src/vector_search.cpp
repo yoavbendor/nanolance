@@ -14,6 +14,7 @@
 //             (distance, row id).
 
 #include "nanolance/vector_search.hpp"
+#include "rabitq_build.hpp"
 #include "nanolance/work_stats.hpp"
 #include "nanolance/overlays.hpp"
 #include "nanolance/row_ids.hpp"
@@ -2746,6 +2747,14 @@ std::int32_t field_id(const pb::Manifest& manifest, const std::string& path) {
 
 }  // namespace
 
+namespace rq_build {
+
+void rotate(const float* in, std::size_t dim, const std::uint8_t* signs, float* out) {
+    rq_rotate(in, dim, signs, out);
+}
+
+}  // namespace rq_build
+
 bool index_build::load_vector_model(const std::filesystem::path& dir, VectorModel& out, std::string& error) {
     std::shared_ptr<const IvfIndex> index;
     if (!load_ivf(dir, index, error)) {
@@ -2756,7 +2765,8 @@ bool index_build::load_vector_model(const std::filesystem::path& dir, VectorMode
     out.dim = index->dim;
     out.partitions = index->partitions;
     out.centroids = index->centroids;
-    out.nbits = index->nbits;
+    out.nbits = index->storage == Storage::Rq ? index->rq_bits : index->nbits;
+    out.rq_signs = index->storage == Storage::Rq ? index->rq_signs : std::vector<std::uint8_t>{};
     out.m = index->storage == Storage::Pq ? index->m : 0U;
     out.codebook = index->storage == Storage::Pq ? index->codebook : std::vector<float>{};
     out.lengths = index->lengths;
