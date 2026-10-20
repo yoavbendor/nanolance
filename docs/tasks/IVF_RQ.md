@@ -98,3 +98,22 @@ bindings/python/tests/test_ivf_rq.py | tail -2`; the phase's target pylance test
 (`-p nanolance.lance._pytest_plugin`); `python3 tools/pylance_suite.py | tail -4`; the benchmark lines;
 last, once: the full pytest. Report under 40 lines: questions first, then files, per-test status, tails,
 decisions.
+
+**R1a, first session (2026-10-20):** stopped at a stop-and-ask point; its code is in the tree, not
+committed (src/vector_search.cpp: `Storage::Rq`, `load_rq_metadata` (refuses everything but 5 bits / fast
+rotation / raw_query / packed / L2, naming each), `load_rq_partition`, `rq_rotate` (fast rotation, with
+the non-power-of-two path), `rq_prepare`, `rq_row_codes` / `rq_binary_ip` (packed layout), `rq_distance`
+(4-bit blocked extended codes), the hook in `search_segment`). Measured:
+- Full estimates equal pylance's to float rounding (max |diff| 3e-5 at distances near 140, dims 64 and
+  128, 2 and 16 partitions), once Lance's default binary sum is ported: for full 32-row blocks the u8-
+  quantized distance table (affine, ties to even), the remainder rows exact. With refine_factor 4 the
+  results equal pylance's.
+- **Top k differs**, because Lance's default top-k prunes: a row is skipped when its lower bound
+  (`raw_query_binary_distance - error_factor * query_error`, query_error = sqrt(dist(q, centroid))) is not
+  below the k-th best of a heap shared across partitions, scanned partition by partition and row by row
+  in order. pylance can therefore drop a row whose full estimate is in the top k (dim 128, 2 partitions,
+  k 10, seed 5: pylance returns row 1004 at 176.528 and omits 2365 at 174.399).
+- Reviewer's decision: **port the gating** (option A), inside the RQ path only: partitions scanned in
+  probe order with one shared heap, the gate as Lance computes it (`__error_factors` column), so the rows
+  are pylance's. Other index kinds' search does not change. Tests must cover several seeds, k 1 / 10 /
+  100, nprobes 1 / 2 / all, with and without refine, and the case above.
