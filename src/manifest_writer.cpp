@@ -11,6 +11,8 @@
 #include "nanolance/version.hpp"
 #include "nanolance/dataset_refs.hpp"
 #include "transaction_file.hpp"
+#include "nanolance/byte_sink.hpp"
+#include "nanolance/byte_source.hpp"
 #include <sstream>
 #include <iomanip>
 #include "nanolance/schema_mapper.hpp"
@@ -73,18 +75,20 @@ std::string manifest_filename(std::uint64_t version, bool v2) {
 std::uint64_t next_version(const std::filesystem::path& versions_dir, bool& v2_out) {
     std::uint64_t max_version = 0;
     v2_out = false;
-    std::error_code ec;
-    if (!std::filesystem::exists(versions_dir, ec)) {
+    // A local directory or an object-store prefix (one LIST); a missing one lists as empty.
+    std::vector<io::DirEntry> entries;
+    std::string list_error;
+    if (!io::list_dir(versions_dir.string(), entries, list_error)) {
         return 1;
     }
-    for (const auto& entry : std::filesystem::directory_iterator(versions_dir, ec)) {
-        if (ec || !entry.is_regular_file()) {
+    for (const auto& entry : entries) {
+        if (entry.is_dir) {
             continue;
         }
         // Shared with the reader on purpose: this used to be a private copy that parsed the digits
         // literally, so appending to a pylance dataset (whose manifests are named u64::MAX - version)
         // numbered the new manifest u64::MAX -- which reads back as version 0, behind everything.
-        const auto name = entry.path().filename().string();
+        const auto& name = entry.name;
         std::uint64_t version = 0;
         if (parse_manifest_version(name, version)) {
             max_version = std::max(max_version, version);
@@ -154,15 +158,27 @@ bool check_data_file_versions(pb::Manifest& manifest, std::string& error) {
     return true;
 }
 
+/// The transaction file named by the manifest at `manifest_path` ("" when it cannot be read).
+std::string published_transaction(const std::filesystem::path& manifest_path) {
+    pb::Manifest published;
+    std::string ignored;
+    if (!load_manifest_file_unchecked(manifest_path, published, ignored)) {
+        return "";
+    }
+    return published.transaction_file;
+}
+
 }  // namespace
 
 bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manifest& manifest,
                       std::string& error) {
     error.clear();
-    // Writers write local files only: a URI (s3://, gs://, https://) would otherwise become a local
+    // Local paths and registered object stores (s3://); any other URI would otherwise become a local
     // directory named after its scheme.
-    if (dataset_path.string().find("://") != std::string::npos) {
-        error = "writes to object stores are not supported: " + dataset_path.string();
+    const bool object_store = io::is_object_store_output(dataset_path.string());
+    if (!object_store && dataset_path.string().find("://") != std::string::npos) {
+        error = "writes to " + dataset_path.string().substr(0, dataset_path.string().find("://")) +
+                ":// are not supported (nanolance writes local paths and s3:// URIs): " + dataset_path.string();
         return false;
     }
     // Before anything is written: a refused commit leaves the version and its files as they were.
@@ -170,12 +186,6 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
         return false;
     }
     const auto versions_dir = dataset_path / "_versions";
-    std::error_code ec;
-    std::filesystem::create_directories(versions_dir, ec);
-    if (ec) {
-        error = "failed to create _versions directory: " + ec.message();
-        return false;
-    }
 
     if (!manifest.index_section_error.empty()) {
         // Committing would drop indices this version has but could not be read.
@@ -220,17 +230,8 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
     // A new dataset gets V2 names, Lance's default (enable_v2_manifest_paths); an existing one keeps its
     // scheme, since Lance refuses a _versions directory that mixes the two.
     const auto name = manifest_filename(manifest.version, first || existing_is_v2);
-    // The temp name is the writer's own: two writers racing for one version must not share it, or
-    // one's link could publish the other's manifest (and report success for a change it lost).
-    static std::atomic<std::uint64_t> counter{0};
-    const auto unique = std::to_string(std::random_device{}()) + "-" + std::to_string(counter.fetch_add(1U));
-    const auto temp_path = versions_dir / (name + "." + unique + ".tmp");
     const auto final_path = versions_dir / name;
-    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        error = "failed to open manifest temp file";
-        return false;
-    }
+    std::ostringstream out(std::ios::binary);
     write_le32(out, 0);
     if (written.has_index_section) {
         write_le32(out, static_cast<std::uint32_t>(index_section.size()));
@@ -243,38 +244,34 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
     write_le16(out, 0);
     write_le16(out, 2);
     out.write("LANC", 4);
-    out.close();
-    work_stats::count_written_file(temp_path);
-    if (!out) {
-        error = "failed to write manifest temp file";
-        return false;
-    }
+    const std::string text = std::move(out).str();
+    const std::vector<std::uint8_t> bytes(text.begin(), text.end());
 
-    // Publish without replacing: a hard link fails if the name exists, so a version another writer
-    // committed meanwhile is never overwritten (rename would silently replace it). File systems
-    // without hard links fall back to rename.
-    std::filesystem::create_hard_link(temp_path, final_path, ec);
-    if (!ec) {
-        drop_transaction.committed = true;
-        std::filesystem::remove(temp_path, ec);
-        if ((manifest.version & (1ULL << 63U)) == 0U) {
-            run_auto_cleanup(dataset_path, manifest.version, manifest.config);
+    // Publish without replacing (io::put_if_absent: a hard link locally, a create-only PUT on an object
+    // store), so a version another writer committed meanwhile is never overwritten.
+    bool taken = false;
+    if (!io::put_if_absent(final_path.string(), bytes, taken, error)) {
+        if (!taken) {
+            return false;
         }
-        return true;
-    }
-    if (std::filesystem::exists(final_path)) {
-        std::filesystem::remove(temp_path, ec);
+        // Taken -- possibly by this very commit: a create-only PUT whose response was lost and that was
+        // retried sees its own manifest as a failed precondition. The transaction file names the commit
+        // (a fresh uuid), so a manifest naming ours is ours. (Lance 12 does not check, and would rebase a
+        // copy of the change on top of itself.)
+        if (object_store && published_transaction(final_path) == transaction) {
+            error.clear();
+            drop_transaction.committed = true;
+            return true;
+        }
         error = "commit conflict: version " + std::to_string(manifest.version) + " was committed concurrently";
         return false;
     }
-    ec.clear();
-    std::filesystem::rename(temp_path, final_path, ec);
-    if (ec) {
-        error = "failed to atomically publish manifest: " + ec.message();
-        return false;
-    }
+    work_stats::count_written_file(final_path);
     drop_transaction.committed = true;
-    run_auto_cleanup(dataset_path, manifest.version, manifest.config);
+    // (A store that ignores If-None-Match is refused before the first publish: the s3 backend probes it.)
+    if (!object_store && (manifest.version & (1ULL << 63U)) == 0U) {
+        run_auto_cleanup(dataset_path, manifest.version, manifest.config);
+    }
     return true;
 }
 
@@ -369,12 +366,6 @@ bool commit_dataset_version_once(const std::filesystem::path& dataset_path, cons
                                  std::string& error, const CommitExtras& extras) {
     error.clear();
     const auto versions_dir = dataset_path / "_versions";
-    std::error_code ec;
-    std::filesystem::create_directories(versions_dir, ec);
-    if (ec) {
-        error = "failed to create _versions directory: " + ec.message();
-        return false;
-    }
 
     bool unused_v2 = false;
     version = next_version(versions_dir, unused_v2);

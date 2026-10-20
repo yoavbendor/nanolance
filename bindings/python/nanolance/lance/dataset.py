@@ -115,6 +115,17 @@ def _path_of(uri: Union[str, Path, "LanceDataset"]) -> str:
 
 
 def _exists(path: str) -> bool:
+    if path.startswith("s3://"):
+        # One LIST of _versions/. Only "not found" means absent: any other failure (the network, the
+        # credentials) is raised, never taken for an empty dataset.
+        try:
+            with native():
+                _nanolance._ds_latest_version(path)
+        except (OSError, ValueError) as exc:
+            if "was not found" in str(exc):
+                return False
+            raise
+        return True
     return os.path.isdir(os.path.join(path, "_versions")) and any(
         name.endswith(".manifest") for name in os.listdir(os.path.join(path, "_versions"))
     )
@@ -376,9 +387,10 @@ class LanceDataset(pa.dataset.Dataset):
         self._default_scan_options = dict(default_scan_options or {})
         try:
             with native():
-                if self._uri.startswith("s3://"):
-                    # The bucket's options (pylance's storage_options keys) apply to the reads of this open.
-                    options = {str(k): str(v) for k, v in (storage_options or {}).items()}
+                if self._uri.startswith("s3://") and storage_options is not None:
+                    # The bucket's options (pylance's storage_options keys) apply to the reads of this open;
+                    # an open without them keeps the bucket's current ones (a write in progress, an earlier open).
+                    options = {str(k): str(v) for k, v in storage_options.items()}
                     _nanolance._set_storage_options(self._uri, options)
                 info = _nanolance._ds_info(self._uri, version)
         except Exception:
@@ -4670,7 +4682,6 @@ def write_dataset(
     packed or dedicated by size, URIs as external references -- which, the dataset having no
     registered external bases, takes ``allow_external_blob_outside_bases=True``. With
     ``external_blob_mode="ingest"`` the bytes a URI names are copied into the dataset instead."""
-    refuse_object_store_write(uri, "write_dataset")
     namespace_client = kwargs.pop("namespace_client", None)
     if namespace_client is None:
         namespace_client = namespace
@@ -4728,6 +4739,13 @@ def write_dataset(
 
         _validate_threshold("blob_pack_file_size_threshold", blob_pack_file_size_threshold, allow_zero=False)
     path = _path_of(uri)
+    if path.startswith("s3://"):
+        # The bucket's credentials and endpoint (pylance's storage_options keys), for the writes and for
+        # the dataset returned.
+        with native():
+            _nanolance._set_storage_options(path, {str(k): str(v) for k, v in (storage_options or {}).items()})
+        if initial_bases or target_bases or target_all_bases:
+            raise unsupported("base paths on object stores")
     reader = _coerce_reader(data_obj, schema)
     exists = _exists(path)
     in_memory = not isinstance(uri, LanceDataset) and os.fspath(uri).startswith("memory://")
@@ -4793,7 +4811,7 @@ def write_dataset(
             after_version = int(_nanolance._ds_info(path, None)["version"])
         _native_log.new_versions(shown, path, before_version, after_version, "Append" if append else "Overwrite")
     with _native_log.quiet():
-        return LanceDataset(path)
+        return LanceDataset(path, storage_options=storage_options) if path.startswith("s3://") else LanceDataset(path)
 
 
 def _base_plan(uri, path: str, exists: bool, mode: str, initial_bases, target_bases, target_all_bases,

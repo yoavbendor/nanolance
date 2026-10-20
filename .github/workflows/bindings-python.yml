@@ -83,7 +83,7 @@ jobs:
           NANOLANCE_S3_TEST_ENDPOINT: http://127.0.0.1:5055
           NANOLANCE_LANCE_C_S3_READ: ${{ github.workspace }}/build-s3/lance_c_s3_read
         run: |
-          pytest -o addopts= -q -rs tests/test_object_store.py tests/test_object_store_writes.py | tee /tmp/object-store-tests.log
+          pytest -o addopts= -q -rs tests/test_object_store.py tests/test_object_store_writes.py tests/test_object_store_commits.py | tee /tmp/object-store-tests.log
           if grep -q skipped /tmp/object-store-tests.log; then echo "object-store tests must not skip here"; exit 1; fi
 
       - name: Upload the S3 server log

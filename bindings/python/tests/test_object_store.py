@@ -177,7 +177,6 @@ def test_storage_option_spellings_agree(uri):
 
 
 WRITES = {
-    "write_dataset": lambda ds, uri: nl.write_dataset(sample_table(10), uri, storage_options=options()),
     "delete": lambda ds, uri: ds.delete("id = 1"),
     "update": lambda ds, uri: ds.update({"name": "'x'"}, where="id = 1"),
     "add_columns": lambda ds, uri: ds.add_columns({"extra": "id + 1"}),

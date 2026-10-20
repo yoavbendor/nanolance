@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/byte_sink.hpp"
 #include "nanolance/data_file_writer.hpp"
 #include "nanolance/parallel.hpp"
 #include "nanolance/work_stats.hpp"
@@ -2183,19 +2184,13 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
     const auto relative_path =
         extras != nullptr && !extras->path.empty() ? extras->path : std::filesystem::path("data") / file_name;
     const auto full_path = extras != nullptr && !extras->path.empty() ? extras->path : dataset_path / relative_path;
-    std::error_code ec;
-    std::filesystem::create_directories(full_path.parent_path(), ec);
-    if (ec) {
-        error = "failed to create data directory: " + ec.message();
-        return false;
-    }
-
     work_stats::WrittenFileTally tally(full_path);
-    std::ofstream out(full_path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        error = "failed to open data file for writing";
+    // A local file (its directory created), or an object uploaded on commit() (io::open_output).
+    auto output = io::open_output(full_path.string(), error);
+    if (!output) {
         return false;
     }
+    std::ostream& out = *output;
 
     // Lance's blob preprocessing, now that the file's name is known: blobs given as bytes are placed --
     // inline ones here at the head of the file, before any column (their descriptors hold absolute
@@ -3274,13 +3269,13 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         error = "failed to write Lance data file";
         return false;
     }
-
-    result.relative_path = relative_path;
-    result.file_size_bytes = std::filesystem::file_size(full_path, ec);
-    if (ec) {
-        error = "failed to stat data file: " + ec.message();
+    const auto file_size = pos(out);
+    if (!output->commit(error)) {
         return false;
     }
+
+    result.relative_path = relative_path;
+    result.file_size_bytes = file_size;
     return true;
 }
 

@@ -78,6 +78,8 @@ def translate(message: str) -> Exception:
         return OSError(text)
     if "merge insert failed" in lower:
         return OSError(text)
+    if "does not honour conditional writes" in lower:
+        return OSError(text)  # the object store is unsafe for concurrent commits: an I/O-level failure
     if "not found" in lower or "no manifest" in lower:
         return ValueError(text)
     if "not supported" in lower or "unsupported" in lower:

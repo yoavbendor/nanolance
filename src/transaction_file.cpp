@@ -12,6 +12,8 @@
 #include "nanolance/work_stats.hpp"
 #include "transaction_file.hpp"
 
+#include "nanolance/byte_sink.hpp"
+
 #include "nanolance/manifest_reader.hpp"
 
 #include <algorithm>
@@ -486,22 +488,18 @@ bool write_transaction_file(const std::filesystem::path& dataset_path, const pb:
     }
 
     file_name = std::to_string(read_version) + "-" + uuid + ".txn";
-    const auto dir = dataset_path / "_transactions";
-    std::error_code ec;
-    std::ofstream out(dir / file_name, std::ios::binary | std::ios::trunc);
-    if (!out) {  // the first transaction: no directory yet
-        std::filesystem::create_directories(dir, ec);
-        out.clear();
-        out.open(dir / file_name, std::ios::binary | std::ios::trunc);
-    }
-    out.write(reinterpret_cast<const char*>(tx.data()), static_cast<std::streamsize>(tx.size()));
-    out.close();
-    work_stats::count_written_file(dir / file_name);
+    const auto path = (dataset_path / "_transactions" / file_name).string();
+    auto out = io::open_output(path, error);
     if (!out) {
-        std::filesystem::remove(dir / file_name, ec);
-        error = "failed to write " + (dir / file_name).string();
         return false;
     }
+    out->write(reinterpret_cast<const char*>(tx.data()), static_cast<std::streamsize>(tx.size()));
+    if (!out->commit(error)) {
+        std::string ignored;
+        io::remove_output(path, ignored);
+        return false;
+    }
+    work_stats::count_written_file(path);
     return true;
 }
 
@@ -511,9 +509,9 @@ std::pair<std::uint32_t, std::vector<std::uint8_t>> derive_transaction_operation
 }
 
 void remove_transaction_file(const std::filesystem::path& dataset_path, const std::string& file_name) {
-    std::error_code ec;
+    std::string ignored;  // best effort: an unreferenced transaction file is harmless (cleanup removes it)
     if (!file_name.empty()) {
-        std::filesystem::remove(dataset_path / "_transactions" / file_name, ec);
+        io::remove_output((dataset_path / "_transactions" / file_name).string(), ignored);
     }
 }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/byte_sink.hpp"
 #include "nanolance/nano_lance_writer.h"
 
 #include "nanolance/array_accessor.hpp"
@@ -635,9 +636,12 @@ int nano_lance_writer_open(NanoLanceWriter* writer, const char* path, const Nano
     if (path == nullptr || path[0] == '\0') {
         return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "dataset path must not be empty");
     }
-    // Writers write local files only (a URI would become a local directory named after its scheme).
-    if (std::strstr(path, "://") != nullptr) {
-        return set_error(writer, NANO_LANCE_UNSUPPORTED, std::string("writes to object stores are not supported: ") + path);
+    // Local paths and registered object stores (s3://); any other URI would become a local directory
+    // named after its scheme.
+    if (std::strstr(path, "://") != nullptr && !nano_lance::io::is_object_store_output(path)) {
+        return set_error(writer, NANO_LANCE_UNSUPPORTED,
+                         std::string("writes to this kind of URI are not supported (local paths and s3:// only): ") +
+                             path);
     }
     if (opts.compression_level < 0 || opts.compression_level > 22) {
         return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "zstd compression level must be in range 0..22");
@@ -686,7 +690,9 @@ int nano_lance_writer_open(NanoLanceWriter* writer, const char* path, const Nano
 
     if (opts.append) {
         std::error_code ec;
-        if (!std::filesystem::exists(state->dataset_path / "_versions", ec)) {
+        // An object store has no directories: loading the latest manifest below checks it there.
+        if (!nano_lance::io::is_object_store_output(state->dataset_path.string()) &&
+            !std::filesystem::exists(state->dataset_path / "_versions", ec)) {
             return set_error(writer, NANO_LANCE_IO_ERROR, "init_append requires an existing dataset with _versions");
         }
 
@@ -989,7 +995,8 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     }
 
     std::error_code error;
-    if (is_append && !std::filesystem::exists(state->dataset_path, error)) {
+    const bool object_store = nano_lance::io::is_object_store_output(state->dataset_path.string());
+    if (is_append && !object_store && !std::filesystem::exists(state->dataset_path, error)) {
         return set_error(writer, NANO_LANCE_IO_ERROR, "append requested but dataset path does not exist");
     }
     if (!state->has_schema) {
@@ -997,7 +1004,7 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     }
 
     std::string writer_error;
-    if (!is_append) {
+    if (!is_append && !object_store) {
         std::filesystem::create_directories(state->dataset_path / "_versions", error);
         if (error) {
             return set_error(writer, NANO_LANCE_IO_ERROR, "failed to create dataset version directory: " + error.message());
@@ -1337,7 +1344,9 @@ int nano_lance_writer_finish(NanoLanceWriter* writer, int mode, uint64_t* versio
     extras.transaction_properties = state->transaction_properties;
     extras.stable_row_ids = state->stable_row_ids;
     extras.initial_bases = state->initial_bases.empty() ? nullptr : &state->initial_bases;
-    std::filesystem::create_directories(state->dataset_path / "data", ec);
+    if (!nano_lance::io::is_object_store_output(state->dataset_path.string())) {
+        std::filesystem::create_directories(state->dataset_path / "data", ec);
+    }
     if (!nano_lance::commit_dataset_version(state->dataset_path, mapping, state->staged, commit_mode, version, error,
                                             extras)) {
         return set_error(writer, NANO_LANCE_IO_ERROR, error);

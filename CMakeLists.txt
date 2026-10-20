@@ -251,6 +251,7 @@ target_link_libraries(nanolance_proto PRIVATE nanolance_nanom)
 
 add_library(nanolance_reader STATIC
     src/byte_source.cpp
+    src/byte_sink.cpp
     src/manifest_reader.cpp
     src/nano_lance_reader.cpp
     src/nano_lance_external_blob.cpp
@@ -286,12 +287,12 @@ elseif(NANOLANCE_ENABLE_S3)
     # still builds -- the wrapper version-gates on NANOS3READER_VERSION.
     FetchContent_Declare(nanos3reader
         GIT_REPOSITORY ${NANOLANCE_GIT_URL_NANOS3READER}
-        GIT_TAG 71585957ef0fa5cee753f27dd7d37de50fc0c9c3)
+        GIT_TAG d178546eb03973f78d2a3dac01387df0fd8359ff)
     FetchContent_MakeAvailable(nanos3reader)
     target_link_libraries(nanolance_reader PRIVATE nanos3reader::nanos3reader)
     target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_READER_HAS_S3=1)
     # s3:// datasets: the byte source and lister over S3Client (registered for "s3" by byte_source.cpp).
-    target_sources(nanolance_reader PRIVATE src/s3_byte_source.cpp)
+    target_sources(nanolance_reader PRIVATE src/s3_byte_source.cpp src/s3_byte_sink.cpp)
     target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_HAS_S3_BYTE_SOURCE=1)
     set(NANOLANCE_S3_NANOS3READER_ACTIVE ON)
 endif()

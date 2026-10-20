@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 #include "s3_byte_source.hpp"
+#include "s3_byte_sink.hpp"
 
 #include "nanolance/object_store.hpp"
 
@@ -156,6 +157,15 @@ bool list_s3(const std::string& dir_uri, std::vector<DirEntry>& out, std::string
         }
     }
     return true;
+}
+
+std::shared_ptr<nanos3reader::S3Client> s3_client_for_uri(const std::string& uri, std::string& error) {
+    std::string bucket;
+    if (!bucket_of(uri, bucket)) {
+        error = "not an s3:// URI with a bucket: " + uri;
+        return nullptr;
+    }
+    return client_for_bucket(bucket);
 }
 
 bool set_object_store_options(const std::string& uri, const ObjectStoreOptions& options, std::string& error) {

@@ -1,6 +1,6 @@
 # Design: writes to object stores (ROADMAP Wave 3, item 8)
 
-Status: design (Opus, 2026-10-20). Implementation phases W1-W5 below; W1 and W5 by Opus, W2-W4 delegated.
+Status: W1 done (2026-10-20, Opus); W2-W4 delegated next, W5 by Opus.
 
 ## 1. Goal
 
@@ -83,18 +83,23 @@ bool make_dirs(const std::string& uri, std::string& error);         // no-op on 
    `cleanup_old_versions`, which already deletes unreferenced files (on S3 through LIST + DELETE, W4).
 
 Latest-version discovery for the read version: one LIST of `_versions/` (as pylance). V1-named datasets
-on S3 (`{version}.manifest`) list in the wrong order; they are read, and written only after
-`migrate_manifest_paths_v2` (T5).
+on S3 (`{version}.manifest`) work as they do locally (both engines parse every name in the listing; only
+Lance's newest-first shortcut needs V2 names); `migrate_manifest_paths_v2` stays local-only, since a rename
+on an object store is a copy and a delete, not atomic.
 
 ### 3.3 Safety on stores without conditional PUT
 
 AWS S3 (since 2024-08), MinIO (2024+), R2 and GCS honour `If-None-Match: *`. A store that ignores the
-header turns step 2 into an overwrite, and two writers can both "win". Lance 12 trusts the store. nanolance
-adds a cheap guard: after a successful publish, read the manifest back and check that its
-`transaction_file` is ours. A mismatch means the store does not honour conditional writes: fail loudly
-("the object store did not honour If-None-Match; concurrent commits are unsafe on it") instead of
-corrupting silently. This costs one GET per commit and is skipped for endpoints known to honour it
-(`storage_options` `conditional_put="verified"`, and AWS by default).
+header turns step 2 into an overwrite, and two writers can both "win". Lance 12 trusts the store.
+nanolance probes it instead, once per bucket and process, before its first publish: a probe object next to
+the manifests (`_versions/.nanolance-conditional-put-probe-<random>`) is created, created again (which must
+answer 412) and removed. A store that accepts the second PUT is refused for every commit ("does not honour
+conditional writes"). Three requests per process and bucket; nothing per commit.
+
+A read-back of the published manifest is **not** a guard: measured in W1 (two Python processes racing on
+a store that ignores the header), a later writer's overwrite lands after the earlier writer has read its
+own manifest back, and 6 of 12 appends reported done were lost. The read-back is kept only for step 3
+(a 412 that may be our own lost reply).
 
 ## 4. Tests
 
