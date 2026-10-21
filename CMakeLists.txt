@@ -48,6 +48,13 @@ if(NANOLANCE_STANDALONE)
     endif()
 endif()
 
+# nanom (a dependency) uses C++23 `if consteval`, which GCC supports from 12. Say so up front rather
+# than failing deep inside a header. CI builds with GCC 13 (and Clang for wasm / macOS).
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 12)
+    message(FATAL_ERROR "nanolance needs GCC 12 or newer (found ${CMAKE_CXX_COMPILER_VERSION}). "
+                        "Install g++-13 and configure with CC=gcc-13 CXX=g++-13 (a fresh build directory).")
+endif()
+
 option(ENABLE_NANO_LANCE_WRITER "Build nanolance (legacy cache name; OFF skips this tree)" ON)
 if(DEFINED ENABLE_NANO_LANCE_WRITER AND NOT ENABLE_NANO_LANCE_WRITER)
     message(STATUS "nanolance: disabled (ENABLE_NANO_LANCE_WRITER=OFF)")
