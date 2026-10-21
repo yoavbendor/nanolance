@@ -1410,6 +1410,12 @@ still passes when the rows come back right but slowly. Don't time it (CI machine
 <li>File I/O on read paths goes through <code>io::ByteSource</code> (<code>include/nanolance/byte_source.hpp</code>), never
   <code>std::ifstream</code> or <code>std::filesystem</code> directly, so the reader keeps working from <code>https://</code> in the
   WebAssembly build (<code>wasm/</code>). Writers and maintenance (cleanup, drop) stay on local files.</li>
+<li>The WebAssembly build is guarded by <code>.github/workflows/wasm.yml</code>: Emscripten (single-threaded,
+  <code>-Oz</code>, <code>-Werror</code>) builds <code>libnanolance</code>, <code>wasm/build_weblance.sh</code> links weblance, the gzipped
+  <code>weblance.wasm</code> must stay under the budget in that workflow, and <code>wasm/test/run_browser_test.cjs local</code>
+  must pass in headless Chromium. Locally: <code>emcmake cmake -S . -B build-wasm -G Ninja
+  -DCMAKE_BUILD_TYPE=MinSizeRel -DFETCHCONTENT_BASE_DIR=$PWD/.deps</code> with the <code>NANOLANCE_BUILD_*</code>
+  options off (see the workflow), then <code>cmake --build build-wasm</code> and <code>wasm/build_weblance.sh OUTDIR</code>.</li>
 </ul>
 
 

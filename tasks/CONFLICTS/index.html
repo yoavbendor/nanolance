@@ -1,0 +1,1273 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A standalone C++ Arrow <-> Lance v2.2 writer and reader — no Rust lance core. Rows keep large payloads external (uri + offset + size, never copied); the reader is hardened against untrusted files (bounds/overflow-checked decode, allocation budgets, ASan+UBSan+LSan CI, continuous fuzzing).">
+      
+      
+      
+        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/tasks/CONFLICTS/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Task: Lance's conflict rules in the C++ commit path - nanolance</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#task-lances-conflict-rules-in-the-c-commit-path" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="nanolance" class="md-header__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            nanolance
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Task: Lance's conflict rules in the C++ commit path
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="nanolance" class="md-nav__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    nanolance
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../SAFETY/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory safety & Rust reviewers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../agents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AI agent integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarks
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Benchmarks
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench-write-read/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Write/read vs Parquet & Rust lance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench-trusted-parity/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety-parity (trusted vs default)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../OPTIMIZATION_PLAN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap & review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../PROGRESS/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation progress
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../s3_reader_notes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    S3 reader notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../disk-lru-block-cache/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Disk LRU block cache
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../lance_table_reader_plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Table reader design notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#0-context-budget-read-this-first" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        0. Context budget (read this first)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-goal" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Goal
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-facts-measured-on-pylance-1200-do-not-re-derive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Facts (measured on pylance 12.0.0 -- do not re-derive)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-where-things-are-in-nanolance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Where things are in nanolance
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-phases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Phases
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-tests-you-write" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Tests you write
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-rules" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Rules
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-stop-and-ask-question-first-in-the-report" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Stop and ask (question first in the report)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-done-and-report" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8. Done and report
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="task-lances-conflict-rules-in-the-c-commit-path">Task: Lance's conflict rules in the C++ commit path<a class="headerlink" href="#task-lances-conflict-rules-in-the-c-commit-path" title="Permanent link">&para;</a></h1>
+<p>Status: <strong>delegated</strong> (implementer: Claude Haiku 5.5, reviewer: Claude Opus 5.5). ROADMAP "Table-format
+items", <strong>T2</strong> (Wave 2). Three sessions: <strong>C1</strong> (classify each concurrent pair as Lance does: compatible,
+retryable, incompatible), <strong>C2</strong> (rebase compatible pairs without re-running the operation), <strong>C3</strong>
+(merge deletion vectors of concurrent deletes / updates on the same fragment). Do only the phase you are
+given.</p>
+<h2 id="0-context-budget-read-this-first">0. Context budget (read this first)<a class="headerlink" href="#0-context-budget-read-this-first" title="Permanent link">&para;</a></h2>
+<p>Budget about 200k tokens; aim for 120k. Never read a large file whole: <code>grep -n</code>, then <code>sed -n 'A,Bp'</code>
+windows of at most ~120 lines. Big ones: <code>src/dataset_ops.cpp</code> (2k+), <code>src/dataset_transaction.cpp</code>,
+<code>src/transaction_file.cpp</code>, <code>bindings/python/nanolance/lance/dataset.py</code> (5k+). Lance's Rust: only
+<code>/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/lance-12.0.0/src/io/commit/conflict_resolver.rs</code>
+(5.6k lines; the functions named below, by <code>grep -n "fn check_"</code>). Cut output: <code>| tail -15</code> for pytest
+(add <code>-o addopts=</code>), <code>| tail -5</code> for <code>tools/pylance_suite.py</code>.</p>
+<h2 id="1-goal">1. Goal<a class="headerlink" href="#1-goal" title="Permanent link">&para;</a></h2>
+<p>When a C++ commit (<code>commit_next_version</code>, <code>src/dataset.cpp</code> ~line 182) loses the race for its version,
+nanolance today does one of two things: <code>rebase</code> (same file, ~line 92) succeeds only when the other
+writers did nothing but add fragments; anything else is a "commit conflict" and the operation's
+<code>retry_on_conflict</code> wrapper re-runs it from scratch on the new version. Two consequences:</p>
+<ul>
+<li><strong>Wrong results where Lance refuses.</strong> A delete raced by an overwrite is re-run on the new data and
+  succeeds; Lance raises "Incompatible transaction". Same for two <code>update_config</code> calls on one key (last
+  writer wins silently).</li>
+<li><strong>Needless work where Lance rebases.</strong> An index build raced by a delete, an update, or a compaction of
+  fragments it does not cover re-builds the whole index; Lance publishes it on top. Same for a
+  compaction raced by a delete on other fragments, and a delete raced by a delete on other fragments.</li>
+</ul>
+<p>After this task every pair is decided by Lance 12's rules (<code>TransactionRebase::check_txn</code> and its
+<code>check_*_txn</code> functions): <strong>compatible</strong> pairs are rebased (C2, C3) without re-running, <strong>incompatible</strong>
+ones fail with Lance's message and are not re-run, <strong>retryable</strong> ones keep today's behaviour (re-run by
+<code>retry_on_conflict</code>, up to its limit -- a deliberate, documented difference: pylance surfaces some of them
+to the user, nanolance retries them itself, with the same end state a user retry gives).</p>
+<h2 id="2-facts-measured-on-pylance-1200-do-not-re-derive">2. Facts (measured on pylance 12.0.0 -- do not re-derive)<a class="headerlink" href="#2-facts-measured-on-pylance-1200-do-not-re-derive" title="Permanent link">&para;</a></h2>
+<p>Probe: <code>/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchpad/t2/probe.py</code> (pylance)
+and <code>probe_nl.py</code> (the same through <code>nanolance.lance</code>); outputs <code>py.txt</code>, <code>nl.txt</code>. A 100-row dataset
+(<code>id</code> int64, <code>v</code> float64; two fragments of 50); writer A opens v1; writer B commits one change; then A
+commits its change from v1. pylance's results:</p>
+<table>
+<thead>
+<tr>
+<th>A (ours)</th>
+<th>B (theirs, committed first)</th>
+<th>pylance</th>
+<th>nanolance today</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>delete id=2</td>
+<td>delete id=1 (same fragment)</td>
+<td>ok (98 rows)</td>
+<td>ok</td>
+</tr>
+<tr>
+<td>delete id=1</td>
+<td>delete id=1</td>
+<td>ok (99)</td>
+<td>ok</td>
+</tr>
+<tr>
+<td>delete id=70</td>
+<td>delete id=1 (other fragment)</td>
+<td>ok</td>
+<td>ok</td>
+</tr>
+<tr>
+<td>delete id=2</td>
+<td>overwrite</td>
+<td><strong>OSError: <code>Incompatible transaction: This Delete transaction is incompatible with concurrent transaction Overwrite at version 2.</code></strong></td>
+<td>ok (wrong)</td>
+</tr>
+<tr>
+<td>update id=2</td>
+<td>delete id=1 (same fragment)</td>
+<td>ok</td>
+<td>ok</td>
+</tr>
+<tr>
+<td>delete id=1</td>
+<td>update id=2</td>
+<td>ok</td>
+<td>ok</td>
+</tr>
+<tr>
+<td>delete id=2</td>
+<td>compaction</td>
+<td>ok</td>
+<td>ok</td>
+</tr>
+<tr>
+<td>compaction</td>
+<td>delete id=2</td>
+<td>CommitConflictError <code>Retryable commit conflict for version 2: This Rewrite transaction was preempted by concurrent transaction Delete at version 2. Please retry.</code></td>
+<td>ok (re-run: keep)</td>
+</tr>
+<tr>
+<td>create BTREE id</td>
+<td>delete</td>
+<td>ok</td>
+<td>ok (re-built: C2 rebases)</td>
+</tr>
+<tr>
+<td>create BTREE id</td>
+<td>compaction of its fragments</td>
+<td>CommitConflictError (Rewrite)</td>
+<td>ok (re-run: keep)</td>
+</tr>
+<tr>
+<td>create BTREE id</td>
+<td>create BTREE v</td>
+<td>ok</td>
+<td>ok</td>
+</tr>
+<tr>
+<td>create BTREE id</td>
+<td>create BTREE id (same name)</td>
+<td>CommitConflictError (CreateIndex)</td>
+<td>ok (re-run: keep)</td>
+</tr>
+<tr>
+<td>append</td>
+<td>overwrite</td>
+<td>ok (2 rows)</td>
+<td>ok</td>
+</tr>
+<tr>
+<td>add_columns</td>
+<td>delete</td>
+<td>CommitConflictError (Merge vs Delete)</td>
+<td>ok (re-run: keep)</td>
+</tr>
+<tr>
+<td>drop_columns</td>
+<td>append</td>
+<td>ok</td>
+<td>ok</td>
+</tr>
+<tr>
+<td>update_config k=2</td>
+<td>update_config k=1</td>
+<td><strong>OSError: <code>Incompatible transaction: This UpdateConfig transaction is incompatible with concurrent transaction UpdateConfig at version 2.</code></strong></td>
+<td>ok (wrong)</td>
+</tr>
+<tr>
+<td>restore</td>
+<td>append</td>
+<td>ok</td>
+<td>ok</td>
+</tr>
+</tbody>
+</table>
+<p>The pylance "ok" rows above can be internal re-runs (pylance's own <code>delete</code> / <code>update</code> retry); the
+row counts are what must match. The wording to use (Lance's <code>retryable_conflict_err</code> /
+<code>incompatible_conflict_err</code>, conflict_resolver.rs ~line 229):</p>
+<ul>
+<li>incompatible: <code>Incompatible transaction: This {Ours} transaction is incompatible with concurrent
+  transaction {Theirs} at version {v}.</code> -- through Python an <code>OSError</code> (not <code>CommitConflictError</code>);
+  through lance-c the error code pylance's maps to (see <code>src/lance_c.cpp</code> ~line 202, which already maps
+  "commit conflict").</li>
+<li>retryable: keep nanolance's <code>commit conflict: ...</code> prefix (that is what <code>retry_on_conflict</code> and
+  <code>src/lance_c.cpp</code> key on), followed by Lance's text <code>Retryable commit conflict for version {v}: This
+  {Ours} transaction was preempted by concurrent transaction {Theirs} at version {v}. Please retry.</code>
+  -- seen only when the retries run out, or by operations that do not retry.</li>
+</ul>
+<p><code>{Ours}</code> / <code>{Theirs}</code> are Lance's operation names (Append, Delete, Overwrite, CreateIndex, Rewrite,
+Merge, Restore, ReserveFragments, Update, Project, UpdateConfig, DataReplacement, DataOverlay, Clone,
+UpdateBases).</p>
+<h2 id="3-where-things-are-in-nanolance">3. Where things are in nanolance<a class="headerlink" href="#3-where-things-are-in-nanolance" title="Permanent link">&para;</a></h2>
+<ul>
+<li><code>src/dataset.cpp</code>: <code>rebase</code> (~92), <code>commit_next_version</code> (~182; the retry loop ~227).</li>
+<li>What a commit <em>is</em>, as Lance's transaction: <code>derive_transaction_operation(parent, next)</code>
+  (<code>src/transaction_file.hpp</code>) -- the same derivation that writes <code>_transactions/*.txn</code> on every commit.
+  The other writers' transactions: each intervening manifest's <code>transaction_file</code>
+  (<code>_transactions/&lt;name&gt;</code>), written by nanolance and by pylance alike. A version with no transaction file
+  (old datasets) is a <strong>retryable</strong> conflict (today's behaviour).</li>
+<li>Decoding and applying a transaction: <code>src/dataset_transaction.cpp</code> -- <code>decode_operation</code> (~295),
+  <code>struct Operation</code> (~259), <code>apply_operation(base, op, next, ...)</code> (~847), used by the Python
+  <code>LanceDataset.commit</code> path. Move what you need into an internal header (<code>src/dataset_transaction_ops.hpp</code>
+  or similar); do not duplicate the decoder.</li>
+<li>The Python transaction API's own port of the matrix: <code>bindings/python/nanolance/lance/_transactions.py</code>
+  <code>conflict_with</code> (~1002). It covers hand-built transactions without affected rows; the C++ port must
+  agree with it on every pair it covers (a test asserts this for the pairs both can express). Do not
+  change the Python commit path in this task.</li>
+<li>Re-run wrappers: <code>grep -n "retry_on_conflict" src/*.cpp src/*.hpp</code> (delete, update, merge_insert,
+  compaction, optimize_indices). Index builds (<code>src/scalar_index.cpp</code> ~1882 / ~2127,
+  <code>src/vector_index_build.cpp</code> ~2187, <code>src/fts_index_build.cpp</code> ~955, <code>src/index_segments.cpp</code> ~397)
+  call <code>commit_next_version</code> directly.</li>
+</ul>
+<h2 id="4-phases">4. Phases<a class="headerlink" href="#4-phases" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>C1 (classify).</strong> On a lost race, for each version <code>v</code> in (read version, latest]: decode its
+  transaction, decide ours-vs-theirs with a C++ port of <code>check_txn</code> (the <code>check_*_txn</code> functions for the
+  operations nanolance's C++ commits: Append, Delete, Update, Overwrite, CreateIndex, Rewrite, Merge,
+  Project, UpdateConfig, Restore, ReserveFragments, DataReplacement, DataOverlay, Clone, UpdateBases;
+  the MemWAL / FRI-only branches only where nanolance writes those). The first incompatible or retryable
+  verdict decides. Incompatible: fail with the message in section 2, no re-run. Retryable: today's path.
+  All compatible: today's <code>rebase</code> for now (C2 replaces it). The two "wrong" rows of section 2 then
+  match pylance.</li>
+<li><strong>C2 (rebase).</strong> When every intervening transaction is compatible, build the new manifest by applying
+  <em>our</em> operation to the latest manifest (<code>apply_operation</code>), with Lance's adjustments in <code>finish</code> /
+  <code>finish_create_index</code> / <code>finish_rewrite</code> (conflict_resolver.rs ~1814, ~2082, ~2197): an index built
+  from an older version keeps only the fragments still present
+  (<code>prune_updated_fields_from_indices</code> for a concurrent Update of an indexed field), a rewrite's indexes
+  remapped against the latest manifest, fragment ids after the latest <code>max_fragment_id</code>. <code>rebase</code>'s
+  append-only special case becomes one instance of this, or goes. Add an internal counter (C++ only, for
+  tests: e.g. <code>commit_conflict_stats()</code> with <code>rebased</code>, <code>retried</code>, <code>refused</code>) so tests can tell a rebase
+  from a re-run.</li>
+<li><strong>C3 (deletion vectors).</strong> Delete / Update against a concurrent Delete / Update on the same fragment
+  with unchanged data files (<code>check_delete_txn</code> ~349, <code>check_update_txn</code> ~453, <code>finish_delete_update</code>
+  ~1836): the delete / update passes the row addresses it deleted (its <em>affected rows</em>) to the commit;
+  the commit reads the latest deletion file of each such fragment, conflicts (retryable, Lance's
+  row-address message) if they overlap, else writes a merged deletion file (and removes a fragment whose
+  rows are now all deleted, as Lance does). Without affected rows, retryable (as Lance).</li>
+</ul>
+<h2 id="5-tests-you-write">5. Tests you write<a class="headerlink" href="#5-tests-you-write" title="Permanent link">&para;</a></h2>
+<p>C++: <code>tests/test_commit_conflicts.cpp</code> (add to CMake like the other <code>tests/test_*.cpp</code>). A two-writer
+harness: open at v1, commit "theirs" through the public API, then commit "ours" from the stale v1
+manifest. One test per row of section 2 (outcome and row count), plus each compatible pair of C2 / C3
+asserting <strong>rebased, not re-run</strong> via the counter, plus: a version without a transaction file is
+retryable; an incompatible verdict is not re-run (counter <code>retried == 0</code>).
+Python: <code>bindings/python/tests/test_commit_conflicts.py</code> (<code>require_pylance()</code>): the probe of section 2
+through both engines, outcomes equal row by row except the four documented "re-run: keep" rows; a
+pylance writer racing a nanolance writer and the reverse (each reads the other's transaction file).</p>
+<h2 id="6-rules">6. Rules<a class="headerlink" href="#6-rules" title="Permanent link">&para;</a></h2>
+<p><code>AGENTS.md</code> sections 5 and 7. No skipped or weakened tests; no <code>except Exception</code> around failures. C++
+without warnings (CI uses <code>-Werror</code>; the wasm build too: no threads, no <code>std::filesystem</code> on read paths).
+A commit that does not race must not change: same files, same manifest bytes as before this task (the
+existing tests and the pylance suite check this). Do not commit, push, change git branches, or run
+<code>--update</code>. Scratch files only in <code>/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchpad/t2-work/</code>.
+Work only in <code>/home/user/nanolance</code>. Builds: <code>cd build &amp;&amp; ninja</code>, then <code>cd
+bindings/python/build/cp311-cp311-linux_x86_64 &amp;&amp; ninja &amp;&amp; cp _nanolance.cpython-311-x86_64-linux-gnu.so
+/usr/local/lib/python3.11/dist-packages/nanolance/</code>. Run each full suite once, at the end, one at a time;
+no sleep loops; kill by PID. Delete <code>/tmp/pytest-of-root</code> after full runs (the disk is small).</p>
+<h2 id="7-stop-and-ask-question-first-in-the-report">7. Stop and ask (question first in the report)<a class="headerlink" href="#7-stop-and-ask-question-first-in-the-report" title="Permanent link">&para;</a></h2>
+<ul>
+<li>a pair whose Lance verdict depends on state nanolance's transaction files do not record (say which
+  field);</li>
+<li><code>apply_operation</code> would need a change that alters what a non-racing commit writes;</li>
+<li>a pylance test that passes today fails after your change.</li>
+</ul>
+<h2 id="8-done-and-report">8. Done and report<a class="headerlink" href="#8-done-and-report" title="Permanent link">&para;</a></h2>
+<p>Tails of: <code>cd build &amp;&amp; ctest -j8 | tail -3</code>; <code>./build/test_commit_conflicts | tail -5</code>;
+<code>python3 -m pytest -o addopts= -q bindings/python/tests/test_commit_conflicts.py | tail -2</code>;
+<code>python3 tools/pylance_suite.py | tail -4</code>; last, once: <code>cd bindings/python &amp;&amp; python3 -m pytest -o
+addopts= -q -p no:cacheprovider tests | tail -3</code>. Report under 40 lines: questions first, then files,
+per-pair status, tails, decisions.</p>
+<p><strong>C1 outcome (2026-10-20, first session):</strong> verdicts implemented (<code>src/commit_conflicts.{hpp,cpp}</code>, decoder
+moved to <code>src/dataset_operation.{hpp,cpp}</code>, <code>classify_concurrent</code> in <code>commit_next_version</code>, counters in
+<code>include/nanolance/dataset_commit.hpp</code>, <code>_errors.py</code> maps "Incompatible transaction:" to OSError,
+<code>tests/test_commit_conflicts.cpp</code> at verdict level). Reviewer found: <strong>the probe of section 2 is unchanged
+end to end</strong>, because nanolance's Python mutations never race from a stale handle -- <code>delete_once</code>
+(<code>src/dataset_ops.cpp</code> ~791) and the other <code>*_once</code> functions <code>load_latest</code>, so a handle opened at v1
+deletes from v3. pylance commits from the handle's own version (<code>read_version</code>), then resolves.
+Reviewer's answers to the session's questions:
+1-2. <code>Update.inserted_rows_filter</code> and <code>update_mode</code>: record them in <code>derive_transaction_operation</code> as
+   pylance does (C2; measure pylance's .txn for a keyed merge_insert and an update first).
+3. Overwrite <code>config_upsert_values</code>: write what pylance writes (C2; measure a pylance overwrite's .txn
+   carrying an unchanged config key). Until then, accepted.
+4. Lance wins: change <code>_transactions.py</code> <code>conflict_with</code> to agree with Lance on 4a-4d (C1b).
+5. lance-c: keep <code>LANCE_ERR_INTERNAL</code> (lance.h is upstream's header; never add codes; pylance raises a
+   plain OSError for it, not CommitConflictError).
+6. FRI / MemWAL names: accepted as absent.</p>
+<p><strong>C1b (second session):</strong> finish C1.
+- <strong>Read version.</strong> Each mutation commits from the version the dataset object was opened at, as
+  pylance does: the Python methods pass the handle's version (<code>self._version</code>, or "latest" when the
+  object follows latest) down through the bindings to the C++ <code>*_once</code> functions, which load that
+  version instead of <code>load_latest</code>; on a lost race the classification of C1 decides (compatible -&gt;
+  rebase, retryable -&gt; <code>retry_on_conflict</code> re-runs on latest, as pylance's own retries do; incompatible
+  -&gt; error). Operations: delete, update, merge_insert, add_columns / drop_columns / alter_columns,
+  update_config / table and schema metadata, compaction, create_index / create_scalar_index,
+  optimize_indices, restore. Overwrite and append need no read version (their pairs do not depend on
+  it beyond Lance's rules for Append / Overwrite as "ours"). C++ API: an optional read version
+  parameter (default: latest, today's behaviour, so lance-c and C++ callers are unchanged).
+- The two "wrong" rows of section 2 now raise pylance's OSError through <code>nanolance.lance</code>; the four
+  "re-run: keep" rows still succeed; every other row unchanged. Write
+  <code>bindings/python/tests/test_commit_conflicts.py</code> (section 5) and the C++ two-writer tests
+  (incompatible not re-run; no transaction file -&gt; retryable).
+- Align <code>_transactions.py</code> <code>conflict_with</code> with Lance on 4a-4d above, and add the C++-vs-Python
+  agreement test for the pairs both express.
+- Check the wasm build still compiles the touched sources (<code>docs/../AGENTS.md</code>, wasm note).</p>
+<p><strong>C1b outcome (2026-10-20):</strong> mutations commit from the handle's version (<code>ReadVersion</code>,
+<code>retry_from_read_version</code>; C++ default stays "latest"): delete, update, merge_insert, add / drop / alter
+columns, compaction, update_config and table / schema metadata (the last two now retry too). The probe:
+"delete vs overwrite" and "update_config same key" raise pylance's OSError; the four "re-run: keep" rows
+succeed; all other rows unchanged. <code>bindings/python/tests/test_commit_conflicts.py</code> (20),
+<code>tests/test_commit_conflicts.cpp</code> two-writer tests. Reviewer: removed <code>load_latest</code> (unused; the wasm
+build's clang <code>-Werror</code> failed on it). Decisions:
+- A reader-form <code>add_columns</code> (stream, not replayable) surfaces a retryable verdict as a commit conflict
+  instead of re-running: accepted (pylance surfaces that pair too).
+- A handle whose version auto-cleanup removed commits from the latest manifest: accepted
+  (<code>test_enable_disable_auto_cleanup</code>).
+- "4a-4d" in the C1 answers referred to the first session's report; the list is now spelled out in C2.</p>
+<p><strong>C2 scope, in addition to section 4:</strong>
+- Index builds (<code>create_index</code>, <code>create_scalar_index</code>, <code>optimize_indices</code>, segment commits) and
+  <code>restore</code> commit from the handle's version too; with C2's rebase an index build raced by an append /
+  delete / update is published without re-building (counter: <code>rebased</code>, not <code>retried</code>).
+- <code>derive_transaction_operation</code> records <code>Update.inserted_rows_filter</code>, <code>Update.update_mode</code> and
+  Overwrite's <code>config_upsert_values</code> as pylance writes them (measure a pylance .txn for a keyed
+  merge_insert, an update, and an overwrite carrying an unchanged config key first).
+- <code>_transactions.py</code> <code>conflict_with</code> agrees with Lance (and the C++ port) on: Overwrite vs Overwrite and
+  vs UpdateConfig on one config key (incompatible); UpdateConfig (ours) vs Overwrite on a config key;
+  UpdateConfig vs UpdateConfig both setting schema metadata (Lance's rule, conflict_resolver.rs
+  <code>check_update_config_txn</code>); Rewrite (ours) vs CreateIndex on overlapping fragments (retryable);
+  Rewrite / Update (ours) vs DataOverlay on overlapping fragments (retryable); CreateIndex as ours. Add
+  the C++-vs-Python agreement test over the pairs both can express.</p>
+<p><strong>C2 outcome (2026-10-20):</strong> compatible pairs rebase by applying our operation to the latest manifest
+(<code>rebase_operation</code>, <code>src/dataset_transaction.cpp</code>; the append-only <code>rebase</code> is gone); index builds and
+restore commit from the handle's version; <code>_transactions.py</code> <code>conflict_with</code> agrees with the C++ port
+over all ordered pairs of 15 operations (<code>_commit_verdict</code> test). Measured: pylance writes
+<code>inserted_rows_filter</code> only for merge_insert on an unenforced primary key, <code>update_mode</code> only for
+<code>rewrite_columns</code>, and no <code>config_upsert_values</code> on a plain overwrite, so <code>derive_transaction_operation</code>
+is unchanged. Reviewer removed the old helpers (wasm clang <code>-Werror</code>). Accepted gaps: no key-existence
+filter (a pylance PK merge_insert racing a nanolance update re-runs where Lance refuses); a row-moving
+update of an indexed column does not prune the racing index build's coverage (results stay correct);
+rewrite_columns merges recorded as RewriteRows; on stable-row-id datasets Append / Update / Merge /
+Overwrite are re-run, not rebased (the old <code>rebase</code> kept base-counter row ids: possible duplicates).</p>
+<p><strong>C3 scope, in addition to section 4:</strong>
+- Affected rows: <code>delete_once</code> / <code>update_once</code> (and merge_insert's delete / update paths) know the row
+  offsets they delete per fragment (<code>apply_deletions</code> gets them). Pass them to the commit (a new optional
+  argument of <code>commit_next_version</code>, or a field next to <code>ReadVersion</code>), so a Delete / Update raced by a
+  Delete / Update on the same fragment with unchanged data files is merged as <code>finish_delete_update</code>
+  does: read the latest deletion file of each such fragment, overlap -&gt; retryable with Lance's message
+  (<code>This {Ours} transaction was preempted by concurrent transaction {Theirs} at version {v} (both
+  modified rows at addresses [...]). Please retry</code>, up to 5 addresses), else write a merged deletion
+  file (Lance's name and format, as <code>apply_deletions</code> writes them) and drop a fragment whose rows are
+  now all deleted. Counter: <code>rebased</code>, not <code>retried</code>. Two-writer tests: disjoint rows (merged, rows
+  equal pylance's), the same row (retryable -&gt; re-run, rows equal pylance's), all rows of a fragment.
+- Found in the C2 review: a compaction raced by a delete now ends one version later than before (probe
+  <code>compaction vs delete</code>: v5, was v4): its ReserveFragments commit rebases over the delete, then the
+  Rewrite is retryable and the re-run reserves again, leaving an empty ReserveFragments version. Make
+  the re-run reuse the reservation it already committed (or not reserve again when the reserved ids are
+  still unused), so the probe ends at v4 again with the same rows.</p>
+<p><strong>C3 outcome (2026-10-20): task done.</strong> Delete / Update raced by a Delete / Update on the same fragment
+merge deletion vectors as Lance's <code>finish_delete_update</code> (overlap -&gt; retryable with Lance's message; a
+fragment left with no rows is removed); affected rows passed by delete, update and merge_insert
+(<code>AffectedRows</code>, <code>commit_next_version</code>). Compaction checks its rewritten fragments against the latest
+version before committing ReserveFragments, so the probe's compaction vs delete ends at v4 again (a
+writer landing between that check and the commit can still leave an empty ReserveFragments version:
+accepted). Found and fixed: C2's rebase kept the fragment id an Append / Update chose on its stale base,
+so it could duplicate a concurrent writer's id (a dropped row in <code>test_concurrent_writers</code>); added
+fragments are now numbered after the latest manifest's. Reviewer: <code>test_concurrent_writers</code> 6 of 6.
+Open, not reproduced: one <code>test_index_optimize.py::test_optimize_after_append[pylance]</code> failure in a full
+run (the known k-means flake in ROADMAP "Small items").</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Apache-2.0
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/yoavbendor/nanolance" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>

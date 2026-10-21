@@ -748,6 +748,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#index-plan-for-ai-users-2026-10-19-revised" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Index plan for AI users (2026-10-19, revised)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#features-left-smallest-first" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -925,6 +936,22 @@ a user report can be matched to it.</p>
 </tr>
 </tbody>
 </table>
+<h2 id="index-plan-for-ai-users-2026-10-19-revised">Index plan for AI users (2026-10-19, revised)<a class="headerlink" href="#index-plan-for-ai-users-2026-10-19-revised" title="Permanent link">&para;</a></h2>
+<p>The plan, with each item's failing pylance tests, the Opus step, the Haiku sessions and the
+done-criteria, is in <code>docs/ROADMAP.md</code> ("Index plan for AI users"). Next, Wave 1, in order, each
+briefed by Opus and implemented by Haiku:</p>
+<ol>
+<li><strong>First, T1</strong>: refuse manifests whose feature flags nanolance does not support, on open and on write.
+   Nothing checks them today, so a newer dataset can read as empty. 1 session.</li>
+<li>Full-text search on list columns: 5 tests, 1 session.</li>
+<li>Index build progress callbacks: 5 tests, 1 session. Also make the hybrid refusal pylance's exact message.</li>
+<li>Multivector search: 4 tests, 3 sessions (M1 flat, M2 search, M3 build) after Opus measures the format.</li>
+<li>Deferred index remap and the Fragment Reuse Index: 4 tests, 1-2 sessions.</li>
+</ol>
+<p>T4 (Arrow dictionary columns on write) is a one-session filler. Meanwhile Opus researches Wave 2:
+object-store reads, branches and clones (T3), IVF_RQ, the commit conflict rules (T2), binary IVF. Corrections to earlier
+summaries: CJK segmentation is not done. Hybrid search is refused by pylance too, so it is LanceDB's
+feature. Compaction already remaps indexes; the FRI only serves deferred remap.</p>
 <h2 id="features-left-smallest-first">Features left, smallest first<a class="headerlink" href="#features-left-smallest-first" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -941,6 +968,18 @@ a user report can be matched to it.</p>
 <td>85</td>
 <td>format research (Opus) + sessions</td>
 <td>the largest group of pylance failures; see the suite breakdown below</td>
+</tr>
+<tr>
+<td><code>create_scalar_index(IndexConfig(index_type="inverted", parameters={...}))</code> ignores the parameters for INVERTED builds (only list-element builds read them); found in FTS_LISTS L2</td>
+<td>--</td>
+<td>small</td>
+<td>string-column builds made this way change, so test against pylance</td>
+</tr>
+<tr>
+<td>Staged (distributed) INVERTED builds over list elements are refused; <code>infer_index_segment_details</code> would drop <code>document_granularity</code> (field 14)</td>
+<td>--</td>
+<td>small</td>
+<td>FTS_LISTS L2</td>
 </tr>
 <tr>
 <td><code>Compaction.plan</code>, <code>lance.debug.format_fragment</code>, <code>lance.util.KMeans</code>, <code>lance.pydantic.Vector</code></td>
@@ -1304,6 +1343,9 @@ optimization; compare engines within one run (ratios), never across days.</p>
   <code>delete()</code>), a reader path that silently returned a short dictionary column, <code>__int128</code> breaking
   MSVC, a full-text change that needed an A/B timing to show it was not slower.</li>
 <li>Run one full pytest at a time; two at once caused one spurious failure.</li>
+<li>Compaction with <code>max_bytes_per_file</code>: pylance cuts files at batch granularity (<code>test_optimize_max_bytes</code> wants 2 fragments, nanolance writes 8); changes eager compaction output, decide first.</li>
+<li><code>list_indices()</code> / <code>describe_indices()</code>: pylance sorts by name and reports each index's own version; nanolance keeps manifest order and reports the dataset version.</li>
+<li><code>compact_files(defer_index_remap=True)</code> with stable row ids is refused; FRI details over 200 KB (external) are refused when writing.</li>
 </ul>
 
 

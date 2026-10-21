@@ -1,0 +1,1119 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A standalone C++ Arrow <-> Lance v2.2 writer and reader — no Rust lance core. Rows keep large payloads external (uri + offset + size, never copied); the reader is hardened against untrusted files (bounds/overflow-checked decode, allocation budgets, ASan+UBSan+LSan CI, continuous fuzzing).">
+      
+      
+      
+        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/tasks/BRANCHES/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Task: branches and clones (create_branch, checkout of a branch, branches API, shallow / deep clone) - nanolance</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#task-branches-and-clones-create_branch-checkout-of-a-branch-branches-api-shallow-deep-clone" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="nanolance" class="md-header__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            nanolance
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Task: branches and clones (create_branch, checkout of a branch, branches API, shallow / deep clone)
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="nanolance" class="md-nav__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    nanolance
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../SAFETY/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory safety & Rust reviewers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../agents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AI agent integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarks
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Benchmarks
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench-write-read/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Write/read vs Parquet & Rust lance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench-trusted-parity/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety-parity (trusted vs default)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../OPTIMIZATION_PLAN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap & review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../PROGRESS/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation progress
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../s3_reader_notes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    S3 reader notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../disk-lru-block-cache/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Disk LRU block cache
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../lance_table_reader_plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Table reader design notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#0-context-budget-read-this-first" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        0. Context budget (read this first)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-goal" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Goal
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-facts-measured-on-pylance-1200-do-not-re-derive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Facts (measured on pylance 12.0.0 -- do not re-derive)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-where-things-are-in-nanolance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Where things are in nanolance
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-phases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Phases
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-tests-you-write" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Tests you write
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-rules" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Rules
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-stop-and-ask-question-first-in-the-report" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Stop and ask (question first in the report)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-done-and-report" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8. Done and report
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="task-branches-and-clones-create_branch-checkout-of-a-branch-branches-api-shallow-deep-clone">Task: branches and clones (create_branch, checkout of a branch, branches API, shallow / deep clone)<a class="headerlink" href="#task-branches-and-clones-create_branch-checkout-of-a-branch-branches-api-shallow-deep-clone" title="Permanent link">&para;</a></h1>
+<p>Status: <strong>delegated</strong> (implementer: Claude Haiku 5.5, reviewer: Claude Opus 5.5). ROADMAP "Table-format
+items", <strong>T3</strong> (Wave 2). Three sessions: <strong>B1</strong> (read pylance's branches), <strong>B2</strong> (create and write
+branches; the branches API), <strong>B3</strong> (shallow / deep clone; namespace branch operations). Do only the phase
+you are given.</p>
+<h2 id="0-context-budget-read-this-first">0. Context budget (read this first)<a class="headerlink" href="#0-context-budget-read-this-first" title="Permanent link">&para;</a></h2>
+<p>Budget about 200k tokens; aim for 120k. Never read a large file whole: <code>grep -n</code>, then <code>sed -n 'A,Bp'</code>
+windows of at most ~120 lines. Big ones: <code>bindings/python/nanolance/lance/dataset.py</code> (5k+),
+<code>src/dataset.cpp</code>, <code>src/manifest_writer.cpp</code>, <code>src/dataset_ops.cpp</code>, <code>bindings/python/src/nanolance_bindings.cpp</code>.
+Lance's Rust: read only the files named here. Cut output: <code>| tail -15</code> for pytest (add <code>-o addopts=</code>),
+<code>| tail -5</code> for <code>tools/pylance_suite.py</code>.</p>
+<h2 id="1-goal">1. Goal<a class="headerlink" href="#1-goal" title="Permanent link">&para;</a></h2>
+<p>pylance 12 datasets can carry branches: named lines of versions forked from a version of another branch
+(or main). nanolance refuses them by name today (<code>dataset.py</code>: <code>raise unsupported("branches")</code> near lines
+636 and 2460, and the attribute list near line 2260; <code>_namespace_dir.py</code> near lines 1186 and 1765). After
+this task nanolance reads, creates, writes, lists and deletes branches exactly as pylance does, on disk
+and through the API, and <code>shallow_clone</code> / <code>deep_clone</code> work. Each engine opens and appends to the other's
+branches.</p>
+<p>Targets (<code>.deps/pylance-tests/v12.0.0/tests/</code>): <code>test_dataset.py::test_branches</code>, <code>::test_shallow_clone</code>,
+<code>::test_deep_clone</code>; <code>test_namespace_dir.py::...::test_branch_crud_round_trip</code>,
+<code>::test_create_branch_from_other_branch</code> (B3). <code>test_s3_ddb_branches</code> and
+<code>test_namespace_managed_branches</code> need DynamoDB / S3 writes: out of scope.</p>
+<h2 id="2-facts-measured-on-pylance-1200-do-not-re-derive">2. Facts (measured on pylance 12.0.0 -- do not re-derive)<a class="headerlink" href="#2-facts-measured-on-pylance-1200-do-not-re-derive" title="Permanent link">&para;</a></h2>
+<p>Re-run in <code>/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchpad/br/</code> (<code>ds.lance</code>:
+v1 3 rows, v2 +1 row; branch <code>exp</code> from v1, then one append on <code>exp</code>).</p>
+<p>Layout. A branch <code>B</code> lives under <code>&lt;root&gt;/tree/B/</code> with its own <code>_versions/</code>, <code>_transactions/</code>, <code>data/</code>
+(and <code>_versions/latest_version_hint.json</code>, <code>{"version":N}</code>, which pylance writes on every commit, main
+included). Branch names can contain <code>/</code> (Lance's <code>branch_location.rs</code>). Its reference is
+<code>&lt;root&gt;/_refs/branches/B.json</code>:</p>
+<div class="language-json highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="p">{</span><span class="nt">&quot;parentBranch&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;identifier&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">&quot;version_mapping&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[[</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;1935c23a6df942abaf8023c96579f240&quot;</span><span class="p">]]},</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w"> </span><span class="nt">&quot;parentVersion&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;createAt&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1792482184</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;manifestSize&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">369</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;metadata&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{}}</span>
+</code></pre></div>
+<p><code>parentBranch</code> is null for main, else the parent's name. <code>identifier.version_mapping</code> is the chain of
+(parent_version, 32-hex random id) from the root: a branch of a branch has two entries (its parent's,
+then its own). <code>createAt</code> is Unix seconds; <code>manifestSize</code> the size in bytes of the parent manifest it was
+forked from.</p>
+<p>The branch's first manifest has the <strong>same version number as the parent version</strong> it forks (branch from
+v1: the branch's <code>_versions/</code> holds version 1), and is the parent's manifest with:
+- every inherited data file (and deletion file) gets <code>base_id = 0</code> (DataFile field 7): base path id 0,
+  not "the dataset itself" -- only an absent base_id means the dataset's own directory (Lance
+  <code>dataset.rs</code> <code>data_file_dir_for_base</code>);
+- <code>base_paths</code> (Manifest field 18) gains <code>{id: 0, is_dataset_root: true, path: &lt;parent's root, as the
+  dataset was opened: relative if opened relative&gt;}</code> (BasePath fields 1, 3, 4);
+- reader and writer feature flags (Manifest fields 9, 10) gain 16 (base paths);
+- <code>branch</code> (Manifest field 20) = <code>"B"</code>;
+- a new transaction file (a Clone operation; nanolance's transaction writer must learn it) in
+  <code>tree/B/_transactions/</code>.</p>
+<p>Files written on the branch afterwards have no <code>base_id</code> (they live under <code>tree/B/data/</code>); the next
+version is parent version + 1 (append on <code>exp</code> from v1 -&gt; <code>exp</code> v2 while main has its own v2). Main is
+never touched by a branch write.</p>
+<p>API (pylance 12):
+- <code>ds.create_branch(name, reference=None)</code> -&gt; the branch as a <code>LanceDataset</code> at its first version.
+  <code>reference</code>: <code>None</code> (this dataset's current version on its branch), an int version, a tag name, or a
+  <code>(branch, version)</code> tuple where branch <code>None</code> or <code>"main"</code> is main and version <code>None</code> is that branch's
+  latest. <code>branch.uri</code> is <code>&lt;root&gt;/tree/&lt;name&gt;</code> (absolute if the root was). A second branch of the same
+  name fails (pylance's own message is an internal error; raise <code>OSError</code> containing "already exists").
+- <code>lance.dataset(&lt;root&gt;/tree/B)</code> opens the branch; <code>write_dataset(..., &lt;root&gt;/tree/B or the branch
+  dataset, mode="append"/"overwrite")</code> commits on it.
+- <code>ds.checkout_version(x)</code>: <code>x</code> an int, a tag, or <code>(branch, version)</code>. A missing branch:
+  <code>ValueError</code> ("Not found: .../tree/nope/_versions"); a missing tag name: <code>OSError</code> containing "does not
+  exist" (test_branches relies on it). <code>checkout_latest()</code> moves to the branch's latest.
+- <code>ds.branches</code>: <code>list()</code> -&gt; <code>{name: {"parent_branch", "branch_identifier": [(int, str), ...],
+  "parent_version", "create_at", "manifest_size", "metadata"}}</code>; <code>list_ordered()</code> (by <code>create_at</code>, then
+  name: check against pylance); <code>delete(name)</code>; <code>replace_metadata(name, dict)</code>. Deleting <code>"main"</code>:
+  <code>OSError</code> "Ref is invalid: Branch name cannot be 'main'". Deleting a branch another branch forks from:
+  <code>OSError</code> 'Ref conflict error: Branch b1 is referenced by [("b1child", 1)] versions, can not delete'.
+  Delete removes the JSON and <code>tree/B/</code>.
+- Tags gain a branch: <code>_refs/tags/T.json</code> has <code>"branch": "exp"</code> or <code>null</code>; <code>tags.create(name, ref)</code>
+  takes the same reference forms (<code>(None, None)</code> and <code>("main", None)</code> are main's latest);
+  <code>tags.list()[t]["branch"]</code>.
+- <code>shallow_clone(target, reference)</code>: <code>target/_versions/</code> gets one manifest (same version number as the
+  source version) whose files all point at the source through <code>base_paths</code> (as a branch's do), plus a
+  transaction; no <code>data/</code>. <code>deep_clone(target, reference)</code>: the same, with the data (and deletion) files
+  copied into <code>target/</code> and no base path to the source. Both return the clone, opened.</p>
+<p>Lance's code (sources under <code>/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/</code>):
+<code>lance-12.0.0/src/dataset/refs.rs</code> (branch and tag JSON, checks, errors), <code>.../dataset/branch_location.rs</code>
+(paths), <code>lance-12.0.0/src/dataset.rs</code> lines 601 (<code>create_branch</code>), 3264 (<code>shallow_clone</code>), 3314
+(<code>deep_clone</code>); the Clone transaction in <code>lance-12.0.0/src/dataset/transaction.rs</code>
+(<code>grep -n "Clone" ...</code>); <code>lance-table-12.0.0/protos/table.proto</code> (Manifest field 20 <code>branch</code>, 18
+<code>base_paths</code>) and <code>transaction.proto</code> (the Clone operation).</p>
+<h2 id="3-where-things-are-in-nanolance">3. Where things are in nanolance<a class="headerlink" href="#3-where-things-are-in-nanolance" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Base paths are read and written already: <code>include/nanolance/base_paths.hpp</code>, <code>src/base_paths.cpp</code>
+  (<code>read_base_paths</code>, <code>write_base_paths</code>, data-file resolution by <code>base_id</code>); multi-base datasets are done
+  (<code>docs/tasks/MULTI_BASE.md</code>).</li>
+<li>Manifests: <code>src/dataset.cpp</code> (reading, line ~281 reads base paths), <code>src/manifest_writer.cpp</code>
+  (feature flags, unknown-field preservation: check field 20 survives a commit).</li>
+<li>Transaction files: <code>grep -rn "Clone\|write_transaction" src/*.cpp | head</code>.</li>
+<li>Tags (Python): <code>dataset.py</code> near line 2460 (<code>Tags</code>); refs JSON reading in <code>_namespace_dir.py</code> near 1670.</li>
+<li>Commit retries / version numbering: <code>src/dataset.cpp</code> (<code>rebase</code>), <code>src/manifest_writer.cpp</code>.</li>
+</ul>
+<h2 id="4-phases">4. Phases<a class="headerlink" href="#4-phases" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>B1</strong> (read): open a pylance branch by <code>&lt;root&gt;/tree/B</code> and by <code>checkout_version((B, v))</code> /
+  <code>(B, None)</code>; scans, takes, filters, indexes inherited from the parent all answer as pylance does;
+  <code>branches.list()</code> / <code>list_ordered()</code> and tags with a branch read pylance's JSON; nanolance appends to a
+  pylance branch and pylance reads the result (files under <code>tree/B/data/</code>, version parent+1, main
+  unchanged).</li>
+<li><strong>B2</strong> (create / write): <code>create_branch</code> with every reference form, branches of branches, <code>delete</code>
+  (and its two refusals), <code>replace_metadata</code>, tags on branches, <code>latest_version_hint.json</code> on every commit
+  if pylance needs it to open (measure: does pylance open a nanolance branch without it?). pylance reads
+  nanolance's branches with the same results. <code>test_branches</code> passes.</li>
+<li><strong>B3</strong> (clones): <code>shallow_clone</code>, <code>deep_clone</code> (C++ core function + Python), the namespace branch
+  operations in <code>_namespace_dir.py</code> (<code>create_table_branch</code>, <code>list_table_branches</code>,
+  <code>delete_table_branch</code>, <code>describe_table</code> / <code>list_table_versions</code> with <code>branch=</code>); the remaining targets
+  pass.</li>
+</ul>
+<h2 id="5-tests-you-write">5. Tests you write<a class="headerlink" href="#5-tests-you-write" title="Permanent link">&para;</a></h2>
+<p><code>bindings/python/tests/test_branches.py</code> (<code>require_pylance()</code>): each engine creates a branch (from main,
+from a tag, from a branch), appends and overwrites on it, and the other engine reads it with the same
+rows and versions; main untouched; scalar and vector indexes inherited by a branch answer as pylance's;
+the refs JSON nanolance writes equals pylance's in every field but ids and times; delete and its
+refusals; tags with branches; clones (shallow reads through the source, deep has its own files and still
+reads after the source is deleted).</p>
+<h2 id="6-rules">6. Rules<a class="headerlink" href="#6-rules" title="Permanent link">&para;</a></h2>
+<p><code>AGENTS.md</code> sections 5 and 7. No skipped or weakened tests; no <code>except Exception</code> around failures. C++
+without warnings (CI uses <code>-Werror</code>). Datasets without branches must not change on disk (no new files or
+fields; if <code>latest_version_hint.json</code> turns out to be needed, ask first). Do not commit, push, change git
+branches, or run <code>--update</code>. Scratch files only in
+<code>/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchpad/br-work/</code>. Work only in
+<code>/home/user/nanolance</code> (never <code>/home/user/nl-perf</code>). Builds: <code>cd build &amp;&amp; ninja</code>, then <code>cd
+bindings/python/build/cp311-cp311-linux_x86_64 &amp;&amp; ninja &amp;&amp; cp _nanolance.cpython-311-x86_64-linux-gnu.so
+/usr/local/lib/python3.11/dist-packages/nanolance/</code>. Run each full suite once, at the end, one at a time;
+never two at once; no sleep loops; kill by PID. Delete <code>/tmp/pytest-of-root</code> after full runs (the disk is
+small).</p>
+<h2 id="7-stop-and-ask-question-first-in-the-report">7. Stop and ask (question first in the report)<a class="headerlink" href="#7-stop-and-ask-question-first-in-the-report" title="Permanent link">&para;</a></h2>
+<ul>
+<li>a branch write needs a change to how main's commits are written (beyond carrying field 20 and the base
+  paths);</li>
+<li>pylance cannot open a branch nanolance wrote, and the difference is not in the facts above;</li>
+<li><code>latest_version_hint.json</code> (or another new file) is needed on datasets without branches.</li>
+</ul>
+<h2 id="8-done-and-report">8. Done and report<a class="headerlink" href="#8-done-and-report" title="Permanent link">&para;</a></h2>
+<p>Tails of: <code>cd build &amp;&amp; ctest -j8 | tail -3</code>; the target pylance tests run through nanolance (<code>cd
+.deps/pylance-tests/v12.0.0 &amp;&amp; python3 -m pytest -o addopts= -q -p nanolance.lance._pytest_plugin
+tests/test_dataset.py -k "branches or clone" | tail -5</code>); <code>python3 -m pytest -o addopts= -q
+bindings/python/tests/test_branches.py | tail -2</code>; <code>python3 tools/pylance_suite.py | tail -4</code>; last, once:
+<code>cd bindings/python &amp;&amp; python3 -m pytest -o addopts= -q -p no:cacheprovider tests | tail -3</code>. Report
+under 40 lines: questions first, then files, per-test status, tails, decisions.</p>
+<p><strong>B1 outcome (2026-10-20):</strong> done in one Haiku session; reviewed. pylance's branches open by
+<code>&lt;root&gt;/tree/B</code> and by <code>checkout_version((B, v))</code> / <code>(B, None)</code> / a branch tag; data, deletion and index
+files resolve through the manifest's base paths (base_id 0 is base path 0; index <code>base_id</code>, IndexMetadata
+field 9, honoured on every index read path); <code>branches.list()</code> / <code>list_ordered()</code> (pylance's order:
+parent_version descending, then name), tags with a branch, names with <code>/</code>; nanolance appends and
+overwrites on a pylance branch and pylance reads the result. <code>tests/test_branches.py</code> (12). Reviewer's
+decisions for B2:
+- <strong>Cleanup must be branch-aware</strong> (the session found the data loss): pylance's <code>cleanup_old_versions</code>
+  keeps every version a branch forks from (measured: main v1 forked as <code>keep</code>, main overwritten, cleanup
+  with <code>older_than=0, delete_unverified=True</code> -&gt; <code>old_versions: 0</code>, the branch still reads). nanolance's
+  cleanup (and <code>restore</code> / <code>drop</code> where they delete) must keep the same versions and files; a test
+  reproduces the loss first (<code>scratchpad/br-work/clean2.py</code>).
+- <code>latest_version_hint.json</code>: not written (pylance opens branches without it; no new files on datasets
+  without branches).
+- Index write and maintenance paths (<code>index_segments</code> commit / merge, <code>index_optimize</code> segment dirs) still
+  use <code>&lt;dataset&gt;/_indices</code>: B2 makes them branch-correct (an index built on a branch lives under
+  <code>tree/B/_indices</code>).
+- <code>checkout_version((B, v)).uri</code> is <code>tree/B</code> (pylance reports the root); keep it, writes need it.</p>
+<p><strong>B2 outcome (2026-10-20):</strong> done in one Haiku session; reviewed. <code>create_branch</code> (every reference form;
+branches of branches), the branch manifest and refs JSON as pylance writes them (a test compares the two
+field by field), the Clone transaction, <code>branches.delete</code> (Lance's refusals: main, referenced by a
+branch, referenced by a tag), <code>replace_metadata</code>, tags on branches, index builds / <code>optimize_indices</code> /
+uncommitted segments on a branch under <code>tree/B/_indices</code>. Cleanup is branch-aware (Lance's
+<code>find_referenced_branches</code> / <code>retain_branch_lineage_files</code>): the versions branches fork from and the
+files their manifests name here are kept. <code>test_branches</code> and <code>test_tag</code> pass (expected list 1228);
+<code>tests/test_branches.py</code> 24. Reviewer's changes and decisions:
+- Fixed a data-loss case in the new cleanup: a branch pylance made from a <em>relative</em> open records its
+  parent root as that relative text, which the cleanup compared after resolving it against its own
+  working directory; run from elsewhere, it removed the branch's files. A relative root is now taken to
+  name the dataset being cleaned (keeps files rather than lose them); a test fails without the fix.
+- <code>Dataset.drop(root/tree/B)</code>: as Lance (removes that directory only; ref and children not touched).
+- Inherited index on a branch of a branch: pylance 12 remaps its base_id to the new base path and then
+  cannot read its own index (<code>Not found under tree/sub/_indices</code>); nanolance keeps the inherited base id,
+  which pylance reads. Recorded for an upstream report.
+- nanolance records base paths absolute (it opens paths absolute); pylance reads both.</p>
+<p><strong>B3 outcome (2026-10-20):</strong> done in one Haiku session; reviewed. <code>shallow_clone</code> (one manifest at the source
+version, files through base paths: base 0 the source root, or a base named after a source branch; flags
+16; no field 20; Clone transaction with is_shallow, ref_name, ref_version) and <code>deep_clone</code> (data,
+deletions and indices copied, no base paths) as pylance writes them, compared field by field; a failed
+clone removes only what it created. Namespace <code>create_table_branch</code> / <code>list_table_branches</code> /
+<code>delete_table_branch</code>, <code>list_table_versions(branch=)</code>. <code>test_shallow_clone</code>, <code>test_deep_clone</code> and the four
+namespace branch tests pass (expected list 1234); <code>tests/test_branches.py</code> 31. Reviewer's decisions:
+- Cleanup on a shallow clone's <em>source</em> can remove files the clone reads -- pylance does the same
+  (measured): the source keeps no record of its shallow clones, so its cleanup cannot know them. Kept as
+  pylance; documented here.
+- An inherited index on a shallow clone of a branch keeps its base id (pylance remaps it and then cannot
+  read its own index), as in B2.
+- Also fixed in review: a GCC -O3 <code>-Wmaybe-uninitialized</code> in B2's cleanup (a copied std::optional), which
+  failed CI's -Werror build of lance-c's S3 reader.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Apache-2.0
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/yoavbendor/nanolance" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
