@@ -315,4 +315,10 @@ Two repo rules that came out of the same incident:
 - File I/O on read paths goes through `io::ByteSource` (`include/nanolance/byte_source.hpp`), never
   `std::ifstream` or `std::filesystem` directly, so the reader keeps working from `https://` in the
   WebAssembly build (`wasm/`). Writers and maintenance (cleanup, drop) stay on local files.
+- The WebAssembly build is guarded by `.github/workflows/wasm.yml`: Emscripten (single-threaded,
+  `-Oz`, `-Werror`) builds `libnanolance`, `wasm/build_weblance.sh` links weblance, the gzipped
+  `weblance.wasm` must stay under the budget in that workflow, and `wasm/test/run_browser_test.cjs local`
+  must pass in headless Chromium. Locally: `emcmake cmake -S . -B build-wasm -G Ninja
+  -DCMAKE_BUILD_TYPE=MinSizeRel -DFETCHCONTENT_BASE_DIR=$PWD/.deps` with the `NANOLANCE_BUILD_*`
+  options off (see the workflow), then `cmake --build build-wasm` and `wasm/build_weblance.sh OUTDIR`.
 

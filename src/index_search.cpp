@@ -27,6 +27,7 @@
 // AND intersects answers where both apply; OR unites them where both apply; NOT and anything
 // else answer nothing.
 
+#include "nanolance/base_paths.hpp"
 #include "nanolance/index_search.hpp"
 #include "nanolance/work_stats.hpp"
 
@@ -34,10 +35,13 @@
 
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/fts_tokenizer.hpp"
+#include "nanolance/frag_reuse.hpp"
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/bloom_filter.hpp"
 #include "nanolance/roaring_bitmap.hpp"
+
+#include <bit>
 #include "nanolance/schema_mapper.hpp"
 #include "nanolance/overlays.hpp"
 #include "nanolance/row_ids.hpp"
@@ -201,11 +205,69 @@ struct RowSet {
     bool exact = false;
 };
 
+/// `offsets` ascending, each once: a bitset over their range when they are dense enough (a range predicate's
+/// rows, in no order), else a sort.
+void sort_unique_offsets(std::vector<std::uint32_t>& offsets) {
+    if (offsets.size() < 64U) {
+        std::sort(offsets.begin(), offsets.end());
+        offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+        return;
+    }
+    const auto [lo, hi] = std::minmax_element(offsets.begin(), offsets.end());
+    const std::uint32_t base = *lo;
+    const std::uint64_t span = static_cast<std::uint64_t>(*hi) - base + 1U;
+    if (span / 64U > 4U * offsets.size()) {
+        std::sort(offsets.begin(), offsets.end());
+        offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+        return;
+    }
+    std::vector<std::uint64_t> bits(static_cast<std::size_t>((span + 63U) / 64U), 0U);
+    for (const auto o : offsets) {
+        const std::uint32_t d = o - base;
+        bits[d / 64U] |= std::uint64_t{1} << (d % 64U);
+    }
+    offsets.clear();
+    for (std::size_t w = 0; w < bits.size(); ++w) {
+        for (std::uint64_t word = bits[w]; word != 0U; word &= word - 1U) {
+            offsets.push_back(base + static_cast<std::uint32_t>(w * 64U) +
+                              static_cast<std::uint32_t>(std::countr_zero(word)));
+        }
+    }
+}
+
 void add_addresses(RowSet& set, std::vector<std::uint64_t>& addrs) {
-    std::sort(addrs.begin(), addrs.end());
-    addrs.erase(std::unique(addrs.begin(), addrs.end()), addrs.end());
+    // By fragment (a dataset has few), then each fragment's offsets in order.
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint32_t>>> by_fragment;
+    std::size_t at = 0;
     for (const auto a : addrs) {
-        set.rows[static_cast<std::uint32_t>(a >> 32U)].push_back(static_cast<std::uint32_t>(a));
+        const auto fragment = static_cast<std::uint32_t>(a >> 32U);
+        if (at >= by_fragment.size() || by_fragment[at].first != fragment) {
+            at = 0;
+            while (at < by_fragment.size() && by_fragment[at].first != fragment) {
+                ++at;
+            }
+            if (at == by_fragment.size()) {
+                if (by_fragment.size() == 32U) {  // many fragments: one sort of the addresses instead
+                    std::sort(addrs.begin(), addrs.end());
+                    addrs.erase(std::unique(addrs.begin(), addrs.end()), addrs.end());
+                    for (const auto b : addrs) {
+                        set.rows[static_cast<std::uint32_t>(b >> 32U)].push_back(static_cast<std::uint32_t>(b));
+                    }
+                    return;
+                }
+                by_fragment.emplace_back(fragment, std::vector<std::uint32_t>{});
+            }
+        }
+        by_fragment[at].second.push_back(static_cast<std::uint32_t>(a));
+    }
+    for (auto& [fragment, offsets] : by_fragment) {
+        sort_unique_offsets(offsets);
+        auto& rows = set.rows[fragment];
+        if (rows.empty()) {
+            rows = std::move(offsets);
+        } else {
+            rows.insert(rows.end(), offsets.begin(), offsets.end());
+        }
     }
 }
 
@@ -1086,6 +1148,30 @@ bool search_bitmap(const std::filesystem::path& dir, bool label_list, const expr
 
 // ── the filter ──────────────────────────────────────────────────────────────────────────────────
 
+/// The rows of `set` as the fragment-reuse index says they are now: deleted rows drop out, moved rows
+/// land in their new fragments. A fragment no version rewrote keeps its rows as they are.
+void remap_rows(const FragReuse& fri, RowSet& set) {
+    std::map<std::uint32_t, std::vector<std::uint32_t>> moved;
+    for (auto& [fragment, offsets] : set.rows) {
+        if (!fri.touches(fragment)) {
+            auto& to = moved[fragment];
+            to.insert(to.end(), offsets.begin(), offsets.end());
+            continue;
+        }
+        for (const auto offset : offsets) {
+            std::uint64_t to = 0;
+            if (fri.resolve((static_cast<std::uint64_t>(fragment) << 32U) | offset, to)) {
+                moved[static_cast<std::uint32_t>(to >> 32U)].push_back(static_cast<std::uint32_t>(to));
+            }
+        }
+    }
+    for (auto& [fragment, offsets] : moved) {
+        std::sort(offsets.begin(), offsets.end());
+        offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+    }
+    set.rows = std::move(moved);
+}
+
 struct Search {
     const std::filesystem::path& dataset_path;
     const pb::Manifest& manifest;
@@ -1093,6 +1179,7 @@ struct Search {
     std::string& error;
     std::vector<std::string> used;
     const RowIdToAddress* row_ids = nullptr;  // with stable row ids: what an index holds are ids
+    const FragReuse* frag_reuse = nullptr;    // a deferred compaction moved rows: the indexes hold old addresses
 
     /// An answer read from an index of a dataset with stable row ids is in ids; make it addresses
     /// (a row whose id is gone, deleted, is dropped).
@@ -1188,7 +1275,10 @@ struct Search {
             bool exact_all = true;
             for (const auto* index : segments) {
                 const auto& kind = index->details_type_url;
-                const auto dir = dataset_path / "_indices" / pb::uuid_string(index->uuid);
+                std::filesystem::path dir;
+                if (!index_dir_of(dataset_path, manifest, *index, dir, error)) {
+                    return false;
+                }
                 RowSet one;
                 bool answered = false;
                 bool ok = true;
@@ -1234,10 +1324,19 @@ struct Search {
                     break;
                 }
                 exact_all = exact_all && exact_segment;
+                // The rows an index holds are addresses, as they were when it was built: a compaction
+                // that deferred the index remap moved them since (stable row ids: the ids do not move).
+                if (frag_reuse != nullptr && (row_ids == nullptr || !row_ids->stable())) {
+                    remap_rows(*frag_reuse, one);
+                }
                 if (!zoned) {
                     to_addresses(one);  // a zonemap holds addresses already
                 }
-                one.covered.insert(index->fragment_ids.begin(), index->fragment_ids.end());
+                auto coverage = index->fragment_ids;
+                if (frag_reuse != nullptr) {
+                    frag_reuse->remap_coverage(coverage);
+                }
+                one.covered.insert(coverage.begin(), coverage.end());
                 for (const auto stale : fragments_stale_for_index(manifest, index->fields, index->dataset_version)) {
                     one.covered.erase(stale);  // overlaid since the index was built: scanned instead
                 }
@@ -1304,17 +1403,18 @@ bool index_candidates(const std::filesystem::path& dataset_path, const pb::Manif
     out.used.clear();
     out.exact = false;
     error.clear();
-    // An index whose rows a deferred compaction moved needs the fragment-reuse index to be found again.
-    if (manifest.indices.empty() ||
-        std::any_of(manifest.indices.begin(), manifest.indices.end(),
-                    [](const pb::IndexMetadata& i) { return i.name == "__lance_frag_reuse"; })) {
+    if (manifest.indices.empty()) {
         return true;
+    }
+    std::shared_ptr<const FragReuse> frag_reuse;
+    if (!FragReuse::load(dataset_path, manifest, frag_reuse, error)) {
+        return false;
     }
     RowIdToAddress resolver;
     if (!RowIdToAddress::build(dataset_path, manifest, resolver, error)) {
         return false;
     }
-    Search search{dataset_path, manifest, {}, error, {}, &resolver};
+    Search search{dataset_path, manifest, {}, error, {}, &resolver, frag_reuse.get()};
     for (const auto& f : manifest.fragments) {
         search.physical[static_cast<std::uint32_t>(f.id)] = f.physical_rows;
     }

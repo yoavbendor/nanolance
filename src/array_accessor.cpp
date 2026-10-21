@@ -483,6 +483,28 @@ void append_bits(std::vector<std::uint8_t>& bits, std::uint64_t& nulls, std::uin
     const auto* src = array.n_buffers >= 1 && array.buffers != nullptr && array.null_count != 0
                           ? static_cast<const std::uint8_t*>(array.buffers[0])
                           : nullptr;
+    if (src == nullptr) {
+        // All valid: nothing to record until a null has been seen; after one, a run of set bits.
+        if (bits.empty() || count <= 0) {
+            return;
+        }
+        const auto from = have;
+        const auto to = have + static_cast<std::uint64_t>(count);
+        bits.resize(static_cast<std::size_t>((to + 7U) / 8U), 0U);
+        auto b = from;
+        for (; b < to && (b & 7U) != 0U; ++b) {
+            bits[static_cast<std::size_t>(b >> 3U)] |= static_cast<std::uint8_t>(1U << (b & 7U));
+        }
+        if (b + 8U <= to) {
+            const auto whole = (to - b) / 8U;
+            std::memset(bits.data() + (b >> 3U), 0xFF, static_cast<std::size_t>(whole));
+            b += whole * 8U;
+        }
+        for (; b < to; ++b) {
+            bits[static_cast<std::size_t>(b >> 3U)] |= static_cast<std::uint8_t>(1U << (b & 7U));
+        }
+        return;
+    }
     for (std::int64_t i = 0; i < count; ++i) {
         const auto b = static_cast<std::uint64_t>(at + i);
         const bool valid = src == nullptr || ((src[b >> 3U] >> (b & 7U)) & 1U) != 0U;

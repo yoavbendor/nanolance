@@ -234,7 +234,7 @@ set(NANO_LANCE_BLOB_V2_GOLDEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/golden/blob_v2")
 # them (C++23), so nanolance's public headers stay C++20.
 FetchContent_Declare(nanom
     GIT_REPOSITORY ${NANOLANCE_GIT_URL_NANOM}
-    GIT_TAG ffb03d35c3ce16d8ee5fd1702a6921989061383a
+    GIT_TAG 0c6cbabe94e669cad2ca17e4c94a731ed9517907
     GIT_SHALLOW FALSE)
 FetchContent_GetProperties(nanom)
 if(NOT nanom_POPULATED)
@@ -251,6 +251,7 @@ target_link_libraries(nanolance_proto PRIVATE nanolance_nanom)
 
 add_library(nanolance_reader STATIC
     src/byte_source.cpp
+    src/byte_sink.cpp
     src/manifest_reader.cpp
     src/nano_lance_reader.cpp
     src/nano_lance_external_blob.cpp
@@ -281,14 +282,18 @@ elseif(NANOLANCE_ENABLE_S3)
     set(NANOS3READER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(NANOS3READER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     # nanos3reader 0.2.0 adds the on-disk LRU block cache (configure_disk_cache) that
-    # nano_lance_block_cache_configure() forwards to. Pinned to the 0.2.0 commit; switch to the v0.2.0 tag
-    # once it is published. An older reader still builds — the wrapper version-gates on NANOS3READER_VERSION.
+    # nano_lance_block_cache_configure() forwards to; 0.4.0 adds S3Client (HEAD, exact range reads,
+    # ListObjectsV2), which s3:// datasets read through. Pinned to the 0.4.0 commit. An older reader
+    # still builds -- the wrapper version-gates on NANOS3READER_VERSION.
     FetchContent_Declare(nanos3reader
         GIT_REPOSITORY ${NANOLANCE_GIT_URL_NANOS3READER}
-        GIT_TAG 21558644771b37b6fefa440ee42ff7e8281c4748)
+        GIT_TAG d178546eb03973f78d2a3dac01387df0fd8359ff)
     FetchContent_MakeAvailable(nanos3reader)
     target_link_libraries(nanolance_reader PRIVATE nanos3reader::nanos3reader)
     target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_READER_HAS_S3=1)
+    # s3:// datasets: the byte source and lister over S3Client (registered for "s3" by byte_source.cpp).
+    target_sources(nanolance_reader PRIVATE src/s3_byte_source.cpp src/s3_byte_sink.cpp)
+    target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_HAS_S3_BYTE_SOURCE=1)
     set(NANOLANCE_S3_NANOS3READER_ACTIVE ON)
 endif()
 
@@ -299,6 +304,7 @@ add_library(nanolance STATIC
     src/blob_v2_external.cpp
     src/buffer_pool.cpp
     src/column_slice.cpp
+    src/frag_reuse.cpp
     src/index_maintenance.cpp
     src/lance_file_writer.cpp
     src/scalar_index.cpp
@@ -339,6 +345,8 @@ add_library(nanolance STATIC
     src/arrow_slice.cpp
     src/dataset_ops.cpp
     src/dataset_transaction.cpp
+    src/dataset_operation.cpp
+    src/commit_conflicts.cpp
     src/dataset_stitcher.cpp
     src/schema_mapper.cpp
     src/writer.cpp
@@ -609,6 +617,12 @@ add_executable(nano_lance_writer_lifecycle_test tests/test_writer_lifecycle.cpp)
 target_compile_features(nano_lance_writer_lifecycle_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_writer_lifecycle_test PRIVATE nanolance)
 
+add_executable(test_commit_conflicts tests/test_commit_conflicts.cpp)
+target_compile_features(test_commit_conflicts PRIVATE cxx_std_23)
+target_include_directories(test_commit_conflicts PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_commit_conflicts PRIVATE nanolance)
+add_test(NAME commit_conflicts COMMAND $<TARGET_FILE:test_commit_conflicts>)
+
 add_executable(nano_lance_int128_test tests/test_int128.cpp)
 target_compile_features(nano_lance_int128_test PRIVATE cxx_std_20)
 target_include_directories(nano_lance_int128_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -658,6 +672,11 @@ if(TARGET lance_c)
     target_link_libraries(nano_lance_lance_c_search_test PRIVATE lance_c nanolance)
     add_test(NAME nano_lance_lance_c_search COMMAND $<TARGET_FILE:nano_lance_lance_c_search_test>
              "${CMAKE_CURRENT_BINARY_DIR}/lance_c_search_tmp")
+
+    # Not a ctest: needs an S3 endpoint; bindings/python/tests/test_object_store.py drives it.
+    add_executable(lance_c_s3_read tests/lance_c_s3_read.cpp)
+    target_compile_features(lance_c_s3_read PRIVATE cxx_std_20)
+    target_link_libraries(lance_c_s3_read PRIVATE lance_c)
 
     add_executable(nano_lance_lance_c_stable_row_ids_test tests/test_lance_c_stable_row_ids.cpp)
     target_compile_features(nano_lance_lance_c_stable_row_ids_test PRIVATE cxx_std_20)
@@ -752,6 +771,10 @@ target_link_libraries(nano_lance_schema_mapper_test PRIVATE nanolance nanoarrow_
 target_compile_definitions(nano_lance_schema_mapper_test PRIVATE
     NANO_LANCE_BLOB_V2_GOLDEN_DIR="${NANO_LANCE_BLOB_V2_GOLDEN_DIR}"
 )
+
+add_executable(nano_lance_feature_flags_test tests/test_feature_flags.cpp)
+target_compile_features(nano_lance_feature_flags_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_feature_flags_test PRIVATE nanolance)
 
 add_executable(nano_lance_manifest_reader_test tests/test_nano_lance_manifest_reader.cpp)
 target_compile_features(nano_lance_manifest_reader_test PRIVATE cxx_std_20)
@@ -925,6 +948,8 @@ add_test(NAME nano_lance_schema_mapper COMMAND $<TARGET_FILE:nano_lance_schema_m
 set_tests_properties(nano_lance_schema_mapper PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_manifest_reader COMMAND $<TARGET_FILE:nano_lance_manifest_reader_test>)
+add_test(NAME nano_lance_feature_flags COMMAND $<TARGET_FILE:nano_lance_feature_flags_test>)
+set_tests_properties(nano_lance_feature_flags PROPERTIES LABELS "smoke")
 set_tests_properties(nano_lance_manifest_reader PROPERTIES LABELS "smoke" DEPENDS nano_lance_blob_v2_golden_generate)
 
 add_test(NAME nano_lance_writer_append COMMAND $<TARGET_FILE:nano_lance_writer_append_test>)

@@ -79,15 +79,15 @@ class DataFile:
         """The record of a Lance file already in the dataset's ``data/`` directory: its columns matched
         to the dataset's fields by name."""
         from nanolance.lance.base_path import _base_data_dir
-        from nanolance.lance.file import _footer
 
         full = os.path.join(_base_data_dir(dataset.uri, dataset._info.get("base_paths", []), base_id), path)
-        if not os.path.exists(full):
+        if "://" not in full and not os.path.exists(full):
             raise OSError(f"Not found: {full}")
-        # The footer's top-level names are enough, and all a file with a blob column offers on its own.
+        # The footer's top-level names and version are enough (read natively: an s3:// file has no local
+        # path for the Python reader), and all a file with a blob column offers on its own.
         with native():
-            names, _, _ = _nanolance._file_top_fields(full)
-        major, minor = _footer(full)[4:6]
+            names, major, minor = _nanolance._file_top_fields(full)
+            file_size = _nanolance._file_size(full)
         fields, indices = [], []
         by_name = {f.name(): f for f in dataset.lance_schema.fields()}
         column = 0
@@ -101,7 +101,7 @@ class DataFile:
                 fields.append(f.id())
                 indices.append(column)
                 column += 1
-        return cls(path, fields, indices, major, minor, os.path.getsize(full))
+        return cls(path, fields, indices, major, minor, file_size)
 
 
 def _pre_order(f) -> List[Any]:
@@ -410,10 +410,14 @@ class LanceFragment(pa.dataset.Fragment):
         ``LanceOperation.Append`` or ``Overwrite``."""
         _check_namespace(namespace_client, table_id)
         session_for_write(dataset_uri, session)
+        from nanolance.lance.dataset import _register_storage
+
+        _register_storage(dataset_uri, storage_options)
         data_storage_version = _storage_version(data_storage_version, use_legacy_format)
         fragments, _ = _write_uncommitted(data, dataset_uri, schema, mode=mode, max_rows_per_file=None,
                                           max_bytes_per_file=None, progress=progress,
-                                          data_storage_version=data_storage_version, single=True)
+                                          data_storage_version=data_storage_version, single=True,
+                                          fragment_id=fragment_id)
         fragment = fragments[0]
         if fragment_id is not None:
             fragment.id = int(fragment_id)
@@ -423,9 +427,8 @@ class LanceFragment(pa.dataset.Fragment):
     def create_from_file(filename: str, dataset: "LanceDataset", fragment_id: int) -> FragmentMetadata:
         """The fragment of a Lance file already in the dataset's ``data/`` directory."""
         f = DataFile.create(dataset, filename)
-        from nanolance.lance.file import LanceFileReader
-
-        rows = LanceFileReader(os.path.join(dataset.uri, "data", filename)).metadata().num_rows
+        with native():
+            rows = _nanolance._file_info(os.path.join(dataset.uri, "data", filename))[0]
         return FragmentMetadata(id=int(fragment_id), files=[f], physical_rows=int(rows))
 
     def delete(self, predicate: str) -> Optional[FragmentMetadata]:
@@ -786,7 +789,7 @@ def _storage_version(data_storage_version: Optional[str], use_legacy_format: Opt
 def _write_uncommitted(data, dataset_uri, schema, *, mode: str, max_rows_per_file: Optional[int],
                        max_bytes_per_file: Optional[int], progress, data_storage_version: Optional[str],
                        single: bool = False, external_blob_mode: str = "reference",
-                       allow_external_blob_outside_bases: bool = False, base_setup=None):
+                       allow_external_blob_outside_bases: bool = False, base_setup=None, fragment_id=None):
     """Write `data` as data files under `dataset_uri` without committing them: the fragments (ids 0,
     to be assigned at commit) and the schema they were written with (a LanceSchema)."""
     from nanolance.lance.dataset import LanceDataset, _coerce_reader, _path_of, _stage_write
@@ -804,7 +807,7 @@ def _write_uncommitted(data, dataset_uri, schema, *, mode: str, max_rows_per_fil
                                       max_rows_per_file=max_rows_per_file, max_bytes_per_file=max_bytes_per_file,
                                       external_blob_mode=external_blob_mode,
                                       allow_external_blob_outside_bases=allow_external_blob_outside_bases,
-                                      keep_empty=False, setup=base_setup)
+                                      keep_empty=False, setup=base_setup, progress=progress, fragment_id=fragment_id)
     with native():
         messages, fields = writer.take(False)
     fragments = [_decode_fragment(m) for m in messages]
@@ -813,10 +816,6 @@ def _write_uncommitted(data, dataset_uri, schema, *, mode: str, max_rows_per_fil
             raise OSError("Invalid user input: Cannot write a fragment with no rows")
         if len(fragments) > 1:  # one fragment, however many files the writer cut
             raise OSError("LanceFragment.create wrote more than one data file")
-    if progress is not None:
-        for fragment in fragments:
-            progress.begin(fragment)
-            progress.complete(fragment)
     lance_schema = LanceSchema._from_messages(list(fields), {k.decode(): v.decode()
                                                              for k, v in (reader.schema.metadata or {}).items()})
     return fragments, lance_schema
@@ -834,10 +833,11 @@ def write_fragments(data, dataset_uri, schema: Optional[pa.Schema] = None, *, re
     """Write ``data`` into one or more fragments, uncommitted (a distributed write's per-worker step):
     their FragmentMetadata, or with ``return_transaction`` the Transaction that commits them."""
     from nanolance.lance._transactions import LanceOperation, Transaction
-    from nanolance.lance.dataset import LanceDataset, _base_plan, _exists, _path_of, _set_base_plan
+    from nanolance.lance.dataset import LanceDataset, _base_plan, _exists, _path_of, _register_storage, _set_base_plan
 
     _check_namespace(namespace_client, table_id)
     session_for_write(dataset_uri, session)
+    _register_storage(dataset_uri, storage_options)
     if external_blob_mode not in ("reference", "ingest"):
         raise ValueError(f"Invalid user input: Invalid external blob mode: {external_blob_mode}")
     if external_blob_mode == "ingest" and allow_external_blob_outside_bases:

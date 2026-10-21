@@ -13,7 +13,9 @@
 //             indexed -- and an exact scan of the fragments the index does not cover; best k by
 //             (distance, row id).
 
+#include "nanolance/base_paths.hpp"
 #include "nanolance/vector_search.hpp"
+#include "rabitq_build.hpp"
 #include "nanolance/work_stats.hpp"
 #include "nanolance/overlays.hpp"
 #include "nanolance/row_ids.hpp"
@@ -31,6 +33,8 @@
 #include "lance_minimal.pb.hpp"
 
 #include <nanoarrow/nanoarrow.h>
+
+#include "float16.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -73,6 +77,7 @@ const char* vector_metric_name(VectorMetric metric) {
     switch (metric) {
         case VectorMetric::Cosine: return "cosine";
         case VectorMetric::Dot: return "dot";
+        case VectorMetric::Hamming: return "hamming";
         default: return "l2";
     }
 }
@@ -166,7 +171,7 @@ bool add_varints(const Field& f, std::vector<std::uint64_t>& out) {
 
 /// Tensor { data_type = 1, shape = 2, data = 3 }, its values as floats.
 bool decode_tensor(const std::uint8_t* data, std::size_t size, std::vector<std::uint64_t>& shape,
-                   std::vector<float>& values, std::string& error) {
+                   std::vector<float>& values, std::string& error, std::vector<std::uint8_t>* u8 = nullptr) {
     const auto* p = data;
     const auto* end = data + size;
     std::uint64_t type = 0;
@@ -204,6 +209,13 @@ bool decode_tensor(const std::uint8_t* data, std::size_t size, std::vector<std::
                 std::memcpy(values.data(), bytes, values.size() * 4U);
             }
             return true;
+        case 4:  // UINT8: a Hamming index's centroids, kept as bytes
+            if (u8 == nullptr) {
+                error = "a Tensor of data type 4 (UINT8) is not supported here";
+                return false;
+            }
+            u8->assign(bytes, bytes + nbytes);
+            return true;
         case 3: {  // FLOAT64
             values.resize(nbytes / 8U);
             for (std::size_t i = 0; i < values.size(); ++i) {
@@ -222,6 +234,7 @@ bool decode_tensor(const std::uint8_t* data, std::size_t size, std::vector<std::
 /// IVF { centroids = 1 (deprecated, floats), offsets = 2, lengths = 3, centroids_tensor = 4 }.
 struct IvfModel {
     std::vector<float> centroids;
+    std::vector<std::uint8_t> bytes;  // a UINT8 tensor (Hamming centroids), instead of centroids
     std::size_t partitions = 0;
     std::size_t dim = 0;
     std::vector<std::uint64_t> offsets;
@@ -266,7 +279,7 @@ bool decode_ivf(const std::vector<std::uint8_t>& message, IvfModel& out, std::st
             out.has_loss = true;
         } else if (f.number == 4 && f.wire == 2) {
             std::vector<std::uint64_t> shape;
-            if (!decode_tensor(f.data, f.size, shape, out.centroids, error)) {
+            if (!decode_tensor(f.data, f.size, shape, out.centroids, error, &out.bytes)) {
                 return false;
             }
             if (shape.size() == 2U) {
@@ -393,6 +406,73 @@ bool collect_vectors(const ArrowSchema& schema, const std::vector<ArrowArray>& b
     return true;
 }
 
+/// The vectors of a multivector column (a list of fixed-size lists): row r holds count[r] vectors of
+/// `dim` values, the first being vector first[r] of `values` (of `bytes` for a uint8 column). A null or
+/// empty row holds none.
+struct MultiRows {
+    std::size_t dim = 0;
+    std::vector<float> values;
+    std::vector<std::uint8_t> bytes;
+    std::vector<std::size_t> first;
+    std::vector<std::size_t> count;
+    std::vector<std::uint64_t> ids;
+};
+
+/// Append the rows of one batch: the multivector column at `vector_column` (inside structs along
+/// `sub_path`) and the row addresses at `id_column`. Values are read as collect_vectors reads them.
+bool collect_multivectors(const ArrowSchema& schema, const ArrowArray& batch, int vector_column, int id_column,
+                          MultiRows& out, std::string& error, const std::vector<int>& sub_path = {}) {
+    BatchView b(schema, batch, error);
+    if (!b.ok) {
+        return false;
+    }
+    const ArrowArrayView* list = b.view.children[vector_column];
+    for (const int child : sub_path) {
+        list = list->children[child];
+    }
+    const ArrowArrayView* vectors = list->children[0];  // the fixed-size lists
+    const ArrowArrayView* items = vectors->children[0];  // their values
+    const ArrowArrayView* ids = b.view.children[id_column];
+    const auto dim = static_cast<std::int64_t>(out.dim);
+    const bool f32 = items->storage_type == NANOARROW_TYPE_FLOAT;
+    const bool u8 = items->storage_type == NANOARROW_TYPE_UINT8;
+    const std::int32_t* offsets = list->buffer_views[1].data.as_int32;
+    for (std::int64_t r = 0; r < batch.length; ++r) {
+        const std::int64_t row = b.view.offset + r;
+        const bool null = ArrowArrayViewIsNull(list, row);
+        const std::int64_t begin = null ? 0 : offsets[list->offset + row];
+        const std::int64_t n = null ? 0 : offsets[list->offset + row + 1] - begin;
+        out.first.push_back(out.count.empty() ? 0 : out.first.back() + out.count.back());
+        out.count.push_back(static_cast<std::size_t>(n));
+        for (std::int64_t j = 0; j < n; ++j) {
+            // element begin + j of the fixed-size lists sits at (list offset + begin + j) * dim of the values
+            const std::int64_t at = (vectors->offset + begin + j) * dim;
+            if (u8) {
+                const std::size_t old = out.bytes.size();
+                out.bytes.resize(old + out.dim);
+                std::memcpy(out.bytes.data() + old, items->buffer_views[1].data.as_uint8 + items->offset + at,
+                            out.dim);
+            } else {
+                const std::size_t old = out.values.size();
+                out.values.resize(old + out.dim);
+                if (f32) {
+                    std::memcpy(out.values.data() + old, items->buffer_views[1].data.as_float + items->offset + at,
+                                out.dim * sizeof(float));
+                } else {
+                    for (std::int64_t k = 0; k < dim; ++k) {
+                        out.values[old + static_cast<std::size_t>(k)] =
+                            static_cast<float>(ArrowArrayViewGetDoubleUnsafe(items, at + k));
+                    }
+                }
+            }
+        }
+        if (ids != nullptr) {
+            out.ids.push_back(ArrowArrayViewGetUIntUnsafe(ids, row));
+        }
+    }
+    return true;
+}
+
 // ── distances ───────────────────────────────────────────────────────────────────────────────────
 
 float dot(const float* a, const float* b, std::size_t n) {
@@ -483,7 +563,15 @@ bool in_range(float d, const NearestQuery& q) {
 struct Partition {
     std::vector<std::uint64_t> ids;
     std::vector<float> vectors;       // IVF_FLAT: n * dim
-    std::vector<std::uint8_t> codes;  // IVF_PQ: [code bytes][n]; IVF_HNSW_SQ: [n][dim]
+    std::vector<std::uint8_t> codes;  // IVF_PQ: [code bytes][n]; IVF_HNSW_SQ: [n][dim]; IVF_RQ: packed bits
+    // IVF_RQ: the add / scale factors of the 1-bit code and of the extended code, one per row, and
+    // the extended codes in Lance's blocked layout ([n][ex row bytes]).
+    std::vector<float> rq_add;
+    std::vector<float> rq_scale;
+    std::vector<float> rq_ex_add;
+    std::vector<float> rq_ex_scale;
+    std::vector<float> rq_err;  // __error_factors: the lower bound's error term, per row
+    std::vector<std::uint8_t> rq_ex;
     // IVF_HNSW_SQ: the partition's graph. Level 0 holds every node (row == node id); an upper level
     // only the nodes on it.
     std::vector<std::uint32_t> level0_offsets;  // n + 1
@@ -526,7 +614,7 @@ struct CacheCount {
 };
 
 /// An IVF index's rows (auxiliary.idx): FLAT floats, PQ codes or 8-bit SQ codes.
-enum class Storage { Flat, Pq, Sq };
+enum class Storage { Flat, Pq, Sq, Rq };
 /// The sub-index over each partition (index.idx): FLAT (exhaustive) or an HNSW graph.
 enum class SubIndex { Flat, Hnsw };
 
@@ -543,6 +631,8 @@ bool split_index_type(const std::string& type, Storage& storage, SubIndex& sub) 
         storage = Storage::Pq;
     } else if (name == "SQ") {
         storage = Storage::Sq;
+    } else if (name == "RQ") {
+        storage = Storage::Rq;
     } else {
         return false;
     }
@@ -559,6 +649,7 @@ struct IvfIndex {
     std::size_t dim = 0;
     std::size_t partitions = 0;
     std::vector<float> centroids;  // partitions * dim
+    std::vector<std::uint8_t> binary_centroids;  // Hamming: partitions * dim bytes, instead of centroids
     std::vector<std::uint64_t> offsets;
     std::vector<std::uint64_t> lengths;
     std::uint32_t nbits = 8;
@@ -577,6 +668,12 @@ struct IvfIndex {
     std::uint32_t hnsw_ef_construction = 150;
     std::uint32_t hnsw_max_level = 7;
     std::vector<float> codebook_t;  // the same as [m][dim / m][2^nbits]: a table row is one sweep
+    // IVF_RQ: the fast rotation's sign bits (4 rounds of ceil(dim / 8) bytes) and the extended code's
+    // bytes per row (4 extended bits, blocked: padded dim * 4 / 8).
+    std::vector<std::uint8_t> rq_signs;
+    std::size_t rq_ex_len = 0;
+    std::uint32_t rq_bits = 5;     // num_bits: 1 binary bit and rq_bits - 1 extended bits
+    bool rq_packed = true;         // the binary codes are in Lance's packed layout (else row-major)
 
     mutable std::mutex mutex;
     mutable std::unordered_map<std::size_t, std::shared_ptr<const Partition>> loaded;
@@ -698,6 +795,135 @@ bool IvfIndex::load_graph(std::size_t p, Partition& part, std::string& error) co
     return true;
 }
 
+/// IVF_RQ's storage_metadata (a JSON list of one JSON string): the rotation, the code and the query
+/// estimator. R1a reads the default layout only (5 bits, fast rotation, raw-query estimator, packed
+/// codes, L2); anything else is refused by name.
+bool load_rq_metadata(const std::string& text, IvfIndex& index, std::string& error) {
+    fts::json::Value list;
+    fts::json::Value meta;
+    if (!fts::json::parse(text, list) || list.kind != fts::json::Value::Array || list.items.empty() ||
+        list.items[0].kind != fts::json::Value::String || !fts::json::parse(list.items[0].s, meta)) {
+        error = "vector index: IVF_RQ storage metadata is malformed";
+        return false;
+    }
+    const auto* bits = meta.get("num_bits");
+    const auto* estimator = meta.get("query_estimator");
+    const auto* rotation = meta.get("rotation_type");
+    const auto* position = meta.get("rotate_mat_position");
+    const auto* packed = meta.get("packed");
+    const auto* code_dim = meta.get("code_dim");
+    const auto* signs = meta.get("fast_rotation_signs");
+    // num_bits 1 to 9 (Lance's range): one binary bit and num_bits - 1 extended bits.
+    if (bits == nullptr || bits->n < 1.0 || bits->n > 9.0 || bits->n != std::floor(bits->n)) {
+        error = "vector index: IVF_RQ with " + std::to_string(bits == nullptr ? 0 : static_cast<int>(bits->n)) +
+                " bits is not supported";
+        return false;
+    }
+    if (estimator == nullptr || estimator->s != "raw_query") {
+        error = "vector index: IVF_RQ with the " + (estimator == nullptr ? std::string("missing") : estimator->s) +
+                " query estimator is not supported yet";
+        return false;
+    }
+    if (rotation == nullptr || rotation->s != "fast") {
+        error = "vector index: IVF_RQ with the " + (rotation == nullptr ? std::string("missing") : rotation->s) +
+                " rotation is not supported yet";
+        return false;
+    }
+    if (position != nullptr && position->kind != fts::json::Value::Null) {
+        error = "vector index: IVF_RQ with a dense rotation matrix is not supported yet";
+        return false;
+    }
+    // Lance packs unpacked codes (skip_transpose) when it loads them, so both layouts search alike.
+    if (packed == nullptr || packed->kind != fts::json::Value::Bool) {
+        error = "vector index: IVF_RQ storage metadata has no packed flag";
+        return false;
+    }
+    index.rq_packed = packed->b;
+    index.rq_bits = static_cast<std::uint32_t>(bits->n);
+    const std::size_t dim = index.dim;
+    if (dim == 0U || dim % 8U != 0U || code_dim == nullptr || static_cast<std::size_t>(code_dim->n) != dim) {
+        error = "vector index: IVF_RQ code_dim does not match the centroids' dimension " + std::to_string(dim);
+        return false;
+    }
+    const std::size_t bytes_per_round = (dim + 7U) / 8U;
+    if (signs == nullptr || signs->kind != fts::json::Value::Array || signs->items.size() != 4U * bytes_per_round) {
+        error = "vector index: IVF_RQ has no fast rotation signs for dimension " + std::to_string(dim);
+        return false;
+    }
+    index.rq_signs.clear();
+    for (const auto& item : signs->items) {
+        index.rq_signs.push_back(static_cast<std::uint8_t>(item.n));
+    }
+    index.code_bytes = dim / 8U;
+    // The extended codes: num_bits - 1 bits per dimension, blocked by 64 dims (Lance's blocked_ex_code_bytes).
+    index.rq_ex_len = index.rq_bits > 1U ? (dim + 63U) / 64U * 64U * (index.rq_bits - 1U) / 8U : 0U;
+    return true;
+}
+
+/// One IVF_RQ partition: the 1-bit codes (packed), the factors and, for num_bits > 1, the blocked extended codes.
+bool load_rq_partition(const IvfIndex& index, std::uint64_t first, std::uint64_t n, Partition& part,
+                       std::string& error) {
+    const bool ex = index.rq_bits > 1U;
+    std::vector<std::string> columns = {"_rowid", "_rabit_codes", "__add_factors", "__scale_factors",
+                                        "__error_factors"};
+    if (ex) {
+        columns.insert(columns.end(), {"__add_factors_ex", "__scale_factors_ex", "__blocked_ex_codes"});
+    }
+    FileTable table;
+    if (!read_table(index.aux, &columns, LanceRowRange{first, n}, table, error)) {
+        return false;
+    }
+    std::vector<int> col(columns.size());
+    for (std::size_t c = 0; c < columns.size(); ++c) {
+        col[c] = child_index(table.schema, columns[c]);
+        if (col[c] < 0) {
+            error = "vector index: auxiliary.idx has no " + columns[c] + " column";
+            return false;
+        }
+    }
+    const auto code_bytes = static_cast<std::int64_t>(index.code_bytes);
+    const auto ex_bytes = static_cast<std::int64_t>(index.rq_ex_len);
+    for (const auto& batch : table.batches) {
+        BatchView b(table.schema, batch, error);
+        if (!b.ok) {
+            return false;
+        }
+        const ArrowArrayView* ids = b.view.children[col[0]];
+        const ArrowArrayView* codes = b.view.children[col[1]];
+        const ArrowArrayView* code_items = codes->children[0];
+        const ArrowArrayView* ex_codes = ex ? b.view.children[col[7]] : nullptr;
+        const ArrowArrayView* ex_items = ex ? ex_codes->children[0] : nullptr;
+        for (std::int64_t r = 0; r < batch.length; ++r) {
+            const std::int64_t row = b.view.offset + r;
+            part.ids.push_back(ArrowArrayViewGetUIntUnsafe(ids, row));
+            const auto* src = code_items->buffer_views[1].data.as_uint8 + code_items->offset +
+                              (codes->offset + row) * code_bytes;
+            part.codes.insert(part.codes.end(), src, src + code_bytes);
+            part.rq_add.push_back(static_cast<float>(ArrowArrayViewGetDoubleUnsafe(b.view.children[col[2]], row)));
+            part.rq_scale.push_back(static_cast<float>(ArrowArrayViewGetDoubleUnsafe(b.view.children[col[3]], row)));
+            part.rq_err.push_back(static_cast<float>(ArrowArrayViewGetDoubleUnsafe(b.view.children[col[4]], row)));
+            if (ex) {
+                const auto* ex_src = ex_items->buffer_views[1].data.as_uint8 + ex_items->offset +
+                                     (ex_codes->offset + row) * ex_bytes;
+                part.rq_ex.insert(part.rq_ex.end(), ex_src, ex_src + ex_bytes);
+                part.rq_ex_add.push_back(
+                    static_cast<float>(ArrowArrayViewGetDoubleUnsafe(b.view.children[col[5]], row)));
+                part.rq_ex_scale.push_back(
+                    static_cast<float>(ArrowArrayViewGetDoubleUnsafe(b.view.children[col[6]], row)));
+            }
+        }
+    }
+    const auto n_ex = ex ? n : 0U;
+    if (part.ids.size() != n || part.codes.size() != n * index.code_bytes || part.rq_ex.size() != n_ex * index.rq_ex_len ||
+        part.rq_add.size() != n || part.rq_scale.size() != n || part.rq_ex_add.size() != n_ex ||
+        part.rq_ex_scale.size() != n_ex || part.rq_err.size() != n) {
+        error = "vector index: IVF_RQ partition has " + std::to_string(part.ids.size()) + " rows, not " +
+                std::to_string(n);
+        return false;
+    }
+    return true;
+}
+
 bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, std::string& error,
                          CacheCount& count) const {
     {
@@ -714,7 +940,11 @@ bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, s
     work_stats::count_index_cache(false);
     auto part = std::make_shared<Partition>();
     const std::uint64_t n = lengths[p];
-    if (n != 0U) {
+    if (n != 0U && storage == Storage::Rq) {
+        if (!load_rq_partition(*this, offsets[p], n, *part, error)) {
+            return false;
+        }
+    } else if (n != 0U) {
         const std::vector<std::string> columns = {
             "_rowid", storage == Storage::Pq ? "__pq_code" : (storage == Storage::Sq ? "__sq_code" : "flat")};
         FileTable table;
@@ -731,6 +961,14 @@ bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, s
             if (!load_sq_rows(table, id_col, value_col, *part, error)) {
                 return false;
             }
+        } else if (storage == Storage::Flat && metric == VectorMetric::Hamming) {
+            VectorRows rows;  // uint8 rows: dim bytes each, kept as codes
+            rows.dim = dim;
+            if (!collect_vectors(table.schema, table.batches, value_col, id_col, rows, error)) {
+                return false;
+            }
+            part->ids = std::move(rows.ids);
+            part->codes = std::move(rows.bytes);
         } else if (storage == Storage::Flat) {
             VectorRows rows;
             rows.dim = dim;
@@ -786,6 +1024,15 @@ bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, s
     return true;
 }
 
+/// An index's stored distance type: pylance's names, and "hamming" (IVF_FLAT over uint8 vectors).
+bool parse_index_metric(const std::string& name, VectorMetric& out) {
+    if (name == "hamming") {
+        out = VectorMetric::Hamming;
+        return true;
+    }
+    return parse_vector_metric(name, out);
+}
+
 bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>& out, std::string& error,
               bool use_cache = true) {
     static IndexCache<IvfIndex> cache;
@@ -809,7 +1056,7 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
         error = "vector index type '" + index->type + "' is not supported";
         return false;
     }
-    if (!parse_vector_metric(json_value(value, "distance_type"), index->metric)) {
+    if (!parse_index_metric(json_value(value, "distance_type"), index->metric)) {
         error = "vector index: unknown distance type '" + json_value(value, "distance_type") + "'";
         return false;
     }
@@ -827,7 +1074,16 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
         }
         return false;
     }
-    index->centroids = std::move(model.centroids);
+    const bool binary_index = index->metric == VectorMetric::Hamming;
+    if (binary_index) {
+        if (index->storage != Storage::Flat || index->sub != SubIndex::Flat) {
+            error = "vector index: a Hamming index must be IVF_FLAT";
+            return false;
+        }
+        index->binary_centroids = std::move(model.bytes);
+    } else {
+        index->centroids = std::move(model.centroids);
+    }
     index->partitions = model.partitions;
     index->dim = model.dim;
 
@@ -851,7 +1107,8 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
     }
     index->offsets = std::move(parts.offsets);
     index->lengths = std::move(parts.lengths);
-    if (index->partitions == 0U || index->dim == 0U || index->centroids.size() != index->partitions * index->dim ||
+    const std::size_t centroid_values = binary_index ? index->binary_centroids.size() : index->centroids.size();
+    if (index->partitions == 0U || index->dim == 0U || centroid_values != index->partitions * index->dim ||
         index->offsets.size() != index->partitions || index->lengths.size() != index->partitions) {
         error = "vector index: " + std::to_string(index->partitions) + " partitions of dimension " +
                 std::to_string(index->dim) + " do not match its centroids and partition table";
@@ -919,6 +1176,11 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
                 param("max_level", index->hnsw_max_level);
             }
             index->hnsw_meta.push_back(std::move(m));
+        }
+    }
+    if (index->storage == Storage::Rq) {
+        if (!load_rq_metadata(storage, *index, error)) {
+            return false;
         }
     }
     if (index->storage == Storage::Pq) {
@@ -1210,6 +1472,376 @@ void pq_distances(const IvfIndex& index, const std::vector<float>& table, const 
     }
 }
 
+// ── IVF_RQ (RaBitQ) ───────────────────────────────────────────────────────────────────────────────
+// Lance's raw-query estimator (storage.rs, rotation.rs, ex_dot.rs): the query is rotated by the fast
+// rotation, the 1-bit codes give its inner product with each row's sign pattern through a table of
+// 4-dimension segments, and the 4 extended bits add the rest of the code. Codes are Lance's packed
+// layout (32 rows per block, PERM0 order); the extended codes are the blocked 64-dim layout.
+
+/// Lance's fast rotation: 4 rounds of random sign flips and a Walsh-Hadamard transform, with the
+/// Kac step for dimensions that are not powers of two.
+void rq_fwht(float* v, std::size_t n) {
+    for (std::size_t half = 1; half < n; half *= 2) {
+        for (std::size_t base = 0; base < n; base += 2 * half) {
+            for (std::size_t i = 0; i < half; ++i) {
+                const float x = v[base + i];
+                const float y = v[base + i + half];
+                v[base + i] = x + y;
+                v[base + i + half] = x - y;
+            }
+        }
+    }
+}
+
+void rq_flip(float* v, std::size_t n, const std::uint8_t* signs) {
+    for (std::size_t i = 0; i < n; ++i) {
+        if (((signs[i / 8U] >> (i % 8U)) & 1U) != 0U) {
+            v[i] = -v[i];
+        }
+    }
+}
+
+void rq_scale(float* v, std::size_t n, float factor) {
+    for (std::size_t i = 0; i < n; ++i) {
+        v[i] *= factor;
+    }
+}
+
+void rq_rotate(const float* in, std::size_t dim, const std::uint8_t* signs, float* out) {
+    constexpr std::size_t kRounds = 4;
+    std::copy(in, in + dim, out);
+    const std::size_t bytes_per_round = (dim + 7U) / 8U;
+    std::size_t trunc = 1;
+    while (trunc * 2U <= dim) {
+        trunc *= 2U;
+    }
+    const float scale = 1.0F / std::sqrt(static_cast<float>(trunc));
+    if (trunc == dim) {
+        for (std::size_t round = 0; round < kRounds; ++round) {
+            rq_flip(out, dim, signs + round * bytes_per_round);
+            rq_fwht(out, dim);
+            rq_scale(out, dim, scale);
+        }
+        return;
+    }
+    const std::size_t start = dim - trunc;
+    for (std::size_t round = 0; round < kRounds; ++round) {
+        rq_flip(out, dim, signs + round * bytes_per_round);
+        if (round % 2U == 0U) {
+            rq_fwht(out, trunc);
+            rq_scale(out, trunc, scale);
+        } else {
+            rq_fwht(out + start, trunc);
+            rq_scale(out + start, trunc, scale);
+        }
+        const std::size_t half = dim / 2U;  // the Kac mixing step (x, y) -> (x + y, x - y)
+        for (std::size_t i = 0; i < half; ++i) {
+            const float x = out[i];
+            const float y = out[half + i];
+            out[i] = x + y;
+            out[half + i] = x - y;
+        }
+    }
+    rq_scale(out, dim, 0.25F);
+}
+
+/// The query's side of the estimator, once per search: the rotated query (zero-padded to 64-dim
+/// blocks for the extended dot), its 4-dimension distance tables and its sum.
+struct RqQuery {
+    std::vector<float> dist_table;  // dim / 4 segments of 16 sums: entry [s * 16 + code]
+    std::vector<float> ex_query;    // the rotated query, padded to a multiple of 64
+    std::vector<float> rotated;     // the rotated query (dot: its inner product with the rotated centroids)
+    float sum_q = 0.0F;
+    bool packed = true;  // the index's binary codes are packed (else row-major: skip_transpose)
+    bool gate = false;   // Lance's top-k lower-bound gate: raw_query with num_bits > 1, not approx Fast
+    ApproxMode approx = ApproxMode::Normal;  // pylance's approx_mode (Fast: 1-bit scores only)
+    // Lance's default (Normal) binary inner products of the full 32-row blocks come from the table
+    // quantized to u8 (affine over [qmin, qmax]) and the integer sums, dequantized as
+    // sum * range + segments * qmin. The remaining rows are exact. `exact_only` is Lance's fallback
+    // when that affine map would overflow f32.
+    std::vector<std::uint8_t> qtable;
+    float range = 0.0F;
+    float sum_min = 0.0F;
+    bool exact_only = false;
+    // Approx Accurate (Lance's hacc path): the same sums from the table quantized to u16 over
+    // [qmin, qmax], dequantized as sum * (qmax - qmin) / 65535 + segments * qmin.
+    std::vector<std::uint16_t> qtable16;
+    float range16 = 0.0F;
+};
+
+RqQuery rq_prepare(const IvfIndex& index, const float* key, ApproxMode approx) {
+    const std::size_t dim = index.dim;
+    std::vector<float> rotated(dim);
+    rq_rotate(key, dim, index.rq_signs.data(), rotated.data());
+    RqQuery q;
+    q.packed = index.rq_packed;
+    q.approx = approx;
+    q.gate = index.rq_bits > 1U && approx != ApproxMode::Fast;
+    q.rotated = rotated;
+    q.dist_table.assign(dim * 4U, 0.0F);
+    for (std::size_t seg = 0; seg < dim / 4U; ++seg) {
+        float* table = q.dist_table.data() + seg * 16U;
+        table[0] = 0.0F;
+        for (std::size_t j = 1; j < 16U; ++j) {
+            const std::size_t low = j & (~j + 1U);  // lowbit(j)
+            std::size_t bit = 0;
+            while (((low >> bit) & 1U) == 0U) {
+                ++bit;
+            }
+            table[j] = table[j - low] + rotated[4U * seg + bit];
+        }
+    }
+    q.ex_query.assign((dim + 63U) / 64U * 64U, 0.0F);
+    std::copy(rotated.begin(), rotated.end(), q.ex_query.begin());
+    for (const float x : rotated) {
+        q.sum_q += x;
+    }
+    // quantize_dist_table_into (dist_table_quant.rs): min and max over the whole table.
+    const auto segments = static_cast<float>(dim / 4U);
+    const float qmin = *std::min_element(q.dist_table.begin(), q.dist_table.end());
+    const float qmax = *std::max_element(q.dist_table.begin(), q.dist_table.end());
+    if (!std::isfinite(segments * qmin) || !std::isfinite(segments * qmax) ||
+        !std::isfinite(segments * (qmax - qmin))) {
+        q.exact_only = true;
+        return q;
+    }
+    if (approx == ApproxMode::Accurate) {
+        // quantize_dist_table_u16_into: the same affine map over 16 bits.
+        q.qtable16.assign(q.dist_table.size(), 0U);
+        const float factor16 = 65535.0F / (qmax - qmin);
+        if (std::isfinite(factor16)) {
+            for (std::size_t i = 0; i < q.dist_table.size(); ++i) {
+                q.qtable16[i] = static_cast<std::uint16_t>(std::nearbyint((q.dist_table[i] - qmin) * factor16));
+            }
+        }
+        q.range16 = (qmax - qmin) / 65535.0F;
+        q.sum_min = segments * qmin;
+        return q;
+    }
+    q.qtable.assign(q.dist_table.size(), 0U);
+    const float factor = 255.0F / (qmax - qmin);
+    if (std::isfinite(factor)) {
+        for (std::size_t i = 0; i < q.dist_table.size(); ++i) {
+            q.qtable[i] = static_cast<std::uint8_t>(std::nearbyint((q.dist_table[i] - qmin) * factor));
+        }
+    }
+    q.range = (qmax - qmin) / 255.0F;
+    q.sum_min = segments * qmin;
+    return q;
+}
+
+/// One row's 1-bit code, as sequential bytes (bit d of the code is byte d / 8, bit d % 8), read from
+/// Lance's packed layout: 32 rows per block of code_len 32-byte columns in PERM0 order, the remaining
+/// rows transposed after them.
+void rq_row_codes(const std::uint8_t* packed, std::size_t n, std::size_t code_len, std::size_t id,
+                  std::uint8_t* codes) {
+    static constexpr std::size_t kPerm0Inverse[16] = {0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15};
+    const std::size_t rem = n % 32U;
+    const std::size_t full = n - rem;
+    if (id < full) {
+        // The nibble pair of one column byte: lower nibble = segment 2c, upper = segment 2c + 1.
+        const std::size_t base = (id / 32U) * 32U * code_len;
+        const std::size_t in_batch = id % 32U;
+        const std::size_t idx = kPerm0Inverse[in_batch % 16U];
+        const bool lower = in_batch < 16U;
+        for (std::size_t col = 0; col < code_len; ++col) {
+            const std::uint8_t* block = packed + base + col * 32U;
+            codes[col] = lower ? static_cast<std::uint8_t>((block[idx] & 0x0FU) |
+                                                           static_cast<std::uint8_t>(block[idx + 16U] << 4U))
+                               : static_cast<std::uint8_t>((block[idx] >> 4U) | (block[idx + 16U] & 0xF0U));
+        }
+        return;
+    }
+    const std::size_t off = id - full;
+    const std::uint8_t* rest = packed + full * code_len;
+    for (std::size_t col = 0; col < code_len; ++col) {
+        codes[col] = rest[col * rem + off];
+    }
+}
+
+/// The row's binary inner product with the query: the exact sum of the dist table (Lance's
+/// compute_single_rq_distance) for the remainder rows and the exact fallback, else the dequantized
+/// sum of the u8 table (binary_distances_with_scratch; the u16 table for approx Accurate, hacc).
+float rq_binary_ip(const RqQuery& q, const std::uint8_t* packed, std::size_t n, std::size_t code_len,
+                   std::size_t id) {
+    std::uint8_t codes_buf[256];
+    const std::uint8_t* codes = codes_buf;
+    if (q.packed) {
+        rq_row_codes(packed, n, code_len, id, codes_buf);
+    } else {
+        codes = packed + id * code_len;  // row-major (skip_transpose): Lance packs these at load
+    }
+    const bool simd_row = !q.exact_only && id < n - n % 32U;
+    if (simd_row && q.approx == ApproxMode::Accurate) {
+        std::uint32_t sum = 0;
+        for (std::size_t col = 0; col < code_len; ++col) {
+            sum += q.qtable16[(2U * col) * 16U + (codes[col] & 0x0FU)] +
+                   q.qtable16[(2U * col + 1U) * 16U + (codes[col] >> 4U)];
+        }
+        return static_cast<float>(sum) * q.range16 + q.sum_min;
+    }
+    if (simd_row) {
+        std::uint32_t sum = 0;
+        for (std::size_t col = 0; col < code_len; ++col) {
+            sum += q.qtable[(2U * col) * 16U + (codes[col] & 0x0FU)] +
+                   q.qtable[(2U * col + 1U) * 16U + (codes[col] >> 4U)];
+        }
+        return static_cast<float>(sum) * q.range + q.sum_min;
+    }
+    float dist = 0.0F;
+    for (std::size_t col = 0; col < code_len; ++col) {
+        dist += q.dist_table[(2U * col) * 16U + (codes[col] & 0x0FU)] +
+                q.dist_table[(2U * col + 1U) * 16U + (codes[col] >> 4U)];
+    }
+    return dist;
+}
+
+/// Lance's blocked extended codes, unpacked (ex_dot.rs unpack_group): one group of dims per call, the
+/// group's codes at `c`. Groups of 16 dims for 1, 4 and 8 bits, 64 dims otherwise.
+void rq_unpack_group(unsigned bits, const std::uint8_t* c, std::uint8_t* out) {
+    const auto plane_at = [](const std::uint8_t* p) {
+        std::uint64_t v = 0;
+        for (int i = 7; i >= 0; --i) {
+            v = (v << 8U) | p[i];
+        }
+        return v;
+    };
+    // The top bit of dimension 16k + b, in the top-bit plane at `plane` (bit 8 * (b % 8) + 2k + b / 8).
+    const auto top_bit = [](std::uint64_t plane, std::size_t k, std::size_t b) {
+        return static_cast<std::uint8_t>((plane >> (8U * (b % 8U) + 2U * k + b / 8U)) & 1U);
+    };
+    switch (bits) {
+        case 1:
+            for (std::size_t i = 0; i < 16; ++i) {
+                out[i] = static_cast<std::uint8_t>((c[i / 8U] >> (i % 8U)) & 1U);
+            }
+            break;
+        case 2:
+            for (std::size_t k = 0; k < 4; ++k) {
+                for (std::size_t b = 0; b < 16; ++b) {
+                    out[16U * k + b] = static_cast<std::uint8_t>((c[b] >> (2U * k)) & 3U);
+                }
+            }
+            break;
+        case 3: {
+            const std::uint64_t plane = plane_at(c + 16);
+            for (std::size_t k = 0; k < 4; ++k) {
+                for (std::size_t b = 0; b < 16; ++b) {
+                    out[16U * k + b] = static_cast<std::uint8_t>(((c[b] >> (2U * k)) & 3U) | (top_bit(plane, k, b) << 2U));
+                }
+            }
+            break;
+        }
+        case 4:
+            for (std::size_t b = 0; b < 8; ++b) {
+                out[b] = c[b] & 0x0FU;
+                out[8U + b] = static_cast<std::uint8_t>(c[b] >> 4U);
+            }
+            break;
+        case 5: {
+            const std::uint64_t plane = plane_at(c + 32);
+            for (std::size_t k = 0; k < 4; ++k) {
+                for (std::size_t b = 0; b < 16; ++b) {
+                    const auto nibble = static_cast<std::uint8_t>((c[16U * (k / 2U) + b] >> (4U * (k % 2U))) & 0x0FU);
+                    out[16U * k + b] = static_cast<std::uint8_t>(nibble | (top_bit(plane, k, b) << 4U));
+                }
+            }
+            break;
+        }
+        case 6:
+        case 7: {
+            for (std::size_t k = 0; k < 3; ++k) {
+                for (std::size_t b = 0; b < 16; ++b) {
+                    out[16U * k + b] = c[16U * k + b] & 0x3FU;
+                }
+            }
+            for (std::size_t b = 0; b < 16; ++b) {
+                out[48U + b] = static_cast<std::uint8_t>((c[b] >> 6U) | ((c[16U + b] >> 6U) << 2U) |
+                                                         ((c[32U + b] >> 6U) << 4U));
+            }
+            if (bits == 7) {
+                const std::uint64_t plane = plane_at(c + 48);
+                for (std::size_t k = 0; k < 4; ++k) {
+                    for (std::size_t b = 0; b < 16; ++b) {
+                        out[16U * k + b] |= static_cast<std::uint8_t>(top_bit(plane, k, b) << 6U);
+                    }
+                }
+            }
+            break;
+        }
+        default:  // 8
+            for (std::size_t i = 0; i < 16; ++i) {
+                out[i] = c[i];
+            }
+            break;
+    }
+}
+
+/// One row's extended codes, as one value per dimension (`padded` of them, a multiple of 64).
+void rq_unpack_ex(unsigned bits, const std::uint8_t* row, std::size_t padded, std::uint8_t* out) {
+    const std::size_t block_bytes = 64U * bits / 8U;
+    for (std::size_t base = 0; base < padded; base += 64U) {
+        const std::uint8_t* c = row + base / 64U * block_bytes;
+        if (bits == 1 || bits == 4 || bits == 8) {
+            for (std::size_t g = 0; g < 4U; ++g) {
+                rq_unpack_group(bits, c + g * 2U * bits, out + base + 16U * g);
+            }
+        } else {
+            rq_unpack_group(bits, c, out + base);
+        }
+    }
+}
+
+/// Lance's raw-query distance of one row (RabitDistCalculator::raw_query_multi_bit_exact_distance for
+/// num_bits > 1, raw_query_binary_distance for num_bits 1), L2 terms: the binary inner product, the
+/// extended dot and the factors of the row. `ex_values` is scratch of `q.ex_query.size()` bytes.
+float rq_distance(const IvfIndex& index, const RqQuery& q, const Partition& part, std::size_t id,
+                  float query_factor, float binary_ip, std::uint8_t* ex_values) {
+    if (index.rq_bits <= 1U || q.approx == ApproxMode::Fast) {
+        return (binary_ip - 0.5F * q.sum_q) * part.rq_scale[id] + part.rq_add[id] + query_factor;
+    }
+    const unsigned ex_bits = index.rq_bits - 1U;
+    rq_unpack_ex(ex_bits, part.rq_ex.data() + id * index.rq_ex_len, q.ex_query.size(), ex_values);
+    // sum_d query[d] * ex[d]
+    float ex_dot = 0.0F;
+    for (std::size_t d = 0; d < q.ex_query.size(); ++d) {
+        ex_dot += q.ex_query[d] * static_cast<float>(ex_values[d]);
+    }
+    const auto levels = static_cast<float>(1U << ex_bits);
+    const float code_bias = -(levels - 0.5F);
+    const float full_dot = levels * binary_ip + ex_dot + code_bias * q.sum_q;
+    return full_dot * part.rq_ex_scale[id] + part.rq_ex_add[id] + query_factor;
+}
+
+/// Lance's raw-query terms of one partition: the query factor and the query error (raw_query_factor,
+/// raw_query_error). L2: the squared distance to the centroid. Cosine: that distance, with no -1 (measured:
+/// pylance's cosine distances are one more than Lance's raw_query_factor Cosine branch gives). Dot: the
+/// rotated query against the rotated centroid (`rotated_centroid`), which Lance's search always has.
+void rq_query_terms(const IvfIndex& index, const RqQuery& q, float dist_q_c, const float* rotated_centroid,
+                    float& factor, float& error) {
+    const std::size_t dim = index.dim;
+    if (index.metric == VectorMetric::Dot) {
+        factor = -dot(q.rotated.data(), rotated_centroid, dim);
+        error = std::sqrt(l2(q.rotated.data(), rotated_centroid, dim));
+        return;
+    }
+    factor = dist_q_c;
+    error = dist_q_c > 0.0F ? std::sqrt(dist_q_c) : 0.0F;
+}
+
+/// One IVF_RQ partition's distances to the query. `query_factor` as rq_query_terms gives it.
+void rq_distances(const IvfIndex& index, const RqQuery& q, const Partition& part, float query_factor,
+                  std::vector<float>& d) {
+    const std::size_t n = part.ids.size();
+    d.resize(n);
+    const std::size_t code_len = index.dim / 8U;
+    std::vector<std::uint8_t> ex_values(q.ex_query.size());
+    for (std::size_t r = 0; r < n; ++r) {
+        d[r] = rq_distance(index, q, part, r, query_factor, rq_binary_ip(q, part.codes.data(), n, code_len, r),
+                           ex_values.data());
+    }
+}
+
 // ── IVF_HNSW_SQ ───────────────────────────────────────────────────────────────────────────────
 
 /// Rust's std::collections::BinaryHeap (a max-heap) over `T`, compared by `less` alone: pushes,
@@ -1390,9 +2022,10 @@ struct FloatDistance {
     const IvfIndex* index = nullptr;
     const Partition* part = nullptr;
     const std::vector<float>* key = nullptr;
+    float key_norm = 1.0F;  // |key|: 1 unless a float16 column's normalized query was rounded again
     float operator()(std::uint32_t id) const {
         return distance(index->metric, part->vectors.data() + static_cast<std::size_t>(id) * index->dim, key->data(),
-                        index->dim, 1.0F);
+                        index->dim, key_norm);
     }
 };
 
@@ -1614,7 +2247,7 @@ bool hnsw_search_partition(const Partition& part, const Dist& dist, const Neares
             std::vector<float> residual(index.dim);
             const float* c = index.centroids.data() + p * index.dim;
             for (std::size_t j = 0; j < index.dim; ++j) {
-                residual[j] = key[j] - c[j];
+                residual[j] = q.f16_column ? ArrowHalfFloatToFloat(float16_bits(key[j] - c[j])) : key[j] - c[j];
             }
             pq_table(index, residual.data(), table);
         }
@@ -1624,7 +2257,82 @@ bool hnsw_search_partition(const Partition& part, const Dist& dist, const Neares
     if (index.storage == Storage::Sq) {
         return hnsw_search_partition(part, SqDistance(index, part, key), q, mask, kk, local, why);
     }
-    return hnsw_search_partition(part, FloatDistance{&index, &part, &key}, q, mask, kk, local, why);
+    const float key_norm = index.metric == VectorMetric::Cosine && q.f16_column
+                               ? std::sqrt(dot(key.data(), key.data(), index.dim))
+                               : 1.0F;
+    return hnsw_search_partition(part, FloatDistance{&index, &part, &key, key_norm}, q, mask, kk, local, why);
+}
+
+/// Lance's top-k scan of one IVF_RQ partition into the heap all the partitions share
+/// (accumulate_raw_query_multi_bit_topk). A row whose lower bound -- its 1-bit estimate less
+/// error_factor * query_error -- is at least the heap's worst distance, once the heap holds `k`
+/// rows, is skipped without its extended distance. Otherwise that distance is computed and the row
+/// replaces the worst one when it is smaller. `query_error` is sqrt of the squared distance to the
+/// centroid (raw_query_error, L2). Upper and lower bounds are f32 max and min: nothing is cut by them.
+template <typename Heap>
+void rq_gate_partition(const IvfIndex& index, const RqQuery& q, const Partition& part, float query_factor,
+                       float query_error, const RowMask& mask, std::size_t k, Heap& heap) {
+    if (k == 0U) {
+        return;
+    }
+    const std::size_t n = part.ids.size();
+    const std::size_t code_len = index.dim / 8U;
+    const float top = std::numeric_limits<float>::max();
+    std::vector<std::uint8_t> ex_values(q.ex_query.size());
+    for (std::size_t r = 0; r < n; ++r) {
+        const std::uint64_t id = part.ids[r];
+        if (!mask.allows(id)) {
+            continue;
+        }
+        const float binary_ip = rq_binary_ip(q, part.codes.data(), n, code_len, r);
+        if (q.gate) {
+            const float binary = (binary_ip - 0.5F * q.sum_q) * part.rq_scale[r] + part.rq_add[r] + query_factor;
+            const float lower = binary - part.rq_err[r] * query_error;
+            if (lower >= top || (heap.size() >= k && lower >= heap.peek().d)) {
+                continue;
+            }
+        }
+        const float d = rq_distance(index, q, part, r, query_factor, binary_ip, ex_values.data());
+        if (d < -top || d >= top) {
+            continue;
+        }
+        if (heap.size() < k) {
+            heap.push(Candidate{d, id});
+        } else if (heap.peek().d > d) {
+            heap.pop();
+            heap.push(Candidate{d, id});
+        }
+    }
+}
+
+// The Hamming (binary IVF_FLAT) steps of search_segment, kept out of line so the float search loop
+// compiles as it did before they existed.
+[[gnu::noinline]] void hamming_to_centroids(const IvfIndex& index, const std::vector<std::uint8_t>& key,
+                                            std::vector<float>& out) {
+    for (std::size_t p = 0; p < index.partitions; ++p) {
+        out[p] = hamming(key.data(), index.binary_centroids.data() + p * index.dim, index.dim);
+    }
+}
+
+/// Each row of `part` into Lance's global top-k heap: a row replaces the heap's worst only when strictly
+/// closer, so among equal distances the one met first stays.
+template <typename Heap>
+[[gnu::noinline]] void hamming_into_heap(const Partition& part, const std::vector<std::uint8_t>& key, std::size_t dim,
+                                         const NearestQuery& q, const RowMask& mask, std::size_t kk, Heap& heap) {
+    const std::size_t n = part.ids.size();
+    for (std::size_t r = 0; r < n; ++r) {
+        const float d = hamming(part.codes.data() + r * dim, key.data(), dim);
+        if (!in_range(d, q) || !mask.allows(part.ids[r])) {
+            continue;
+        }
+        const Candidate c{d, part.ids[r]};
+        if (heap.size() < kk) {
+            heap.push(c);
+        } else if (heap.peek().d > d) {
+            heap.pop();
+            heap.push(c);
+        }
+    }
 }
 
 /// The best `kk` candidates of one index segment.
@@ -1636,19 +2344,41 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
                 std::to_string(index.dim);
         return false;
     }
+    std::vector<std::uint8_t> bkey;  // Hamming: the query's bytes (dataset_nearest checked them)
+    if (index.metric == VectorMetric::Hamming) {
+        for (const float x : q.key) {
+            bkey.push_back(static_cast<std::uint8_t>(x));
+        }
+    }
     std::vector<float> key = q.key;
     if (index.metric == VectorMetric::Cosine) {
-        const float norm = std::sqrt(dot(key.data(), key.data(), key.size()));
+        // Lance's normalize_arrow: a sequential f32 sum of squares (not a lane-wise dot), then x / norm.
+        // The order matters: the norm's last bit moves the RQ distance table across a u8 rounding step.
+        float sum = 0.0F;
+        for (const float x : key) {
+            sum += x * x;
+        }
+        const float norm = std::sqrt(sum);
         for (auto& x : key) {
             x /= norm;
+            if (q.f16_column) {  // pylance's normalized query is a float16 vector again (measured to 1e-7)
+                x = ArrowHalfFloatToFloat(float16_bits(x));
+            }
         }
     }
     const std::size_t dim = index.dim;
+    // |key| for the cosine distances: 1 for a normalized float32 query; a float16 one, rounded again after
+    // normalizing, is not quite of length 1 (pylance divides by its true norm).
+    const float key_norm = index.metric == VectorMetric::Cosine && q.f16_column ? std::sqrt(dot(key.data(), key.data(), dim)) : 1.0F;
     const std::size_t P = index.partitions;
     std::vector<float> to_centroid(P);
-    for (std::size_t p = 0; p < P; ++p) {
-        const float* c = index.centroids.data() + p * dim;
-        to_centroid[p] = index.metric == VectorMetric::Dot ? 1.0F - dot(key.data(), c, dim) : l2(key.data(), c, dim);
+    if (index.metric == VectorMetric::Hamming) {
+        hamming_to_centroids(index, bkey, to_centroid);
+    } else {
+        for (std::size_t p = 0; p < P; ++p) {
+            const float* c = index.centroids.data() + p * dim;
+            to_centroid[p] = index.metric == VectorMetric::Dot ? 1.0F - dot(key.data(), c, dim) : l2(key.data(), c, dim);
+        }
     }
     std::vector<std::size_t> order(P);
     std::iota(order.begin(), order.end(), std::size_t{0});
@@ -1665,6 +2395,23 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
     const std::uint64_t max_results =
         mask.has_count ? std::min<std::uint64_t>(q.k, mask.count) : static_cast<std::uint64_t>(q.k);
 
+    RqQuery rq;  // IVF_RQ: the rotated query and its tables, once for every partition
+    std::vector<float> rq_rotated_centroids;  // IVF_RQ dot: the centroids rotated (Lance's search cache)
+    if (index.storage == Storage::Rq) {
+        rq = rq_prepare(index, key.data(), q.approx_mode);
+        if (index.metric == VectorMetric::Dot) {
+            rq_rotated_centroids.resize(P * dim);
+            for (std::size_t p = 0; p < P; ++p) {
+                rq_rotate(index.centroids.data() + p * dim, dim, index.rq_signs.data(),
+                          rq_rotated_centroids.data() + p * dim);
+            }
+        }
+    }
+    // IVF_RQ: partition p's query factor and error (rq_query_terms).
+    const auto rq_terms = [&](std::size_t p, float& factor, float& error) {
+        rq_query_terms(index, rq, to_centroid[p],
+                       rq_rotated_centroids.empty() ? nullptr : rq_rotated_centroids.data() + p * dim, factor, error);
+    };
     std::vector<float> dot_table;  // dot: one table for every partition
     if (index.storage == Storage::Pq && index.metric == VectorMetric::Dot) {
         pq_table(index, key.data(), dot_table);
@@ -1686,7 +2433,7 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
                 std::vector<float> residual(dim);
                 const float* c = index.centroids.data() + p * dim;
                 for (std::size_t j = 0; j < dim; ++j) {
-                    residual[j] = key[j] - c[j];
+                    residual[j] = q.f16_column ? ArrowHalfFloatToFloat(float16_bits(key[j] - c[j])) : key[j] - c[j];
                 }
                 pq_table(index, residual.data(), own);
             }
@@ -1697,10 +2444,15 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
             for (std::size_t r = 0; r < n; ++r) {
                 d[r] = dist(static_cast<std::uint32_t>(r));
             }
+        } else if (index.storage == Storage::Rq) {
+            float factor = 0.0F;
+            float error = 0.0F;
+            rq_terms(p, factor, error);
+            rq_distances(index, rq, *part, factor, d);
         } else {
             d.resize(n);
             for (std::size_t r = 0; r < n; ++r) {
-                d[r] = distance(index.metric, part->vectors.data() + r * dim, key.data(), dim, 1.0F);
+                d[r] = distance(index.metric, part->vectors.data() + r * dim, key.data(), dim, key_norm);
             }
         }
         // Gathered on the stack, not in `local`: the parallel callers' vectors share cache lines.
@@ -1714,6 +2466,76 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
         local.insert(local.end(), found.begin(), found.end());
         return true;
     };
+    // The end of every search: the prefilter's rows the search did not reach, the best `kk`, the plan.
+    const auto finish = [&](std::size_t searched, std::uint64_t found) {
+        // Fewer rows pass the prefilter than k, and the search did not reach them all: Lance returns
+        // the rest too, at an infinite distance.
+        if (mask.has_count && mask.count <= q.k && found < mask.count) {
+            std::set<std::uint64_t> have;
+            for (const auto& c : out) {
+                have.insert(c.id);
+            }
+            for (const auto& [frag, rows] : mask.rows) {
+                for (std::size_t r = 0; r < rows.size(); ++r) {
+                    const std::uint64_t id = (static_cast<std::uint64_t>(frag) << 32U) | r;
+                    if (rows[r] != 0U && have.count(id) == 0U && mask.allows(id)) {
+                        out.push_back(Candidate{std::numeric_limits<float>::infinity(), id});
+                    }
+                }
+            }
+        }
+        keep_best(out, kk);
+        plan = "ANNIvfPartition: nprobes=" + std::to_string(searched) + " of " + std::to_string(P) +
+               " (minimum " + std::to_string(first) + ") minimum_nprobes=" + std::to_string(q.minimum_nprobes) +
+               " maximum_nprobes=" +
+               (q.maximum_nprobes ? "Some(" + std::to_string(*q.maximum_nprobes) + ")" : std::string("None"));
+        return true;
+    };
+
+    if (index.metric == VectorMetric::Hamming) {
+        // Lance's global top-k heap over the probed partitions (IVF_FLAT supports it): a row replaces the
+        // heap's worst only when strictly closer, so among equal distances the one met first stays.
+        const auto by_dist = [](const Candidate& a, const Candidate& b) { return a.d < b.d; };
+        RustHeap<Candidate, decltype(by_dist)> heap(by_dist);
+        std::size_t searched = 0;
+        for (std::size_t i = 0; i < most && (i < first || heap.size() < max_results); ++i, ++searched) {
+            std::shared_ptr<const Partition> part;
+            if (!index.partition(order[i], part, error, count)) {
+                return false;
+            }
+            hamming_into_heap(*part, bkey, dim, q, mask, kk, heap);
+        }
+        std::uint64_t added = 0;
+        for (const Candidate& c : std::move(heap).into_sorted()) {
+            out.push_back(c);
+            ++added;
+        }
+        return finish(searched, added);
+    }
+    if (index.storage == Storage::Rq) {
+        // IVF_RQ searches as Lance's FLAT sub-index does under IVF's global top-k heap: every probed
+        // partition in probe order into one heap of kk entries, rows gated against it. The first
+        // `first` partitions always; then more, one at a time, only while fewer than k rows were found.
+        const auto by_dist = [](const Candidate& a, const Candidate& b) { return a.d < b.d; };
+        RustHeap<Candidate, decltype(by_dist)> heap(by_dist);
+        std::size_t searched = 0;
+        for (std::size_t i = 0; i < most && (i < first || heap.size() < max_results); ++i, ++searched) {
+            std::shared_ptr<const Partition> part;
+            if (!index.partition(order[i], part, error, count)) {
+                return false;
+            }
+            float factor = 0.0F;
+            float error = 0.0F;
+            rq_terms(order[i], factor, error);
+            rq_gate_partition(index, rq, *part, factor, error, mask, kk, heap);
+        }
+        std::uint64_t added = 0;
+        for (const Candidate& c : std::move(heap).into_sorted()) {
+            out.push_back(c);
+            ++added;
+        }
+        return finish(searched, added);
+    }
     // The first `first` partitions are searched whatever they hold, in parallel.
     std::vector<std::vector<Candidate>> early(std::min(first, most));
     std::vector<std::string> errors(early.size());
@@ -1750,28 +2572,7 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
         }
         searched += pulled;
     }
-    // Fewer rows pass the prefilter than k, and the search did not reach them all: Lance returns
-    // the rest too, at an infinite distance.
-    if (mask.has_count && mask.count <= q.k && found < mask.count) {
-        std::set<std::uint64_t> have;
-        for (const auto& c : out) {
-            have.insert(c.id);
-        }
-        for (const auto& [frag, rows] : mask.rows) {
-            for (std::size_t r = 0; r < rows.size(); ++r) {
-                const std::uint64_t id = (static_cast<std::uint64_t>(frag) << 32U) | r;
-                if (rows[r] != 0U && have.count(id) == 0U && mask.allows(id)) {
-                    out.push_back(Candidate{std::numeric_limits<float>::infinity(), id});
-                }
-            }
-        }
-    }
-    keep_best(out, kk);
-    plan = "ANNIvfPartition: nprobes=" + std::to_string(searched) + " of " + std::to_string(P) +
-           " (minimum " + std::to_string(first) + ") minimum_nprobes=" + std::to_string(q.minimum_nprobes) +
-           " maximum_nprobes=" +
-           (q.maximum_nprobes ? "Some(" + std::to_string(*q.maximum_nprobes) + ")" : std::string("None"));
-    return true;
+    return finish(searched, found);
 }
 
 // ── exact distances ─────────────────────────────────────────────────────────────────────────────
@@ -1804,8 +2605,12 @@ bool vector_sub_path(const ArrowSchema& schema, const std::string& column, int& 
 }
 
 /// Exact distances of `rows`' vectors (null vectors dropped).
+float multivec_distance(const MultiRows& v, std::size_t r, const NearestQuery& q, VectorMetric metric,
+                        const std::vector<std::uint8_t>* binary_key, std::size_t dim);
+
 bool rescore(const std::filesystem::path& path, const NearestQuery& q, VectorMetric metric, std::size_t dim,
-             std::vector<Candidate>& rows, std::string& error) {
+             std::vector<Candidate>& rows, std::string& error, bool multi = false,
+             const std::vector<std::uint8_t>* binary_key = nullptr) {
     if (rows.empty()) {
         return true;
     }
@@ -1832,6 +2637,39 @@ bool rescore(const std::filesystem::path& path, const NearestQuery& q, VectorMet
     if (!addrs.empty() && !lance_dataset_take_rows(path, request, addrs, schema, batches, error)) {
         return false;
     }
+    if (multi) {
+        // A multivector column: each candidate's exact multivec_distance over all the query's vectors.
+        MultiRows v;
+        v.dim = dim;
+        int vc = -1;
+        std::vector<int> sub;
+        const int ic = child_index(schema, "_rowaddr");
+        bool ok = addrs.empty() || (vector_sub_path(schema, q.column, vc, sub, error) && ic >= 0);
+        for (std::size_t b = 0; ok && b < batches.size(); ++b) {
+            ok = collect_multivectors(schema, batches[b], vc, ic, v, error, sub);
+        }
+        for (auto& b : batches) {
+            b.release(&b);
+        }
+        if (schema.release != nullptr) {
+            schema.release(&schema);
+        }
+        if (!ok) {
+            return false;
+        }
+        std::vector<Candidate> out;
+        for (std::size_t r = 0; r < v.ids.size(); ++r) {
+            const float d = multivec_distance(v, r, q, metric, nullptr, dim);
+            if (!std::isnan(d)) {
+                out.push_back(Candidate{d, v.ids[r]});
+            }
+        }
+        for (const auto& [id, d] : keep) {
+            out.push_back(Candidate{d, id});
+        }
+        rows = std::move(out);
+        return true;
+    }
     VectorRows v;
     v.dim = dim;
     int vc = -1;
@@ -1851,7 +2689,10 @@ bool rescore(const std::filesystem::path& path, const NearestQuery& q, VectorMet
     std::vector<Candidate> out;
     for (std::size_t r = 0; r < v.ids.size(); ++r) {
         if (v.valid[r] != 0U) {
-            out.push_back(Candidate{distance(metric, v.values.data() + r * dim, q.key.data(), dim, q_norm), v.ids[r]});
+            const float d = binary_key != nullptr
+                                ? hamming(v.bytes.data() + r * dim, binary_key->data(), dim)
+                                : distance(metric, v.values.data() + r * dim, q.key.data(), dim, q_norm);
+            out.push_back(Candidate{d, v.ids[r]});
         }
     }
     for (const auto& [id, d] : keep) {
@@ -1861,10 +2702,43 @@ bool rescore(const std::filesystem::path& path, const NearestQuery& q, VectorMet
     return true;
 }
 
+/// Row `r` of a multivector column against the query's vectors (Lance's multivec_distance): for each
+/// query vector, the least distance to a vector of the row, summed. A null or empty row is NaN. The
+/// query's uint8 values are `binary_key` (Hamming distance) when given.
+float multivec_distance(const MultiRows& v, std::size_t r, const NearestQuery& q, VectorMetric metric,
+                        const std::vector<std::uint8_t>* binary_key, std::size_t dim) {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    if (v.count[r] == 0U) {
+        return nan;
+    }
+    float total = 0;
+    for (std::size_t qi = 0; qi < q.key_vectors; ++qi) {
+        // the least distance, NaN only when every distance is NaN (Lance's min_by total_cmp order)
+        float best = nan;
+        const float* qv = binary_key != nullptr ? nullptr : q.key.data() + qi * dim;
+        const float q_norm = qv != nullptr && metric == VectorMetric::Cosine ? std::sqrt(dot(qv, qv, dim)) : 0.0F;
+        for (std::size_t j = 0; j < v.count[r]; ++j) {
+            const std::size_t at = (v.first[r] + j) * dim;
+            float d = 0;
+            if (binary_key != nullptr) {
+                d = hamming(v.bytes.data() + at, binary_key->data() + qi * dim, dim);
+            } else {
+                d = distance(metric, v.values.data() + at, qv, dim, q_norm);
+            }
+            if (std::isnan(best) || (!std::isnan(d) && d < best)) {
+                best = d;
+            }
+        }
+        total += best;
+    }
+    return total;
+}
+
 /// The best k of `fragments` by exact distance; `binary_key` (a uint8 column's query): by Hamming distance.
+/// `multi`: a multivector column, searched by multivec_distance.
 bool flat_search(const std::filesystem::path& path, const NearestQuery& q, VectorMetric metric, std::size_t dim,
                  const std::vector<std::uint64_t>& fragments, std::vector<Candidate>& out, std::string& error,
-                 const std::vector<std::uint8_t>* binary_key = nullptr) {
+                 const std::vector<std::uint8_t>* binary_key = nullptr, bool multi = false) {
     if (fragments.empty()) {
         return true;
     }
@@ -1892,7 +2766,21 @@ bool flat_search(const std::filesystem::path& path, const NearestQuery& q, Vecto
     }
     std::vector<Candidate> found;
     for (auto& batch : batches) {
-        if (ok) {
+        if (ok && multi) {
+            MultiRows v;
+            v.dim = dim;
+            ok = collect_multivectors(schema, batch, vc, ic, v, error, sub);
+            for (std::size_t r = 0; ok && r < v.ids.size(); ++r) {
+                // a null or empty row (a NaN distance) is left out, as Lance's KNN leaves it out
+                const float d = multivec_distance(v, r, q, metric, binary_key, dim);
+                if (!std::isnan(d) && in_range(d, q)) {
+                    found.push_back(Candidate{d, v.ids[r]});
+                }
+            }
+            if (found.size() > 4U * q.k + 1024U) {
+                keep_best(found, q.k);
+            }
+        } else if (ok) {
             VectorRows v;
             v.dim = dim;
             std::vector<ArrowArray> one;  // collect_vectors takes a list; reuse without copying ownership
@@ -2008,6 +2896,14 @@ std::int32_t field_id(const pb::Manifest& manifest, const std::string& path) {
 
 }  // namespace
 
+namespace rq_build {
+
+void rotate(const float* in, std::size_t dim, const std::uint8_t* signs, float* out) {
+    rq_rotate(in, dim, signs, out);
+}
+
+}  // namespace rq_build
+
 bool index_build::load_vector_model(const std::filesystem::path& dir, VectorModel& out, std::string& error) {
     std::shared_ptr<const IvfIndex> index;
     if (!load_ivf(dir, index, error)) {
@@ -2018,7 +2914,9 @@ bool index_build::load_vector_model(const std::filesystem::path& dir, VectorMode
     out.dim = index->dim;
     out.partitions = index->partitions;
     out.centroids = index->centroids;
-    out.nbits = index->nbits;
+    out.binary_centroids = index->binary_centroids;
+    out.nbits = index->storage == Storage::Rq ? index->rq_bits : index->nbits;
+    out.rq_signs = index->storage == Storage::Rq ? index->rq_signs : std::vector<std::uint8_t>{};
     out.m = index->storage == Storage::Pq ? index->m : 0U;
     out.codebook = index->storage == Storage::Pq ? index->codebook : std::vector<float>{};
     out.lengths = index->lengths;
@@ -2123,10 +3021,71 @@ bool vector_index_details(const std::filesystem::path& index_dir, VectorIndexDet
     return true;
 }
 
-bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQuery& q, NearestResult& out,
+/// Lance's XTR search of a multivector query over an IVF_FLAT index (`multivec_ann` and
+/// `MultivectorScoringExec`). For each query vector: the index's best `kk` entries, sorted by (distance,
+/// row id), each row's first (best) entry kept; its similarity is 1 - distance. A row's similarity is
+/// summed over the query vectors in turn: a row missing from a list adds that list's `min_sim` (the
+/// similarity of its last kept entry), a row new to the sum starts at its similarity plus the earlier
+/// lists' `min_sim`s. The distance is the query vector count minus the sum; `keep` rows are kept.
+bool xtr_search(const NearestQuery& q, const std::vector<std::shared_ptr<const IvfIndex>>& loaded,
+                const std::vector<RowMask>& masks, RowIdToAddress& resolver, std::size_t dim, bool f32_column,
+                std::uint32_t overfetch, std::size_t keep, std::vector<Candidate>& out,
+                std::vector<std::string>& plan, std::string& error, CacheCount& counts) {
+    const std::size_t queries = q.key_vectors;
+    const std::size_t kk = static_cast<std::size_t>(q.k) * overfetch;  // the candidates per query vector
+    std::unordered_map<std::uint64_t, float> sums;
+    float missed = 0.0F;  // the sum of the earlier lists' min_sim
+    for (std::size_t qi = 0; qi < queries; ++qi) {
+        NearestQuery one = q;
+        one.key.assign(q.key.begin() + static_cast<std::ptrdiff_t>(qi * dim),
+                       q.key.begin() + static_cast<std::ptrdiff_t>((qi + 1U) * dim));
+        one.key_vectors = 1;
+        // Lance's per-vector query carries refine_factor = overfetch (its probing is then the legacy rule,
+        // not the adaptive one) and keeps k * overfetch candidates.
+        one.refine_factor = overfetch;
+        std::vector<Candidate> list;
+        for (std::size_t s = 0; s < loaded.size(); ++s) {
+            std::string line;
+            if (!search_segment(*loaded[s], one, f32_column, masks[s], kk, list, line, error, counts)) {
+                return false;
+            }
+            if (qi == 0) {
+                plan.push_back("  " + line);
+            }
+        }
+        if (resolver.stable()) {  // as the exact search: the candidates are addresses from here on
+            for (auto& hit : list) {
+                resolver.find(hit.id, hit.id);
+            }
+        }
+        keep_best(list, kk);
+        const float min_sim = list.empty() ? 0.0F : 1.0F - list.back().d;
+        std::unordered_map<std::uint64_t, float> first;  // the best entry of each row in this list
+        for (const auto& c : list) {
+            first.emplace(c.id, 1.0F - c.d);
+        }
+        for (auto& [id, sum] : sums) {
+            const auto it = first.find(id);
+            sum += it != first.end() ? it->second : min_sim;
+        }
+        for (const auto& [id, sim] : first) {
+            sums.emplace(id, sim + missed);  // emplace: a row already summed keeps its sum
+        }
+        missed += min_sim;
+    }
+    out.clear();
+    for (const auto& [id, sum] : sums) {
+        out.push_back(Candidate{static_cast<float>(queries) - sum, id});
+    }
+    keep_best(out, keep);
+    return true;
+}
+
+bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQuery& query, NearestResult& out,
                      std::string& error) {
     out = NearestResult{};
     error.clear();
+    NearestQuery q = query;  // f16_column is set below, from the column's type
     if (q.key.empty()) {
         error = "the query vector is empty";
         return false;
@@ -2148,6 +3107,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
     std::size_t dim = 0;
     bool f32_column = false;
     bool binary = false;  // a uint8 column: binary vectors, searched by Hamming distance
+    bool multi = false;   // a list of fixed-size lists: a multivector column (multivec_distance)
     {
         const ArrowSchema* column = nullptr;
         const ArrowSchema* level = &schema;
@@ -2167,13 +3127,22 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             level = column;
             at = dot_at + 1U;
         }
-        std::string format = column == nullptr || column->format == nullptr ? "" : column->format;
-        std::string item = column == nullptr || column->n_children != 1 || column->children[0]->format == nullptr
+        // A multivector column is a list of fixed-size lists: the vectors are the inner lists'.
+        const ArrowSchema* vectors = column;
+        if (column != nullptr && column->format != nullptr && std::string(column->format) == "+l" &&
+            column->n_children == 1 && column->children[0]->format != nullptr &&
+            std::string(column->children[0]->format).rfind("+w:", 0) == 0) {
+            vectors = column->children[0];
+            multi = true;
+        }
+        std::string format = vectors == nullptr || vectors->format == nullptr ? "" : vectors->format;
+        std::string item = vectors == nullptr || vectors->n_children != 1 || vectors->children[0]->format == nullptr
                                ? ""
-                               : column->children[0]->format;
-        if (column != nullptr && format.rfind("+w:", 0) == 0) {
+                               : vectors->children[0]->format;
+        if (vectors != nullptr && format.rfind("+w:", 0) == 0) {
             dim = static_cast<std::size_t>(std::strtoull(format.c_str() + 3, nullptr, 10));
             f32_column = item == "f";
+            q.f16_column = item == "e";
             binary = item == "C";
         }
         schema.release(&schema);
@@ -2186,9 +3155,13 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             return false;
         }
     }
-    if (q.key.size() != dim) {
-        error = "Query vector size " + std::to_string(q.key.size()) + " does not match index column size " +
-                std::to_string(dim);
+    if (!multi && q.key_vectors != 1U) {
+        error = "Query column " + q.column + " must be a multivector to take several query vectors";
+        return false;
+    }
+    if (q.key.size() != dim * q.key_vectors) {
+        error = "Query vector size " + std::to_string(q.key.size() / std::max<std::size_t>(q.key_vectors, 1U)) +
+                " does not match index column size " + std::to_string(dim);
         return false;
     }
     // Binary vectors: Hamming distance only, exact (no index), the query's values are bytes.
@@ -2227,10 +3200,6 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
                 segments.push_back(&index);
             }
         }
-    }
-    if (binary && !segments.empty()) {
-        error = "a vector index on a binary (UInt8) column is not supported; search it without an index";
-        return false;
     }
     const bool chosen = q.use_index && !q.segments.empty();
     if (chosen) {
@@ -2276,8 +3245,19 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             }
             std::shared_ptr<const IvfIndex> index;
             std::string why;
-            if (!load_ivf(dataset_path / "_indices" / pb::uuid_string(s->uuid), index, why, q.index_cache)) {
+            std::filesystem::path seg_dir;
+            if (!index_dir_of(dataset_path, manifest, *s, seg_dir, why) ||
+                !load_ivf(seg_dir, index, why, q.index_cache)) {
                 not_used = why;
+            } else if (binary != (index->metric == VectorMetric::Hamming)) {
+                if (chosen) {
+                    error = "with_index_segments: the selected index segments cannot be searched: metric " +
+                            std::string(vector_metric_name(index->metric)) + " for this column";
+                    return false;
+                }
+                not_used = binary ? std::string("the index's metric is ") + vector_metric_name(index->metric) +
+                                        ", not hamming"
+                                  : std::string("the index's metric is hamming");
             } else if (q.metric && *q.metric != index->metric) {
                 if (chosen) {
                     error = std::string("with_index_segments requested metric ") + vector_metric_name(*q.metric) +
@@ -2319,7 +3299,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
         } else {
             out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name +
                                " (exact, " + std::to_string(all_fragments.size()) + " fragments)");
-            if (!flat_search(dataset_path, q, metric, dim, all_fragments, hits, error, binary ? &binary_key : nullptr)) {
+            if (!flat_search(dataset_path, q, metric, dim, all_fragments, hits, error, binary ? &binary_key : nullptr, multi)) {
                 return false;
             }
         }
@@ -2330,10 +3310,14 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
         std::vector<Candidate> ann;
         CacheCount counts;
         out.plan.push_back("ANNSubIndex: name=" + index_name + ", k=" + std::to_string(q.k) + ", deltas=" +
-                           std::to_string(loaded.size()) + ", metric=" + metric_name + " (" +
+                           std::to_string(loaded.size()) + ", metric=" + (binary ? "Hamming" : metric_name) + " (" +
                            loaded.front()->type + ")");
+        // Each segment's row mask (the fragments it covers, deletions, the prefilter), built once.
+        std::vector<RowMask> masks;
+        masks.reserve(loaded.size());
         for (std::size_t s = 0; s < loaded.size(); ++s) {
-            RowMask mask;
+            masks.emplace_back();
+            RowMask& mask = masks.back();
             mask.resolver = &resolver;
             mask.caller = q.row_mask;
             for (const auto& f : manifest.fragments) {
@@ -2378,20 +3362,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
                 }
             }
             mask.seal();
-            std::string line;
-            if (!search_segment(*loaded[s], q, f32_column, mask, kk, ann, line, error, counts)) {
-                return false;
-            }
-            out.plan.push_back("  " + line);
         }
-        out.index_cache_hits = counts.hits.load();
-        out.index_cache_misses = counts.misses.load();
-        if (resolver.stable()) {  // from here on the candidates are addresses, as the exact search's are
-            for (auto& hit : ann) {
-                resolver.find(hit.id, hit.id);
-            }
-        }
-        keep_best(ann, kk);
         std::vector<std::uint64_t> unindexed;
         if (!q.fast_search && !chosen) {
             for (const auto& f : manifest.fragments) {
@@ -2400,19 +3371,62 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
                 }
             }
         }
-        if (q.refine_factor || !unindexed.empty()) {
-            if (!rescore(dataset_path, q, metric, dim, ann, error)) {
+        if (multi) {
+            // XTR over the index (xtr_search). Distance bounds are not written for several vectors per row
+            // yet: refused rather than answered from the wrong distances.
+            if (q.lower_bound || q.upper_bound) {
+                error = "distance bounds on a multivector index are not supported yet";
                 return false;
             }
-            keep_best(ann, q.k);
-            out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name +
-                               " (refine " + std::to_string(kk) + " candidates)");
+            constexpr std::uint32_t kXtrOverfetch = 10;  // Lance's DEFAULT_XTR_OVERFETCH
+            // Lance's multivec_ann keeps k * refine_factor rows (1 without a refine_factor).
+            if (!xtr_search(q, loaded, masks, resolver, dim, f32_column, kXtrOverfetch, kk, ann, out.plan, error,
+                            counts)) {
+                return false;
+            }
+            out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name + " (multivector XTR, " +
+                               std::to_string(q.key_vectors) + " query vectors)");
+            if (q.refine_factor || !unindexed.empty()) {
+                // Lance's scanner: with a refine_factor, the candidates are re-scored exactly and the top k
+                // kept; knn_combined does the same once unindexed fragments are merged in. The XTR
+                // distances are only for choosing the candidates.
+                if (!rescore(dataset_path, q, metric, dim, ann, error, true)) {
+                    return false;
+                }
+                keep_best(ann, q.k);
+                out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name +
+                                   " (exact re-score of the XTR candidates)");
+            }
+        } else {
+            for (std::size_t s = 0; s < loaded.size(); ++s) {
+                std::string line;
+                if (!search_segment(*loaded[s], q, f32_column, masks[s], kk, ann, line, error, counts)) {
+                    return false;
+                }
+                out.plan.push_back("  " + line);
+            }
+            if (resolver.stable()) {  // from here on the candidates are addresses, as the exact search's are
+                for (auto& hit : ann) {
+                    resolver.find(hit.id, hit.id);
+                }
+            }
+            keep_best(ann, kk);
+            if (q.refine_factor || !unindexed.empty()) {
+                if (!rescore(dataset_path, q, metric, dim, ann, error, false, binary ? &binary_key : nullptr)) {
+                    return false;
+                }
+                keep_best(ann, q.k);
+                out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name +
+                                   " (refine " + std::to_string(kk) + " candidates)");
+            }
         }
+        out.index_cache_hits = counts.hits.load();
+        out.index_cache_misses = counts.misses.load();
         hits = std::move(ann);
         if (!unindexed.empty()) {
             out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name + " (exact, " +
                                std::to_string(unindexed.size()) + " unindexed fragments)");
-            if (!flat_search(dataset_path, q, metric, dim, unindexed, hits, error, binary ? &binary_key : nullptr)) {
+            if (!flat_search(dataset_path, q, metric, dim, unindexed, hits, error, binary ? &binary_key : nullptr, multi)) {
                 return false;
             }
         }
@@ -2471,6 +3485,9 @@ bool read_vector_index_model(const std::filesystem::path& dir, VectorIndexModel&
         return false;
     }
     out.centroids = std::move(model.centroids);
+    for (const std::uint8_t b : model.bytes) {  // a Hamming index: its centroids' byte values
+        out.centroids.push_back(static_cast<float>(b));
+    }
     out.partitions = model.partitions;
     out.dim = model.dim;
     out.has_loss = model.has_loss;
@@ -2503,7 +3520,12 @@ bool read_vector_index_partition(const std::filesystem::path& dir, std::size_t p
         return true;
     }
     const std::size_t n = part->ids.size();
-    if (index->storage == Storage::Flat) {
+    if (index->storage == Storage::Flat && index->metric == VectorMetric::Hamming) {
+        out.column = "flat";
+        out.width = index->dim;
+        out.uint8 = true;
+        out.codes = part->codes;
+    } else if (index->storage == Storage::Flat) {
         out.column = "flat";
         out.width = index->dim;
         out.floats = part->vectors;

@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: Apache-2.0
+name: wasm
+
+# Keeps the WebAssembly build working: builds libnanolance with Emscripten (single-threaded, -Oz), links
+# weblance (wasm/weblance_glue.cpp), checks the module's gzipped size against a budget, and reads a
+# pylance-written dataset over HTTP Range from headless Chromium (wasm/test/run_browser_test.cjs local).
+# Runs on every push and PR: anything that stops compiling for wasm32 (threads, mmap, std::filesystem on a
+# read path, a native-only dependency) fails here.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: wasm-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  EMSDK_VERSION: "6.0.12"
+  # weblance.wasm, gzip -9. 387 KB at the time this check was added.
+  WASM_GZIP_BUDGET_KB: "512"
+
+jobs:
+  weblance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache emsdk
+        id: emsdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/emsdk
+          key: emsdk-${{ env.EMSDK_VERSION }}
+
+      - name: Install emsdk
+        if: steps.emsdk-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git ~/emsdk
+          ~/emsdk/emsdk install "$EMSDK_VERSION"
+          ~/emsdk/emsdk activate "$EMSDK_VERSION"
+
+      - name: Install ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Configure (emcmake, MinSizeRel -Oz)
+        run: |
+          source ~/emsdk/emsdk_env.sh
+          emcmake cmake -S . -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DCMAKE_CXX_FLAGS_MINSIZEREL="-Oz -DNDEBUG" -DCMAKE_C_FLAGS_MINSIZEREL="-Oz -DNDEBUG" \
+            -DFETCHCONTENT_BASE_DIR="$PWD/.deps" -DNANOLANCE_WERROR=ON \
+            -DNANOLANCE_BUILD_TESTS=OFF -DNANOLANCE_BUILD_TOOLS=OFF -DNANOLANCE_BUILD_EXAMPLES=OFF \
+            -DNANOLANCE_BUILD_LANCE_C=OFF -DNANOLANCE_BUILD_PCAPNG2LANCE_NANOM=OFF
+
+      - name: Build libnanolance (wasm32)
+        run: |
+          source ~/emsdk/emsdk_env.sh
+          cmake --build build-wasm -j"$(nproc)"
+
+      - name: Link weblance
+        run: |
+          source ~/emsdk/emsdk_env.sh
+          WASM_BUILD="$PWD/build-wasm" sh wasm/build_weblance.sh dist-wasm
+
+      - name: Size budget
+        run: |
+          gz=$(gzip -9c dist-wasm/weblance.wasm | wc -c)
+          echo "weblance.wasm: $(stat -c %s dist-wasm/weblance.wasm) bytes, $gz gzipped (budget ${WASM_GZIP_BUDGET_KB} KB)"
+          echo "### weblance.wasm: $((gz / 1024)) KB gzipped (budget ${WASM_GZIP_BUDGET_KB} KB)" >> "$GITHUB_STEP_SUMMARY"
+          test "$gz" -le $((WASM_GZIP_BUDGET_KB * 1024))
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install the test's tools (pylance, Playwright + Chromium)
+        run: |
+          python -m pip install --quiet "pylance==12.0.0" pyarrow
+          npm install --global playwright@1.56.1
+          npx --yes playwright@1.56.1 install --with-deps chromium
+
+      - name: Browser test (local dataset over HTTP Range)
+        run: |
+          NODE_PATH="$(npm root -g)" node wasm/test/run_browser_test.cjs local "$RUNNER_TEMP/weblance" dist-wasm
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: weblance
+          path: |
+            dist-wasm/
+            ${{ runner.temp }}/weblance/report-local.json
+          if-no-files-found: ignore

@@ -25,15 +25,18 @@ namespace nano_lance::index_build {
 
 /// A trained IVF (and PQ) model, as an index's files hold it.
 struct VectorModel {
-    std::string type;  // "IVF_FLAT" / "IVF_PQ" / "IVF_HNSW_SQ"
+    std::string type;  // "IVF_FLAT" / "IVF_PQ" / "IVF_RQ" / "IVF_HNSW_SQ"
     VectorMetric metric = VectorMetric::L2;
     std::size_t dim = 0;
     std::size_t partitions = 0;
     std::vector<float> centroids;  // partitions * dim
+    /// Hamming (IVF_FLAT over uint8 vectors): the centroids as bytes, partitions * dim; `centroids` is empty.
+    std::vector<std::uint8_t> binary_centroids;
     std::uint32_t nbits = 8;
     std::size_t m = 0;             // PQ sub-vectors
     std::vector<float> codebook;   // [m][2^nbits][dim / m]
     std::vector<std::uint64_t> lengths;  // rows per partition
+    std::vector<std::uint8_t> rq_signs;  // IVF_RQ: the fast rotation's sign bytes (the shared model)
     double sq_start = 0;  // IVF_HNSW_SQ: the SQ bounds and the graph parameters
     double sq_end = 0;
     std::uint32_t hnsw_m = 20;
@@ -70,8 +73,9 @@ bool load_vector_model(const std::filesystem::path& dir, VectorModel& out, std::
 /// The analyzer settings of the INVERTED index segment in `dir`.
 bool load_inverted_params(const std::filesystem::path& dir, fts::AnalyzerParams& out, std::string& error);
 
-/// InvertedIndexDetails for these analyzer settings, as Lance 12 fills them in.
-std::vector<std::uint8_t> inverted_details(const fts::AnalyzerParams& params);
+/// InvertedIndexDetails for these analyzer settings, as Lance 12 fills them in (`granularity` is field 14).
+std::vector<std::uint8_t> inverted_details(const fts::AnalyzerParams& params,
+                                           DocGranularity granularity = DocGranularity::Row);
 
 /// The row addresses of the documents of the INVERTED index segment in `dir`.
 bool load_inverted_rows(const std::filesystem::path& dir, std::vector<std::uint64_t>& out, std::string& error);

@@ -472,7 +472,11 @@ def _operation(number: int, data: bytes) -> LanceOperation.BaseOperation:
     if number == 102:
         metadata = dict(_map_entry(v) for n, _, v in items if n == 3)
         schema = _schema([v for n, _, v in items if n == 2], {k.decode(): bytes(v or b"") for k, v in metadata.items()})
-        return LanceOperation.Overwrite(schema, [_fragment(v) for n, _, v in items if n == 1])
+        upserts = {k.decode(): bytes(v or b"").decode() for k, v in (_map_entry(v) for n, _, v in items if n == 4)}
+        op = LanceOperation.Overwrite(schema, [_fragment(v) for n, _, v in items if n == 1], None)
+        if upserts:
+            op.config_upserts = upserts  # Lance's config_upsert_values; not a field of pylance's Overwrite
+        return op
     if number == 103:
         return LanceOperation.CreateIndex([_index(v) for n, _, v in items if n == 1],
                                           [_index(v) for n, _, v in items if n == 2])
@@ -850,6 +854,8 @@ def encode_operation(op: LanceOperation.BaseOperation) -> Tuple[int, bytes]:
             _put_bytes(out, 2, m)
         for k, v in metadata.items():
             _put_map_entry(out, 3, k.encode(), v.encode())
+        for k, v in (getattr(op, "config_upserts", None) or {}).items():  # not a pylance field
+            _put_map_entry(out, 4, k.encode(), v.encode())
         for i, base in enumerate(op.initial_bases or []):
             entry = bytearray()
             _put_uint(entry, 1, i + 1)  # ids count from 1 in the order given
@@ -969,6 +975,10 @@ def _touched(op) -> Set[int]:
         return {f.id for g in op.groups for f in g.old_fragments}
     if isinstance(op, L.DataReplacement):
         return {g.fragment_id for g in op.replacements}
+    if isinstance(op, L.DataOverlay):
+        return {g.fragment_id for g in op.groups}
+    if isinstance(op, L.CreateIndex):  # the fragments its indices cover (Lance's index_fragments)
+        return set().union(*(set(i.fragment_ids) for i in op.new_indices))
     return set()
 
 
@@ -992,11 +1002,50 @@ def _updates_schema_metadata(op) -> bool:
 
 def _upsert_keys(op) -> Tuple[Set[str], Set[str]]:
     """(config keys set, config keys removed) by an Overwrite or UpdateConfig."""
+    if isinstance(op, LanceOperation.Overwrite):
+        return set(getattr(op, "config_upserts", None) or {}), set()
     if isinstance(op, LanceOperation.UpdateConfig) and op.config_updates is not None:
         upserts = {k for k, v in op.config_updates.updates.items() if v is not None}
         deletes = {k for k, v in op.config_updates.updates.items() if v is None}
         return upserts, deletes
     return set(), set()
+
+
+def _key_conflict(a, b) -> bool:
+    """Lance's upsert_key_conflict: one side sets or removes a config key the other sets."""
+    a_up, a_del = _upsert_keys(a)
+    b_up, b_del = _upsert_keys(b)
+    return bool((a_up & (b_up | b_del)) or (b_up & (a_up | a_del)))
+
+
+def _names(indices) -> Set[str]:
+    return {i.name for i in indices}
+
+
+def _index_names_conflict(ours, theirs) -> bool:
+    """Lance's index-name rule for two CreateIndex commits: the same name, or one side's new index whose
+    old one the other side drops."""
+    on, tn = _names(ours.new_indices), _names(theirs.new_indices)
+    orm, trm = _names(ours.removed_indices), _names(theirs.removed_indices)
+    return bool(on & tn) or any(n not in orm and n in trm for n in on) or any(n not in trm and n in orm for n in tn)
+
+
+def _create_index_verdict(ours, theirs, name: str) -> Optional[str]:
+    """CreateIndex as ours (Lance's check_create_index_txn)."""
+    L = LanceOperation
+    if name in ("Overwrite", "Restore"):
+        return "incompatible"
+    if name in ("Append", "DataOverlay", "UpdateBases", "Clone", "Delete", "Update", "Merge", "ReserveFragments",
+                "Project", "UpdateConfig"):
+        return None
+    if name == "CreateIndex":
+        return "retryable" if _index_names_conflict(ours, theirs) else None
+    if name == "Rewrite":
+        return "retryable" if _touched(ours) & _touched(theirs) else None
+    if isinstance(theirs, L.DataReplacement):
+        depended = {x for idx in ours.new_indices for x in idx.fields}
+        return "retryable" if any(x in depended for g in theirs.replacements for x in g.new_file.fields) else None
+    return "retryable"
 
 
 def conflict_with(ours, theirs) -> Optional[str]:
@@ -1017,23 +1066,27 @@ def conflict_with(ours, theirs) -> Optional[str]:
         return "incompatible" if name in ("Overwrite", "Restore") else None
     if isinstance(ours, L.Overwrite):
         if name == "Overwrite":
-            return "retryable"
+            return "incompatible" if _key_conflict(ours, theirs) else "retryable"
+        if name == "UpdateConfig":
+            return "incompatible" if _key_conflict(ours, theirs) else None
         return None
     if isinstance(ours, L.Restore) or isinstance(ours, _ReserveFragments):
         if isinstance(ours, _ReserveFragments) and name in ("Overwrite", "Restore"):
             return "incompatible"
         return None
     if isinstance(ours, (L.Delete, L.Update)):
-        if name in always_ok or name in ("CreateIndex", "ReserveFragments", "Project", "UpdateConfig", "Append",
-                                         "DataOverlay"):
+        if name in always_ok or name in ("CreateIndex", "ReserveFragments", "Project", "UpdateConfig", "Append"):
             return None
         if name in ("Overwrite", "Restore"):
             return "incompatible"
         if name == "Merge":
             return "retryable"
+        if name == "DataOverlay":  # Lance's check_update_txn: only an update that adds rows
+            adds = isinstance(ours, L.Update) and bool(ours.new_fragments)
+            return "retryable" if adds and _touched(ours) & _touched(theirs) else None
         return "retryable" if _touched(ours) & _touched(theirs) else None
     if isinstance(ours, L.Rewrite):
-        if name in always_ok or name in ("Append", "ReserveFragments", "Project", "UpdateConfig", "CreateIndex"):
+        if name in always_ok or name in ("Append", "ReserveFragments", "Project", "UpdateConfig"):
             return None
         if name in ("Overwrite", "Restore"):
             return "incompatible"
@@ -1055,20 +1108,23 @@ def conflict_with(ours, theirs) -> Optional[str]:
     if isinstance(ours, L.UpdateConfig):
         mine_up, mine_del = _upsert_keys(ours)
         if name == "Overwrite":
-            if ours.schema_metadata_updates is not None or ours.field_metadata_updates:
+            if ours.schema_metadata_updates is not None or ours.field_metadata_updates or _key_conflict(ours, theirs):
                 return "incompatible"
             return None
         if name == "UpdateConfig":
-            their_up, their_del = _upsert_keys(theirs)
-            if (mine_up | mine_del) & (their_up | their_del):
+            if _key_conflict(ours, theirs):
                 return "incompatible"
-            for attr in ("table_metadata_updates", "schema_metadata_updates"):
-                a, b = getattr(ours, attr), getattr(theirs, attr)
-                if a is not None and b is not None and (a.replace or b.replace or set(a.updates) & set(b.updates)):
-                    return "incompatible"
+            a, b = ours.table_metadata_updates, theirs.table_metadata_updates
+            if a is not None and b is not None and (a.replace or b.replace or set(a.updates) & set(b.updates)):
+                return "incompatible"
+            # Lance's modifies_same_metadata: both set the schema metadata, whatever the keys
+            if ours.schema_metadata_updates is not None and theirs.schema_metadata_updates is not None:
+                return "incompatible"
             if set(ours.field_metadata_updates or {}) & set(theirs.field_metadata_updates or {}):
                 return "incompatible"
         return None
+    if isinstance(ours, L.CreateIndex):
+        return _create_index_verdict(ours, theirs, name)
     if isinstance(ours, L.DataReplacement):
         if name in always_ok or name in ("Append", "UpdateConfig", "ReserveFragments", "DataOverlay"):
             return None

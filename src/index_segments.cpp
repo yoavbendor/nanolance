@@ -5,6 +5,7 @@
 // listing a logical index's segments.
 
 #include "nanolance/index_segments.hpp"
+#include "nanolance/byte_sink.hpp"
 #include "nanolance/byte_source.hpp"
 
 #include "index_build.hpp"
@@ -68,9 +69,38 @@ std::vector<std::string> field_files(const pb::DataFragment& fragment, const std
     return out;
 }
 
+/// The same over an object-store prefix (no directories there: a LIST per level, the files under it).
+bool list_remote_files(const std::string& dir, const std::string& prefix, bool inverted,
+                       std::vector<pb::IndexMetadata::File>& out, std::string& error) {
+    std::vector<io::DirEntry> entries;
+    if (!io::list_dir(dir, entries, error, true)) {
+        return false;
+    }
+    for (const auto& entry : entries) {
+        const std::string rel = prefix + entry.name;
+        if (entry.is_dir) {
+            if (!list_remote_files(dir + "/" + entry.name, rel + "/", inverted, out, error)) {
+                return false;
+            }
+        } else if (!(inverted && rel.rfind("staging/", 0) == 0)) {
+            out.push_back({rel, entry.size});
+        }
+    }
+    return true;
+}
+
 /// Every file under `dir`, relative to it, with its size; Lance's committed segment files
 /// (staging/ left out for an INVERTED index).
 bool list_files(const std::filesystem::path& dir, bool inverted, std::vector<pb::IndexMetadata::File>& out) {
+    if (io::is_object_store_output(dir.string())) {
+        std::string error;
+        if (!list_remote_files(dir.string(), "", inverted, out, error) || out.empty()) {
+            out.clear();  // an index prefix with no objects is no segment, as a missing directory is not
+            return false;
+        }
+        std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.path < b.path; });
+        return true;
+    }
     std::error_code ec;
     if (!std::filesystem::is_directory(dir, ec)) {
         return false;
@@ -401,6 +431,61 @@ bool dataset_commit_index_segments(const std::filesystem::path& dataset_path, co
     return true;
 }
 
+namespace {
+
+/// A staged partition file: `part_<fragment>_nanolance.json` (see the INVERTED staging in the Python bindings).
+bool is_staged_part(const std::string& name) {
+    return name.rfind("part_", 0) == 0 && ends_with(name, "_nanolance.json");
+}
+
+}  // namespace
+
+bool dataset_write_staged_part(const std::filesystem::path& dataset_path, const std::string& uuid_text,
+                               const std::string& name, const std::vector<std::uint8_t>& bytes, std::string& error) {
+    auto out = io::open_output((dataset_path / "_indices" / uuid_text / name).string(), error);
+    if (!out) {
+        return false;
+    }
+    out->write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    return out->commit(error);
+}
+
+bool dataset_read_staged_parts(const std::filesystem::path& dataset_path, const std::string& uuid_text,
+                               std::vector<std::pair<std::string, std::vector<std::uint8_t>>>& parts,
+                               std::string& error) {
+    parts.clear();
+    const auto dir = (dataset_path / "_indices" / uuid_text).string();
+    std::vector<io::DirEntry> entries;
+    if (!io::list_dir(dir, entries, error)) {
+        return false;
+    }
+    std::vector<std::string> names;
+    for (const auto& entry : entries) {
+        if (!entry.is_dir && is_staged_part(entry.name)) {
+            names.push_back(entry.name);
+        }
+    }
+    std::sort(names.begin(), names.end());
+    for (const auto& name : names) {
+        std::vector<std::uint8_t> bytes;
+        if (!io::read_all(dir + "/" + name, bytes, error)) {
+            return false;
+        }
+        parts.emplace_back(name, std::move(bytes));
+    }
+    return true;
+}
+
+bool dataset_remove_staged_parts(const std::filesystem::path& dataset_path, const std::string& uuid_text,
+                                 const std::vector<std::string>& names, std::string& error) {
+    for (const auto& name : names) {
+        if (!io::remove_output((dataset_path / "_indices" / uuid_text / name).string(), error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool dataset_index_segments(const std::filesystem::path& dataset_path, std::uint64_t version, const std::string& name,
                             std::vector<std::array<std::uint8_t, 16>>& out, std::string& error,
                             SegmentErrorKind& kind) {
@@ -576,7 +661,7 @@ bool dataset_build_index_segment(const std::filesystem::path& dataset_path, cons
     };
     static const std::set<std::string> types = {"BTREE",    "BITMAP", "LABEL_LIST", "INVERTED", "ZONEMAP",
                                                 "BLOOMFILTER", "NGRAM", "IVF_FLAT", "IVF_SQ", "IVF_PQ", "IVF_HNSW_FLAT",
-                                                "IVF_HNSW_SQ", "IVF_HNSW_PQ"};
+                                                "IVF_HNSW_SQ", "IVF_HNSW_PQ", "IVF_RQ"};
     if (types.count(build.type) == 0U) {
         return fail(error, kind, SegmentErrorKind::Other,
                     "index type '" + build.type + "' is not supported for an index segment");
@@ -637,6 +722,7 @@ bool dataset_build_index_segment(const std::filesystem::path& dataset_path, cons
         m.m = build.type == "IVF_PQ" || build.type == "IVF_HNSW_PQ" ? v.num_sub_vectors : 0U;
         m.has_codebook = !build.pq_codebook.empty();
         m.codebook = build.pq_codebook;
+        m.rq_signs = v.rq_signs;
         m.has_sq = false;
         m.hnsw_m = v.hnsw_m;
         m.hnsw_ef_construction = v.hnsw_ef_construction;
@@ -806,8 +892,13 @@ bool dataset_merge_index_segments(const std::filesystem::path& dataset_path,
             if (m.dim != first.dim) {
                 return mismatch("Dimension mismatch across shards");
             }
-            if (!close(m.centroids, first.centroids)) {
+            if (!close(m.centroids, first.centroids) || m.binary_centroids != first.binary_centroids) {
                 return mismatch("IVF centroids mismatch across shards");
+            }
+            if (m.type == "IVF_RQ") {  // one rotation for every shard (Lance's shared rabitq_model)
+                if (m.nbits != first.nbits || m.rq_signs != first.rq_signs) {
+                    return mismatch("IVF_RQ merge: the shards do not share one RaBitQ model");
+                }
             }
             if (m.type == "IVF_PQ" || m.type == "IVF_HNSW_PQ") {
                 if (m.m != first.m || m.nbits != first.nbits) {
@@ -878,6 +969,7 @@ bool dataset_train_vector_model(const std::filesystem::path& dataset_path, std::
     out.dim = trained.dim;
     out.partitions = trained.partitions;
     out.centroids = std::move(trained.centroids);
+    out.binary_centroids = std::move(trained.binary_centroids);
     out.codebook = std::move(trained.codebook);
     return true;
 }

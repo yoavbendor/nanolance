@@ -31,7 +31,7 @@ def _base_data_dir(dataset_uri: str, base_paths: list, base_id: Optional[int]) -
     """The directory of a data file in base ``base_id`` (the manifest's ``base_paths`` entries): the
     dataset's own ``data/`` when there is no base, else the base's path, or its ``data/`` when it is a
     dataset root. Lance's rule, as the reader applies it."""
-    if not base_id:
+    if base_id is None:
         return os.path.join(dataset_uri, "data")
     for base in base_paths:
         if base["id"] == base_id:

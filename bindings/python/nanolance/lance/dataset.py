@@ -27,7 +27,7 @@ import pyarrow.dataset
 
 from nanolance import _nanolance
 from nanolance.lance import _native_log
-from nanolance.lance._errors import NotSupportedError, native, unsupported
+from nanolance.lance._errors import NotSupportedError, index_build, native, refuse_object_store_write, unsupported
 from nanolance.lance._sql import SqlQueryBuilder
 from nanolance.lance.base_path import (_base_data_dir, _DatasetBases, _fragment_targets, _new_base_dicts)
 from nanolance.lance._session import Session, note_data_files, note_indexes, note_manifest
@@ -107,12 +107,36 @@ def _path_of(uri: Union[str, Path, "LanceDataset"]) -> str:
         return os.path.join(_memory_root(), text[len("memory://"):].strip("/") or "_root")
     if text.startswith("file://"):
         text = text[len("file://"):]
+    elif text.startswith("s3://"):
+        return text  # an object-store dataset: read through nanos3reader, by its uri
     elif "://" in text:
         raise unsupported(f"the storage scheme of {text!r} (local paths only)")
     return os.path.abspath(os.path.expanduser(text))
 
 
+def _register_storage(uri, storage_options) -> None:
+    """The bucket's credentials and endpoint (pylance's storage_options keys) for the native calls that follow
+    a write to s3:// given them, as write_dataset and an open do; without them the bucket's options stay."""
+    if storage_options is None:
+        return
+    path = _path_of(uri)
+    if path.startswith("s3://"):
+        with native():
+            _nanolance._set_storage_options(path, {str(k): str(v) for k, v in storage_options.items()})
+
+
 def _exists(path: str) -> bool:
+    if path.startswith("s3://"):
+        # One LIST of _versions/. Only "not found" means absent: any other failure (the network, the
+        # credentials) is raised, never taken for an empty dataset.
+        try:
+            with native():
+                _nanolance._ds_latest_version(path)
+        except (OSError, ValueError) as exc:
+            if "was not found" in str(exc):
+                return False
+            raise
+        return True
     return os.path.isdir(os.path.join(path, "_versions")) and any(
         name.endswith(".manifest") for name in os.listdir(os.path.join(path, "_versions"))
     )
@@ -310,6 +334,30 @@ def _scan_statistics(before: tuple, after: tuple) -> ScanStatistics:
                           iops=reads, parts_loaded=misses, requests=reads)
 
 
+def _is_vector_column(storage) -> bool:
+    """A vector column: a fixed-size list, or a multivector column (a list of fixed-size lists)."""
+    return pa.types.is_fixed_size_list(storage) or (
+        pa.types.is_list(storage) and pa.types.is_fixed_size_list(storage.value_type))
+
+
+def _rq_signs(model, dim: int, num_bits: int) -> bytes:
+    """The fast rotation's sign bytes of a build_rq_model (JSON text, bytes or a dict), checked against the
+    column's dimension and num_bits. A dense rotation is refused."""
+    import json
+
+    if isinstance(model, dict):
+        spec = model
+    else:
+        spec = json.loads(model.decode() if isinstance(model, (bytes, bytearray)) else str(model))
+    if spec.get("rotation_type") != "fast" or spec.get("rotate_mat_position") is not None:
+        raise unsupported("rabitq_model with a dense rotation")
+    if int(spec.get("code_dim", -1)) != dim:
+        raise ValueError(f"rabitq_model is for dimension {spec.get('code_dim')}, not {dim}")
+    if int(spec.get("num_bits", -1)) != int(num_bits):
+        raise ValueError(f"rabitq_model is for num_bits {spec.get('num_bits')}, not {num_bits}")
+    return bytes(int(b) for b in spec["fast_rotation_signs"])
+
+
 class LanceDataset(pa.dataset.Dataset):
     """A Lance dataset at a version. Mirrors ``lance.LanceDataset``."""
 
@@ -340,15 +388,26 @@ class LanceDataset(pa.dataset.Dataset):
         self._index_cache_hits = 0
         self._index_cache_misses = 0
         if isinstance(version, str):
-            version = _tag_version(self._uri, version, ValueError)
+            # A tag's branch is read from the dataset's root (tags are kept there), so the root comes first.
+            with native():
+                probe = _nanolance._ds_info(self._uri, None)
+            root = _root_of(self._uri, probe["branch"])
+            branch, version = _tag_target(root, version, ValueError)
+            self._uri = _branch_uri(root, branch) if branch is not None else root
         self._storage_options = storage_options
         self._default_scan_options = dict(default_scan_options or {})
         try:
             with native():
+                if self._uri.startswith("s3://") and storage_options is not None:
+                    # The bucket's options (pylance's storage_options keys) apply to the reads of this open;
+                    # an open without them keeps the bucket's current ones (a write in progress, an earlier open).
+                    options = {str(k): str(v) for k, v in storage_options.items()}
+                    _nanolance._set_storage_options(self._uri, options)
                 info = _nanolance._ds_info(self._uri, version)
         except Exception:
             _native_log.loading(self._log_uri, status="error")
             raise
+        self._root = _root_of(self._uri, info["branch"])
         _native_log.loading(self._log_uri, status="success", version=int(info["version"]))
         _native_log.debug("nanolance::dataset", f"opened {self._log_uri} at version {int(info['version'])}")
         self._pinned = version is not None
@@ -504,7 +563,7 @@ class LanceDataset(pa.dataset.Dataset):
         return f"LanceDataset(uri={self._uri!r}, version={self._version})"
 
     def __getstate__(self):
-        return {"uri": self._uri, "version": self._version, "pinned": self._pinned}
+        return {"uri": self._uri, "version": self._version, "pinned": self._pinned}  # no credentials pickled
 
     def __reduce__(self):  # over pyarrow.dataset.Dataset's, which would pickle a native dataset
         return (_restore_dataset, (self.__getstate__(),))
@@ -514,7 +573,7 @@ class LanceDataset(pa.dataset.Dataset):
         self._pinned = state.get("pinned", True)
 
     def __copy__(self):
-        return LanceDataset(self._uri, version=self._version)
+        return LanceDataset(self._uri, version=self._version, storage_options=self._storage_options)
 
     # ── versions ──────────────────────────────────────────────────────────────────────────────────
 
@@ -542,6 +601,10 @@ class LanceDataset(pa.dataset.Dataset):
     @property
     def tags(self) -> "Tags":
         return Tags(self)
+
+    @property
+    def branches(self) -> "Branches":
+        return Branches(self)
 
     def cleanup_old_versions(self, older_than: Optional[timedelta] = None, retain_versions: Optional[int] = None, *,
                              delete_unverified: bool = False, error_if_tagged_old_versions: bool = True,
@@ -571,6 +634,8 @@ class LanceDataset(pa.dataset.Dataset):
 
     def _cleanup(self, older_than, retain_versions, delete_unverified, error_if_tagged, delete_rate_limit, versions,
                  execute, max_files):
+        if execute:
+            refuse_object_store_write(self._uri, "cleanup")
         if older_than is None and retain_versions is None and versions is None:
             older_than = timedelta(days=14)
         older_than_ns = None
@@ -591,20 +656,66 @@ class LanceDataset(pa.dataset.Dataset):
              ignore_not_found: Optional[bool] = None) -> None:
         """Delete the dataset and everything under ``base_uri``. Refused (ValueError) unless the path
         holds a manifest that reads, as Lance refuses, so a parent directory given by mistake survives."""
+        _register_storage(base_uri, storage_options)
         with _ref_errors():
             _nanolance._ds_drop(_path_of(base_uri), bool(ignore_not_found))
 
+    @property
+    def _branch(self) -> Optional[str]:
+        """The branch this dataset's version is on (None: main)."""
+        return self._info["branch"] or None
+
+    def create_branch(self, name: str, reference=None) -> "LanceDataset":
+        """Create branch ``name`` forked from ``reference``: this dataset's version on its branch (``None``), an
+        int version of it, a tag, or ``(branch, version)`` (``"main"`` or None is main; a None version is that
+        branch's latest). Returns the branch at its first version, opened at ``<root>/tree/<name>``."""
+        branch, version = _reference(self, reference, (self._branch, self._version))
+        if version == 0:
+            version = _latest_of(self._root, branch)
+        with _branch_errors():
+            _nanolance._ds_create_branch(self._root, str(name), branch, int(version))
+        return LanceDataset(_branch_uri(self._root, str(name)), storage_options=self._storage_options)
+
+    def shallow_clone(self, target_path, reference, storage_options: Optional[Dict[str, str]] = None,
+                      **kwargs) -> "LanceDataset":
+        """Clone ``reference`` (an int version of this dataset's branch, a tag, or ``(branch, version)``) into a new
+        dataset at ``target_path``. The clone's files stay in this dataset, reached through a base path; nothing
+        is copied. Returns the clone, opened."""
+        return self._clone(target_path, reference, False, storage_options, kwargs)
+
+    def deep_clone(self, target_path, reference, storage_options: Optional[Dict[str, str]] = None,
+                   **kwargs) -> "LanceDataset":
+        """As ``shallow_clone``, but the data, deletion and index files the version names are copied into the
+        clone, which reads on after this dataset is deleted."""
+        return self._clone(target_path, reference, True, storage_options, kwargs)
+
+    def _clone(self, target_path, reference, deep: bool, storage_options, kwargs) -> "LanceDataset":
+        target = _path_of(target_path)
+        _register_storage(target, storage_options)
+        if isinstance(reference, str):
+            branch, version = _tag_target(self._root, reference, OSError)
+        else:
+            branch, version = _reference(self, reference, (self._branch, self._version))
+        if version == 0:
+            version = _latest_of(self._root, branch)
+        with _clone_errors():
+            _nanolance._ds_clone(self._root, branch, int(version), target, bool(deep))
+        if storage_options is None:
+            storage_options = self._storage_options
+        return LanceDataset(target, storage_options=storage_options, **kwargs)
+
     def checkout_version(self, version) -> "LanceDataset":
         if isinstance(version, str):
-            version = _tag_version(self._uri, version, OSError)
+            version = _tag_target(self._root, version, OSError)
         if isinstance(version, tuple):
             branch, number = version
-            if branch not in (None, "main"):
-                raise unsupported("branches")
-            version = number
+            if branch in (None, "main"):
+                return LanceDataset(self._root, version=number, storage_options=self._storage_options)
+            uri = _existing_branch_uri(self._root, branch)
+            return LanceDataset(uri, version=number, storage_options=self._storage_options)
         if version is None:
-            return LanceDataset(self._uri)
-        return LanceDataset(self._uri, version=version)
+            return LanceDataset(self._uri, storage_options=self._storage_options)
+        return LanceDataset(self._uri, version=version, storage_options=self._storage_options)
 
     def checkout_latest(self) -> "LanceDataset":
         with native():
@@ -614,7 +725,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def restore(self) -> None:
         with native():
-            _nanolance._ds_restore(self._uri, self._version)
+            _nanolance._ds_restore(self._uri, self._version, self._version)
         self._refresh_latest("Restore")
 
     # ── config and metadata ───────────────────────────────────────────────────────────────────────
@@ -629,13 +740,13 @@ class LanceDataset(pa.dataset.Dataset):
             remove = sorted(set(remove) | (set(current) - set(values)))
         upsert = {k: str(v) for k, v in values.items() if v is not None}
         with native():
-            _nanolance._ds_update_config(self._uri, upsert, remove)
+            _nanolance._ds_update_config(self._uri, upsert, remove, self._version)
         self._refresh_latest("UpdateConfig")
         return self.config()
 
     def delete_config_keys(self, keys: List[str]) -> None:
         with native():
-            _nanolance._ds_update_config(self._uri, {}, list(keys))
+            _nanolance._ds_update_config(self._uri, {}, list(keys), self._version)
         self._refresh_latest("UpdateConfig")
 
     @property
@@ -650,7 +761,7 @@ class LanceDataset(pa.dataset.Dataset):
             else:
                 merged[k] = str(v)
         with native():
-            _nanolance._ds_update_table_metadata(self._uri, merged, True)
+            _nanolance._ds_update_table_metadata(self._uri, merged, True, self._version)
         self._refresh_latest("UpdateConfig")
         return self.metadata
 
@@ -666,7 +777,7 @@ class LanceDataset(pa.dataset.Dataset):
             else:
                 merged[k] = str(v)
         with native():
-            _nanolance._ds_update_schema_metadata(self._uri, merged, True)
+            _nanolance._ds_update_schema_metadata(self._uri, merged, True, self._version)
         self._refresh_latest("UpdateConfig")
         return self.schema_metadata
 
@@ -1021,7 +1132,7 @@ class LanceDataset(pa.dataset.Dataset):
         if sql is None:
             raise ValueError("delete needs a predicate")
         with native():
-            deleted, _ = _nanolance._ds_delete(self._uri, sql)
+            deleted, _ = _nanolance._ds_delete(self._uri, sql, self._version)
         self._refresh_latest("Delete")
         return {"num_deleted_rows": int(deleted)}
 
@@ -1041,7 +1152,7 @@ class LanceDataset(pa.dataset.Dataset):
             addresses = self.to_table(columns=[], filter=sql, with_row_address=True).column("_rowaddr")
             allowlist, sql = serialize_row_addrs(addresses.to_pylist()), None
         with native():
-            updated, _ = _nanolance._ds_update(self._uri, sql, assignments, allowlist)
+            updated, _ = _nanolance._ds_update(self._uri, sql, assignments, allowlist, self._version)
         self._refresh_latest("Update")
         return {"num_rows_updated": int(updated)}
 
@@ -1054,20 +1165,20 @@ class LanceDataset(pa.dataset.Dataset):
         if isinstance(transforms, dict):
             columns = [(str(k), str(v)) for k, v in transforms.items()]
             with native():
-                _nanolance._ds_add_columns_sql(self._uri, columns)
+                _nanolance._ds_add_columns_sql(self._uri, columns, self._version)
         elif isinstance(transforms, (pa.Field, pa.Schema)) or (
             isinstance(transforms, list) and transforms and all(isinstance(f, pa.Field) for f in transforms)
         ):
             fields = [transforms] if isinstance(transforms, pa.Field) else list(transforms)
             with native():
-                _nanolance._ds_add_columns_nulls(self._uri, pa.schema(fields))
+                _nanolance._ds_add_columns_nulls(self._uri, pa.schema(fields), self._version)
         elif callable(transforms):
             self._add_columns_udf(transforms, read_columns, batch_size)
             return
         else:
             reader = _coerce_reader(transforms, reader_schema)
             with native():
-                _nanolance._ds_add_columns_stream(self._uri, reader)
+                _nanolance._ds_add_columns_stream(self._uri, reader, self._version)
         self._refresh_latest("Merge")
 
     def _add_columns_udf(self, transforms, read_columns, batch_size) -> None:
@@ -1126,14 +1237,14 @@ class LanceDataset(pa.dataset.Dataset):
         added = pa.table(added.columns, schema=pa.schema(fields, metadata=added.schema.metadata))
         with native():
             _nanolance._ds_add_columns_stream(self._uri, pa.RecordBatchReader.from_batches(
-                added.schema, added.to_batches()))
+                added.schema, added.to_batches()), self._version)
         self._refresh_latest("Merge")
 
     def drop_columns(self, columns: List[str]) -> None:
         if isinstance(columns, str):
             columns = [columns]
         with native():
-            _nanolance._ds_drop_columns(self._uri, [str(c) for c in columns])
+            _nanolance._ds_drop_columns(self._uri, [str(c) for c in columns], self._version)
         self._refresh_latest("Project")
 
     def alter_columns(self, *alterations) -> None:
@@ -1149,11 +1260,12 @@ class LanceDataset(pa.dataset.Dataset):
                 item["data_type"] = pa.field("x", item["data_type"])
             items.append(item)
         with native():
-            _nanolance._ds_alter_columns(self._uri, items)
+            _nanolance._ds_alter_columns(self._uri, items, self._version)
         self._refresh_latest("Project")
 
     # ── indices ───────────────────────────────────────────────────────────────────────────────────
 
+    @index_build
     def create_scalar_index(self, column: str, index_type: str, name: Optional[str] = None, *,
                             replace: bool = True, train: bool = True, fragment_ids: Optional[List[int]] = None,
                             index_uuid: Optional[str] = None, **kwargs) -> "LanceDataset":
@@ -1186,6 +1298,11 @@ class LanceDataset(pa.dataset.Dataset):
                              f'index_type="{kind}", fragment_ids=...)')
         uuid_bytes = _parse_index_uuid(index_uuid)
         if kind == "INVERTED":
+            if is_config and kwargs.get("document_granularity") is not None and \
+                    _granularity_name(kwargs["document_granularity"]) == "list_element":
+                # A list-element index takes its IndexConfig's parameters (positions for phrases). Other
+                # INVERTED builds keep ignoring them, as they always have.
+                kwargs = {**config, **kwargs}
             if fragment_ids is not None:
                 return self._stage_inverted_part(column, name, fragment_ids, uuid_bytes, kwargs)
             return self._create_inverted_index(column, name, replace, kwargs)
@@ -1200,7 +1317,7 @@ class LanceDataset(pa.dataset.Dataset):
             raise unsupported(f"create_scalar_index options {sorted(kwargs) + sorted(config)}")
         with native():
             _nanolance._ds_create_scalar_index(self._uri, str(column), kind, name or "", bool(replace), rows_per_zone,
-                                               number_of_items, probability, None)
+                                               number_of_items, probability, None, self._version)
         self._refresh_latest("CreateIndex")
         return self
 
@@ -1231,7 +1348,7 @@ class LanceDataset(pa.dataset.Dataset):
                                     "(supported: an optional '$', then dot-separated names)")
         with native():
             _nanolance._ds_create_scalar_index(self._uri, str(column), "BTREE", name or "", bool(replace), 0, 0, 0.0,
-                                               path)
+                                               path, self._version)
         self._refresh_latest("CreateIndex")
         return self
 
@@ -1333,8 +1450,7 @@ class LanceDataset(pa.dataset.Dataset):
                     raise TypeError("'None' is not an instance of 'str'")
                 if value is not None or key in ("max_token_length", "custom_stop_words"):
                     params[key] = value
-        for ignored in ("num_workers", "memory_limit", "progress", "train", "progress_callback",
-                        "document_granularity"):
+        for ignored in ("num_workers", "memory_limit", "progress", "train", "progress_callback"):
             kwargs.pop(ignored, None)
         if kwargs:
             raise unsupported(f"INVERTED index options {sorted(kwargs)}")
@@ -1342,14 +1458,40 @@ class LanceDataset(pa.dataset.Dataset):
         LanceDataset._inverted_format_and_block(params)
         return json.dumps(params)
 
+    @staticmethod
+    def _document_granularity(kwargs) -> str:
+        """The ``document_granularity`` argument (taken out of kwargs): "row" or "list_element"."""
+        from nanolance.lance.query import DocumentGranularity
+
+        value = kwargs.pop("document_granularity", None)
+        if value is None:
+            return DocumentGranularity.ROW.value
+        try:
+            return DocumentGranularity(value).value
+        except ValueError:
+            raise ValueError(f"unknown document granularity {value!r}") from None
+
     def _create_inverted_index(self, column, name, replace, kwargs) -> "LanceDataset":
+        progress_callback = kwargs.pop("progress_callback", None)
+        granularity = self._document_granularity(kwargs)
         params = self._inverted_params(kwargs)
         if isinstance(column, (list, tuple)):
             if len(column) != 1:
                 raise unsupported("an index over more than one column")
             column = column[0]
+        native_progress = None
+        if progress_callback is not None:
+            from nanolance.lance.progress import IndexProgress
+
+            events = ("start", "progress", "complete")
+
+            def native_progress(event, stage, total, unit, completed):
+                # Every event carries its count: complete reports the stage's last one, as pylance's does.
+                progress_callback(IndexProgress(events[event], stage, completed, total or None, unit))
         with _lance_errors():
-            _nanolance._ds_create_inverted_index(self._uri, str(column), name or "", bool(replace), params)
+            extra = () if native_progress is None else (native_progress,)  # the callback only when given
+            _nanolance._ds_create_inverted_index(self._uri, str(column), name or "", bool(replace), params,
+                                                 granularity, self._version, *extra)
         self._refresh_latest("CreateIndex")
         return self
 
@@ -1359,6 +1501,8 @@ class LanceDataset(pa.dataset.Dataset):
         import json
         import uuid as uuid_module
 
+        if self._document_granularity(kwargs) != "row":
+            raise unsupported("a distributed INVERTED build over list elements")
         params = self._inverted_params(kwargs)
         fragments = sorted({int(f) for f in fragment_ids})
         known = {f["id"] for f in self._info["fragments"]}
@@ -1368,12 +1512,11 @@ class LanceDataset(pa.dataset.Dataset):
         if self._field(str(column)) is None:
             raise ValueError(f"column '{column}' does not exist")
         segment = str(uuid_module.UUID(bytes=uuid_bytes)) if uuid_bytes else str(uuid_module.uuid4())
-        directory = os.path.join(self._uri, "_indices", segment)
-        os.makedirs(directory, exist_ok=True)
         part = {"column": str(column), "name": name or "", "params": json.loads(params),
                 "dataset_version": self._version, "fragment_ids": fragments}
-        with open(os.path.join(directory, f"part_{fragments[0]}_nanolance.json"), "w") as handle:
-            json.dump(part, handle)
+        with _lance_errors():
+            _nanolance._index_stage_write(self._uri, segment, f"part_{fragments[0]}_nanolance.json",
+                                          json.dumps(part).encode())
         return self
 
     def merge_index_metadata(self, index_uuid: str, index_type: str, batch_readhead: Optional[int] = None,
@@ -1406,15 +1549,15 @@ class LanceDataset(pa.dataset.Dataset):
                 progress_callback(IndexProgress(event, stage, completed, total, unit))
 
         directory = os.path.join(self._uri, "_indices", str(index_uuid))
-        names = sorted(n for n in (os.listdir(directory) if os.path.isdir(directory) else [])
-                       if n.startswith("part_") and n.endswith("_nanolance.json"))
-        if not names:
+        with _lance_errors():
+            staged = _nanolance._index_stage_read(self._uri, str(index_uuid))
+        if not staged:
             raise OSError(f"No partition metadata files found in index directory: {directory}")
+        names = [name for name, _ in staged]
         report("start", "read_partition_metadata", 0, len(names), "partitions")
         parts = []
-        for i, part_name in enumerate(names):
-            with open(os.path.join(directory, part_name)) as handle:
-                parts.append(json.load(handle))
+        for i, (_, text) in enumerate(staged):
+            parts.append(json.loads(text))
             report("progress", "read_partition_metadata", i + 1, len(names), "partitions")
         report("complete", "read_partition_metadata", len(names), len(names), "partitions")
         fragments = sorted({f for p in parts for f in p["fragment_ids"]})
@@ -1424,8 +1567,8 @@ class LanceDataset(pa.dataset.Dataset):
             _nanolance._index_build_segment(self._uri, first["column"], "INVERTED", first["name"],
                                             min(p["dataset_version"] for p in parts), fragments, uuid_bytes,
                                             json.dumps(first["params"]), {}, None, None)
-        for part_name in names:  # built: the staged parts are done with (kept if the build failed)
-            os.remove(os.path.join(directory, part_name))
+        with _lance_errors():  # built: the staged parts are done with (kept if the build failed)
+            _nanolance._index_stage_remove(self._uri, str(index_uuid), names)
         report("progress", "remap_partition_files", len(fragments), len(fragments), "fragments")
         report("complete", "remap_partition_files", len(fragments), len(fragments), "fragments")
         report("start", "write_merged_metadata", 0, 1, "files")
@@ -1495,12 +1638,24 @@ class LanceDataset(pa.dataset.Dataset):
                 if centroids is None:
                     raise ValueError("pq_codebook requires ivf_centroids")
                 codebook = _float32_matrix(pq_codebook, dim)
+            rabitq_model = kwargs.pop("rabitq_model", None)
+            if rabitq_model is not None and kind != "IVF_RQ":
+                raise ValueError(f"rabitq_model is for IVF_RQ indexes, not {kind}")
             vector = {"metric": str(metric).lower(), "num_partitions": num_partitions,
                       "target_partition_size": target_partition_size, "num_sub_vectors": num_sub_vectors,
-                      "num_bits": kwargs.pop("num_bits", 8), "max_iters": kwargs.pop("max_iters", 50),
+                      "num_bits": kwargs.pop("num_bits", 5 if kind == "IVF_RQ" else 8),
+                      "max_iters": kwargs.pop("max_iters", 50),
                       "sample_rate": kwargs.pop("sample_rate", 256), "seed": kwargs.pop("seed", None),
                       "m": kwargs.pop("m", 20), "ef_construction": kwargs.pop("ef_construction", 150),
                       "max_level": kwargs.pop("max_level", 7)}
+            if kind == "IVF_RQ":
+                if dim % 8:
+                    raise ValueError("vector dimension must be divisible by 8 for IVF_RQ")
+                vector["skip_transpose"] = bool(kwargs.pop("skip_transpose", False))
+                if not 1 <= int(vector["num_bits"]) <= 9:
+                    raise ValueError(f"Invalid user input: IVF_RQ num_bits must be in 1..=9, got {vector['num_bits']}")
+                if rabitq_model is not None:
+                    vector["rq_signs"] = _rq_signs(rabitq_model, dim, vector["num_bits"])
             for ignored in ("one_pass_ivfpq", "skip_transpose", "streaming_sample_rate", "streaming_coreset_rate",
                             "streaming_refine_passes", "progress", "progress_callback", "kmeans_redos"):
                 kwargs.pop(ignored, None)
@@ -1576,9 +1731,11 @@ class LanceDataset(pa.dataset.Dataset):
         if field is None:
             raise KeyError(f"{column} not found in schema")
         storage = getattr(field.type, "storage_type", field.type)
-        if not pa.types.is_fixed_size_list(storage):
+        if not _is_vector_column(storage):
             raise TypeError(f"Vector column {column} must be FixedSizeListArray 1-dimensional "
                             f"FixedShapeTensorArray, got {field.type}")
+        if pa.types.is_list(storage):  # a multivector column: the dimension of its vectors
+            storage = storage.value_type
         return storage.list_size
 
     def _field(self, column: str) -> Optional[pa.Field]:
@@ -1591,9 +1748,11 @@ class LanceDataset(pa.dataset.Dataset):
         return field
 
     _VECTOR_INDEX_TYPES = ["IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ", "IVF_HNSW_SQ", "IVF_RQ"]
-    # The kinds nanolance builds (create_index, create_index_uncommitted); IVF_RQ is not built yet.
-    _BUILDABLE_VECTOR_INDEX_TYPES = ("IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ", "IVF_HNSW_SQ")
+    # The kinds nanolance builds (create_index, create_index_uncommitted).
+    _BUILDABLE_VECTOR_INDEX_TYPES = ("IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_RQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ",
+                                     "IVF_HNSW_SQ")
 
+    @index_build
     def create_index(self, column, index_type: str, name: Optional[str] = None, metric: str = "L2",
                      replace: bool = False, num_partitions: Optional[int] = None, ivf_centroids=None,
                      pq_codebook=None, num_sub_vectors: Optional[int] = None, accelerator=None,
@@ -1602,8 +1761,9 @@ class LanceDataset(pa.dataset.Dataset):
                      precomputed_partition_dataset=None, storage_options=None, filter_nan: bool = True,
                      train: bool = True, fragment_ids=None, index_uuid=None, *,
                      target_partition_size: Optional[int] = None, **kwargs) -> "LanceDataset":
-        """Build an index on `column`, in Lance's format. IVF_FLAT, IVF_SQ, IVF_PQ, IVF_HNSW_FLAT, IVF_HNSW_PQ and IVF_HNSW_SQ vector indexes
-        (pylance and LanceDB search them as their own); scalar index types go to create_scalar_index."""
+        """Build an index on `column`, in Lance's format. IVF_FLAT, IVF_SQ, IVF_PQ, IVF_RQ, IVF_HNSW_FLAT, IVF_HNSW_PQ and
+        IVF_HNSW_SQ vector indexes (pylance and LanceDB search them as their own); scalar index types go to
+        create_scalar_index. IVF_RQ takes num_bits (1 to 9, default 5) and skip_transpose."""
         kind = str(index_type).upper()
         if isinstance(column, (list, tuple)):
             if len(column) != 1:
@@ -1620,7 +1780,7 @@ class LanceDataset(pa.dataset.Dataset):
                               ("fragment_ids", fragment_ids), ("index_uuid", index_uuid)):
             if value is not None:
                 raise unsupported(f"create_index option {option}")
-        if not train:  # pylance refuses an empty vector index too, before writing anything
+        if not train or (kind == "IVF_RQ" and self.count_rows() == 0):  # pylance refuses an empty vector index too
             raise NotImplementedError(
                 f"Not supported: Creating empty vector indices with train=False is not yet implemented. "
                 f"Index '{name or f'{column}_idx'}' for column '{column}' cannot be created without training.")
@@ -1635,7 +1795,11 @@ class LanceDataset(pa.dataset.Dataset):
         skip_transpose = bool(kwargs.pop("skip_transpose", False))
         if kind in ("IVF_PQ", "IVF_HNSW_PQ") and num_sub_vectors is None:
             raise ValueError(f"num_partitions and num_sub_vectors are required for {kind}")
-        num_bits = int(kwargs.pop("num_bits", 8))
+        if kind == "IVF_RQ" and self._vector_dimension(str(column)) % 8:
+            raise ValueError("vector dimension must be divisible by 8 for IVF_RQ")
+        if kind == "IVF_RQ" and not 1 <= int(kwargs.get("num_bits", 5)) <= 9:
+            raise ValueError(f"Invalid user input: IVF_RQ num_bits must be in 1..=9, got {kwargs.get('num_bits')}")
+        num_bits = int(kwargs.pop("num_bits", 5 if kind == "IVF_RQ" else 8))
         max_iters = int(kwargs.pop("max_iters", 50))
         sample_rate = int(kwargs.pop("sample_rate", 256))
         seed = kwargs.pop("seed", None)
@@ -1650,7 +1814,7 @@ class LanceDataset(pa.dataset.Dataset):
         field = next((f for f in self._data_schema if f.name == str(column)), None)
         if field is not None:
             storage = getattr(field.type, "storage_type", field.type)
-            if not pa.types.is_fixed_size_list(storage):
+            if not _is_vector_column(storage):
                 raise TypeError(f"Vector column {column} must be FixedSizeListArray 1-dimensional "
                                 f"FixedShapeTensorArray, got {field.type}")
         centroids_bytes = codebook_bytes = None
@@ -1681,8 +1845,7 @@ class LanceDataset(pa.dataset.Dataset):
 
             def native_progress(event, stage, total, unit, completed):
                 try:
-                    progress_callback(IndexProgress(events[event], stage, completed if event == 1 else None,
-                                                    total or None, unit or None))
+                    progress_callback(IndexProgress(events[event], stage, completed, total or None, unit or None))
                 except BaseException as exc:
                     callback_errors.append(exc)  # the build stops; the callback's error is raised as is
                     raise
@@ -1694,7 +1857,7 @@ class LanceDataset(pa.dataset.Dataset):
                     None if target_partition_size is None else int(target_partition_size),
                     0 if num_sub_vectors is None else int(num_sub_vectors), num_bits, max_iters, sample_rate,
                     None if seed is None else int(seed), hnsw_m, ef_construction, max_level,
-                    centroids_bytes, codebook_bytes, skip_transpose, native_progress)
+                    centroids_bytes, codebook_bytes, skip_transpose, self._version, native_progress)
         except Exception:
             if callback_errors:
                 raise callback_errors[0] from None
@@ -1722,7 +1885,7 @@ class LanceDataset(pa.dataset.Dataset):
     def list_indices(self) -> List[Dict[str, Any]]:
         indices = self._raw_indices()
         return [{"name": i["name"], "type": i["type"], "uuid": i["uuid"], "fields": list(i["fields"]),
-                 "version": i["dataset_version"], "fragment_ids": set(i["fragment_ids"]), "base_id": None}
+                 "version": i["dataset_version"], "fragment_ids": set(i["fragment_ids"]), "base_id": i["base_id"]}
                 for i in indices]
 
     @property
@@ -1808,7 +1971,8 @@ class LanceDataset(pa.dataset.Dataset):
             return {}
         with native():
             built = _nanolance._ds_vector_index_details(os.path.join(self._uri, "_indices", index["uuid"]))
-        details = {"metric_type": {"l2": "L2", "cosine": "Cosine", "dot": "Dot"}[built["metric"]]}
+        details = {"metric_type": {"l2": "L2", "cosine": "Cosine", "dot": "Dot",
+                                   "hamming": "HAMMING"}[built["metric"]]}
         if built["pq"]:
             details["compression"] = {"type": "pq", "num_bits": built["num_bits"],
                                       "num_sub_vectors": built["num_sub_vectors"]}
@@ -1831,7 +1995,8 @@ class LanceDataset(pa.dataset.Dataset):
                 name=name, type_url=first["type_url"], index_type=first["type"] if first["type_url"] else "Unknown",
                 fields=list(first["field_ids"]), field_names=list(first["fields"]),
                 num_rows_indexed=sum(s["rows_indexed"] for s in segments),
-                total_size_bytes=sum(s["size_bytes"] for s in segments), details=self._index_details(first),
+                total_size_bytes=None if name == "__lance_frag_reuse" else sum(s["size_bytes"] for s in segments),
+                details=self._index_details(first),
                 segments=[IndexSegmentDescription(
                     uuid=s["uuid"], fragment_ids=set(s["fragment_ids"]), index_version=s["index_version"],
                     dataset_version_at_last_update=s["dataset_version"], size_bytes=s["size_bytes"],
@@ -1845,20 +2010,21 @@ class LanceDataset(pa.dataset.Dataset):
         return DatasetOptimizer(self)
 
     def read_transaction(self, version: int) -> Optional["Transaction"]:
-        """The transaction that made ``version``, from the file its manifest names; None without one."""
+        """The transaction that made ``version``: its transaction file, or the inline one in its manifest
+        (pylance 12 writes both); None without one."""
         from nanolance.lance._transactions import decode_transaction
 
         with native():
-            info = _nanolance._ds_info(self._uri, int(version))
-        name = info.get("transaction_file") or ""
-        if not name:
-            return None
-        try:
-            with open(os.path.join(self._uri, "_transactions", name), "rb") as handle:
-                data = handle.read()
-        except FileNotFoundError:
-            return None
-        return decode_transaction(data)
+            data = _nanolance._ds_transaction(self._uri, int(version))
+        return None if data is None else decode_transaction(data)
+
+    def migrate_manifest_paths_v2(self) -> None:
+        """Rename the V1 manifest names (``{version}.manifest``) to the V2 names pylance's default writes
+        (20 digits), as Lance's migrate_manifest_paths_v2 does. The dataset moves to its latest version."""
+        refuse_object_store_write(self._uri, "migrate manifest paths")
+        with native():
+            _nanolance._ds_migrate_manifest_paths_v2(self._uri)
+        self._refresh_latest("MigrateManifestPaths")
 
     def delta(self, compared_against: Optional[int] = None, *, begin_version: Optional[int] = None,
               end_version: Optional[int] = None) -> DatasetDelta:
@@ -2029,6 +2195,7 @@ class LanceDataset(pa.dataset.Dataset):
             raise TypeError(f"base_uri must be str, Path, or LanceDataset, got {type(base_uri)}")
         if commit_lock and not callable(commit_lock):
             raise TypeError(f"commit_lock must be a function, got {type(commit_lock)}")
+        _register_storage(base_uri, storage_options)
         if (isinstance(operation, LanceOperation.BaseOperation) and read_version is None
                 and not isinstance(operation, (LanceOperation.Overwrite, LanceOperation.Restore))):
             raise ValueError("read_version is required for all operations except Overwrite and Restore")
@@ -2105,6 +2272,7 @@ class LanceDataset(pa.dataset.Dataset):
             raise TypeError(f"base_uri must be str, Path, or LanceDataset, got {type(dest)}")
         if commit_lock and not callable(commit_lock):
             raise TypeError(f"commit_lock must be a function, got {type(commit_lock)}")
+        _register_storage(dest, storage_options)
         transactions = list(transactions)
         if not transactions:
             raise ValueError("Invalid user input: commit_batch needs at least one transaction")
@@ -2148,8 +2316,8 @@ class LanceDataset(pa.dataset.Dataset):
     def __getattr__(self, name: str):
         known = {
             "create_index",
-            "branches", "create_branch", "sql",
-            "shallow_clone", "deep_clone", "join",
+            "create_branch", "sql",
+            "join",
             "prewarm_index",
         }
         if name in known:
@@ -2337,28 +2505,132 @@ def _ref_errors():
         raise translate(text) from None
 
 
-def _tag_reference(ds: "LanceDataset", reference) -> int:
-    """A tag's target as pylance takes it: a version, another tag's name, ``(branch, version)`` on the
-    main branch (``None`` for the latest), or ``None`` for the latest; 0 means the latest."""
+@contextlib.contextmanager
+def _branch_errors():
+    """Branch errors as pylance raises them: a missing branch or version is a ValueError, a refused change an
+    OSError (its ``Ref`` messages, and "already exists")."""
+    try:
+        yield
+    except RuntimeError as exc:
+        text = str(exc)
+        if text.startswith(("Ref not found", "Version not found")):
+            raise ValueError(text) from None
+        if text.startswith("Ref "):
+            raise OSError(text) from None
+        from nanolance.lance._errors import translate
+
+        raise translate(text) from None
+
+
+@contextlib.contextmanager
+def _clone_errors():
+    """Clone errors as pylance raises them: a missing version, tag or branch and a target that already holds a
+    dataset are OSErrors (not the ValueErrors of a missing branch)."""
+    try:
+        yield
+    except RuntimeError as exc:
+        text = str(exc)
+        if "not found" in text or "already exists" in text:
+            raise OSError(text) from None
+        from nanolance.lance._errors import translate
+
+        raise translate(text) from None
+
+
+def _root_of(uri: str, branch: Optional[str]) -> str:
+    """The dataset root a dataset at ``uri`` on ``branch`` sits in: its uri without ``tree/<branch>``."""
+    if not branch:
+        return uri
+    suffix = os.path.join("tree", branch)
+    if not uri.rstrip("/").endswith(suffix):
+        raise OSError(f"Invalid user input: {uri} is not the location of branch {branch}")
+    return uri.rstrip("/")[: -len(suffix)].rstrip("/")
+
+
+def _branch_uri(root: str, branch: str) -> str:
+    """Where a branch's versions live: ``<root>/tree/<branch>``, as pylance lays it out."""
+    return os.path.join(root, "tree", branch)
+
+
+def _existing_branch_uri(root: str, branch: str) -> str:
+    """The location of ``branch``, which must exist: pylance's ValueError for one that does not."""
+    uri = _branch_uri(root, branch)
+    with native():
+        names = {b["name"] for b in _nanolance._ds_branches(root)}
+    if branch not in names:
+        raise ValueError(f"Not found: {os.path.join(uri, '_versions')}")
+    return uri
+
+
+def _tag_target(root: str, name: str, error_type) -> Tuple[Optional[str], int]:
+    """A tag's ``(branch, version)`` in the dataset at ``root``; branch None is main."""
+    for tag in _nanolance._ds_tags(root):
+        if tag["name"] == name:
+            return tag["branch"], int(tag["version"])
+    raise error_type(f"Ref not found error: tag {name} does not exist")
+
+
+def _reference(ds: "LanceDataset", reference, unset: Tuple[Optional[str], int]) -> Tuple[Optional[str], int]:
+    """A reference as ``(branch, version)``, branch None for main and version 0 for that branch's latest: an
+    int is a version of this dataset's branch, a tag name is the tag's ``(branch, version)``, a
+    ``(branch, version)`` tuple is as given (``"main"`` is main; ``None`` the latest). ``None`` itself is
+    ``unset``."""
     if reference is None:
-        return 0
+        return unset
     if isinstance(reference, str):
-        return _tag_version(ds.uri, reference, ValueError)
+        return _tag_target(ds._root, reference, ValueError)
     if isinstance(reference, tuple):
         branch, number = reference
-        if branch not in (None, "main"):
-            raise unsupported("branches")
-        return 0 if number is None else int(number)
-    return int(reference)
+        branch = None if branch in (None, "main") else str(branch)
+        return branch, 0 if number is None else int(number)
+    return ds._branch, int(reference)
 
 
-def _tag_version(uri: str, name: str, error_type) -> int:
-    for tag in _nanolance._ds_tags(uri):
-        if tag["name"] == name:
-            if tag["branch"] is not None:
-                raise unsupported("branches")
-            return int(tag["version"])
-    raise error_type(f"Ref not found error: tag {name} does not exist")
+def _latest_of(root: str, branch: Optional[str]) -> int:
+    """The latest version of ``branch`` (None: main) of the dataset at ``root``."""
+    uri = _branch_uri(root, branch) if branch else root
+    with native():
+        return int(_nanolance._ds_info(uri, None)["version"])
+
+
+class Branches:
+    """Mirrors ``lance.dataset.Branches``: the branches of the dataset's root (``_refs/branches``)."""
+
+    def __init__(self, dataset: "LanceDataset"):
+        self._ds = dataset
+
+    def _all(self):
+        with _ref_errors():
+            raw = _nanolance._ds_branches(self._ds._root)
+        return [(b["name"], {"parent_branch": b["parent_branch"],
+                             "branch_identifier": [(int(v), i) for v, i in b["branch_identifier"]],
+                             "parent_version": int(b["parent_version"]), "create_at": int(b["create_at"]),
+                             "manifest_size": int(b["manifest_size"]), "metadata": dict(b["metadata"])})
+                for b in raw]
+
+    def list(self) -> Dict[str, Dict[str, Any]]:
+        return dict(self._all())
+
+    def list_ordered(self, order: Optional[str] = None) -> List[Tuple[str, Dict[str, Any]]]:
+        """By parent version, newest first (``order="desc"``, the default) or oldest first; then by name, as
+        Lance orders them."""
+        if order not in (None, "asc", "desc"):
+            raise ValueError(f"Invalid order: {order}; expected 'asc' or 'desc'")
+        branches = self._all()
+        branches.sort(key=lambda b: b[0])
+        branches.sort(key=lambda b: b[1]["parent_version"], reverse=order != "asc")
+        return branches
+
+    def delete(self, name: str) -> None:
+        """Delete a branch and its versions. Refused (OSError) for main, for a branch another branch forks from, and
+        for a branch a tag names."""
+        with _branch_errors():
+            _nanolance._ds_delete_branch(self._ds._root, str(name))
+
+    def replace_metadata(self, name: str, metadata: Dict[str, str]) -> None:
+        with _branch_errors():
+            _nanolance._ds_replace_branch_metadata(self._ds._root, str(name),
+                                                   {str(k): str(v) for k, v in metadata.items()})
 
 
 class Tags:
@@ -2370,7 +2642,7 @@ class Tags:
 
     def _all(self):
         with _ref_errors():
-            raw = _nanolance._ds_tags(self._ds.uri)
+            raw = _nanolance._ds_tags(self._ds._root)
         return [(t["name"], {"branch": t["branch"], "version": int(t["version"]),
                              "created_at": _parse_rfc3339(t["created_at"]),
                              "updated_at": _parse_rfc3339(t["updated_at"]),
@@ -2390,25 +2662,29 @@ class Tags:
         return tags
 
     def get_version(self, tag: str) -> int:
-        return _tag_version(self._ds.uri, tag, ValueError)
+        return _tag_target(self._ds._root, tag, ValueError)[1]
 
     def create(self, tag: str, reference=None) -> None:
-        version = _tag_reference(self._ds, reference)
+        root = self._ds._root
+        branch, version = _reference(self._ds, reference, (self._ds._branch, 0))
         with _ref_errors():
-            _nanolance._ds_create_tag(self._ds.uri, str(tag), version)
+            _nanolance._ds_create_tag(root, str(tag), branch, version)
 
     def delete(self, tag: str) -> None:
+        root = self._ds._root
         with _ref_errors():
-            _nanolance._ds_delete_tag(self._ds.uri, str(tag))
+            _nanolance._ds_delete_tag(root, str(tag))
 
     def update(self, tag: str, reference=None) -> None:
-        version = _tag_reference(self._ds, reference)
+        root = self._ds._root
+        branch, version = _reference(self._ds, reference, (self._ds._branch, 0))
         with _ref_errors():
-            _nanolance._ds_update_tag(self._ds.uri, str(tag), version)
+            _nanolance._ds_update_tag(root, str(tag), branch, version)
 
     def replace_metadata(self, tag: str, metadata: Dict[str, str]) -> None:
+        root = self._ds._root
         with _ref_errors():
-            _nanolance._ds_replace_tag_metadata(self._ds.uri, str(tag), {str(k): str(v) for k, v in metadata.items()})
+            _nanolance._ds_replace_tag_metadata(root, str(tag), {str(k): str(v) for k, v in metadata.items()})
 
 
 class CleanupStats:
@@ -2635,6 +2911,13 @@ def _segment_message(ds: "LanceDataset", segment) -> bytes:
     })
 
 
+def _granularity_name(value) -> str:
+    """A document granularity argument ("row" or "list_element", or the enum) as its name."""
+    from nanolance.lance.query import DocumentGranularity
+
+    return DocumentGranularity(value).value
+
+
 @contextlib.contextmanager
 def _lance_errors():
     """Errors raised as pylance raises them: its Rust core's (k-means, PQ training, a name taken)
@@ -2645,11 +2928,14 @@ def _lance_errors():
         text = str(exc)
         if text.startswith("dimension (") or "num_sub_vectors are required" in text:
             raise ValueError(text) from None
-        if "mismatch across shards" in text or "do not share a storage format" in text:
+        if "mismatch across shards" in text or "do not share a storage format" in text or (
+                "multivector type supports only cosine distance" in text):  # pylance's Rust error, as it raises it
             raise RuntimeError(f"LanceError(Index): {text}") from None
         if ("KMeans cannot train" in text or "Not enough rows to train PQ" in text or "already exists" in text
                 or "num_bits" in text):
             raise RuntimeError(text) from None
+        if text.startswith("FTS field path ") and "does not exist in the dataset schema" in text:
+            raise RuntimeError(f"LanceError(Index): {text}") from None
         from nanolance.lance._errors import translate
         raise translate(text) from None
 
@@ -2731,9 +3017,7 @@ def _nearest_query(ds, nearest, limit=None) -> dict:
         raise TypeError(f"nearest() got unexpected keyword arguments {sorted(unknown)}")
     column = nearest.get("column")
     rows, batch = _query_rows(nearest.get("q"))
-    if batch and "query_index" in ds._data_schema.names:
-        raise ValueError("Invalid user input: batch nearest neighbor search cannot be used on datasets "
-                         "with column 'query_index'")
+    multi = False
     node = None
     for i, part in enumerate(str(column).split(".")):
         if i > 0 and not pa.types.is_struct(node.type):
@@ -2749,9 +3033,18 @@ def _nearest_query(ds, nearest, limit=None) -> dict:
     if pa.types.is_fixed_size_list(storage):
         dim = storage.list_size
     elif pa.types.is_list(storage) and pa.types.is_fixed_size_list(storage.value_type):
-        raise unsupported("multivector search")
+        # A multivector column: a list of vectors is one query (its vectors are summed, as Lance does).
+        multi = True
+        dim = storage.value_type.list_size
+        if batch and pa.types.is_uint8(storage.value_type.value_type):
+            # pylance 12 turns a list of vectors into a float32 query, which a uint8 column refuses
+            raise ValueError(f"Invalid user input: Column {column} has element type UInt8 and the query vector "
+                             "is Float32")
     else:
         raise TypeError(f"Query column {column} must be a vector. Got {arrow_type}.")
+    if not multi and batch and "query_index" in ds._data_schema.names:
+        raise ValueError("Invalid user input: batch nearest neighbor search cannot be used on datasets "
+                         "with column 'query_index'")
     if len(rows[0]) != dim:
         # pylance's message: for a batch, the size it names is the number of query rows.
         size = len(rows) if batch else len(rows[0])
@@ -2803,11 +3096,21 @@ def _nearest_query(ds, nearest, limit=None) -> dict:
         "lower_bound": None if lower is None else float(lower),
         "upper_bound": None if upper is None else float(upper),
         "ef": None if ef is None else int(ef),
+        # IVF_RQ only (the other kinds ignore it, as pylance does); 'normal' is the default.
+        "approx_mode": approx_mode,
     }
+    elem = storage.value_type.value_type if multi else getattr(storage, "value_type", None)
+    if elem is not None and pa.types.is_float16(elem):
+        # pylance casts the query to the column's element type: a float16 column's query is rounded
+        # (measured: its exact distances equal ours to 1e-7 only with the rounded query)
+        rows = [row.astype(np.float16).astype(np.float32) for row in rows]
+    if multi:
+        # The query's vectors one after another (the scanner reads them as n x dim).
+        return dict(shared, q=[x for row in rows for x in row.tolist()], vectors=len(rows))
     if batch:
         # One query per row, in row order: the list is the batch (see ScannerBuilder._nearest_table).
-        return [dict(shared, q=row.tolist()) for row in rows]
-    return dict(shared, q=rows[0].tolist())
+        return [dict(shared, q=row.tolist(), vectors=1) for row in rows]
+    return dict(shared, q=rows[0].tolist(), vectors=1)
 
 
 def _filter_sql(filter) -> Optional[str]:
@@ -2995,7 +3298,7 @@ class MergeInsertBuilder:
                     self._ds.uri, self._on, False, False, self._delete_by_source, self._delete_condition,
                     self._fill_missing_columns(pa.RecordBatchReader.from_batches(keys.schema, keys.to_batches()),
                                                target, read_old=False),
-                    "", "delete", self._uncommitted, *self._targets())
+                    "", "delete", self._uncommitted, *self._targets(), self._ds._version)
             self._ds._refresh_latest("Update")
             return {k: int(v) for k, v in stats.items()}
         _check_append_schema(target, reader.schema, allow_subset=True)
@@ -3026,7 +3329,7 @@ class MergeInsertBuilder:
             stats, _, self._transaction = _nanolance._ds_merge_insert(
                 self._ds.uri, self._on, self._update_all, self._insert_all, self._delete_by_source,
                 self._delete_condition, conformed, self._update_condition, self._when_matched, self._uncommitted,
-                dirs, base_ids)
+                dirs, base_ids, self._ds._version)
         self._ds._refresh_latest("Update")
         return {k: int(v) for k, v in stats.items()}
 
@@ -3124,7 +3427,7 @@ class DatasetOptimizer:
                       materialize_deletions_threshold: Optional[float] = None, num_threads=None, batch_size=None,
                       reindex: bool = True, max_source_fragments: Optional[int] = None,
                       max_source_rows: Optional[int] = None, max_source_bytes: Optional[int] = None,
-                      excluded_fragment_ids=None, **kwargs):
+                      excluded_fragment_ids=None, defer_index_remap: bool = False, **kwargs):
         """Rewrite small fragments (and those with many deleted rows) into fewer, larger ones. The
         indexes that covered the rewritten rows take them back, as Lance's compaction remaps its
         indexes (a second version; nanolance's `reindex=False` leaves them covering fewer fragments)."""
@@ -3138,7 +3441,7 @@ class DatasetOptimizer:
                 bool(reindex), *(None if v is None else int(v)
                                  for v in (max_source_fragments, max_source_rows, max_source_bytes)),
                 sorted({int(i) for i in (excluded_fragment_ids or [])}), int(max_bytes_per_file or 0),
-                int(batch_size or 0))
+                int(batch_size or 0), bool(defer_index_remap), self._ds._version)
         self._ds._refresh_latest("Rewrite")
         return CompactionMetrics(**{k: int(v) for k, v in metrics.items() if not k.startswith("indexes_")})
 
@@ -3166,7 +3469,7 @@ class DatasetOptimizer:
         with native():
             _nanolance._ds_optimize_indices(self._ds.uri, names,
                                             None if num_indices_to_merge is None else int(num_indices_to_merge),
-                                            bool(retrain))
+                                            bool(retrain), self._ds._version)
         self._ds._refresh_latest("CreateIndex")
 
 
@@ -3314,7 +3617,7 @@ def _segment_statistics(ds: "LanceDataset", segment: dict) -> Dict[str, Any]:
             return int(_nanolance._file_info(os.path.join(directory, name))[0])
 
     try:
-        if kind in ("IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ", "IVF_SQ", "IVF_HNSW_PQ", "IVF_HNSW_FLAT"):
+        if kind in ("IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ", "IVF_SQ", "IVF_HNSW_PQ", "IVF_HNSW_FLAT", "IVF_RQ"):
             return _vector_statistics(ds, segment, directory)
         if kind == "ZoneMap":
             meta = metadata("zonemap.lance")
@@ -3425,7 +3728,7 @@ class VectorIndexReader:
         fields = [pa.field("_rowid", pa.uint64())]
         if with_vector:
             width, column = part["width"], part["column"]
-            if column == "flat":
+            if column == "flat" and not part["uint8"]:
                 values = pa.array(np.frombuffer(part["values"], dtype=np.float32).copy())
                 arrays.append(pa.FixedSizeListArray.from_arrays(values, width))
                 fields.append(pa.field(column, pa.list_(pa.float32(), width), nullable=False))
@@ -3846,11 +4149,11 @@ class LanceScanner(pa.dataset.Scanner):
     def _search(self, n):
         with native():
             ids, distances, plan, hits, misses = _nanolance._ds_nearest(
-                self._ds.uri, self._ds.version, n["column"], n["q"], n["k"], n["minimum_nprobes"],
+                self._ds.uri, self._ds.version, n["column"], n["q"], n["vectors"], n["k"], n["minimum_nprobes"],
                 n["maximum_nprobes"], n["refine_factor"], n["metric"], n["use_index"], n["lower_bound"],
                 n["upper_bound"], self._filter, self._prefilter, self._fast_search, n.get("ef"),
                 self._ds._index_cache_enabled(), self._index_segments, self._mask["row_addr_allowlist"],
-                self._mask["row_addr_blocklist"])
+                self._mask["row_addr_blocklist"], n.get("approx_mode"))
         self._ds._count_index_cache(hits, misses)
         note_indexes(self._ds, column=n["column"])
         return ids, distances, plan
@@ -3924,7 +4227,7 @@ class LanceScanner(pa.dataset.Scanner):
 
     def _fts_table(self) -> pa.Table:
         """The matching rows, best first: the columns asked for, then ``_score`` (then the row id columns)."""
-        ids, scores, _ = self._fts_search()
+        ids, scores, _, doc_indices = self._fts_search()
         names = self._names
         if self._order is not None and "_score" in self._order:
             names = [c for c in names if c != "_score"] if names is not None else None
@@ -3933,6 +4236,8 @@ class LanceScanner(pa.dataset.Scanner):
         system = [c for c in ("_rowid", "_rowaddr") if c in table.column_names]
         data = table.drop_columns(system)
         out = data.append_column("_score", pa.array(scores, pa.float32()))
+        if doc_indices is not None:  # list-element documents: the element's position in its list
+            out = out.append_column("_doc_index", pa.array([[d] for d in doc_indices], pa.list_(pa.uint32())))
         for c in system:
             out = out.append_column(c, table.column(c))
         if self._offset:
@@ -4413,6 +4718,13 @@ def write_dataset(
 
         _validate_threshold("blob_pack_file_size_threshold", blob_pack_file_size_threshold, allow_zero=False)
     path = _path_of(uri)
+    if path.startswith("s3://"):
+        # The bucket's credentials and endpoint (pylance's storage_options keys), for the writes and for
+        # the dataset returned.
+        with native():
+            _nanolance._set_storage_options(path, {str(k): str(v) for k, v in (storage_options or {}).items()})
+        if initial_bases or target_bases or target_all_bases:
+            raise unsupported("base paths on object stores")
     reader = _coerce_reader(data_obj, schema)
     exists = _exists(path)
     in_memory = not isinstance(uri, LanceDataset) and os.fspath(uri).startswith("memory://")
@@ -4462,7 +4774,7 @@ def write_dataset(
         _native_log.writing(shown, "Append" if append else ("Overwrite" if exists else "Create"))
         before_files = _native_log.data_files(path)
     with _native_log.quiet():
-        writer, _ = _stage_write(path, reader, mode=mode, max_rows_per_file=max_rows_per_file,
+        writer, _ = _stage_write(path, reader, mode=mode, progress=progress, max_rows_per_file=max_rows_per_file,
                                  max_bytes_per_file=max_bytes_per_file, external_blob_mode=external_blob_mode,
                                  allow_external_blob_outside_bases=allow_external_blob_outside_bases, setup=setup)
     with native():
@@ -4478,7 +4790,7 @@ def write_dataset(
             after_version = int(_nanolance._ds_info(path, None)["version"])
         _native_log.new_versions(shown, path, before_version, after_version, "Append" if append else "Overwrite")
     with _native_log.quiet():
-        return LanceDataset(path)
+        return LanceDataset(path, storage_options=storage_options) if path.startswith("s3://") else LanceDataset(path)
 
 
 def _base_plan(uri, path: str, exists: bool, mode: str, initial_bases, target_bases, target_all_bases,
@@ -4514,9 +4826,27 @@ def _set_base_plan(writer, initial_bases, targets, exists: bool) -> None:
                                         [int(base_id) for _, base_id in targets])
 
 
+def _file_events(progress, fragment_id):
+    """The writer's data-file events as a FragmentWriteProgress sees them (pylance's begin and complete): a
+    file begins with its first rows, under the name it will have, and completes once written."""
+    from nanolance.lance.fragment import DataFile, FragmentMetadata
+
+    def events(event: int, name: str, rows: int) -> None:
+        fragment = FragmentMetadata(id=0 if fragment_id is None else int(fragment_id),
+                                    files=[DataFile(path=name, fields=[])],
+                                    physical_rows=rows if event == 2 else None)
+        if event == 0:
+            progress.begin(fragment)
+        else:
+            progress.complete(fragment)
+
+    return events
+
+
 def _stage_write(path: str, reader: pa.RecordBatchReader, *, mode: str, max_rows_per_file: Optional[int],
                  max_bytes_per_file: Optional[int], external_blob_mode: str = "reference",
-                 allow_external_blob_outside_bases: bool = False, setup=None, keep_empty: bool = True):
+                 allow_external_blob_outside_bases: bool = False, setup=None, keep_empty: bool = True,
+                 progress=None, fragment_id=None):
     """Write `reader`'s rows as staged data files under `path` (none published): appended to the
     dataset's schema with mode "append" on a dataset that exists, a new schema otherwise. Returns the
     writer -- for its finish() to commit the files or take() to hand them over -- and the rows written."""
@@ -4541,6 +4871,9 @@ def _stage_write(path: str, reader: pa.RecordBatchReader, *, mode: str, max_rows
         target = pa.schema([f for f in target if f.name in reader.schema.names], metadata=target.metadata)
         with native():
             writer.project(target.names)
+    if progress is not None:
+        with native():
+            writer.set_file_events(_file_events(progress, fragment_id))
     wrote = False
     rows = 0
     limit = int(max_rows_per_file or 0)
@@ -4787,12 +5120,13 @@ def dataset(
         ds._attach_namespace(namespace_client, table_id, managed)
         return ds
     if asof is not None:
-        ds = LanceDataset(uri, session=session)
+        ds = LanceDataset(uri, session=session, storage_options=storage_options)
         ts = asof if isinstance(asof, datetime) else datetime.fromisoformat(str(asof))
         candidates = [v for v in ds.versions() if v["timestamp"] <= ts]
         if not candidates:
             raise ValueError(f"no version of {uri} at or before {asof}")
-        return LanceDataset(uri, version=candidates[-1]["version"], session=session)
+        return LanceDataset(uri, version=candidates[-1]["version"], session=session,
+                            storage_options=storage_options)
     return LanceDataset(uri, version=version, default_scan_options=default_scan_options,
                         storage_options=storage_options, index_cache_size=index_cache_size,
                         index_cache_size_bytes=index_cache_size_bytes,

@@ -610,7 +610,7 @@ bool RowIdIndex::build(const std::filesystem::path& dataset_path, const pb::Mani
         }
         std::vector<std::uint32_t> deleted;
         if (fragment.deletion_file.present &&
-            !read_deletion_vector(dataset_path, fragment.id, fragment.deletion_file, deleted, error)) {
+            !read_manifest_deletion_vector(dataset_path, manifest, fragment.id, fragment.deletion_file, deleted, error)) {
             return false;
         }
         std::uint64_t start = 0;
@@ -715,7 +715,7 @@ bool resolve_row_ids(const std::filesystem::path& dataset_path, std::optional<st
             auto slot = deleted.find(fragment->first);
             if (slot == deleted.end()) {
                 std::vector<std::uint32_t> offsets;
-                if (!read_deletion_vector(dataset_path, fragment->first, fragment->second->deletion_file, offsets,
+                if (!read_manifest_deletion_vector(dataset_path, manifest, fragment->first, fragment->second->deletion_file, offsets,
                                           error)) {
                     return false;
                 }

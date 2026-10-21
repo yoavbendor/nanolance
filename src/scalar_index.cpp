@@ -8,6 +8,8 @@
 
 #include "float_text.hpp"
 #include "index_build.hpp"
+#include "nanolance/base_paths.hpp"
+#include "nanolance/frag_reuse.hpp"
 #include "nanolance/scalar_index.hpp"
 #include "nanolance/vector_search.hpp"
 
@@ -206,6 +208,11 @@ void radix_sort(std::vector<T>& v, Bits bits) {
     const std::size_t n = v.size();
     if (n < 2048U) {
         std::stable_sort(v.begin(), v.end(), [&](const T& a, const T& b) { return bits(a) < bits(b); });
+        return;
+    }
+    // Keys already in order (row ids, timestamps appended in time order) stay as they are: the input is in
+    // item order, so the sorted order, ties included, is the input's. One pass, stopping at the first descent.
+    if (std::is_sorted(v.begin(), v.end(), [&](const T& a, const T& b) { return bits(a) < bits(b); })) {
         return;
     }
     std::vector<std::array<std::size_t, 256>> counts(kBytes);
@@ -1534,7 +1541,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     if (target != nullptr && target->manifest != nullptr) {
         manifest = *target->manifest;
         version = target->version;
-    } else if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+    } else if (!load_read_version(dataset_path, options.read_version, manifest, version, error)) {
         return false;
     }
     const bool commit = target == nullptr || target->out == nullptr;
@@ -1777,10 +1784,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
 
     const auto uuid = target != nullptr && target->uuid != nullptr ? *target->uuid : new_uuid();
     const auto dir = dataset_path / "_indices" / pb::uuid_string(uuid);
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    if (ec) {
-        error = "cannot create " + dir.string() + ": " + ec.message();
+    if (!index_files::create_index_dir(dir, error)) {
         return false;
     }
     std::vector<WrittenFile> files;
@@ -1834,7 +1838,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         break;
     }
     if (!written) {
-        std::filesystem::remove_all(dir, ec);
+        index_files::remove_index_dir(dir);
         return false;
     }
     if (progress != nullptr) {
@@ -1873,7 +1877,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     }
     manifest.indices.push_back(std::move(entry));
     if (!commit_next_version(dataset_path, std::move(manifest), new_version, error)) {
-        std::filesystem::remove_all(dir, ec);
+        index_files::remove_index_dir(dir);
         return false;
     }
     return true;
@@ -1884,7 +1888,15 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
 bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, const std::string& column,
                                  ScalarIndexType type, const ScalarIndexOptions& options,
                                  std::uint64_t& new_version, std::string& error) {
-    return create_scalar_index(dataset_path, column, type, options, nullptr, new_version, error);
+    // Built from the version the caller read; a retryable conflict re-runs the build on the latest.
+    return retry_from_read_version(
+        options.read_version,
+        [&](ReadVersion from) {
+            ScalarIndexOptions o = options;
+            o.read_version = from;
+            return create_scalar_index(dataset_path, column, type, o, nullptr, new_version, error);
+        },
+        error);
 }
 
 bool index_build::build_scalar_segment(const std::filesystem::path& dataset_path, const std::string& column,
@@ -1953,6 +1965,10 @@ bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_ve
     } else if (!load_latest_manifest(dataset_path, manifest, version, error)) {
         return false;
     }
+    std::shared_ptr<const FragReuse> frag_reuse;
+    if (!FragReuse::load(dataset_path, manifest, frag_reuse, error)) {
+        return false;
+    }
     std::map<std::int32_t, const pb::Field*> by_id;
     for (const auto& f : manifest.fields) {
         by_id[f.id] = &f;
@@ -1965,12 +1981,20 @@ bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_ve
         return path;
     };
     for (const auto& index : manifest.indices) {
-        if (is_system_index(index)) {
+        // The fragment-reuse index is listed as Lance lists it; the other system indexes are not.
+        if (is_system_index(index) && index.name != "__lance_frag_reuse") {
             continue;
         }
         IndexInfo info;
         info.name = index.name;
         info.uuid = pb::uuid_string(index.uuid);
+        if (!index_base_id(index, info.base_id, error)) {
+            return false;
+        }
+        std::filesystem::path index_dir;
+        if (!index_dir_of(dataset_path, manifest, index, index_dir, error)) {
+            return false;
+        }
         const auto& url = index.details_type_url;
         const auto dot = url.rfind('.');
         std::string details = dot == std::string::npos ? url : url.substr(dot + 1);
@@ -1981,7 +2005,7 @@ bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_ve
         info.type = details;
         if (is_vector_index_url(url)) {
             const auto type =  // IVF_PQ, IVF_FLAT, ...
-                vector_index_type(dataset_path / "_indices" / pb::uuid_string(index.uuid), index.details_value);
+                vector_index_type(index_dir, index.details_value);
             if (!type.empty()) {
                 info.type = type;
             }
@@ -1990,6 +2014,9 @@ bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_ve
             info.fields.push_back(path_of(id));
         }
         info.fragment_ids = index.fragment_ids;
+        if (frag_reuse != nullptr) {
+            frag_reuse->remap_coverage(info.fragment_ids);  // coverage as Lance reads it
+        }
         info.dataset_version = index.dataset_version;
         info.index_version = index.index_version;
         info.type_url = index.details_type_url;
@@ -2000,7 +2027,7 @@ bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_ve
             info.size_bytes += f.size;
         }
         for (const auto& f : manifest.fragments) {
-            if (std::binary_search(index.fragment_ids.begin(), index.fragment_ids.end(),
+            if (std::binary_search(info.fragment_ids.begin(), info.fragment_ids.end(),
                                    static_cast<std::uint32_t>(f.id))) {
                 info.rows_indexed +=
                     f.physical_rows - (f.deletion_file.present ? f.deletion_file.num_deleted_rows : 0U);
@@ -2066,7 +2093,7 @@ bool dataset_count_from_index(const std::filesystem::path& dataset_path, bool ha
         // The index lists deleted rows too: take out those the fragment's deletion vector holds. Both
         // lists are ascending physical offsets.
         std::vector<std::uint32_t> deleted;
-        if (!read_deletion_vector(dataset_path, f.id, f.deletion_file, deleted, error)) {
+        if (!read_manifest_deletion_vector(dataset_path, manifest, f.id, f.deletion_file, deleted, error)) {
             return false;
         }
         std::size_t hits = 0;

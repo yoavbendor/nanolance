@@ -241,6 +241,11 @@ class _Retry(Exception):
     """A rewrite lost the race for the next version; try again against what won."""
 
 
+def _named_branch(branch: Optional[str]) -> Optional[str]:
+    """A request's branch: None for main (absent, empty or "main"), else the branch's name."""
+    return None if branch in (None, "", "main") else branch
+
+
 class _ManifestNamespace:
     """The ``__manifest`` table: Lance's ManifestNamespace."""
 
@@ -1211,8 +1216,13 @@ class PyDirectoryNamespace:
     def list_table_versions(self, request) -> Dict[str, Any]:
         req = _as_dict(request)
         self._record("list_table_versions")
-        self._check_branch(req)
-        path, _ = self._resolve(req.get("id"))
+        path, uri = self._resolve(req.get("id"))
+        branch = _named_branch(req.get("branch"))
+        if branch is not None:
+            ds = self._open(path, None, "list_table_versions", uri)
+            if branch not in ds.branches.list():
+                raise ns_error("TableNotFound", f"branch '{branch}' not found for table at '{uri}'")
+            path = os.path.join(path, "tree", branch)
         return {"versions": self._list_versions(path, req.get("descending") is True, req.get("limit")),
                 "page_token": None}
 
@@ -1765,13 +1775,52 @@ class PyDirectoryNamespace:
     # ── branches ──────────────────────────────────────────────────────────────────────────────────
 
     def create_table_branch(self, request) -> Dict[str, Any]:
-        raise ns_error("Unsupported", "table branches (nanolance does not implement them)")
+        req = _as_dict(request)
+        self._record("create_table_branch")
+        path, uri = self._resolve(req.get("id"))
+        name = req.get("name") or ""
+        if not name:
+            raise ns_error("InvalidInput", "branch name must not be empty for create_table_branch")
+        ds = self._open(path, None, "create_table_branch", uri)
+        if name in ds.branches.list():
+            raise ns_error("TableBranchAlreadyExists", f"branch '{name}' for table at '{uri}'")
+        version = req.get("from_version")
+        reference = (_named_branch(req.get("from_branch")), None if version is None else int(version))
+        try:
+            ds.create_branch(name, reference)
+        except Exception as exc:  # noqa: BLE001
+            text = str(exc)
+            if "not found" in text.lower() or "does not exist" in text.lower():
+                raise ns_error("InvalidInput", f"from_branch/from_version for branch '{name}' refers to a source "
+                                               f"that does not exist: {text}") from None
+            raise ns_error("Internal", f"branch operation failed for branch '{name}' on table at '{uri}': {text}") \
+                from None
+        return {"transaction_id": None}
 
     def list_table_branches(self, request) -> Dict[str, Any]:
-        raise ns_error("Unsupported", "table branches (nanolance does not implement them)")
+        req = _as_dict(request)
+        self._record("list_table_branches")
+        path, uri = self._resolve(req.get("id"))
+        ds = self._open(path, None, "list_table_branches", uri)
+        branches = {name: {"parentBranch": b["parent_branch"], "parentVersion": int(b["parent_version"]),
+                           "createAt": int(b["create_at"]), "manifestSize": int(b["manifest_size"]),
+                           "metadata": b.get("metadata") or None}
+                    for name, b in ds.branches.list().items()}
+        return {"branches": branches, "page_token": None}
 
     def delete_table_branch(self, request) -> Dict[str, Any]:
-        raise ns_error("Unsupported", "table branches (nanolance does not implement them)")
+        req = _as_dict(request)
+        self._record("delete_table_branch")
+        path, uri = self._resolve(req.get("id"))
+        name = req.get("name") or ""
+        ds = self._open(path, None, "delete_table_branch", uri)
+        if name not in ds.branches.list():
+            raise ns_error("TableBranchNotFound", f"branch '{name}' for table at '{uri}'")
+        try:
+            ds.branches.delete(name)
+        except Exception as exc:  # noqa: BLE001
+            raise ns_error("InvalidInput", f"cannot delete branch '{name}' for table at '{uri}': {exc}") from None
+        return {"transaction_id": None}
 
     def __getattr__(self, name: str):
         if name.startswith("_"):

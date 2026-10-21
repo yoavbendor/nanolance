@@ -887,6 +887,227 @@ void test_fuzzy(const std::filesystem::path& dir) {
     }
 }
 
+// lance_scanner_set_approx_mode reaches IVF_RQ searches: each mode answers as nanolance's own search in
+// that mode (test_ivf_rq.py checks those against pylance), and 'fast' (1-bit estimates) is not 'normal'.
+void test_rq_approx_mode(const std::string& uri) {
+    check(write(uri, 0, 2000, LANCE_WRITE_CREATE), "write: " + last_error());
+    nano_lance::VectorIndexOptions o;
+    o.type = "IVF_RQ";
+    o.num_partitions = 4;
+    o.num_bits = 5;
+    o.seed = 7;
+    std::uint64_t version = 0;
+    std::string error;
+    check(nano_lance::dataset_create_vector_index(uri, "vec", o, version, error), "build IVF_RQ: " + error);
+    std::vector<std::vector<float>> by_mode;
+    for (const auto mode : {LANCE_APPROX_MODE_FAST, LANCE_APPROX_MODE_NORMAL, LANCE_APPROX_MODE_ACCURATE}) {
+        const auto q = query_vector(5);
+        nano_lance::NearestQuery core;
+        core.column = "vec";
+        core.key = q;
+        core.k = 20;
+        core.minimum_nprobes = 4;
+        core.maximum_nprobes = 4;
+        core.approx_mode = mode == LANCE_APPROX_MODE_FAST       ? nano_lance::ApproxMode::Fast
+                           : mode == LANCE_APPROX_MODE_ACCURATE ? nano_lance::ApproxMode::Accurate
+                                                                : nano_lance::ApproxMode::Normal;
+        nano_lance::NearestResult want;
+        check(nano_lance::dataset_nearest(uri, core, want, error), "core IVF_RQ nearest: " + error);
+        LanceDataset* ds = lance_dataset_open(uri.c_str(), nullptr, 0);
+        const char* cols[] = {"id", nullptr};
+        LanceScanner* sc = lance_scanner_new(ds, cols, nullptr);
+        check(lance_scanner_nearest(sc, "vec", q.data(), q.size(), LANCE_DTYPE_FLOAT32, 20) == 0, "nearest");
+        check(lance_scanner_set_nprobes(sc, 4) == 0, "nprobes");
+        check(lance_scanner_set_approx_mode(sc, mode) == 0, "approx_mode");
+        check(lance_scanner_with_row_id(sc, true) == 0, "with_row_id");
+        const auto got = collect(sc, "_distance");
+        lance_scanner_close(sc);
+        lance_dataset_close(ds);
+        const std::string tag = "IVF_RQ approx_mode " + std::to_string(static_cast<int>(mode));
+        check(got.ok, tag + ": " + got.error);
+        check(got.row_ids == want.row_ids && got.values == want.distances, tag + ": as the core search");
+        by_mode.push_back(got.values);
+    }
+    check(by_mode[0] != by_mode[1], "IVF_RQ approx_mode fast differs from normal");
+}
+
+/// LANCE_METRIC_HAMMING over a Hamming IVF_FLAT index of uint8 vectors (built by nanolance): a uint8 query
+/// searches it by bit distance, exactly as the brute force over the rows; the index is probed in full.
+void test_hamming(const std::filesystem::path& dir) {
+    constexpr int kBytes = 16;
+    constexpr int kRows = 300;
+    const std::string uri = (dir / "hamming.lance").string();
+    std::mt19937_64 rng(11);
+    std::vector<uint8_t> rows(kRows * kBytes);
+    for (auto& b : rows) b = static_cast<uint8_t>(rng());
+    ArrowSchema schema;
+    ArrowArray array;
+    ArrowSchemaInit(&schema);
+    ArrowSchemaSetTypeStruct(&schema, 2);
+    ArrowSchemaSetType(schema.children[0], NANOARROW_TYPE_INT64);
+    ArrowSchemaSetName(schema.children[0], "id");
+    ArrowSchemaSetTypeFixedSize(schema.children[1], NANOARROW_TYPE_FIXED_SIZE_LIST, kBytes);
+    ArrowSchemaSetName(schema.children[1], "vec");
+    ArrowSchemaSetType(schema.children[1]->children[0], NANOARROW_TYPE_UINT8);
+    ArrowArrayInitFromSchema(&array, &schema, nullptr);
+    ArrowArrayStartAppending(&array);
+    for (int i = 0; i < kRows; ++i) {
+        ArrowArrayAppendInt(array.children[0], i);
+        for (int b = 0; b < kBytes; ++b) {
+            ArrowArrayAppendUInt(array.children[1]->children[0], rows[i * kBytes + b]);
+        }
+        ArrowArrayFinishElement(array.children[1]);
+        ArrowArrayFinishElement(&array);
+    }
+    ArrowArrayFinishBuildingDefault(&array, nullptr);
+    ArrowArrayStream stream;
+    ArrowBasicArrayStreamInit(&stream, &schema, 1);
+    ArrowBasicArrayStreamSetArray(&stream, 0, &array);
+    LanceDataset* created = nullptr;
+    check(lance_dataset_write(uri.c_str(), &schema, &stream, LANCE_WRITE_CREATE, nullptr, &created) == 0,
+          "write uint8: " + last_error());
+    if (created != nullptr) lance_dataset_close(created);
+
+    nano_lance::VectorIndexOptions o;
+    o.type = "IVF_FLAT";
+    o.metric = nano_lance::VectorMetric::Hamming;
+    o.num_partitions = 4;
+    o.seed = 5;
+    std::uint64_t version = 0;
+    std::string error;
+    check(nano_lance::dataset_create_vector_index(uri, "vec", o, version, error), "hamming index: " + error);
+
+    for (int seed = 0; seed < 4; ++seed) {
+        std::vector<uint8_t> q(kBytes);
+        for (auto& b : q) b = static_cast<uint8_t>(rng());
+        std::vector<std::pair<int, int>> brute;  // (distance, id)
+        for (int i = 0; i < kRows; ++i) {
+            int bits = 0;
+            for (int b = 0; b < kBytes; ++b) bits += __builtin_popcount(rows[i * kBytes + b] ^ q[b]);
+            brute.emplace_back(bits, i);
+        }
+        std::sort(brute.begin(), brute.end());
+        LanceDataset* ds = lance_dataset_open(uri.c_str(), nullptr, 0);
+        const char* cols[] = {"id", nullptr};
+        LanceScanner* sc = lance_scanner_new(ds, cols, nullptr);
+        check(lance_scanner_nearest(sc, "vec", q.data(), q.size(), LANCE_DTYPE_UINT8, 10) == 0,
+              "uint8 nearest: " + last_error());
+        check(lance_scanner_set_metric(sc, LANCE_METRIC_HAMMING) == 0, "hamming on a uint8 query: " + last_error());
+        check(lance_scanner_set_nprobes(sc, 4) == 0, "nprobes");
+        const auto r = collect(sc, "_distance");
+        check(r.error.empty(), "hamming search: " + r.error);
+        check(r.values.size() == 10, "ten hamming neighbours");
+        for (std::size_t i = 0; i < r.values.size() && i < 10; ++i) {
+            check(r.values[i] == static_cast<float>(brute[i].first), "hamming distance " + std::to_string(i));
+        }
+        lance_scanner_close(sc);
+        lance_dataset_close(ds);
+    }
+    // A float query is refused by Hamming, as it is over a float column.
+    LanceDataset* ds = lance_dataset_open(uri.c_str(), nullptr, 0);
+    LanceScanner* sc = lance_scanner_new(ds, nullptr, nullptr);
+    const std::vector<float> f(kBytes, 1.0F);
+    check(lance_scanner_nearest(sc, "vec", f.data(), f.size(), LANCE_DTYPE_FLOAT32, 3) == 0, "float nearest");
+    check(lance_scanner_set_metric(sc, LANCE_METRIC_HAMMING) != 0 && lance_last_error_code() == LANCE_ERR_NOT_SUPPORTED,
+          "hamming on a float query");
+    lance_scanner_close(sc);
+    lance_dataset_close(ds);
+}
+
+// ── INVERTED on struct leaves through lance-c: "meta.title" and "meta.body.text" name the leaves ────
+void test_nested(const std::filesystem::path& dir) {
+    const std::string uri = (dir / "nested.lance").string();
+    ArrowSchema schema;
+    ArrowSchemaInit(&schema);
+    ArrowSchemaSetTypeStruct(&schema, 2);
+    ArrowSchemaSetType(schema.children[0], NANOARROW_TYPE_INT64);
+    ArrowSchemaSetName(schema.children[0], "id");
+    ArrowSchemaSetName(schema.children[1], "meta");
+    ArrowSchemaSetTypeStruct(schema.children[1], 2);
+    ArrowSchema* meta = schema.children[1];
+    ArrowSchemaSetType(meta->children[0], NANOARROW_TYPE_STRING);
+    ArrowSchemaSetName(meta->children[0], "title");
+    ArrowSchemaSetName(meta->children[1], "body");
+    ArrowSchemaSetTypeStruct(meta->children[1], 1);
+    ArrowSchemaSetType(meta->children[1]->children[0], NANOARROW_TYPE_STRING);
+    ArrowSchemaSetName(meta->children[1]->children[0], "text");
+
+    // Null leaves, no null structs: a leaf's null is a document with no tokens.
+    const std::vector<std::pair<const char*, const char*>> rows = {
+        {"red apple pie", "sweet fruit"}, {nullptr, "apple tree"}, {"blue sky", "no fruit here"},
+        {"apple apple", nullptr}, {"green apple", "sour fruit"}, {"plum fig", "fresh fruit"}};
+    ArrowArray array;
+    ArrowArrayInitFromSchema(&array, &schema, nullptr);
+    ArrowArrayStartAppending(&array);
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        ArrowArrayAppendInt(array.children[0], static_cast<int64_t>(i));
+        ArrowArray* m = array.children[1];
+        if (rows[i].first != nullptr) {
+            ArrowArrayAppendString(m->children[0], ArrowCharView(rows[i].first));
+        } else {
+            ArrowArrayAppendNull(m->children[0], 1);
+        }
+        ArrowArray* body = m->children[1];
+        if (rows[i].second != nullptr) {
+            ArrowArrayAppendString(body->children[0], ArrowCharView(rows[i].second));
+        } else {
+            ArrowArrayAppendNull(body->children[0], 1);
+        }
+        ArrowArrayFinishElement(body);
+        ArrowArrayFinishElement(m);
+        ArrowArrayFinishElement(&array);
+    }
+    ArrowArrayFinishBuildingDefault(&array, nullptr);
+    ArrowArrayStream stream;
+    ArrowBasicArrayStreamInit(&stream, &schema, 1);
+    ArrowBasicArrayStreamSetArray(&stream, 0, &array);
+    ArrowSchema schema2;
+    ArrowSchemaDeepCopy(&schema, &schema2);
+    LanceDataset* out = nullptr;
+    check(lance_dataset_write(uri.c_str(), &schema2, &stream, LANCE_WRITE_CREATE, nullptr, &out) == 0,
+          "write nested: " + last_error());
+    schema2.release(&schema2);
+    if (out != nullptr) {
+        lance_dataset_close(out);
+    }
+
+    LanceDataset* ds = lance_dataset_open(uri.c_str(), nullptr, 0);
+    check(ds != nullptr, "open nested: " + last_error());
+    check(lance_dataset_create_scalar_index(ds, "meta.title", "title_fts", LANCE_SCALAR_INVERTED,
+                                            R"({"base_tokenizer":"simple"})", false) == 0,
+          "create INVERTED on meta.title: " + last_error());
+    check(lance_dataset_create_scalar_index(ds, "meta.body.text", "text_fts", LANCE_SCALAR_INVERTED,
+                                            R"({"base_tokenizer":"simple"})", false) == 0,
+          "create INVERTED on meta.body.text: " + last_error());
+    const std::vector<std::pair<std::string, std::string>> queries = {
+        {"meta.title", "apple"}, {"meta.body.text", "fruit"}, {"meta.title", "plum fig"}};
+    for (const auto& [column, text] : queries) {
+        nano_lance::FtsSearchRequest core;
+        core.query.kind = nano_lance::FtsQuery::Kind::Match;
+        core.query.text = text;
+        core.query.columns = {column};
+        nano_lance::FtsSearchResult want;
+        std::string error;
+        check(nano_lance::dataset_full_text_search(uri, core, want, error), "core nested fts: " + error);
+        check(!want.row_ids.empty(), "nested fts finds rows: " + column + " " + text);
+
+        LanceFtsQueryContext* ctx =
+            lance_dataset_prepare_fts_match_query(ds, column.c_str(), text.c_str(), LANCE_FTS_MATCH_OPERATOR_OR, 0,
+                                                  LANCE_FTS_COVERAGE_STRICT);
+        check(ctx != nullptr, "prepare nested match: " + last_error());
+        LanceScanner* cs = lance_scanner_new(ds, nullptr, nullptr);
+        check(lance_scanner_set_fts_query_context(cs, ctx) == 0, "set nested context");
+        lance_fts_query_context_close(ctx);
+        lance_scanner_with_row_id(cs, true);
+        const auto got = collect(cs, "_score");
+        lance_scanner_close(cs);
+        check(got.ok, std::string("nested fts: ") + got.error);
+        check(got.row_ids == want.row_ids && got.values == want.scores,
+              "nested rows and scores: " + column + " " + text);
+    }
+    lance_dataset_close(ds);
+}
+
 int main(int argc, char** argv) {
     const std::filesystem::path dir =
         argc > 1 ? std::filesystem::path(argv[1]) : std::filesystem::temp_directory_path() / "nl_lance_c_search";
@@ -919,9 +1140,12 @@ int main(int argc, char** argv) {
     }
     test_segments(dir);
     test_phrase(dir);
+    test_nested(dir);
     test_fuzzy(dir);
     test_include_deleted_rows((dir / "deleted.lance").string());
     test_update_if((dir / "upsert.lance").string());
+    test_rq_approx_mode((dir / "rq.lance").string());
+    test_hamming(dir);
     if (std::getenv("NANOLANCE_KEEP_TEST_DATA") == nullptr) {
         std::filesystem::remove_all(dir);
     }

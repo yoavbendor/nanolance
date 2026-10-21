@@ -34,6 +34,8 @@ enum class ScalarIndexType { BTree, Bitmap, LabelList, ZoneMap, BloomFilter, NGr
 bool parse_scalar_index_type(const std::string& name, ScalarIndexType& type);
 
 struct ScalarIndexOptions {
+    /// The version the index is built from (the handle's, as a commit's read version): latest when unset.
+    std::optional<std::uint64_t> read_version;
     /// Empty: "<column>_idx", Lance's default.
     std::string name;
     /// An index of the same name is replaced; without `replace`, that is an error.
@@ -65,6 +67,7 @@ bool dataset_drop_index(const std::filesystem::path& dataset_path, const std::st
 struct IndexInfo {
     std::string name;
     std::string uuid;
+    std::optional<std::uint32_t> base_id;  // the base path its files are in; nullopt: the dataset's own
     std::string type;  // "BTree", "Bitmap", "LabelList", "Inverted", "Vector", ...: from its details
     std::vector<std::string> fields;  // column paths
     std::vector<std::uint32_t> fragment_ids;

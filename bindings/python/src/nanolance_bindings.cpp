@@ -6,6 +6,7 @@
 #include "arrow_capsule.hpp"
 
 #include <nanolance/blob_v2_external.hpp>
+#include <nanolance/byte_source.hpp>
 #include <nanolance/dataset.hpp>
 #include <nanolance/dataset_ops.hpp>
 #include <nanolance/dataset_refs.hpp>
@@ -20,6 +21,7 @@
 #include <nanolance/lance_table_reader.hpp>
 #include <nanolance/nano_lance_reader.h>
 #include <nanolance/nano_lance_writer.h>
+#include <nanolance/object_store.hpp>
 #include <nanolance/data_file_reader.hpp>
 #include <nanolance/row_ids.hpp>
 #include <nanolance/scalar_index.hpp>
@@ -40,12 +42,16 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <exception>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "nanolance/dataset.hpp"
+#include "nanolance/dataset_commit.hpp"
+#include "nanolance/manifest_reader.hpp"
 #include "nanolance/work_stats.hpp"
 
 namespace nb = nanobind;
@@ -608,7 +614,18 @@ nb::dict ds_info(const std::filesystem::path& path, std::optional<std::uint64_t>
         base_paths.append(bd);
     }
     d["base_paths"] = base_paths;
+    d["branch"] = info.branch.empty() ? nb::none() : nb::object(nb::str(info.branch.c_str()));
     return d;
+}
+
+// pylance's storage_options for an object-store bucket, as the next open of that bucket uses them. Keys
+// are pylance's (and the aws_-prefixed forms); keys this binding does not use are ignored.
+void ds_set_storage_options(const std::string& uri, const std::map<std::string, std::string>& options) {
+    const auto o = nano_lance::io::object_store_options_from({options.begin(), options.end()});
+    std::string error;
+    if (!nano_lance::io::set_object_store_options(uri, o, error)) {
+        throw std::runtime_error(error);
+    }
 }
 
 nb::list ds_versions(const std::filesystem::path& path) {
@@ -717,6 +734,16 @@ nb::tuple file_top_fields(const std::filesystem::path& path) {
     return nb::make_tuple(names, layout.major_version, layout.minor_version);
 }
 
+/// A data file's size in bytes, local or s3:// (what DataFile.create records).
+std::uint64_t file_size(const std::string& path) {
+    std::string error;
+    const auto source = nano_lance::io::open_source(path, error);
+    if (!source) {
+        throw_dataset(error);
+    }
+    return source->size();
+}
+
 /// A writer that stages fragments and publishes them as one version at finish() -- a Lance write.
 class StagedWriter {
 public:
@@ -769,6 +796,7 @@ public:
             }
             pending_ = 0;
         }
+        raise_pending();
     }
 
     /// An append that covers only these top-level columns (the rest read as null).
@@ -829,6 +857,35 @@ public:
     /// The staged data files as fragments (lance.table.DataFragment messages, ids not yet assigned)
     /// and the schema they were written with (lance.file.Field messages) -- for a commit made apart
     /// (LanceFragment.create / write_fragments) instead of finish().
+    /// A progress tracker's data-file events: events(event, file name, rows), 0 begin and 2 complete, called
+    /// with the GIL held. An error it raises is kept and raised by the call that reported it, after the
+    /// write has stopped at that point.
+    void set_file_events(nb::object events) {
+        std::string error;
+        auto callback = [this, events_fn = nb::object(events)](int event, const std::string& name,
+                                                              std::uint64_t rows) {
+            nb::gil_scoped_acquire acquire;
+            try {
+                events_fn(event, name, rows);
+            } catch (nb::python_error&) {
+                if (!pending_error_) {
+                    pending_error_ = std::current_exception();
+                }
+            }
+        };
+        if (!nano_lance::writer_set_file_events(&writer_, callback, error)) {
+            throw_dataset(error);
+        }
+    }
+
+    void raise_pending() {
+        if (pending_error_) {
+            const auto error = pending_error_;
+            pending_error_ = nullptr;
+            std::rethrow_exception(error);
+        }
+    }
+
     nb::tuple take(bool keep_empty) {
         std::vector<nano_lance::NewFragment> files;
         nano_lance::LanceSchemaMapping mapping;
@@ -839,6 +896,7 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             ok = nano_lance::writer_take_staged(&writer_, files, mapping, error, keep_empty);
         }
+        raise_pending();
         if (!ok) {
             throw_dataset(error);
         }
@@ -870,6 +928,7 @@ public:
                 rc = nano_lance_writer_finish(&writer_, mode, &version);
             }
         }
+        raise_pending();
         if (rc != NANO_LANCE_OK) {
             throw_lance_writer("commit", rc, &writer_);
         }
@@ -884,6 +943,7 @@ private:
     std::int64_t pending_ = 0;
     bool open_ = false;
     std::mutex mutex_;
+    std::exception_ptr pending_error_;  // raised by the next call (set_file_events)
 };
 
 
@@ -985,12 +1045,29 @@ std::array<std::uint8_t, 16> uuid_of(const nb::bytes& b) {
     return out;
 }
 
+/// A build's metric: the vector metrics, and "hamming" (an IVF_FLAT index over uint8 vectors).
+bool parse_build_metric(const std::string& name, nano_lance::VectorMetric& out) {
+    if (name == "hamming") {
+        out = nano_lance::VectorMetric::Hamming;
+        return true;
+    }
+    return nano_lance::parse_vector_metric(name, out);
+}
+
 nano_lance::VectorIndexOptions vector_options_of(const nb::dict& d) {
     nano_lance::VectorIndexOptions o;
+    if (d.contains("skip_transpose")) {
+        o.skip_transpose = nb::cast<bool>(d["skip_transpose"]);
+    }
+    if (d.contains("rq_signs")) {  // IVF_RQ: the fast rotation's sign bytes (build_rq_model's)
+        const auto signs = nb::cast<nb::bytes>(d["rq_signs"]);
+        const auto* first = reinterpret_cast<const std::uint8_t*>(signs.c_str());
+        o.rq_signs.assign(first, first + signs.size());
+    }
     if (d.contains("metric")) {
         const auto metric = nb::cast<std::string>(d["metric"]);
-        if (!nano_lance::parse_vector_metric(metric, o.metric)) {
-            throw nb::value_error(("metric '" + metric + "' is not supported (l2, cosine, dot)").c_str());
+        if (!parse_build_metric(metric, o.metric)) {
+            throw nb::value_error(("metric '" + metric + "' is not supported (l2, cosine, dot, hamming)").c_str());
         }
     }
     if (d.contains("num_partitions") && !d["num_partitions"].is_none()) {
@@ -1217,7 +1294,34 @@ NB_MODULE(_nanolance, m) {
         return sequence.to_vector();
     }, nb::arg("data"));
     m.def("_ds_info", &ds_info, nb::arg("path"), nb::arg("version").none());
+    m.def("_ds_transaction", [](const std::filesystem::path& path, std::uint64_t version) -> std::optional<nb::bytes> {
+        std::vector<std::uint8_t> bytes;
+        bool found = false;
+        std::string error;
+        if (!nano_lance::dataset_transaction(path, version, bytes, found, error)) {
+            throw_dataset(error);
+        }
+        if (!found) {
+            return std::nullopt;
+        }
+        return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    }, nb::arg("path"), nb::arg("version"));
+    m.def("_ds_needs_migration", [](const std::filesystem::path& path, std::uint64_t version) {
+        bool out = false;
+        std::string error;
+        if (!nano_lance::dataset_needs_migration(path, true, version, out, error)) {
+            throw_dataset(error);
+        }
+        return out;
+    }, nb::arg("path"), nb::arg("version"));
+    m.def("_ds_migrate_manifest_paths_v2", [](const std::filesystem::path& path) {
+        std::string error;
+        if (!nano_lance::migrate_manifest_names_v2(path, error)) {
+            throw_dataset(error);
+        }
+    }, nb::arg("path"));
     m.def("_ds_versions", &ds_versions, nb::arg("path"));
+    m.def("_set_storage_options", &ds_set_storage_options, nb::arg("uri"), nb::arg("options"));
     m.def("_ds_latest_version", [](const std::filesystem::path& path) {
         std::uint64_t v = 0;
         std::string error;
@@ -1227,6 +1331,30 @@ NB_MODULE(_nanolance, m) {
         return v;
     });
     // Tags, cleanup and drop (dataset_refs.hpp).
+    m.def("_ds_branches", [](const std::filesystem::path& path) {
+        std::vector<nano_lance::BranchInfo> branches;
+        std::string error;
+        if (!nano_lance::list_branches(path, branches, error)) {
+            throw_dataset(error);
+        }
+        nb::list out;
+        for (const auto& b : branches) {
+            nb::dict d;
+            d["name"] = b.name;
+            d["parent_branch"] = b.parent_branch ? nb::object(nb::str(b.parent_branch->c_str())) : nb::none();
+            nb::list identifier;
+            for (const auto& [version, id] : b.identifier) {
+                identifier.append(nb::make_tuple(version, id));
+            }
+            d["branch_identifier"] = identifier;
+            d["parent_version"] = b.parent_version;
+            d["create_at"] = b.create_at;
+            d["manifest_size"] = b.manifest_size;
+            d["metadata"] = b.metadata;
+            out.append(d);
+        }
+        return out;
+    });
     m.def("_ds_tags", [](const std::filesystem::path& path) {
         std::vector<nano_lance::TagInfo> tags;
         std::string error;
@@ -1247,15 +1375,47 @@ NB_MODULE(_nanolance, m) {
         }
         return out;
     });
-    m.def("_ds_create_tag", [](const std::filesystem::path& path, const std::string& name, std::uint64_t version) {
+    m.def("_ds_create_tag", [](const std::filesystem::path& path, const std::string& name,
+                               std::optional<std::string> branch, std::uint64_t version) {
         std::string error;
-        if (!nano_lance::create_tag(path, name, version, error)) {
+        if (!nano_lance::create_tag(path, name, branch.value_or(std::string()), version, error)) {
+            throw_dataset(error);
+        }
+    }, nb::arg("path"), nb::arg("name"), nb::arg("branch").none(), nb::arg("version"));
+    m.def("_ds_update_tag", [](const std::filesystem::path& path, const std::string& name,
+                               std::optional<std::string> branch, std::uint64_t version) {
+        std::string error;
+        if (!nano_lance::update_tag(path, name, branch.value_or(std::string()), version, error)) {
+            throw_dataset(error);
+        }
+    }, nb::arg("path"), nb::arg("name"), nb::arg("branch").none(), nb::arg("version"));
+    m.def("_ds_create_branch", [](const std::filesystem::path& path, const std::string& name,
+                                  std::optional<std::string> source_branch, std::uint64_t version) {
+        std::string error;
+        if (!nano_lance::create_branch(path, name, source_branch.value_or(std::string()), version, error)) {
+            throw_dataset(error);
+        }
+    }, nb::arg("path"), nb::arg("name"), nb::arg("source_branch").none(), nb::arg("version"));
+    m.def("_ds_clone", [](const std::filesystem::path& path, std::optional<std::string> source_branch,
+                          std::uint64_t version, const std::filesystem::path& target, bool deep) {
+        std::string error;
+        const auto branch = source_branch.value_or(std::string());
+        const bool ok = deep ? nano_lance::deep_clone(path, branch, version, target, error)
+                             : nano_lance::shallow_clone(path, branch, version, target, error);
+        if (!ok) {
+            throw_dataset(error);
+        }
+    }, nb::arg("path"), nb::arg("source_branch").none(), nb::arg("version"), nb::arg("target"), nb::arg("deep"));
+    m.def("_ds_delete_branch", [](const std::filesystem::path& path, const std::string& name) {
+        std::string error;
+        if (!nano_lance::delete_branch(path, name, error)) {
             throw_dataset(error);
         }
     });
-    m.def("_ds_update_tag", [](const std::filesystem::path& path, const std::string& name, std::uint64_t version) {
+    m.def("_ds_replace_branch_metadata", [](const std::filesystem::path& path, const std::string& name,
+                                            const std::map<std::string, std::string>& metadata) {
         std::string error;
-        if (!nano_lance::update_tag(path, name, version, error)) {
+        if (!nano_lance::replace_branch_metadata(path, name, metadata, error)) {
             throw_dataset(error);
         }
     });
@@ -1336,27 +1496,43 @@ NB_MODULE(_nanolance, m) {
             throw_dataset(error);
         }
     });
-    m.def("_ds_restore", [](const std::filesystem::path& path, std::uint64_t version) {
+    m.def("_commit_verdict", [](std::uint32_t ours_field, nb::bytes ours, std::uint32_t theirs_field, nb::bytes theirs) {
+        // Lance's verdict (0 compatible, 1 retryable, 2 incompatible) on two transaction operations, for the
+        // Python conflict port's agreement test.
+        const auto* a = static_cast<const std::uint8_t*>(ours.data());
+        const auto* b = static_cast<const std::uint8_t*>(theirs.data());
+        int verdict = 0;
+        std::string error;
+        if (!nano_lance::commit_verdict(ours_field, std::vector<std::uint8_t>(a, a + ours.size()), theirs_field,
+                                        std::vector<std::uint8_t>(b, b + theirs.size()), verdict, error)) {
+            throw nb::value_error(error.c_str());
+        }
+        return verdict;
+    });
+    m.def("_ds_restore", [](const std::filesystem::path& path, std::uint64_t version,
+                            std::optional<std::uint64_t> read_version) {
         return new_version_or_throw([&](std::uint64_t& v, std::string& e) {
-            return nano_lance::dataset_restore(path, version, v, e);
+            return nano_lance::dataset_restore(path, version, v, e, read_version);
         });
     });
     m.def("_ds_update_config", [](const std::filesystem::path& path, const std::map<std::string, std::string>& upsert,
-                                  const std::vector<std::string>& remove) {
+                                  const std::vector<std::string>& remove, std::optional<std::uint64_t> read_version) {
         return new_version_or_throw([&](std::uint64_t& v, std::string& e) {
-            return nano_lance::dataset_update_config(path, upsert, remove, v, e);
+            return nano_lance::dataset_update_config(path, upsert, remove, v, e, read_version);
         });
     });
     m.def("_ds_update_table_metadata", [](const std::filesystem::path& path,
-                                          const std::map<std::string, std::string>& values, bool replace) {
+                                          const std::map<std::string, std::string>& values, bool replace,
+                                          std::optional<std::uint64_t> read_version) {
         return new_version_or_throw([&](std::uint64_t& v, std::string& e) {
-            return nano_lance::dataset_update_table_metadata(path, values, replace, v, e);
+            return nano_lance::dataset_update_table_metadata(path, values, replace, v, e, read_version);
         });
     });
     m.def("_ds_update_schema_metadata", [](const std::filesystem::path& path,
-                                           const std::map<std::string, std::string>& values, bool replace) {
+                                           const std::map<std::string, std::string>& values, bool replace,
+                                           std::optional<std::uint64_t> read_version) {
         return new_version_or_throw([&](std::uint64_t& v, std::string& e) {
-            return nano_lance::dataset_update_schema_metadata(path, values, replace, v, e);
+            return nano_lance::dataset_update_schema_metadata(path, values, replace, v, e, read_version);
         });
     });
     m.def("_file_read", &file_read, nb::arg("path"), nb::arg("columns").none(), nb::arg("offset"),
@@ -1364,11 +1540,13 @@ NB_MODULE(_nanolance, m) {
     m.def("_file_take", &file_take, nb::arg("path"), nb::arg("rows"), nb::arg("columns").none());
     m.def("_file_info", &file_info, nb::arg("path"));
     m.def("_file_top_fields", &file_top_fields, nb::arg("path"));
+    m.def("_file_size", &file_size, nb::arg("path"));
     nb::class_<StagedWriter>(m, "_StagedWriter")
         .def(nb::init<const std::filesystem::path&, const LanceWriterOptions&, bool, std::int64_t, std::uint64_t>(),
              nb::arg("path"), nb::arg("options"), nb::arg("append"), nb::arg("max_rows_per_file"),
              nb::arg("max_bytes_per_file"))
         .def("write_batch", &StagedWriter::write_batch)
+        .def("set_file_events", &StagedWriter::set_file_events)
         .def("project", &StagedWriter::project)
         .def("set_initial_config", &StagedWriter::set_initial_config)
         .def("set_initial_bases", &StagedWriter::set_initial_bases)
@@ -1381,25 +1559,29 @@ NB_MODULE(_nanolance, m) {
     m.attr("COMMIT_CREATE") = static_cast<int>(NANO_LANCE_COMMIT_CREATE);
     m.attr("COMMIT_APPEND") = static_cast<int>(NANO_LANCE_COMMIT_APPEND);
     m.attr("COMMIT_OVERWRITE") = static_cast<int>(NANO_LANCE_COMMIT_OVERWRITE);
-    m.def("_ds_delete", [](const std::filesystem::path& path, const std::string& predicate) {
+    m.def("_ds_delete", [](const std::filesystem::path& path, const std::string& predicate,
+                           std::optional<std::uint64_t> read_version) {
         std::uint64_t deleted = 0;
         std::uint64_t version = 0;
-        run_op([&](std::string& e) { return nano_lance::dataset_delete(path, predicate, deleted, version, e); });
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_delete(path, predicate, deleted, version, e, read_version);
+        });
         return nb::make_tuple(deleted, version);
     });
     m.def("_ds_update", [](const std::filesystem::path& path, std::optional<std::string> where,
                            const std::vector<std::pair<std::string, std::string>>& assignments,
-                           const std::optional<nb::bytes>& row_addr_allowlist) {
+                           const std::optional<nb::bytes>& row_addr_allowlist,
+                           std::optional<std::uint64_t> read_version) {
         std::uint64_t updated = 0;
         std::uint64_t version = 0;
         const auto mask = row_addr_mask(row_addr_allowlist, std::nullopt);
         run_op([&](std::string& e) {
             return nano_lance::dataset_update(path, where ? &*where : nullptr, assignments, updated, version, e,
-                                              mask ? &*mask : nullptr);
+                                              mask ? &*mask : nullptr, read_version);
         });
         return nb::make_tuple(updated, version);
     }, nb::arg("path"), nb::arg("where").none(), nb::arg("assignments"),
-       nb::arg("row_addr_allowlist").none() = nb::none());
+       nb::arg("row_addr_allowlist").none() = nb::none(), nb::arg("read_version").none() = nb::none());
     // JSON columns: arrow.json text <-> Lance's JSONB (jsonb.hpp), a whole array at a time. Each
     // returns (schema capsule, array capsule): large_binary for _json_encode, utf8 for _json_decode.
     auto convert_json = [](nb::handle array, bool encode) {
@@ -1534,7 +1716,8 @@ NB_MODULE(_nanolance, m) {
                                  const std::string& delete_condition, nb::handle data,
                                  const std::string& update_condition, const std::string& when_matched,
                                  bool uncommitted, const std::vector<std::string>& target_dirs,
-                                 const std::vector<std::uint32_t>& target_base_ids) {
+                                 const std::vector<std::uint32_t>& target_base_ids,
+                                 std::optional<std::uint64_t> read_version) {
         nano_lance::MergeInsertSpec spec;
         nano_lance::MergeInsertSpec::Uncommitted transaction;
         if (uncommitted) {
@@ -1558,7 +1741,9 @@ NB_MODULE(_nanolance, m) {
         ArrowArrayStream stream = stream_of(data);
         nano_lance::MergeInsertStats stats;
         std::uint64_t version = 0;
-        run_op([&](std::string& e) { return nano_lance::dataset_merge_insert(path, spec, stream, stats, version, e); });
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_merge_insert(path, spec, stream, stats, version, e, read_version);
+        });
         nb::dict d;
         d["num_inserted_rows"] = stats.inserted;
         d["num_updated_rows"] = stats.updated;
@@ -1698,28 +1883,38 @@ NB_MODULE(_nanolance, m) {
         return nb::make_tuple(bytes_of(fragment.data(), fragment.size()), field_list, written);
     });
     m.def("_ds_add_columns_sql", [](const std::filesystem::path& path,
-                                    const std::vector<std::pair<std::string, std::string>>& columns) {
+                                    const std::vector<std::pair<std::string, std::string>>& columns,
+                                    std::optional<std::uint64_t> read_version) {
         std::uint64_t version = 0;
-        run_op([&](std::string& e) { return nano_lance::dataset_add_columns_sql(path, columns, version, e); });
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_add_columns_sql(path, columns, version, e, read_version);
+        });
         return version;
     });
-    m.def("_ds_add_columns_nulls", [](const std::filesystem::path& path, nb::handle schema) {
+    m.def("_ds_add_columns_nulls", [](const std::filesystem::path& path, nb::handle schema,
+                                      std::optional<std::uint64_t> read_version) {
         SchemaHolder holder;
         schema_of(schema, holder);
         std::uint64_t version = 0;
-        run_op([&](std::string& e) { return nano_lance::dataset_add_columns_nulls(path, holder.schema, version, e); });
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_add_columns_nulls(path, holder.schema, version, e, read_version);
+        });
         return version;
     });
-    m.def("_ds_add_columns_stream", [](const std::filesystem::path& path, nb::handle data) {
+    m.def("_ds_add_columns_stream", [](const std::filesystem::path& path, nb::handle data,
+                                       std::optional<std::uint64_t> read_version) {
         ArrowArrayStream stream = stream_of(data);
         std::uint64_t version = 0;
-        run_op([&](std::string& e) { return nano_lance::dataset_add_columns_stream(path, stream, version, e); });
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_add_columns_stream(path, stream, version, e, read_version);
+        });
         return version;
     });
     m.def("_ds_create_scalar_index", [](const std::filesystem::path& path, const std::string& column,
                                           const std::string& index_type, const std::string& name, bool replace,
                                           std::uint64_t rows_per_zone, std::uint64_t number_of_items,
-                                          double probability, std::optional<std::string> json_path) {
+                                          double probability, std::optional<std::string> json_path,
+                                          std::optional<std::uint64_t> read_version) {
         nano_lance::ScalarIndexType type{};
         if (!nano_lance::parse_scalar_index_type(index_type, type)) {
             throw nb::value_error(("unsupported index type '" + index_type + "'").c_str());
@@ -1731,6 +1926,7 @@ NB_MODULE(_nanolance, m) {
         options.number_of_items = number_of_items;
         options.probability = probability;
         options.json_path = json_path;
+        options.read_version = read_version;
         std::uint64_t version = 0;
         run_op([&](std::string& e) {
             return nano_lance::dataset_create_scalar_index(path, column, type, options, version, e);
@@ -1738,20 +1934,47 @@ NB_MODULE(_nanolance, m) {
         return version;
     });
     m.def("_ds_create_inverted_index", [](const std::filesystem::path& path, const std::string& column,
-                                          const std::string& name, bool replace, const std::string& params) {
+                                          const std::string& name, bool replace, const std::string& params,
+                                          const std::string& granularity, std::optional<std::uint64_t> read_version,
+                                          nb::object progress) {
         nano_lance::InvertedIndexOptions options;
+        options.read_version = read_version;
         options.name = name;
         options.replace = replace;
         std::string error;
         if (!nano_lance::fts::parse_params(params, options.params, error)) {
             throw nb::value_error(error.c_str());
         }
+        if (granularity == "list_element") {
+            options.granularity = nano_lance::DocGranularity::ListElement;
+        } else if (granularity != "row") {
+            throw nb::value_error("unknown document granularity");
+        }
+        if (!progress.is_none()) {
+            // Called with the GIL held, as the vector build's callback is. An exception it raises unwinds the
+            // build and nothing is committed, except one raised by the last stage's completion: the index
+            // is committed by then, and pylance ignores that error.
+            options.progress = [callback = nb::object(progress)](int event, const char* stage, std::uint64_t total,
+                                                                 const char* unit, std::uint64_t completed) {
+                nb::gil_scoped_acquire acquire;
+                if (event == 2 && std::string_view(stage) == "write_metadata") {
+                    try {
+                        callback(event, std::string(stage), total, std::string(unit), completed);
+                    } catch (nb::python_error&) {
+                        // ignored: pylance does not raise it
+                    }
+                    return;
+                }
+                callback(event, std::string(stage), total, std::string(unit), completed);
+            };
+        }
         std::uint64_t version = 0;
         run_op([&](std::string& e) {
             return nano_lance::dataset_create_inverted_index(path, column, options, version, e);
         });
         return version;
-    });
+    }, nb::arg("path"), nb::arg("column"), nb::arg("name"), nb::arg("replace"), nb::arg("params"),
+       nb::arg("granularity"), nb::arg("read_version") = nb::none(), nb::arg("progress") = nb::none());
     // lance.tokenize: the analyzer the params JSON describes, run on `text`; (text, position) pairs with
     // the positions as the index counts them (Python makes them relative to the first token).
     m.def("_fts_tokenize", [](const std::string& params, const std::string& text) {
@@ -1832,6 +2055,26 @@ NB_MODULE(_nanolance, m) {
               });
               return bytes_of(segment.data(), segment.size());
           });
+    m.def("_index_stage_write", [](const std::filesystem::path& path, const std::string& uuid_text,
+                                   const std::string& name, const nb::bytes& text) {
+        const auto bytes = vec_of(text);
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_write_staged_part(path, uuid_text, name, bytes, e);
+        });
+    });
+    m.def("_index_stage_remove", [](const std::filesystem::path& path, const std::string& uuid_text,
+                                    const std::vector<std::string>& names) {
+        run_op([&](std::string& e) { return nano_lance::dataset_remove_staged_parts(path, uuid_text, names, e); });
+    });
+    m.def("_index_stage_read", [](const std::filesystem::path& path, const std::string& uuid_text) {
+        std::vector<std::pair<std::string, std::vector<std::uint8_t>>> parts;
+        run_op([&](std::string& e) { return nano_lance::dataset_read_staged_parts(path, uuid_text, parts, e); });
+        nb::list out;
+        for (const auto& [name, bytes] : parts) {
+            out.append(nb::make_tuple(name, bytes_of(bytes.data(), bytes.size())));
+        }
+        return out;
+    });
     m.def("_index_merge_segments", [](const std::filesystem::path& path, const std::vector<nb::bytes>& segments) {
         std::vector<std::vector<std::uint8_t>> in;
         for (const auto& s : segments) {
@@ -1868,8 +2111,11 @@ NB_MODULE(_nanolance, m) {
                                                           fragments ? &*fragments : nullptr,
                                                           ivf_centroids ? &centroids : nullptr, model, e);
         });
-        return nb::make_tuple(model.dim, model.partitions,
-                              bytes_of(model.centroids.data(), model.centroids.size() * sizeof(float)),
+        // The centroids in the index's element type: float32, or uint8 for a Hamming index.
+        const auto centroid_bytes = o.metric == nano_lance::VectorMetric::Hamming
+                                        ? bytes_of(model.binary_centroids.data(), model.binary_centroids.size())
+                                        : bytes_of(model.centroids.data(), model.centroids.size() * sizeof(float));
+        return nb::make_tuple(model.dim, model.partitions, centroid_bytes,
                               bytes_of(model.codebook.data(), model.codebook.size() * sizeof(float)));
     });
     m.def("_ds_drop_index", [](const std::filesystem::path& path, const std::string& name) {
@@ -1896,6 +2142,7 @@ NB_MODULE(_nanolance, m) {
             d["details"] = nb::bytes(reinterpret_cast<const char*>(i.details_value.data()), i.details_value.size());
             d["field_ids"] = i.field_ids;
             d["created_at"] = i.created_at;
+            d["base_id"] = i.base_id ? nb::object(nb::int_(*i.base_id)) : nb::none();
             d["size_bytes"] = i.size_bytes;
             d["rows_indexed"] = i.rows_indexed;
             out.append(d);
@@ -1991,6 +2238,7 @@ NB_MODULE(_nanolance, m) {
         d["partitions"] = part.partitions;
         d["width"] = part.width;
         d["column"] = part.column;
+        d["uint8"] = part.uint8;
         d["ids"] = nb::bytes(reinterpret_cast<const char*>(part.ids.data()), part.ids.size() * sizeof(std::uint64_t));
         if (!part.floats.empty()) {
             d["values"] = nb::bytes(reinterpret_cast<const char*>(part.floats.data()),
@@ -2018,17 +2266,25 @@ NB_MODULE(_nanolance, m) {
         return nb::make_tuple(counted.exact, counted.count, counted.uncovered, counted.lines);
     });
     m.def("_ds_nearest", [](const std::filesystem::path& path, std::optional<std::uint64_t> version,
-                            const std::string& column, const std::vector<float>& key, std::uint64_t k,
-                            std::uint32_t minimum_nprobes, std::optional<std::uint32_t> maximum_nprobes,
+                            const std::string& column, const std::vector<float>& key, std::uint64_t key_vectors,
+                            std::uint64_t k, std::uint32_t minimum_nprobes, std::optional<std::uint32_t> maximum_nprobes,
                             std::optional<std::uint32_t> refine_factor, std::optional<std::string> metric,
                             bool use_index, std::optional<float> lower_bound, std::optional<float> upper_bound,
                             std::optional<std::string> filter, bool prefilter, bool fast_search,
                             std::optional<std::uint32_t> ef, bool index_cache, const std::vector<nb::bytes>& segments,
-                            std::optional<nb::bytes> row_addr_allowlist, std::optional<nb::bytes> row_addr_blocklist) {
+                            std::optional<nb::bytes> row_addr_allowlist, std::optional<nb::bytes> row_addr_blocklist,
+                            std::optional<std::string> approx_mode) {
         nano_lance::NearestQuery q;
         const auto mask = row_addr_mask(row_addr_allowlist, row_addr_blocklist);
         q.row_mask = mask ? &*mask : nullptr;
         q.ef = ef;
+        if (approx_mode && *approx_mode == "fast") {
+            q.approx_mode = nano_lance::ApproxMode::Fast;
+        } else if (approx_mode && *approx_mode == "accurate") {
+            q.approx_mode = nano_lance::ApproxMode::Accurate;
+        } else if (approx_mode && *approx_mode != "normal") {
+            throw nb::value_error(("approx_mode must be 'fast', 'normal' or 'accurate', got '" + *approx_mode + "'").c_str());
+        }
         q.index_cache = index_cache;
         for (const auto& s : segments) {
             q.segments.push_back(uuid_of(s));
@@ -2037,6 +2293,7 @@ NB_MODULE(_nanolance, m) {
         q.version = version.value_or(0);
         q.column = column;
         q.key = key;
+        q.key_vectors = key_vectors;
         q.k = k;
         q.minimum_nprobes = minimum_nprobes;
         q.maximum_nprobes = maximum_nprobes;
@@ -2105,7 +2362,12 @@ NB_MODULE(_nanolance, m) {
         r.fast_search = fast_search;
         nano_lance::FtsSearchResult result;
         run_op([&](std::string& e) { return nano_lance::dataset_full_text_search(path, r, result, e); });
-        return std::make_tuple(result.row_ids, result.scores, result.plan);
+        // The element of each hit when list-element documents were searched (else None).
+        std::optional<std::vector<std::uint32_t>> doc_indices;
+        if (result.has_doc_indices) {
+            doc_indices = result.doc_indices;
+        }
+        return std::make_tuple(result.row_ids, result.scores, result.plan, doc_indices);
     });
     m.def("_ds_create_vector_index", [](const std::filesystem::path& path, const std::string& column,
                                         const std::string& type, const std::string& name, const std::string& metric,
@@ -2116,8 +2378,9 @@ NB_MODULE(_nanolance, m) {
                                         std::uint32_t hnsw_m, std::uint32_t ef_construction,
                                         std::uint32_t max_level, std::optional<nb::bytes> ivf_centroids,
                                         std::optional<nb::bytes> pq_codebook, bool skip_transpose,
-                                        nb::object progress) {
+                                        std::optional<std::uint64_t> read_version, nb::object progress) {
         nano_lance::VectorIndexOptions o;
+        o.read_version = read_version;
         o.type = type;
         o.ivf_centroids = floats_of(ivf_centroids);
         o.pq_codebook = floats_of(pq_codebook);
@@ -2131,8 +2394,8 @@ NB_MODULE(_nanolance, m) {
             };
         }
         o.name = name;
-        if (!nano_lance::parse_vector_metric(metric, o.metric)) {
-            throw nb::value_error(("metric '" + metric + "' is not supported (l2, cosine, dot)").c_str());
+        if (!parse_build_metric(metric, o.metric)) {
+            throw nb::value_error(("metric '" + metric + "' is not supported (l2, cosine, dot, hamming)").c_str());
         }
         o.replace = replace;
         o.num_partitions = num_partitions;
@@ -2152,13 +2415,18 @@ NB_MODULE(_nanolance, m) {
        nb::arg("num_partitions"), nb::arg("target_partition_size"), nb::arg("num_sub_vectors"), nb::arg("num_bits"),
        nb::arg("max_iters"), nb::arg("sample_rate"), nb::arg("seed"), nb::arg("hnsw_m"),
        nb::arg("ef_construction"), nb::arg("max_level"), nb::arg("ivf_centroids") = nb::none(),
-       nb::arg("pq_codebook") = nb::none(), nb::arg("skip_transpose") = false, nb::arg("progress") = nb::none());
-    m.def("_ds_drop_columns", [](const std::filesystem::path& path, const std::vector<std::string>& columns) {
+       nb::arg("pq_codebook") = nb::none(), nb::arg("skip_transpose") = false,
+        nb::arg("read_version") = nb::none(), nb::arg("progress") = nb::none());
+    m.def("_ds_drop_columns", [](const std::filesystem::path& path, const std::vector<std::string>& columns,
+                                 std::optional<std::uint64_t> read_version) {
         std::uint64_t version = 0;
-        run_op([&](std::string& e) { return nano_lance::dataset_drop_columns(path, columns, version, e); });
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_drop_columns(path, columns, version, e, read_version);
+        });
         return version;
     });
-    m.def("_ds_alter_columns", [](const std::filesystem::path& path, nb::list alterations) {
+    m.def("_ds_alter_columns", [](const std::filesystem::path& path, nb::list alterations,
+                                  std::optional<std::uint64_t> read_version) {
         std::vector<nano_lance::ColumnAlteration> alts;
         std::vector<std::unique_ptr<SchemaHolder>> types;
         for (auto item : alterations) {
@@ -2179,7 +2447,7 @@ NB_MODULE(_nanolance, m) {
             alts.push_back(std::move(alt));
         }
         std::uint64_t version = 0;
-        run_op([&](std::string& e) { return nano_lance::dataset_alter_columns(path, alts, version, e); });
+        run_op([&](std::string& e) { return nano_lance::dataset_alter_columns(path, alts, version, e, read_version); });
         return version;
     });
     m.def("_ds_compact_files", [](const std::filesystem::path& path, std::uint64_t target_rows,
@@ -2188,9 +2456,11 @@ NB_MODULE(_nanolance, m) {
                                   std::optional<std::uint64_t> max_source_rows,
                                   std::optional<std::uint64_t> max_source_bytes,
                                   const std::vector<std::uint64_t>& excluded_fragment_ids,
-                                  std::uint64_t max_bytes_per_file, std::uint64_t batch_size) {
+                                  std::uint64_t max_bytes_per_file, std::uint64_t batch_size,
+                                  bool defer_index_remap, std::optional<std::uint64_t> read_version) {
         nano_lance::CompactionOptions options;
         options.reindex = reindex;
+        options.defer_index_remap = defer_index_remap;
         options.max_source_fragments = max_source_fragments;
         options.max_source_rows = max_source_rows;
         options.max_source_bytes = max_source_bytes;
@@ -2202,7 +2472,77 @@ NB_MODULE(_nanolance, m) {
         options.materialize_deletions_threshold = threshold;
         nano_lance::CompactionMetrics metrics;
         std::uint64_t version = 0;
-        run_op([&](std::string& e) { return nano_lance::dataset_compact_files(path, options, metrics, version, e); });
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_compact_files(path, options, metrics, version, e, read_version);
+        });
+        nb::dict d;
+        d["fragments_removed"] = metrics.fragments_removed;
+        d["fragments_added"] = metrics.fragments_added;
+        d["files_removed"] = metrics.files_removed;
+        d["files_added"] = metrics.files_added;
+        d["indexes_reindexed"] = metrics.indexes_reindexed;
+        d["indexes_not_reindexed"] = metrics.indexes_not_reindexed;
+        return nb::make_tuple(d, version);
+    });
+    // Compaction as Compaction.plan / CompactionTask.execute / Compaction.commit: the same options as
+    // _ds_compact_files, the tasks' fragment ids, and each rewrite's new fragment messages.
+    m.def("_ds_compact_plan", [](const std::filesystem::path& path, std::uint64_t target_rows,
+                                 bool materialize_deletions, double threshold,
+                                 std::optional<std::uint64_t> max_source_fragments,
+                                 std::optional<std::uint64_t> max_source_rows,
+                                 std::optional<std::uint64_t> max_source_bytes,
+                                 const std::vector<std::uint64_t>& excluded_fragment_ids,
+                                 std::uint64_t max_bytes_per_file, std::uint64_t batch_size) {
+        nano_lance::CompactionOptions options;
+        options.max_source_fragments = max_source_fragments;
+        options.max_source_rows = max_source_rows;
+        options.max_source_bytes = max_source_bytes;
+        options.excluded_fragment_ids = excluded_fragment_ids;
+        options.max_bytes_per_file = max_bytes_per_file;
+        options.batch_size = batch_size;
+        options.target_rows_per_fragment = target_rows;
+        options.materialize_deletions = materialize_deletions;
+        options.materialize_deletions_threshold = threshold;
+        std::uint64_t read_version = 0;
+        std::vector<std::vector<std::uint64_t>> tasks;
+        run_op([&](std::string& e) { return nano_lance::dataset_compact_plan(path, options, read_version, tasks, e); });
+        return nb::make_tuple(read_version, tasks);
+    });
+    m.def("_ds_compact_execute", [](const std::filesystem::path& path, std::uint64_t read_version,
+                                    const std::vector<std::uint64_t>& fragment_ids, std::uint64_t max_bytes_per_file,
+                                    std::uint64_t batch_size) {
+        nano_lance::CompactionOptions options;
+        options.max_bytes_per_file = max_bytes_per_file;
+        options.batch_size = batch_size;
+        nano_lance::CompactionRewrite rewrite;
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_compact_execute(path, options, read_version, fragment_ids, rewrite, e);
+        });
+        nb::list messages;
+        for (const auto& b : rewrite.new_fragments) {
+            messages.append(bytes_of(b.data(), b.size()));
+        }
+        return nb::make_tuple(rewrite.old_fragment_ids, messages);
+    });
+    m.def("_ds_compact_commit", [](const std::filesystem::path& path, std::uint64_t read_version,
+                                   const std::vector<std::vector<std::uint64_t>>& old_ids,
+                                   const std::vector<nb::list>& messages, bool defer_index_remap, bool reindex) {
+        std::vector<nano_lance::CompactionRewrite> rewrites(old_ids.size());
+        for (std::size_t r = 0; r < old_ids.size(); ++r) {
+            rewrites[r].old_fragment_ids = old_ids[r];
+            for (auto item : messages.at(r)) {
+                const auto b = nb::borrow<nb::bytes>(item);
+                rewrites[r].new_fragments.emplace_back(b.c_str(), b.c_str() + b.size());
+            }
+        }
+        nano_lance::CompactionOptions options;
+        options.defer_index_remap = defer_index_remap;
+        options.reindex = reindex;
+        nano_lance::CompactionMetrics metrics;
+        std::uint64_t version = 0;
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_compact_commit(path, options, read_version, rewrites, metrics, version, e);
+        });
         nb::dict d;
         d["fragments_removed"] = metrics.fragments_removed;
         d["fragments_added"] = metrics.fragments_added;
@@ -2213,8 +2553,10 @@ NB_MODULE(_nanolance, m) {
         return nb::make_tuple(d, version);
     });
     m.def("_ds_optimize_indices", [](const std::filesystem::path& path, const std::vector<std::string>& names,
-                                     std::optional<std::uint32_t> num_indices_to_merge, bool retrain) {
+                                     std::optional<std::uint32_t> num_indices_to_merge, bool retrain,
+                                     std::optional<std::uint64_t> read_version) {
         nano_lance::OptimizeIndicesOptions options;
+        options.read_version = read_version;
         options.index_names = names;
         options.num_indices_to_merge = num_indices_to_merge;
         options.retrain = retrain;

@@ -3,6 +3,7 @@
 
 #include "nanolance/work_stats.hpp"
 #include "nanolance/blob_v2_external.hpp"
+#include "nanolance/byte_source.hpp"
 
 #include "nanolance/array_accessor.hpp"
 #include "nanolance/blob_builder.hpp"
@@ -12,7 +13,6 @@
 
 #include <algorithm>
 #include <filesystem>
-#include <fstream>
 #include <cstring>
 #include <limits>
 
@@ -353,20 +353,17 @@ bool blob_v2_thresholds(const LanceField& field, BlobV2Thresholds& out, std::str
 bool BlobV2Placer::write_sidecar(const std::uint32_t id, const std::uint8_t* data, const std::uint64_t n,
                                  std::string& error) {
     const auto path = blob_v2_sidecar_path(data_file_, id);
-    std::error_code ec;
-    std::filesystem::create_directories(path.parent_path(), ec);
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    auto file = io::open_output(path.string(), error);
     if (!file) {
-        error = "cannot create blob file " + path.string();
+        error = "cannot create blob file " + path.string() + ": " + error;
         return false;
     }
     if (n != 0U) {
-        file.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
+        file->write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
     }
-    // The buffer is flushed on close, and a short write (a full disk) shows up only there: check after it.
-    file.close();
-    if (!file) {
-        error = "cannot write blob file " + path.string();
+    // A short write (a full disk) shows up only when the buffer is flushed: commit() checks after it.
+    if (!file->commit(error)) {
+        error = "cannot write blob file " + path.string() + ": " + error;
         return false;
     }
     return true;
@@ -426,18 +423,16 @@ bool BlobV2Placer::place(const ColumnValues& values, const BlobV2Thresholds& thr
                 pack_size_ = 0;
                 pack_max_ = pack_max;
                 const auto path = blob_v2_sidecar_path(data_file_, pack_id_);
-                std::error_code ec;
-                std::filesystem::create_directories(path.parent_path(), ec);
-                pack_.open(path, std::ios::binary | std::ios::trunc);
+                pack_ = io::open_output(path.string(), error);
                 if (!pack_) {
-                    error = "cannot create blob file " + path.string();
+                    error = "cannot create blob file " + path.string() + ": " + error;
                     return false;
                 }
             }
             id = pack_id_;
             position = pack_size_;
-            pack_.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
-            if (!pack_) {
+            pack_->write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
+            if (!*pack_) {
                 error = "cannot write blob file " + blob_v2_sidecar_path(data_file_, id).string();
                 return false;
             }
@@ -468,12 +463,12 @@ bool BlobV2Placer::finish(std::string& error) {
     if (pack_id_ == 0U) {
         return true;
     }
-    pack_.close();
-    if (!pack_) {
-        error = "cannot write blob file " + blob_v2_sidecar_path(data_file_, pack_id_).string();
+    const bool ok = pack_->commit(error);
+    pack_.reset();
+    if (!ok) {
+        error = "cannot write blob file " + blob_v2_sidecar_path(data_file_, pack_id_).string() + ": " + error;
         return false;
     }
-    pack_.clear();
     pack_id_ = 0;
     return true;
 }
@@ -1144,27 +1139,25 @@ bool blob_v2_read(const BlobV2Location& location, const std::uint64_t offset, co
         }
         return true;
     }
-    std::ifstream in(location.file, std::ios::binary);
-    std::error_code ec;
-    const auto file_size = std::filesystem::file_size(location.file, ec);
-    if (!in || ec) {
-        error = "cannot open blob file " + location.file;
+    // Through ByteSource: the blob file may be local or on an object store.
+    auto source = io::open_source(location.file, error);
+    if (!source) {
+        error = "cannot open blob file " + location.file + ": " + error;
         out.clear();
         return false;
     }
+    const auto file_size = source->size();
     if (at > file_size || length > file_size - at) {
         error = "blob range is past the end of " + location.file;
         out.clear();
         return false;
     }
-    in.seekg(static_cast<std::streamoff>(at));
-    in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(length));
-    work_stats::count_read(length);
-    if (!in) {
-        error = "cannot read blob file " + location.file;
+    if (!source->read_at(at, length, out.data(), error)) {
+        error = "cannot read blob file " + location.file + ": " + error;
         out.clear();
         return false;
     }
+    work_stats::count_read(length);
     return true;
 }
 

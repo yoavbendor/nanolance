@@ -1,0 +1,284 @@
+{
+ "environment": {
+  "cpu": "AMD EPYC 9V45 96-Core Processor",
+  "cores": 4,
+  "machine": "x86_64"
+ },
+ "metrics": {
+  "scalar build id BTREE": {
+   "family": "scalar",
+   "rust_ms": 38.703973000000005,
+   "nanolance_ms": 29.059176,
+   "speed": 1.3319019438128599
+  },
+  "scalar build f BTREE": {
+   "family": "scalar",
+   "rust_ms": 45.071394,
+   "nanolance_ms": 30.026639,
+   "speed": 1.501046920369609
+  },
+  "scalar build s BTREE": {
+   "family": "scalar",
+   "rust_ms": 90.90955100000001,
+   "nanolance_ms": 61.747982,
+   "speed": 1.4722675633351063
+  },
+  "scalar build cat BITMAP": {
+   "family": "scalar",
+   "rust_ms": 63.825720000000004,
+   "nanolance_ms": 16.82384,
+   "speed": 3.793766464731001
+  },
+  "scalar build tags LABEL_LIST": {
+   "family": "scalar",
+   "rust_ms": 114.637556,
+   "nanolance_ms": 53.539066,
+   "speed": 2.1411945438121767
+  },
+  "scalar query all|id = 123456": {
+   "family": "scalar",
+   "rust_ms": 0.447642,
+   "nanolance_ms": 0.154491,
+   "speed": 2.8975280113404667
+  },
+  "scalar query all|id < 1000": {
+   "family": "scalar",
+   "rust_ms": 6.869948,
+   "nanolance_ms": 0.430355,
+   "speed": 15.963444133331784
+  },
+  "scalar query all|id BETWEEN 1000000 AND 1100000": {
+   "family": "scalar",
+   "rust_ms": 0.17865799999999998,
+   "nanolance_ms": 0.03361,
+   "speed": 5.315620351085986
+  },
+  "scalar query all|s = 'user_00012345'": {
+   "family": "scalar",
+   "rust_ms": 0.181722,
+   "nanolance_ms": 0.100541,
+   "speed": 1.8074417401855958
+  },
+  "scalar query all|cat = 'c7'": {
+   "family": "scalar",
+   "rust_ms": 11.336852,
+   "nanolance_ms": 1.305044,
+   "speed": 8.686950018543437
+  },
+  "scalar query all|array_has_any(tags, ['t5'])": {
+   "family": "scalar",
+   "rust_ms": 9.071786,
+   "nanolance_ms": 1.085045,
+   "speed": 8.360746328493288
+  },
+  "scalar query all|cat = 'c7' AND id < 50000": {
+   "family": "scalar",
+   "rust_ms": 6.80125,
+   "nanolance_ms": 0.872196,
+   "speed": 7.797845897023146
+  },
+  "scalar query id|id = 123456": {
+   "family": "scalar",
+   "rust_ms": 0.368072,
+   "nanolance_ms": 0.105648,
+   "speed": 3.4839466908980765
+  },
+  "scalar query id|id < 1000": {
+   "family": "scalar",
+   "rust_ms": 0.823634,
+   "nanolance_ms": 0.163565,
+   "speed": 5.035514932901293
+  },
+  "scalar query id|id BETWEEN 1000000 AND 1100000": {
+   "family": "scalar",
+   "rust_ms": 0.188753,
+   "nanolance_ms": 0.032559,
+   "speed": 5.797260358119107
+  },
+  "scalar query id|s = 'user_00012345'": {
+   "family": "scalar",
+   "rust_ms": 0.212869,
+   "nanolance_ms": 0.099659,
+   "speed": 2.1359736702154346
+  },
+  "scalar query id|cat = 'c7'": {
+   "family": "scalar",
+   "rust_ms": 1.712558,
+   "nanolance_ms": 0.476863,
+   "speed": 3.5912998072821756
+  },
+  "scalar query id|array_has_any(tags, ['t5'])": {
+   "family": "scalar",
+   "rust_ms": 1.246268,
+   "nanolance_ms": 0.85506,
+   "speed": 1.4575211096297334
+  },
+  "scalar query id|cat = 'c7' AND id < 50000": {
+   "family": "scalar",
+   "rust_ms": 0.899227,
+   "nanolance_ms": 0.624364,
+   "speed": 1.4402287768032749
+  },
+  "vector IVF_FLAT build": {
+   "family": "vector",
+   "rust_ms": 599.3442100000001,
+   "nanolance_ms": 955.780754,
+   "speed": 0.6270729008632037
+  },
+  "vector IVF_PQ build": {
+   "family": "vector",
+   "rust_ms": 10702.704222999999,
+   "nanolance_ms": 6305.257515,
+   "speed": 1.6974253942108815
+  },
+  "vector IVF_HNSW_SQ build": {
+   "family": "vector",
+   "rust_ms": 1560.076589,
+   "nanolance_ms": 2035.08709,
+   "speed": 0.7665895954359379
+  },
+  "vector IVF_FLAT search k=10": {
+   "family": "vector",
+   "rust_ms": 0.75274918,
+   "nanolance_ms": 0.206731,
+   "speed": 3.6412012712171857
+  },
+  "vector IVF_FLAT search k=100": {
+   "family": "vector",
+   "rust_ms": 0.87375654,
+   "nanolance_ms": 0.332578,
+   "speed": 2.6272229071075057
+  },
+  "vector IVF_FLAT search k=10, nprobes=32": {
+   "family": "vector",
+   "rust_ms": 0.9008385,
+   "nanolance_ms": 0.43111,
+   "speed": 2.0895792257196537
+  },
+  "vector IVF_FLAT search k=10, refine_factor=4": {
+   "family": "vector",
+   "rust_ms": 2.73956414,
+   "nanolance_ms": 1.368549,
+   "speed": 2.001802010742765
+  },
+  "vector IVF_PQ search k=10": {
+   "family": "vector",
+   "rust_ms": 2.75046256,
+   "nanolance_ms": 0.74983,
+   "speed": 3.668114852699945
+  },
+  "vector IVF_PQ search k=100": {
+   "family": "vector",
+   "rust_ms": 2.8605560800000003,
+   "nanolance_ms": 0.989226,
+   "speed": 2.8917113783907826
+  },
+  "vector IVF_PQ search k=10, nprobes=32": {
+   "family": "vector",
+   "rust_ms": 0.9878315000000001,
+   "nanolance_ms": 0.244825,
+   "speed": 4.03484733993669
+  },
+  "vector IVF_PQ search k=10, refine_factor=4": {
+   "family": "vector",
+   "rust_ms": 3.4111691200000003,
+   "nanolance_ms": 0.925615,
+   "speed": 3.6853001733982276
+  },
+  "vector IVF_HNSW_SQ search k=10": {
+   "family": "vector",
+   "rust_ms": 4.71208688,
+   "nanolance_ms": 0.784911,
+   "speed": 6.003339079207707
+  },
+  "vector IVF_HNSW_SQ search k=100": {
+   "family": "vector",
+   "rust_ms": 11.02042958,
+   "nanolance_ms": 2.552305,
+   "speed": 4.3178341068171715
+  },
+  "vector IVF_HNSW_SQ search k=10, nprobes=32": {
+   "family": "vector",
+   "rust_ms": 1.35088172,
+   "nanolance_ms": 0.258237,
+   "speed": 5.2311702815630605
+  },
+  "vector IVF_HNSW_SQ search k=10, refine_factor=4": {
+   "family": "vector",
+   "rust_ms": 8.2294614,
+   "nanolance_ms": 1.596822,
+   "speed": 5.153649811938964
+  },
+  "fts build": {
+   "family": "fts",
+   "rust_ms": 732.670593,
+   "nanolance_ms": 594.78126,
+   "speed": 1.231832006610296
+  },
+  "fts search 1 common word, limit 10": {
+   "family": "fts",
+   "rust_ms": 0.54901868,
+   "nanolance_ms": 0.030088,
+   "speed": 18.24709784631747
+  },
+  "fts search 1 rare word, limit 10": {
+   "family": "fts",
+   "rust_ms": 0.47500722,
+   "nanolance_ms": 0.023082,
+   "speed": 20.57911879386535
+  },
+  "fts search 2 words, limit 10": {
+   "family": "fts",
+   "rust_ms": 0.5482820599999999,
+   "nanolance_ms": 0.07144,
+   "speed": 7.674720884658453
+  },
+  "fts search 3 words, limit 10": {
+   "family": "fts",
+   "rust_ms": 0.5594488400000001,
+   "nanolance_ms": 0.05985,
+   "speed": 9.347516123642441
+  },
+  "fts search 3 words, limit 100": {
+   "family": "fts",
+   "rust_ms": 0.64999984,
+   "nanolance_ms": 0.077626,
+   "speed": 8.373481050163605
+  },
+  "fts search 2 words, AND, limit 10": {
+   "family": "fts",
+   "rust_ms": 0.3251005,
+   "nanolance_ms": 0.058969,
+   "speed": 5.513074666350116
+  },
+  "fts search 1 rare word, all matches": {
+   "family": "fts",
+   "rust_ms": 0.5000584,
+   "nanolance_ms": 0.031919,
+   "speed": 15.66648077947304
+  }
+ },
+ "recall": {
+  "vector IVF_FLAT": {
+   "rust": 1.0,
+   "nanolance": 1.0,
+   "rust_std": 0.0,
+   "nanolance_std": 0.0,
+   "builds": 5
+  },
+  "vector IVF_PQ": {
+   "rust": 0.48439999999999994,
+   "nanolance": 0.488,
+   "rust_std": 0.026884940022250423,
+   "nanolance_std": 0.005830951894845316,
+   "builds": 5
+  },
+  "vector IVF_HNSW_SQ": {
+   "rust": 0.9765714285714286,
+   "nanolance": 0.9773333333333333,
+   "rust_std": 0.0009759000729485341,
+   "nanolance_std": 0.0010327955589886455,
+   "builds": 5
+  }
+ }
+}
