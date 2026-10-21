@@ -9,6 +9,7 @@
 #include "index_build.hpp"
 #include "nanolance/fts_search.hpp"
 
+#include "fts_document_text.hpp"
 #include "fts_fst.hpp"
 #include "fts_json.hpp"
 #include "fts_posting.hpp"
@@ -28,7 +29,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <optional>
 #include <system_error>
 #include <unordered_map>
 
@@ -72,7 +75,7 @@ std::string posting_tail_codec(std::uint32_t format_version) {
     return format_version == 1U ? "fixed32_v1" : "varint_delta_v1";
 }
 
-std::vector<std::uint8_t> index_details(const fts::AnalyzerParams& p) {
+std::vector<std::uint8_t> index_details(const fts::AnalyzerParams& p, DocGranularity granularity) {
     std::vector<std::uint8_t> out;
     put_string(out, 1, p.base_tokenizer);
     put_string(out, 2, fts::json::quote(p.language));
@@ -114,6 +117,9 @@ std::vector<std::uint8_t> index_details(const fts::AnalyzerParams& p) {
         put_string(out, 13, std::string(code.begin(), code.end()));
     }
     put_uint(out, 15, fts::resolved_format_version(p));  // posting_format_version
+    if (granularity == DocGranularity::ListElement) {
+        put_uint(out, 14, 1);  // document_granularity: LIST_ELEMENT (ROW is the default, left out)
+    }
     return out;
 }
 
@@ -272,11 +278,116 @@ struct Built {
     std::vector<std::vector<std::uint32_t>> positions;
     std::uint32_t format_version = 2;  // 1: fixed32_v1 tails and the legacy per-document _position
     std::size_t block_size = 128;      // posting blocks: 128 (BitPacker4x) or 256 (BitPacker8x)
+    /// ListElement: one document per list element (`doc_index` is its position in the list), null and
+    /// empty elements included; Row: one per row (no `doc_index`).
+    bool elements = false;
+    std::vector<std::uint32_t> doc_index;
 };
+
+/// One document: its tokens (already positioned) given their row address and, for a list-element
+/// index, the element's position. Ids and postings follow in document order.
+void append_document(Built& b, std::vector<fts::Token>& tokens, std::uint64_t row_id, std::uint32_t element,
+                     std::vector<std::pair<std::uint32_t, std::uint32_t>>& counts) {
+    const auto doc = static_cast<std::uint32_t>(b.row_ids.size());
+    b.row_ids.push_back(row_id);
+    b.num_tokens.push_back(static_cast<std::uint32_t>(tokens.size()));
+    b.total_tokens += tokens.size();
+    if (b.elements) {
+        b.doc_index.push_back(element);
+    }
+    counts.clear();
+    for (auto& t : tokens) {
+        auto [it, inserted] = b.ids.emplace(t.text, static_cast<std::uint32_t>(b.tokens.size()));
+        if (inserted) {
+            b.tokens.push_back(std::move(t.text));
+            b.docs.emplace_back();
+            b.freqs.emplace_back();
+            if (b.with_positions) {
+                b.positions.emplace_back();
+            }
+        }
+        counts.emplace_back(it->second, b.with_positions ? t.position : 0U);
+    }
+    std::sort(counts.begin(), counts.end());
+    for (std::size_t i = 0; i < counts.size();) {
+        std::size_t j = i;
+        while (j < counts.size() && counts[j].first == counts[i].first) {
+            ++j;
+        }
+        b.docs[counts[i].first].push_back(doc);
+        b.freqs[counts[i].first].push_back(static_cast<std::uint32_t>(j - i));
+        if (b.with_positions) {
+            auto& p = b.positions[counts[i].first];
+            for (std::size_t k = i; k < j; ++k) {
+                p.push_back(counts[k].second);
+            }
+        }
+        i = j;
+    }
+}
+
+/// A list-element batch's documents: one per element of each non-null row, in row order then element
+/// order. Each element is tokenized alone, so its positions start at 0 (Lance's element documents).
+bool add_element_documents(const ArrowArrayView* text, const std::vector<const ArrowArrayView*>& above,
+                           const ArrowArrayView* addr, const ArrowArrayView& view, std::int64_t length,
+                           const fts::Analyzer& analyzer, const AddressToRowId& to_row_id, Built& b,
+                           std::string& error) {
+    struct Element {
+        std::int64_t row;  // the row, as the column's accessors take it
+        std::uint32_t k;   // the element's position in its list
+        std::string_view text;
+        bool present;
+    };
+    std::vector<Element> elements;
+    const ArrowArrayView* values = text->children[0];
+    for (std::int64_t r = 0; r < length; ++r) {
+        const std::int64_t row = view.offset + r;
+        if (ArrowArrayViewIsNull(text, row) || fts::null_above(above, row)) {
+            continue;  // a null row (or one under a null struct) has no documents
+        }
+        const std::int64_t first = ArrowArrayViewListChildOffset(text, text->offset + row);
+        const std::int64_t last = ArrowArrayViewListChildOffset(text, text->offset + row + 1);
+        for (std::int64_t e = first; e < last; ++e) {
+            Element el{row, static_cast<std::uint32_t>(e - first), {}, !ArrowArrayViewIsNull(values, e)};
+            if (el.present) {
+                const ArrowStringView sv = ArrowArrayViewGetStringUnsafe(values, e);
+                el.text = std::string_view(sv.data, static_cast<std::size_t>(sv.size_bytes));
+            }
+            elements.push_back(el);
+        }
+    }
+    std::vector<std::vector<fts::Token>> tokens(elements.size());
+    const std::size_t chunk = 1024;
+    parallel::for_each((elements.size() + chunk - 1) / chunk, [&](std::size_t c) {
+        for (std::size_t i = c * chunk; i < std::min(elements.size(), (c + 1) * chunk); ++i) {
+            if (elements[i].present && !elements[i].text.empty()) {
+                analyzer.tokenize(elements[i].text, tokens[i]);
+            }
+        }
+    });
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> counts;  // token id, position
+    for (std::size_t i = 0; i < elements.size(); ++i) {
+        if (b.row_ids.size() >= std::numeric_limits<std::uint32_t>::max()) {
+            error = "more than 2^32 documents";
+            return false;
+        }
+        const std::uint64_t row_id = to_row_id(ArrowArrayViewGetUIntUnsafe(addr, elements[i].row));
+        append_document(b, tokens[i], row_id, elements[i].k, counts);
+    }
+    return true;
+}
 
 /// The documents of `batches` (column 0 text, column 1 row address), added in order.
 bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, const fts::Analyzer& analyzer,
-                   const AddressToRowId& to_row_id, Built& b, std::string& error) {
+                   const AddressToRowId& to_row_id, Built& b, const std::vector<std::string>& below,
+                   std::string& error,
+                   const std::function<void(std::size_t rows, std::uint64_t fragment)>* batch_done = nullptr) {
+    // The text leaf: `below` names the struct fields under the top-level column (none for a top-level column).
+    std::vector<std::size_t> path;
+    if (!fts::text_child_path(schema.children[0], below, path)) {
+        error = "the scanned batches have no text column";
+        return false;
+    }
     for (auto& batch : batches) {
         ArrowArrayView view{};
         ArrowError e{};
@@ -286,18 +397,40 @@ bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, 
             error = std::string("cannot read a batch: ") + e.message;
             return false;
         }
-        const ArrowArrayView* text = view.children[0];
+        std::vector<const ArrowArrayView*> above;  // the structs above the text, null where they are
+        const ArrowArrayView* text = fts::text_view_at(view.children[0], path, above);
         const ArrowArrayView* addr = view.children[1];
+        if (text == nullptr) {
+            ArrowArrayViewReset(&view);
+            error = "the scanned batches have no text column";
+            return false;
+        }
+        // A scan's batches do not cross fragments: the first row's names the batch's.
+        const std::uint64_t fragment =
+            batch.length > 0 ? ArrowArrayViewGetUIntUnsafe(addr, view.offset) >> 32U : 0U;
+        if (b.elements) {
+            const bool ok = add_element_documents(text, above, addr, view, batch.length, analyzer, to_row_id, b, error);
+            ArrowArrayViewReset(&view);
+            if (!ok) {
+                return false;
+            }
+            if (batch_done != nullptr && batch.length > 0) {
+                (*batch_done)(static_cast<std::size_t>(batch.length), fragment);
+            }
+            continue;
+        }
+        const fts::TextColumn kind = fts::text_column_kind(text);
         const auto rows = static_cast<std::size_t>(batch.length);
         // Tokenize side by side; then give ids and postings in row order.
         std::vector<std::vector<fts::Token>> tokens(rows);
         const std::size_t chunk = 1024;
         parallel::for_each((rows + chunk - 1) / chunk, [&](std::size_t c) {
+            std::string joined;  // a list row's text, joined as Lance joins it
             for (std::size_t r = c * chunk; r < std::min(rows, (c + 1) * chunk); ++r) {
                 const std::int64_t row = view.offset + static_cast<std::int64_t>(r);
-                if (!ArrowArrayViewIsNull(text, row)) {
-                    const ArrowStringView s = ArrowArrayViewGetStringUnsafe(text, row);
-                    analyzer.tokenize(std::string_view(s.data, static_cast<std::size_t>(s.size_bytes)), tokens[r]);
+                std::string_view document;
+                if (!fts::null_above(above, row) && fts::row_text(text, kind, row, joined, document)) {
+                    analyzer.tokenize(document, tokens[r]);
                 }
             }
         });
@@ -311,41 +444,13 @@ bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, 
                 error = "more than 2^32 documents";
                 return false;
             }
-            const auto doc = static_cast<std::uint32_t>(b.row_ids.size());
-            b.row_ids.push_back(to_row_id(ArrowArrayViewGetUIntUnsafe(addr, view.offset + static_cast<std::int64_t>(r))));
-            b.num_tokens.push_back(static_cast<std::uint32_t>(tokens[r].size()));
-            b.total_tokens += tokens[r].size();
-            counts.clear();
-            for (auto& t : tokens[r]) {
-                auto [it, inserted] = b.ids.emplace(t.text, static_cast<std::uint32_t>(b.tokens.size()));
-                if (inserted) {
-                    b.tokens.push_back(std::move(t.text));
-                    b.docs.emplace_back();
-                    b.freqs.emplace_back();
-                    if (b.with_positions) {
-                        b.positions.emplace_back();
-                    }
-                }
-                counts.emplace_back(it->second, b.with_positions ? t.position : 0U);
-            }
-            std::sort(counts.begin(), counts.end());
-            for (std::size_t i = 0; i < counts.size();) {
-                std::size_t j = i;
-                while (j < counts.size() && counts[j].first == counts[i].first) {
-                    ++j;
-                }
-                b.docs[counts[i].first].push_back(doc);
-                b.freqs[counts[i].first].push_back(static_cast<std::uint32_t>(j - i));
-                if (b.with_positions) {
-                    auto& p = b.positions[counts[i].first];
-                    for (std::size_t k = i; k < j; ++k) {
-                        p.push_back(counts[k].second);
-                    }
-                }
-                i = j;
-            }
+            append_document(b, tokens[r], to_row_id(ArrowArrayViewGetUIntUnsafe(addr, view.offset + static_cast<std::int64_t>(r))),
+                            0U, counts);
         }
         ArrowArrayViewReset(&view);
+        if (batch_done != nullptr && rows > 0) {
+            (*batch_done)(rows, fragment);
+        }
     }
     return true;
 }
@@ -386,14 +491,19 @@ bool write_tokens(const std::filesystem::path& dir, const Built& b, std::vector<
 bool write_docs(const std::filesystem::path& dir, const Built& b, std::vector<WrittenFile>& files, std::string& error) {
     OwnedSchema schema;
     OwnedArray batch;
-    if (!struct_schema(schema.s, 2) || !field(schema.s.children[0], "_rowid", NANOARROW_TYPE_UINT64, false) ||
-        !field(schema.s.children[1], "_num_tokens", NANOARROW_TYPE_UINT32, false) || !start(schema.s, batch.a)) {
+    // Lance's v3 layout for list elements adds the element's position in its list.
+    const std::int64_t columns = b.elements ? 3 : 2;
+    if (!struct_schema(schema.s, columns) || !field(schema.s.children[0], "_rowid", NANOARROW_TYPE_UINT64, false) ||
+        !field(schema.s.children[1], "_num_tokens", NANOARROW_TYPE_UINT32, false) ||
+        (b.elements && !field(schema.s.children[2], "_doc_index_0", NANOARROW_TYPE_UINT32, false)) ||
+        !start(schema.s, batch.a)) {
         error = "out of memory";
         return false;
     }
     for (std::size_t d = 0; d < b.row_ids.size(); ++d) {
         if (ArrowArrayAppendUInt(batch.a.children[0], b.row_ids[d]) != NANOARROW_OK ||
-            ArrowArrayAppendUInt(batch.a.children[1], b.num_tokens[d]) != NANOARROW_OK) {
+            ArrowArrayAppendUInt(batch.a.children[1], b.num_tokens[d]) != NANOARROW_OK ||
+            (b.elements && ArrowArrayAppendUInt(batch.a.children[2], b.doc_index[d]) != NANOARROW_OK)) {
             error = "out of memory";
             return false;
         }
@@ -674,7 +784,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     if (target != nullptr && target->manifest != nullptr) {
         manifest = *target->manifest;
         version = target->version;
-    } else if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+    } else if (!load_read_version(dataset_path, options.read_version, manifest, version, error)) {
         return false;
     }
     const bool commit = target == nullptr || target->out == nullptr;
@@ -685,14 +795,17 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     std::vector<std::string> parts;
     const auto* f = index_files::find_field(manifest, column, parts);
     if (f == nullptr) {
-        error = "column '" + column + "' not found";
+        error = column.find('[') != std::string::npos
+                    ? "FTS field path '" + column + "' does not exist in the dataset schema"  // a list element path
+                    : "column '" + column + "' not found";
         return false;
     }
-    if (parts.size() != 1U) {
-        error = "an INVERTED index on a nested column is not supported";
-        return false;
-    }
-    const std::string name = options.name.empty() ? column + "_idx" : options.name;
+    // A nested column: its documents are the text leaf below the struct fields (parts[1..]); the scan reads
+    // the top-level column, as a scalar index's does.
+    const std::vector<std::string> below(parts.begin() + 1, parts.end());
+    const bool elements = options.granularity == DocGranularity::ListElement;
+    // Lance's default names: the row index is <column>_idx, the list-element one <column>_list_element_idx.
+    const std::string name = options.name.empty() ? column + (elements ? "_list_element_idx" : "_idx") : options.name;
     const auto existing = std::find_if(manifest.indices.begin(), manifest.indices.end(),
                                        [&](const pb::IndexMetadata& i) { return i.name == name; });
     if (commit && existing != manifest.indices.end() && !options.replace) {
@@ -704,31 +817,49 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     LanceScanRequest request;
     request.has_version = true;
     request.version = version;
-    const std::vector<std::string> columns = {column};
+    const std::vector<std::string> columns = {parts.front()};
     request.columns = &columns;
     request.with_row_address = true;
     request.fragment_ids = target != nullptr ? target->fragments : nullptr;
     const auto is_text = [&](const ArrowSchema& schema) {
-        const char* format = schema.n_children == 2 ? schema.children[0]->format : nullptr;
-        if (format == nullptr || (std::strcmp(format, "u") != 0 && std::strcmp(format, "U") != 0 &&
-                                  std::strcmp(format, "vu") != 0)) {
-            error = "an INVERTED index needs a string column; " + column + " is not one";
+        std::vector<std::size_t> path;
+        const ArrowSchema* text = schema.n_children == 2 && fts::text_child_path(schema.children[0], below, path)
+                                      ? fts::text_schema_at(schema.children[0], path)
+                                      : nullptr;
+        if (fts::text_schema_kind(text) == fts::TextColumn::kNone) {
+            error = "an INVERTED index needs a string column or a list of strings column; " + column + " is not one";
+            return false;
+        }
+        if (elements && fts::text_schema_kind(text) != fts::TextColumn::kStringList) {
+            error = "Invalid user input: FTS field path '" + column + "' has no List layer and cannot use ListElement document granularity";
             return false;
         }
         return true;
     };
     Built built;
+    built.elements = elements;
     built.with_positions = params.with_position;
     built.format_version = format;
     built.block_size = params.block_size;
-    const index_build::Progress* progress = target != nullptr ? target->progress : nullptr;
-    if (progress != nullptr) {
-        (*progress)(0, "tokenize_docs", 0, "rows", 0);
-    }
-    if (target != nullptr && target->rows != nullptr && !target->rows->empty()) {
+    // Pylance's stages: load_data (the documents, an old segment's first), tokenize_docs (one progress
+    // event per batch, the documents counted so far), copy_partitions (the partition's files; this build
+    // writes one partition), write_metadata. Each event carries the stage's total, and "complete" the last
+    // count. Without a callback the work and its order are the same.
+    const index_build::Progress* progress = target != nullptr ? target->progress : (options.progress ? &options.progress : nullptr);
+    const auto report = [&](int event, const char* name, std::uint64_t total, const char* unit, std::uint64_t completed) {
+        if (progress != nullptr) {
+            (*progress)(event, name, total, unit, completed);
+        }
+    };
+    const bool old_rows = target != nullptr && target->rows != nullptr && !target->rows->empty();
+    const bool scan = request.fragment_ids == nullptr || !request.fragment_ids->empty();
+    OwnedSchema taken;
+    index_files::OwnedBatches rows;
+    OwnedSchema scanned;
+    index_files::OwnedBatches batches;
+    report(0, "load_data", 0, "rows", 0);
+    if (old_rows) {
         // An old segment's documents first, deleted or not.
-        OwnedSchema taken;
-        index_files::OwnedBatches rows;
         LanceScanRequest by_address = request;
         by_address.fragment_ids = nullptr;
         std::vector<std::uint64_t> addresses = *target->rows;
@@ -744,41 +875,62 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
             }
             addresses.erase(std::remove(addresses.begin(), addresses.end(), UINT64_MAX), addresses.end());
         }
-        if (!lance_dataset_take_rows(dataset_path, by_address, addresses, taken.s, rows.v, error) ||
-            !is_text(taken.s) || !add_documents(taken.s, rows.v, analyzer, to_row_id, built, error)) {
+        if (!lance_dataset_take_rows(dataset_path, by_address, addresses, taken.s, rows.v, error)) {
             return false;
         }
     }
-    if (request.fragment_ids == nullptr || !request.fragment_ids->empty()) {
-        OwnedSchema scanned;
-        index_files::OwnedBatches batches;
-        if (!lance_dataset_scan(dataset_path, request, scanned.s, batches.v, error) || !is_text(scanned.s) ||
-            !add_documents(scanned.s, batches.v, analyzer, to_row_id, built, error)) {
-            return false;
+    if (scan && !lance_dataset_scan(dataset_path, request, scanned.s, batches.v, error)) {
+        return false;
+    }
+    report(2, "load_data", 0, "rows", 0);
+
+    // One progress event per fragment (the documents counted so far), as pylance reports: not per batch,
+    // whose size depends on how the scan was cut.
+    std::uint64_t tokenized = 0;
+    std::optional<std::uint64_t> current_fragment;
+    const std::function<void(std::size_t, std::uint64_t)> counted = [&](std::size_t rows_done, std::uint64_t fragment) {
+        if (current_fragment && *current_fragment != fragment) {
+            report(1, "tokenize_docs", 0, "rows", tokenized);
         }
+        current_fragment = fragment;
+        tokenized += rows_done;
+    };
+    const std::function<void(std::size_t, std::uint64_t)>* counted_ptr = progress != nullptr ? &counted : nullptr;
+    report(0, "tokenize_docs", 0, "rows", 0);
+    if (old_rows && (!is_text(taken.s) || !add_documents(taken.s, rows.v, analyzer, to_row_id, built, below, error, counted_ptr))) {
+        return false;
     }
-
-    if (progress != nullptr) {
-        (*progress)(2, "tokenize_docs", 0, "", 0);
+    if (scan && (!is_text(scanned.s) || !add_documents(scanned.s, batches.v, analyzer, to_row_id, built, below, error, counted_ptr))) {
+        return false;
     }
+    if (current_fragment) {
+        report(1, "tokenize_docs", 0, "rows", tokenized);
+    }
+    report(2, "tokenize_docs", 0, "rows", tokenized);
 
-    // The files.
+    // The files: the partition's (copy_partitions), then the metadata (write_metadata).
     const auto uuid = target != nullptr && target->uuid != nullptr ? *target->uuid : index_files::new_uuid();
     const auto dir = dataset_path / "_indices" / pb::uuid_string(uuid);
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    if (ec) {
-        error = "cannot create " + dir.string() + ": " + ec.message();
+    if (!index_files::create_index_dir(dir, error)) {
         return false;
     }
     std::vector<WrittenFile> files;
-    if (!index_build::stage(progress, "write_metadata", 4, "files", [&] {
-            return write_postings(dir, built, files, error) && write_tokens(dir, built, files, error) &&
-                   write_docs(dir, built, files, error) && write_metadata(dir, params, files, error);
-        })) {
-        std::filesystem::remove_all(dir, ec);
+    report(0, "copy_partitions", 1, "partitions", 0);
+    if (!(write_postings(dir, built, files, error) && write_tokens(dir, built, files, error) &&
+          write_docs(dir, built, files, error))) {
+        index_files::remove_index_dir(dir);
         return false;
     }
+    report(1, "copy_partitions", 1, "partitions", 1);
+    report(2, "copy_partitions", 1, "partitions", 1);
+
+    report(0, "write_metadata", 1, "files", 0);
+    if (!write_metadata(dir, params, files, error)) {
+        index_files::remove_index_dir(dir);
+        return false;
+    }
+    report(1, "write_metadata", 1, "files", 1);
+    report(2, "write_metadata", 1, "files", 1);
 
     // The manifest entry.
     std::vector<std::uint32_t> fragment_ids;
@@ -802,7 +954,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     auto entry = pb::make_index_metadata(uuid, {f->id}, name, version, fragment_ids,
                                                        "/lance.table.InvertedIndexDetails", format,
                                                        static_cast<std::uint64_t>(now), index_files_list,
-                                                       index_details(params));
+                                                       index_details(params, options.granularity));
     if (!commit) {
         *target->out = std::move(entry);
         return true;
@@ -814,7 +966,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     }
     manifest.indices.push_back(std::move(entry));
     if (!commit_next_version(dataset_path, std::move(manifest), new_version, error)) {
-        std::filesystem::remove_all(dir, ec);
+        index_files::remove_index_dir(dir);
         return false;
     }
     return true;
@@ -825,7 +977,14 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
 bool dataset_create_inverted_index(const std::filesystem::path& dataset_path, const std::string& column,
                                    const InvertedIndexOptions& options, std::uint64_t& new_version,
                                    std::string& error) {
-    return create_inverted_index(dataset_path, column, options, nullptr, new_version, error);
+    return retry_from_read_version(
+        options.read_version,
+        [&](ReadVersion from) {
+            InvertedIndexOptions o = options;
+            o.read_version = from;
+            return create_inverted_index(dataset_path, column, o, nullptr, new_version, error);
+        },
+        error);
 }
 
 bool index_build::build_inverted_segment(const std::filesystem::path& dataset_path, const std::string& column,
@@ -835,8 +994,8 @@ bool index_build::build_inverted_segment(const std::filesystem::path& dataset_pa
     return create_inverted_index(dataset_path, column, options, &target, unused, error);
 }
 
-std::vector<std::uint8_t> index_build::inverted_details(const fts::AnalyzerParams& params) {
-    return index_details(params);
+std::vector<std::uint8_t> index_build::inverted_details(const fts::AnalyzerParams& params, DocGranularity granularity) {
+    return index_details(params, granularity);
 }
 
 }  // namespace nano_lance

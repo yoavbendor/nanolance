@@ -54,6 +54,7 @@ struct DatasetInfo {
     std::string data_storage_version;  // e.g. "2.2"
     std::vector<DatasetFragmentInfo> fragments;  // in manifest order
     std::vector<BasePath> base_paths;            // the dataset's base paths, in manifest order
+    std::string branch;                          // the branch this version is on; empty: main
     std::uint64_t max_fragment_id = 0;
     bool has_max_fragment_id = false;
     std::map<std::string, std::string> config;
@@ -76,6 +77,16 @@ struct DatasetInfo {
 bool dataset_info(const std::filesystem::path& dataset_path, bool has_version, std::uint64_t version,
                   DatasetInfo& out, std::string& error);
 
+/// The transaction that made `version`: the bytes of its transaction file, or of its inline section.
+/// `found` is false when the version has none (no error).
+bool dataset_transaction(const std::filesystem::path& dataset_path, std::uint64_t version,
+                         std::vector<std::uint8_t>& bytes, bool& found, std::string& error);
+
+/// Lance's manifest_needs_migration for the version (the latest when `has_version` is false): a manifest an
+/// older writer made, which the next commit rewrites.
+bool dataset_needs_migration(const std::filesystem::path& dataset_path, bool has_version, std::uint64_t version,
+                             bool& out, std::string& error);
+
 /// Every version of the dataset, oldest first.
 bool dataset_versions(const std::filesystem::path& dataset_path, std::vector<DatasetVersionInfo>& out,
                       std::string& error);
@@ -85,22 +96,25 @@ bool dataset_latest_version(const std::filesystem::path& dataset_path, std::uint
 
 /// Make `version` the latest again: a new version with its schema and fragments (Lance's restore).
 bool dataset_restore(const std::filesystem::path& dataset_path, std::uint64_t version, std::uint64_t& new_version,
-                     std::string& error);
+                     std::string& error, std::optional<std::uint64_t> read_version = std::nullopt);
 
 /// Upsert (and, for `remove`, delete) table config keys in a new version.
 bool dataset_update_config(const std::filesystem::path& dataset_path,
                            const std::map<std::string, std::string>& upsert, const std::vector<std::string>& remove,
-                           std::uint64_t& new_version, std::string& error);
+                           std::uint64_t& new_version, std::string& error,
+                           std::optional<std::uint64_t> read_version = std::nullopt);
 
 /// Replace the table metadata (`replace`) or upsert into it, in a new version.
 bool dataset_update_table_metadata(const std::filesystem::path& dataset_path,
                                    const std::map<std::string, std::string>& values, bool replace,
-                                   std::uint64_t& new_version, std::string& error);
+                                   std::uint64_t& new_version, std::string& error,
+                                   std::optional<std::uint64_t> read_version = std::nullopt);
 
 /// Replace the schema metadata (`replace`) or upsert into it, in a new version.
 bool dataset_update_schema_metadata(const std::filesystem::path& dataset_path,
                                     const std::map<std::string, std::string>& values, bool replace,
-                                    std::uint64_t& new_version, std::string& error);
+                                    std::uint64_t& new_version, std::string& error,
+                                    std::optional<std::uint64_t> read_version = std::nullopt);
 
 /// A field of a dataset's schema, as its manifest holds it (pre-order; a child names its parent).
 struct DatasetField {

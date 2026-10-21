@@ -140,8 +140,8 @@ def test_memory_uri():
 
 def test_unsupported_is_loud(tmp_path):
     ds = nl.write_dataset(table(3), str(tmp_path / "ds"))
-    with pytest.raises(NotImplementedError):
-        ds.create_index("score", "IVF_RQ")  # still unbuilt (RaBitQ is out of scope)
+    with pytest.raises(TypeError, match="Vector column score must be FixedSizeListArray"):
+        ds.create_index("score", "IVF_RQ")  # a vector index on a scalar column: pylance's TypeError
     with pytest.raises(NotImplementedError):
         nl.write_dataset(table(3), str(tmp_path / "old"), data_storage_version="2.0")
 

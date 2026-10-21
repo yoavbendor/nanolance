@@ -16,7 +16,7 @@ import numpy as np
 import pyarrow as pa
 
 from nanolance import _nanolance
-from nanolance.lance._errors import native, unsupported
+from nanolance.lance._errors import native, refuse_object_store_write, unsupported
 
 __all__ = ["indices"]
 
@@ -41,9 +41,8 @@ def _float32_rows(array, dimension: int) -> np.ndarray:
     return np.ascontiguousarray(values, dtype=np.float32).reshape(-1, dimension)
 
 
-def _fixed_size_list(values: np.ndarray, list_size: int) -> pa.FixedSizeListArray:
-    return pa.FixedSizeListArray.from_arrays(pa.array(np.ascontiguousarray(values, np.float32).reshape(-1)),
-                                             list_size)
+def _fixed_size_list(values: np.ndarray, list_size: int, dtype=np.float32) -> pa.FixedSizeListArray:
+    return pa.FixedSizeListArray.from_arrays(pa.array(np.ascontiguousarray(values, dtype).reshape(-1)), list_size)
 
 
 def _fragments(fragment_ids) -> Optional[List[int]]:
@@ -52,12 +51,16 @@ def _fragments(fragment_ids) -> Optional[List[int]]:
 
 def train_ivf_model(dataset, column, dimension, num_partitions, distance_type, sample_rate, max_iters,
                     fragment_ids=None) -> pa.FixedSizeListArray:
-    """IVF centroids by k-means over a sample of `column` (sample_rate rows per partition)."""
-    options = {"metric": _metric(distance_type), "num_partitions": int(num_partitions),
+    """IVF centroids by k-means over a sample of `column` (sample_rate rows per partition); k-modes over a
+    uint8 column with distance_type "hamming" (uint8 centroids)."""
+    hamming = str(distance_type).lower() == "hamming"
+    options = {"metric": "hamming" if hamming else _metric(distance_type), "num_partitions": int(num_partitions),
                "sample_rate": int(sample_rate), "max_iters": int(max_iters)}
     with native():
         dim, _, centroids, _ = _nanolance._index_train_model(dataset.uri, dataset.version, str(column), "IVF_FLAT",
                                                              options, _fragments(fragment_ids), None)
+    if hamming:
+        return _fixed_size_list(np.frombuffer(centroids, dtype=np.uint8), dim, np.uint8)
     return _fixed_size_list(np.frombuffer(centroids, dtype=np.float32), dim)
 
 
@@ -147,6 +150,7 @@ def shuffle_transformed_vectors(unsorted_filenames, dir_path, ivf_centroids, shu
 def load_shuffled_vectors(filenames, dir_path, dataset, column, ivf_centroids, pq_codebook, pq_dimension,
                           num_subvectors, distance_type, index_name=None, num_bits=8) -> None:
     """Commit an IVF_PQ index with these models over the fragments the sorted files hold."""
+    refuse_object_store_write(dataset.uri, "load shuffled vectors")
     from nanolance.lance.file import LanceFileReader
 
     fragments = set()
@@ -167,13 +171,149 @@ def load_shuffled_vectors(filenames, dir_path, dataset, column, ivf_centroids, p
         _nanolance._index_commit_segments(dataset.uri, name, str(column), [segment])
 
 
+def build_rq_model(dimension: int, num_bits: int = 5) -> str:
+    """pylance's indices.build_rq_model: a RaBitQ model (JSON) for IVF_RQ builds that share one rotation (the
+    rabitq_model of create_index_uncommitted; segments built with the same model merge). Fast rotation only."""
+    import json
+
+    dimension = int(dimension)
+    if dimension <= 0 or dimension % 8:
+        raise ValueError("dimension must be divisible by 8 for IVF_RQ")
+    signs = [int(b) for b in os.urandom(4 * (dimension // 8))]
+    return json.dumps({"rotate_mat_position": None, "fast_rotation_signs": signs, "rotation_type": "fast",
+                       "code_dim": dimension, "num_bits": int(num_bits), "packed": False,
+                       "query_estimator": "raw_query"})
+
+
 indices = types.SimpleNamespace(
+    build_rq_model=build_rq_model,
     train_ivf_model=train_ivf_model,
     train_pq_model=train_pq_model,
     transform_vectors=transform_vectors,
     shuffle_transformed_vectors=shuffle_transformed_vectors,
     load_shuffled_vectors=load_shuffled_vectors,
 )
+
+
+# ── compaction: pylance's Compaction.plan / CompactionPlan / CompactionTask / Compaction.commit ──────────────
+
+
+def _fragments_by_id(uri: str, version: int):
+    from nanolance.lance._transactions import _fragment_id
+    from nanolance.lance.fragment import _decode_fragment
+
+    with native():
+        messages = _nanolance._ds_fragment_messages(uri, int(version))
+    return {_fragment_id(m): _decode_fragment(bytes(m)) for m in messages}
+
+
+class CompactionTask:
+    """One bin of a plan: the fragments one rewrite takes. ``execute`` writes them; nothing is committed."""
+
+    def __init__(self, uri: str, read_version: int, fragment_ids: List[int], fragments, max_bytes_per_file: int,
+                 batch_size: int):
+        self._uri = uri
+        self.read_version = read_version
+        self.fragment_ids = fragment_ids
+        self.fragments = fragments
+        self._max_bytes_per_file = max_bytes_per_file
+        self._batch_size = batch_size
+
+    def __eq__(self, other) -> bool:
+        return (isinstance(other, CompactionTask) and self.read_version == other.read_version
+                and self.fragment_ids == other.fragment_ids and self.fragments == other.fragments)
+
+    def __repr__(self) -> str:
+        return f"CompactionTask(read_version={self.read_version}, fragments={self.fragment_ids})"
+
+    def execute(self, dataset) -> "RewriteResult":
+        from nanolance.lance.fragment import _decode_fragment
+        from nanolance.lance.optimize import CompactionMetrics, RewriteResult
+
+        with native():
+            old_ids, messages = _nanolance._ds_compact_execute(self._uri, self.read_version, self.fragment_ids,
+                                                               self._max_bytes_per_file, self._batch_size)
+        messages = [bytes(m) for m in messages]
+        new = [_decode_fragment(m) for m in messages]
+        old = list(self.fragments)
+        metrics = CompactionMetrics(
+            fragments_removed=len(old), fragments_added=len(new),
+            files_removed=sum(len(f.files) + (f.deletion_file is not None) for f in old), files_added=len(new))
+        return RewriteResult(read_version=self.read_version, new_fragments=new, old_fragments=old, metrics=metrics,
+                             _messages=messages)
+
+
+class CompactionPlan:
+    """The tasks a compaction would run on one version (``Compaction.plan``)."""
+
+    def __init__(self, read_version: int, tasks: List[CompactionTask]):
+        self.read_version = read_version
+        self.tasks = tasks
+
+    def num_tasks(self) -> int:
+        return len(self.tasks)
+
+    def __eq__(self, other) -> bool:
+        return (isinstance(other, CompactionPlan) and self.read_version == other.read_version
+                and self.tasks == other.tasks)
+
+    def __repr__(self) -> str:
+        return f"CompactionPlan(read_version={self.read_version}, tasks=<{len(self.tasks)} compaction tasks>)"
+
+
+class Compaction:
+    """Compaction in steps: ``plan`` the tasks, ``execute`` each (in any process), ``commit`` the results."""
+
+    @staticmethod
+    def plan(dataset, options: Optional[dict] = None) -> CompactionPlan:
+        o = dict(options or {})
+
+        def opt(name, default):
+            return default if o.get(name) is None else o[name]
+
+        def limit(name):
+            return None if o.get(name) is None else int(o[name])
+
+        with native():
+            read_version, tasks = _nanolance._ds_compact_plan(
+                dataset.uri, int(opt("target_rows_per_fragment", 1024 * 1024)),
+                bool(opt("materialize_deletions", True)), float(opt("materialize_deletions_threshold", 0.1)),
+                limit("max_source_fragments"), limit("max_source_rows"), limit("max_source_bytes"),
+                sorted({int(i) for i in (o.get("excluded_fragment_ids") or [])}),
+                int(o.get("max_bytes_per_file") or 0), int(o.get("batch_size") or 0))
+        by_id = _fragments_by_id(dataset.uri, read_version)
+        max_bytes, batch = int(o.get("max_bytes_per_file") or 0), int(o.get("batch_size") or 0)
+        return CompactionPlan(read_version, [
+            CompactionTask(dataset.uri, read_version, list(ids), [by_id[i] for i in ids], max_bytes, batch)
+            for ids in tasks])
+
+    @staticmethod
+    def commit(dataset, rewrites, options: Optional[dict] = None):
+        """Commit rewritten tasks as one version (``options``: ``defer_index_remap``, ``reindex``). Returns the
+        CompactionMetrics. A writer that changed a rewritten fragment meanwhile makes it a conflict."""
+        from nanolance.lance.optimize import CompactionMetrics
+
+        rewrites = list(rewrites)
+        if not rewrites:
+            return CompactionMetrics()
+        o = dict(options or {})
+        versions = {r.read_version for r in rewrites}
+        if len(versions) != 1:
+            raise ValueError(f"the rewrites were made from different versions: {sorted(versions)}")
+        with native():
+            metrics, _ = _nanolance._ds_compact_commit(
+                dataset.uri, rewrites[0].read_version, [[int(f.id) for f in r.old_fragments] for r in rewrites],
+                [list(r._messages) for r in rewrites], bool(o.get("defer_index_remap", False)),
+                bool(o.get("reindex", True)))
+        dataset._refresh_latest("Rewrite")
+        return CompactionMetrics(**{k: int(v) for k, v in metrics.items() if not k.startswith("indexes_")})
+
+
+def manifest_needs_migration(dataset) -> bool:
+    """Whether the dataset's latest manifest was written by an older writer, so the next commit rewrites it
+    (Lance's manifest_needs_migration)."""
+    with native():
+        return bool(_nanolance._ds_needs_migration(dataset.uri, int(dataset.version)))
 
 
 def __getattr__(name: str):

@@ -47,11 +47,11 @@ class PyFullTextQuery:
         return f"PyFullTextQuery({self.spec!r})"
 
 
-def _granularity(document_granularity) -> None:
-    if document_granularity is not None and DocumentGranularity(document_granularity) != DocumentGranularity.ROW:
-        from nanolance.lance._errors import unsupported
-
-        raise unsupported("full-text search over list elements")
+def _granularity(document_granularity) -> Optional[str]:
+    """The query's document granularity as the native query JSON names it (None: the index decides)."""
+    if document_granularity is None:
+        return None
+    return DocumentGranularity(document_granularity).value
 
 
 _U32_MAX = 2**32 - 1
@@ -103,7 +103,7 @@ class MatchQuery(FullTextQuery):
     def __init__(self, query: str, column: str, *, boost: float = 1.0, fuzziness: Optional[int] = 0,
                  max_expansions: int = 50, operator: FullTextOperator = FullTextOperator.OR,
                  prefix_length: int = 0, document_granularity: Optional[DocumentGranularity] = None):
-        _granularity(document_granularity)
+        granularity = _granularity(document_granularity)
         # Checked as pylance checks them: None means exact matching for fuzziness, and nothing else
         # is accepted but an integer in the range of its Rust type.
         edits = 0 if fuzziness is None else _unsigned("fuzziness", fuzziness, _U32_MAX,
@@ -111,10 +111,12 @@ class MatchQuery(FullTextQuery):
         expansions = _unsigned("max_expansions", max_expansions, _U64_MAX, "can't convert negative int to unsigned")
         prefix = _unsigned("prefix_length", prefix_length, _U32_MAX,
                            "out of range integral type conversion attempted")
-        self._inner = PyFullTextQuery({"match": {
+        spec = {
             "column": column, "terms": query, "boost": float(boost), "fuzziness": edits,
-            "max_expansions": expansions, "operator": _operator(operator),
-            "prefix_length": prefix}})
+            "max_expansions": expansions, "operator": _operator(operator), "prefix_length": prefix}
+        if granularity is not None:
+            spec["granularity"] = granularity
+        self._inner = PyFullTextQuery({"match": spec})
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.MATCH
@@ -123,8 +125,11 @@ class MatchQuery(FullTextQuery):
 class PhraseQuery(FullTextQuery):
     def __init__(self, query: str, column: str, *, slop: int = 0,
                  document_granularity: Optional[DocumentGranularity] = None):
-        _granularity(document_granularity)
-        self._inner = PyFullTextQuery({"match_phrase": {"column": column, "terms": query, "slop": int(slop)}})
+        spec = {"column": column, "terms": query, "slop": int(slop)}
+        granularity = _granularity(document_granularity)
+        if granularity is not None:
+            spec["granularity"] = granularity
+        self._inner = PyFullTextQuery({"match_phrase": spec})
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.MATCH_PHRASE

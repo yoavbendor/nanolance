@@ -5,6 +5,8 @@
 #include "index_files.hpp"
 
 #include "nanolance/bloom_filter.hpp"
+#include "nanolance/byte_sink.hpp"
+#include "nanolance/byte_source.hpp"
 
 #include "nanolance/lance_file_writer.hpp"
 #include "proto_wire.hpp"
@@ -223,6 +225,49 @@ bool struct_batch(std::vector<ArrowArray*> children, std::int64_t length, ArrowA
 }
 
 std::vector<std::uint8_t> bytes_of(const std::string& s) { return {s.begin(), s.end()}; }
+
+namespace {
+
+/// Removes every object under the object-store prefix `dir` (its subdirectories' too), best effort.
+void remove_remote_tree(const std::string& dir) {
+    std::vector<io::DirEntry> entries;
+    std::string ignored;  // a failed listing or removal leaves objects behind: harmless, cleanup finds them
+    if (!io::list_dir(dir, entries, ignored)) {
+        return;
+    }
+    for (const auto& entry : entries) {
+        const std::string child = dir + "/" + entry.name;
+        if (entry.is_dir) {
+            remove_remote_tree(child);
+        } else {
+            io::remove_output(child, ignored);
+        }
+    }
+}
+
+}  // namespace
+
+bool create_index_dir(const std::filesystem::path& dir, std::string& error) {
+    if (io::is_object_store_output(dir.string())) {
+        return true;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        error = "cannot create " + dir.string() + ": " + ec.message();
+        return false;
+    }
+    return true;
+}
+
+void remove_index_dir(const std::filesystem::path& dir) {
+    if (io::is_object_store_output(dir.string())) {
+        remove_remote_tree(dir.string());
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
 
 bool write_file(const std::filesystem::path& dir, const std::string& name, const ArrowSchema& schema,
                 ArrowArray& batch, LanceFileExtras extras, std::vector<WrittenFile>& files, std::string& error) {

@@ -142,6 +142,11 @@ struct Manifest {
     bool has_index_section = false;
     std::uint64_t index_section = 0;
     std::vector<IndexMetadata> indices;
+    /// Field 21: where the inline transaction sits in the manifest file (`[u32 length][Transaction]`, as
+    /// Lance's read_message lays it out). Pylance 12 writes it beside the transaction file; read by
+    /// read_inline_transaction, never written: a commit's manifest does not carry it.
+    bool has_transaction_section = false;
+    std::uint64_t transaction_section = 0;
     /// Set when the index section could not be read: `indices` is then empty and a commit refuses,
     /// rather than publish a version that silently lost them.
     std::string index_section_error;
@@ -179,6 +184,9 @@ constexpr std::uint64_t kFlagMultipleBasePaths = 1U << 4U;
 /// commit that adds files of another version than the manifest's default, and refuses to read such a
 /// dataset without it.
 constexpr std::uint64_t kFlagMixedDataFileVersions = 1U << 8U;
+/// Every flag bit this build understands (bits 0-8, as Lance 12 defines them). A manifest with a bit
+/// outside it is refused: a reader word for a read, a writer word for a write.
+constexpr std::uint64_t kSupportedFeatureFlags = (1U << 9U) - 1U;
 
 struct Metadata {
     std::uint64_t page_table_position = 0;

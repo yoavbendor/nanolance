@@ -68,7 +68,13 @@ set(NANOLANCE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(NANOLANCE_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(NANOLANCE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(NANOLANCE_BUILD_FUSE_EXAMPLE OFF CACHE BOOL "" FORCE)
-set(NANOLANCE_ENABLE_S3 OFF CACHE BOOL "" FORCE)
+# S3 reads (s3:// datasets, through nanos3reader's S3Client) when libcurl is found; without it the binding
+# builds with S3 off and refuses s3:// by name ("nanolance was built without S3 support").
+find_package(CURL QUIET)
+set(NANOLANCE_ENABLE_S3 ${CURL_FOUND} CACHE BOOL "" FORCE)
+# SigV4's SHA-256 in-tree, so the extension links no libcrypto of its own (a wheel would otherwise bundle
+# one; Homebrew's needs a newer macOS than the wheels target).
+set(NANOLANCE_S3_CRYPTO bundled CACHE STRING "" FORCE)
 add_subdirectory(${NL_ROOT} ${CMAKE_BINARY_DIR}/nanolance_lib EXCLUDE_FROM_ALL)
 
 # --- nanobind extension ---

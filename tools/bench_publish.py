@@ -91,8 +91,9 @@ def index_summary(scalar: dict | None, vector: dict | None, fts: dict | None) ->
     out = {}
 
     def stats(items):
+        # A kind the Rust driver does not run (IVF_RQ) has no Rust timing: left out of the speed.
         xs = [rec["rust"]["median_ms"] / rec["nanolance"]["median_ms"] for rec in items
-              if rec["rust"]["median_ms"] and rec["nanolance"]["median_ms"]]
+              if rec.get("rust") and rec.get("nanolance") and rec["rust"]["median_ms"] and rec["nanolance"]["median_ms"]]
         won = sum(1 for x in xs if x > 1)
         return {"speed": geomean(xs), "wins": won, "of": len(xs)}
 
@@ -211,20 +212,24 @@ def html_page(record: dict, history: list[dict], gate_log: str) -> str:
             f"<td class='n'>{f('rust-lance', 'nanolance-cpp-mt', 'write_ms')}</td>"
             f"<td class='n'>{f('rust-lance', 'nanolance-py', 'write_ms')}</td></tr>")
 
+    def num(x):  # a value the Rust driver does not measure (IVF_RQ) is None: a dash
+        return f"{x:.3f}" if x is not None else "&mdash;"
+
     def index_rows(section: dict | None):
         if not section:
             return "<tr><td colspan='4'>not measured</td></tr>"
         out = []
         for name, rec in section.items():
+            rs = (rec.get("rust") or {}).get("median_ms")
+            nl = (rec.get("nanolance") or {}).get("median_ms")
             out.append(f"<tr><td><code>{cell(name)}</code></td>"
-                       f"<td class='n'>{rec['rust']['median_ms']:.3f}</td>"
-                       f"<td class='n'>{rec['nanolance']['median_ms']:.3f}</td>"
-                       f"<td class='n'>{fx(rec['rust']['median_ms'] / rec['nanolance']['median_ms'])}</td></tr>")
+                       f"<td class='n'>{num(rs)}</td><td class='n'>{num(nl)}</td>"
+                       f"<td class='n'>{fx(rs / nl) if rs and nl else '&mdash;'}</td></tr>")
         return "".join(out)
 
     idx = record.get("index", {})
     recall_rows = "".join(
-        f"<tr><td>{cell(kind)}</td><td class='n'>{rec['rust']:.3f}</td><td class='n'>{rec['nanolance']:.3f}</td></tr>"
+        f"<tr><td>{cell(kind)}</td><td class='n'>{num(rec['rust'])}</td><td class='n'>{num(rec['nanolance'])}</td></tr>"
         for kind, rec in (s["index"].get("vector_recall") or {}).items())
 
     history_rows = "".join(

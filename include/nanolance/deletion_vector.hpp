@@ -28,9 +28,17 @@ namespace nano_lance {
 ///
 /// Offsets are *physical* row offsets within the fragment, which is what the caller must filter on
 /// before any logical row numbering applies.
-bool read_deletion_vector(const std::filesystem::path& dataset_path, std::uint64_t fragment_id,
+/// `deletions_dir` is the `_deletions` directory the file is in (deletion_file_dir): the dataset's own,
+/// or a base path's (a branch's inherited deletions).
+bool read_deletion_vector(const std::filesystem::path& deletions_dir, std::uint64_t fragment_id,
                           const pb::DeletionFile& deletion_file,
                           std::vector<std::uint32_t>& out_sorted_offsets, std::string& error);
+
+/// read_deletion_vector for a deletion file of fragment `fragment_id` of `manifest`: the file's base
+/// path (a branch's inherited deletions name one) is looked up in the manifest.
+bool read_manifest_deletion_vector(const std::filesystem::path& dataset_path, const pb::Manifest& manifest,
+                                   std::uint64_t fragment_id, const pb::DeletionFile& deletion_file,
+                                   std::vector<std::uint32_t>& out_sorted_offsets, std::string& error);
 
 /// Parse a roaring bitmap in the portable serialization format. Exposed for testing.
 ///

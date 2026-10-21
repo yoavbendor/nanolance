@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/byte_sink.hpp"
 #include "nanolance/data_file_writer.hpp"
 #include "nanolance/parallel.hpp"
 #include "nanolance/work_stats.hpp"
@@ -23,6 +24,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -1304,10 +1306,13 @@ bool plan_item_dictionary(const ColumnValues& values, const std::vector<std::uin
     // twice the rule's limit is declined without the full pass.
     constexpr std::size_t kSample = 1024U;
     if (items.size() >= 8U * kSample) {
-        std::vector<std::string_view> sample(kSample);
+        // The sampled values' 64-bit hashes, sorted: equal values sit together as with the values themselves
+        // (integer compares instead of string compares; a collision could only merge two runs).
+        std::vector<std::size_t> sample(kSample);
         const auto stride = items.size() / kSample;
+        const std::hash<std::string_view> hash;
         for (std::size_t k = 0; k < kSample; ++k) {
-            sample[k] = value_at(items[k * stride]);
+            sample[k] = hash(value_at(items[k * stride]));
         }
         std::sort(sample.begin(), sample.end());
         double d = 0.0;
@@ -1529,6 +1534,15 @@ bool plan_item_fsst(const fsst::Encoder& encoder, const ColumnValues& values, co
         }
     };
     put(0U, 0U);
+    // A value with 7 readable bytes after it in the column's buffer is compressed without the zero-padded
+    // copy of its last bytes (the same output; most of the work for short values).
+    const auto* base = values.variable.data.data();
+    const std::size_t readable = values.variable.data.size();
+    const auto compress = [&](std::uint64_t begin, std::size_t size, std::uint8_t* to) {
+        return static_cast<std::size_t>(begin) + size + 7U <= readable
+                   ? fsst::compress_into_padded(encoder, base + begin, size, to)
+                   : fsst::compress_into(encoder, base + begin, size, to);
+    };
     // With threads to spare, the items in parts compressed side by side (a string column's write
     // was 70% here): part k compresses into its own worst-case region of the scratch -- twice the
     // raw bytes before it -- with offsets relative to that region, and a pass after closes the gaps
@@ -1541,7 +1555,7 @@ bool plan_item_fsst(const fsst::Encoder& encoder, const ColumnValues& values, co
         for (const auto i : items) {
             const auto begin = variable_offset(values, i);
             const auto size = static_cast<std::size_t>(variable_offset(values, i + 1U) - begin);
-            at += fsst::compress_into(encoder, values.variable.data.data() + begin, size, scratch.data() + at);
+            at += compress(begin, size, scratch.data() + at);
             put(++slot, at);
         }
     } else {
@@ -1565,8 +1579,7 @@ bool plan_item_fsst(const fsst::Encoder& encoder, const ColumnValues& values, co
             for (auto j = first[k]; j < first[k + 1U]; ++j) {
                 const auto begin = variable_offset(values, items[j]);
                 const auto size = static_cast<std::size_t>(variable_offset(values, items[j] + 1U) - begin);
-                local += fsst::compress_into(encoder, values.variable.data.data() + begin, size,
-                                             dst + region[k] + local);
+                local += compress(begin, size, dst + region[k] + local);
                 put(j + 1U, local);
             }
             written[k] = local;
@@ -2171,19 +2184,13 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
     const auto relative_path =
         extras != nullptr && !extras->path.empty() ? extras->path : std::filesystem::path("data") / file_name;
     const auto full_path = extras != nullptr && !extras->path.empty() ? extras->path : dataset_path / relative_path;
-    std::error_code ec;
-    std::filesystem::create_directories(full_path.parent_path(), ec);
-    if (ec) {
-        error = "failed to create data directory: " + ec.message();
-        return false;
-    }
-
     work_stats::WrittenFileTally tally(full_path);
-    std::ofstream out(full_path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        error = "failed to open data file for writing";
+    // A local file (its directory created), or an object uploaded on commit() (io::open_output).
+    auto output = io::open_output(full_path.string(), error);
+    if (!output) {
         return false;
     }
+    std::ostream& out = *output;
 
     // Lance's blob preprocessing, now that the file's name is known: blobs given as bytes are placed --
     // inline ones here at the head of the file, before any column (their descriptors hold absolute
@@ -3262,13 +3269,13 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         error = "failed to write Lance data file";
         return false;
     }
-
-    result.relative_path = relative_path;
-    result.file_size_bytes = std::filesystem::file_size(full_path, ec);
-    if (ec) {
-        error = "failed to stat data file: " + ec.message();
+    const auto file_size = pos(out);
+    if (!output->commit(error)) {
         return false;
     }
+
+    result.relative_path = relative_path;
+    result.file_size_bytes = file_size;
     return true;
 }
 

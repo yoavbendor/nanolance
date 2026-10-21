@@ -20,17 +20,31 @@
 /// exactly over everything without one.
 namespace nano_lance {
 
-enum class VectorMetric { L2, Cosine, Dot };
+/// Hamming: an IVF_FLAT index over a uint8 column (its centroids and rows are bytes); only an index's
+/// own metric is Hamming, a query asks for it with NearestQuery::hamming.
+enum class VectorMetric { L2, Cosine, Dot, Hamming };
+
+/// pylance's approx_mode, which changes only IVF_RQ searches (other kinds ignore it, as in Lance).
+/// Fast: the 1-bit estimate alone, with no top-k gate. Accurate: the binary sums from a 16-bit
+/// quantized distance table (Lance's hacc path). Normal: the default.
+enum class ApproxMode { Normal, Fast, Accurate };
 
 /// "l2" / "euclidean", "cosine", "dot" (any case). False for anything else.
 bool parse_vector_metric(const std::string& name, VectorMetric& out);
-const char* vector_metric_name(VectorMetric metric);  // "l2", "cosine", "dot"
+const char* vector_metric_name(VectorMetric metric);  // "l2", "cosine", "dot", "hamming"
 
 struct NearestQuery {
     bool has_version = false;
     std::uint64_t version = 0;
     std::string column;
     std::vector<float> key;  // the query vector
+    /// A multivector column (a list of fixed-size lists of floats or whole numbers): `key` holds this
+    /// many query vectors, one after another, and a row's distance sums, over them, the least distance
+    /// to any of the row's vectors (Lance's multivec_distance). 1: an ordinary query vector.
+    std::size_t key_vectors = 1;
+    /// Set by dataset_nearest for a float16 column: pylance casts the query to the column's type, so a
+    /// cosine index search normalizes the (already rounded) query and rounds it to float16 again.
+    bool f16_column = false;
     std::uint64_t k = 10;
     /// Partitions to probe: at least `minimum_nprobes` (Lance's adaptive count when it is 1 and
     /// there is no maximum), at most `maximum_nprobes` (all when unset). `nprobes` sets both.
@@ -51,6 +65,8 @@ struct NearestQuery {
     /// Hamming distance (bits differing) over a binary column: a fixed-size list of uint8. Unset
     /// with a uint8 column: hamming too. Only the flat (unindexed) search supports it.
     bool hamming = false;
+    /// IVF_RQ only: how the binary sums and the top-k gate are computed (see ApproxMode).
+    ApproxMode approx_mode = ApproxMode::Normal;
     bool use_index = true;
     /// Keep loaded indices in the process-wide cache (false: load them afresh for this search).
     bool index_cache = true;
@@ -101,7 +117,9 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
                      std::string& error);
 
 struct VectorIndexOptions {
-    std::string type;  // "IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ", ...
+    /// The version the index is built from (the handle's, as a commit's read version): latest when unset.
+    std::optional<std::uint64_t> read_version;
+    std::string type;  // "IVF_FLAT", "IVF_PQ", "IVF_RQ", "IVF_HNSW_SQ", ...
     std::string name;  // empty: <column>_idx
     VectorMetric metric = VectorMetric::L2;
     bool replace = false;
@@ -125,6 +143,8 @@ struct VectorIndexOptions {
     std::vector<float> pq_codebook;
     /// IVF_PQ: store the codes row by row rather than transposed (Lance's skip_transpose).
     bool skip_transpose = false;
+    /// IVF_RQ: the fast rotation's sign bytes (a build_rq_model's, 4 rounds of dim / 8); empty: random.
+    std::vector<std::uint8_t> rq_signs;
     /// Where the build reports its stages (Lance's progress events: 0 starts a stage of `total` units,
     /// 1 reports `completed` of them, 2 ends it); nothing when empty. An exception it throws stops the
     /// build, and nothing is committed.
@@ -168,6 +188,7 @@ struct VectorIndexPartition {
     std::size_t partitions = 0;
     std::size_t width = 0;  // values per row: dim (flat), code bytes (PQ), dim (SQ)
     std::string column;     // "flat", "__pq_code" or "__sq_code"
+    bool uint8 = false;     // "flat" holds uint8 values (a Hamming index): codes, not floats
     std::vector<std::uint64_t> ids;
     std::vector<float> floats;         // flat: ids.size() * width
     std::vector<std::uint8_t> codes;   // PQ / SQ: ids.size() * width, row by row as stored

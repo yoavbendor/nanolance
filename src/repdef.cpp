@@ -311,7 +311,19 @@ public:
             }
             list_depth_[k] = depth;
         }
+        // next_[k]: the first layer after k that can emit a level -- a list, or a struct with a
+        // validity bitmap. A struct without one is always valid and emits nothing, so visits pass
+        // straight through it (a map's entries struct, a struct column's own layer).
+        next_.assign(layers.size() + 1U, layers.size());
+        for (std::size_t k = layers.size(); k-- > 0;) {
+            const std::size_t after = k + 1U;
+            next_[k] = after < layers.size() && passthrough(layers[after]) ? next_[after] : after;
+        }
+        first_ = !layers.empty() && passthrough(layers[0]) ? next_[0] : 0U;
     }
+
+    /// The layer the rows start at: the outermost one that can emit a level.
+    std::size_t first_layer() const { return first_; }
 
     bool check(std::uint64_t first_row, std::uint64_t num_rows, std::string& error) const {
         for (std::size_t k = 0; k < layers_.size(); ++k) {
@@ -355,7 +367,7 @@ public:
                 push(rep, null_level_[k], lists_below_[k] ? kNoSlot : idx);
                 return true;
             }
-            return visit(k + 1U, idx, rep, emit, error);
+            return visit(next_[k], idx, rep, emit, error);
         }
         const auto& offsets = *layer.offsets;
         if (idx + 1U >= offsets.size()) {
@@ -389,10 +401,10 @@ public:
         // The first child inherits the level that starts this list (and any around it); each later
         // child starts a new entry one list level in.
         const auto continuation = static_cast<std::uint16_t>(list_depth_[k] - 1U);
-        if (k + 1U == layers_.size()) {
+        if (next_[k] == layers_.size()) {
             // The innermost list: its children are the items themselves, so visit them in a loop
             // here rather than one call each -- the bulk of a list column's levels.
-            auto& item_flags = flags_[k + 1U];
+            auto& item_flags = flags_[layers_.size()];
             if (!emit) {
                 const auto n = static_cast<std::uint64_t>(end - begin);
                 levels_ += n;
@@ -404,7 +416,7 @@ public:
                 }
                 return true;
             }
-            const auto null_level = null_level_[k + 1U];
+            const auto null_level = null_level_[layers_.size()];
             for (auto c = begin; c < end; ++c) {
                 const bool item_valid = valid_at(&item_validity_, static_cast<std::uint64_t>(c));
                 push(c == begin ? rep : continuation, item_valid ? 0U : null_level, static_cast<std::uint64_t>(c));
@@ -412,7 +424,7 @@ public:
             return true;
         }
         for (auto c = begin; c < end; ++c) {
-            if (!visit(k + 1U, static_cast<std::uint64_t>(c), c == begin ? rep : continuation, emit, error)) {
+            if (!visit(next_[k], static_cast<std::uint64_t>(c), c == begin ? rep : continuation, emit, error)) {
                 return false;
             }
         }
@@ -501,6 +513,10 @@ public:
 private:
     static constexpr std::uint64_t kNoSlot = ~std::uint64_t{0};
 
+    static bool passthrough(const SerializeLayer& layer) {
+        return !layer.is_list && (layer.validity == nullptr || layer.validity->empty());
+    }
+
     void push(std::uint16_t rep, std::uint16_t def, std::uint64_t slot) {
         const auto at = static_cast<std::size_t>(level_at_);
         if (out_->has_rep) {
@@ -523,6 +539,8 @@ private:
     std::vector<LayerFlags> flags_;
     std::vector<std::uint16_t> list_depth_;
     std::vector<bool> lists_below_;
+    std::vector<std::size_t> next_;
+    std::size_t first_ = 0;
     std::vector<std::uint16_t> null_level_;
     std::vector<std::uint16_t> empty_level_;
     Serialized* out_ = nullptr;
@@ -557,7 +575,7 @@ bool serialize(const std::vector<SerializeLayer>& layers, const std::vector<std:
         std::vector<std::string> errors(parts);
         parallel::for_each(parts, [&](std::size_t k) {
             for (auto r = row_of(k); r < row_of(k + 1U); ++r) {
-                if (!part[k].visit(0, r, 0, false, errors[k])) {
+                if (!part[k].visit(part[k].first_layer(), r, 0, false, errors[k])) {
                     return;
                 }
             }
@@ -582,7 +600,7 @@ bool serialize(const std::vector<SerializeLayer>& layers, const std::vector<std:
         const auto rep = part[0].row_rep();
         parallel::for_each(parts, [&](std::size_t k) {
             for (auto r = row_of(k); r < row_of(k + 1U); ++r) {
-                if (!part[k].visit(0, r, rep, true, errors[k])) {
+                if (!part[k].visit(part[k].first_layer(), r, rep, true, errors[k])) {
                     return;
                 }
             }
@@ -596,14 +614,14 @@ bool serialize(const std::vector<SerializeLayer>& layers, const std::vector<std:
         return true;
     }
     for (std::uint64_t r = first_row; r < first_row + num_rows; ++r) {
-        if (!s.visit(0, r, 0, false, error)) {
+        if (!s.visit(s.first_layer(), r, 0, false, error)) {
             return false;
         }
     }
     s.assign_levels(out);
     const auto rep = s.row_rep();
     for (std::uint64_t r = first_row; r < first_row + num_rows; ++r) {
-        if (!s.visit(0, r, rep, true, error)) {
+        if (!s.visit(s.first_layer(), r, rep, true, error)) {
             return false;
         }
     }

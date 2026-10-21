@@ -498,6 +498,10 @@ bool decode_manifest(const std::vector<std::uint8_t>& bytes, Manifest& manifest)
         manifest.has_index_section = true;
         manifest.index_section = **w.index_section;
     }
+    if (*w.transaction_section) {
+        manifest.has_transaction_section = true;
+        manifest.transaction_section = **w.transaction_section;
+    }
     if (const auto& ts = *w.timestamp) {
         manifest.has_timestamp = true;
         manifest.timestamp_seconds = *ts->seconds;

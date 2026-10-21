@@ -8,6 +8,7 @@
 #include "nanolance/schema_mapper.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,12 @@ bool writer_set_field_id_base(NanoLanceWriter* writer, std::int32_t first_id, st
 /// (with their children), keeping the dataset's field ids and order. The files cover those fields
 /// alone, as Lance writes an append of part of the schema; readers fill the rest with nulls.
 bool writer_project_append(NanoLanceWriter* writer, const std::vector<std::string>& keep, std::string& error);
+
+/// Report a staged writer's data files: `events(0, name, 0)` when a file's first rows are buffered (its name
+/// is the one the file gets), `events(2, name, rows)` when it is written. Called on the writing thread,
+/// inside the write or commit that reaches it; the callback must not throw.
+bool writer_set_file_events(NanoLanceWriter* writer, std::function<void(int, const std::string&, std::uint64_t)> events,
+                            std::string& error);
 
 /// Commit what is pending (a batch of no rows too, with `keep_empty`) and hand over every staged data
 /// file, with the schema they were written with, instead of publishing them.

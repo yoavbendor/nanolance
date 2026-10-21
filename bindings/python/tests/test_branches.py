@@ -1,0 +1,846 @@
+"""Branches written by pylance (B1: reading them, and appending to them, from nanolance).
+
+Each test builds its branches with pylance, the engine that creates them (nanolance does not create
+branches yet), and checks that nanolance opens them, lists them and resolves their references as
+pylance does, and that nanolance's appends and overwrites land on the branch and read back in pylance.
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+import os
+import shutil
+
+import numpy as np
+import pyarrow as pa
+import pytest
+
+import nanolance.lance as nl
+from tests.support import require_pylance
+
+
+@pytest.fixture
+def lance():
+    return require_pylance()
+
+
+def _rows(ds) -> list:
+    return ds.to_table().to_pylist()
+
+
+def _main_and_branch(lance, root):
+    """main at v2 (4 rows); branch ``feat`` forked from main's v2 and appended to once (its v3, 5 rows)."""
+    main = lance.write_dataset(pa.table({"a": [1, 2, 3], "b": [4, 5, 6]}), root)
+    main = lance.write_dataset(pa.table({"a": [7], "b": [8]}), root, mode="append")
+    branch = main.create_branch("feat", main.version)
+    branch = lance.write_dataset(pa.table({"a": [11], "b": [12]}), branch, mode="append")
+    assert branch.version == 3
+    return main, branch
+
+
+def test_branch_dir_opens_as_its_own_dataset(lance, tmp_path):
+    root = tmp_path / "ds"
+    _main_and_branch(lance, root)
+    branch_dir = str(root / "tree" / "feat")
+
+    ours = nl.dataset(branch_dir)
+    theirs = lance.dataset(branch_dir)
+    assert ours.version == theirs.version == 3
+    assert ours.to_table().to_pylist() == theirs.to_table().to_pylist()
+    assert ours.checkout_version(2).to_table().num_rows == 4
+    assert nl.dataset(branch_dir, version=2).to_table().to_pylist() == theirs.checkout_version(2).to_table().to_pylist()
+
+
+def test_checkout_version_by_branch_reference(lance, tmp_path):
+    root = tmp_path / "ds"
+    main, branch = _main_and_branch(lance, root)
+    ours = nl.dataset(str(root))
+
+    latest = ours.checkout_version(("feat", None))
+    assert latest.version == 3
+    assert _rows(latest) == _rows(branch)
+
+    at_fork = ours.checkout_version(("feat", 2))
+    assert at_fork.version == 2
+    assert _rows(at_fork) == _rows(branch.checkout_version(2))
+
+    # main is unchanged by the branch: its own latest, and version 2 of it, read as before.
+    assert _rows(ours.checkout_version(("main", None))) == _rows(main)
+    assert ours.checkout_version(("main", None)).version == 2
+    assert _rows(ours.checkout_version((None, 1))) == [{"a": 1, "b": 4}, {"a": 2, "b": 5}, {"a": 3, "b": 6}]
+
+    # Within a branch, an integer version stays on that branch.
+    assert latest.checkout_version(2).version == 2
+    assert _rows(latest.checkout_version(2)) == _rows(at_fork)
+
+
+def test_missing_branch_is_a_value_error(lance, tmp_path):
+    root = tmp_path / "ds"
+    _main_and_branch(lance, root)
+    with pytest.raises(ValueError, match="Not found"):
+        nl.dataset(str(root)).checkout_version(("nope", None))
+
+
+def test_branches_list_matches_pylance(lance, tmp_path):
+    root = tmp_path / "ds"
+    main, branch = _main_and_branch(lance, root)
+    main.create_branch("other", 1)  # forked from v1: a second branch, to order
+    main.create_branch("team/x", 2)  # a name with a slash: its file is percent-encoded
+    ours = nl.dataset(str(root))
+    assert main.branches.list() == ours.branches.list()
+    for order in (None, "asc", "desc"):
+        assert main.branches.list_ordered(order) == ours.branches.list_ordered(order)
+    assert [n for n, _ in ours.branches.list_ordered()] == ["feat", "team/x", "other"]
+    assert nl.dataset(str(root / "tree" / "team" / "x")).version == 2
+
+    listed = nl.dataset(str(root)).branches.list()
+    assert set(listed) == {"feat", "other", "team/x"}
+    feat = listed["feat"]
+    assert feat["parent_branch"] is None
+    assert feat["parent_version"] == 2
+    assert feat["branch_identifier"][0][0] == 2 and isinstance(feat["branch_identifier"][0][1], str)
+    assert feat["manifest_size"] > 0 and feat["metadata"] == {}
+
+
+def test_branch_of_branch_reads_through_both_forks(lance, tmp_path):
+    root = tmp_path / "ds"
+    main, branch = _main_and_branch(lance, root)
+    grandchild = branch.create_branch("sub", branch.version)  # forked from feat's v3
+    grandchild = lance.write_dataset(pa.table({"a": [21], "b": [22]}), grandchild, mode="append")
+    expected = _rows(grandchild)
+    assert len(expected) == 6
+
+    ours = nl.dataset(str(root)).checkout_version(("sub", None))
+    assert ours.version == grandchild.version
+    assert _rows(ours) == expected
+    assert nl.dataset(str(root)).branches.list()["sub"]["parent_branch"] == "feat"
+    assert _rows(nl.dataset(str(root / "tree" / "sub"))) == expected
+
+
+def test_tags_on_branches_read(lance, tmp_path):
+    root = tmp_path / "ds"
+    main, branch = _main_and_branch(lance, root)
+    branch.tags.create("feat_latest", ("feat", None))
+    main.tags.create("main_latest", (None, None))
+
+    ours = nl.dataset(str(root))
+    tags = ours.tags.list()
+    assert tags == lance.dataset(str(root)).tags.list()
+    assert tags["feat_latest"]["branch"] == "feat"
+    assert tags["main_latest"]["branch"] is None
+    assert ours.tags.get_version("main_latest") == 2
+    assert ours.tags.get_version("feat_latest") == lance.dataset(str(root)).tags.get_version("feat_latest") == 3
+    assert _rows(ours.checkout_version("feat_latest")) == _rows(branch)
+    assert ours.checkout_version("feat_latest").version == 3
+    assert nl.dataset(str(root), version="feat_latest").version == 3
+    assert _rows(nl.dataset(str(root), version="feat_latest")) == _rows(branch)
+    # Opened on a branch's own directory, a tag still names its own branch or main.
+    assert _rows(nl.dataset(str(root / "tree" / "feat"), version="main_latest")) == _rows(main)
+    assert nl.dataset(str(root / "tree" / "feat"), version="feat_latest").version == 3
+
+
+def test_append_on_pylance_branch_lands_on_branch(lance, tmp_path):
+    root = tmp_path / "ds"
+    main, branch = _main_and_branch(lance, root)
+    main_before = _rows(lance.dataset(str(root)))
+    branch_dir = str(root / "tree" / "feat")
+    before_files = set(os.listdir(os.path.join(branch_dir, "data")))
+
+    nd = nl.write_dataset(pa.table({"a": [31, 32], "b": [33, 34]}), nl.dataset(branch_dir), mode="append")
+    assert nd.version == 4
+    assert nd.uri == branch_dir
+
+    # The new rows are a file of the branch's own data directory; the inherited ones are not copied.
+    new_files = set(os.listdir(os.path.join(branch_dir, "data"))) - before_files
+    assert len(new_files) == 1
+
+    expected = [{"a": 1, "b": 4}, {"a": 2, "b": 5}, {"a": 3, "b": 6}, {"a": 7, "b": 8}, {"a": 11, "b": 12},
+                {"a": 31, "b": 33}, {"a": 32, "b": 34}]
+    assert _rows(nl.dataset(branch_dir)) == expected
+    theirs = lance.dataset(branch_dir)
+    assert theirs.version == 4
+    assert _rows(theirs) == expected
+    assert theirs.checkout_version(3).to_table().num_rows == 5
+
+    # main: untouched on disk and to both readers.
+    assert _rows(lance.dataset(str(root))) == main_before
+    assert nl.dataset(str(root)).version == 2
+    assert nl.dataset(str(root)).version_refs() == [{"version": 1}, {"version": 2}]
+
+
+def test_overwrite_on_pylance_branch(lance, tmp_path):
+    root = tmp_path / "ds"
+    main, branch = _main_and_branch(lance, root)
+    branch_dir = str(root / "tree" / "feat")
+    nl.write_dataset(pa.table({"a": [90], "b": [91]}), branch_dir, mode="overwrite")
+
+    theirs = lance.dataset(branch_dir)
+    assert theirs.version == 4
+    assert _rows(theirs) == [{"a": 90, "b": 91}]
+    # Earlier versions of the branch still read as they did, inherited rows included.
+    assert _rows(theirs.checkout_version(3)) == _rows(branch)
+    assert _rows(nl.dataset(branch_dir, version=3)) == _rows(branch)
+    assert _rows(lance.dataset(str(root))) == _rows(main)
+
+
+def test_pylance_branch_of_nanolance_written_main_reads_back(lance, tmp_path):
+    """A branch forked from a version nanolance wrote on main, appended to by nanolance, read by pylance."""
+    root = tmp_path / "ds"
+    lance.write_dataset(pa.table({"a": [1, 2]}), root)
+    nl.write_dataset(pa.table({"a": [3]}), str(root), mode="append")
+    main = lance.dataset(str(root))
+    branch = main.create_branch("from_nano", main.version)
+    nl.write_dataset(pa.table({"a": [4]}), str(root / "tree" / "from_nano"), mode="append")
+    assert _rows(lance.dataset(str(root / "tree" / "from_nano"))) == [{"a": 1}, {"a": 2}, {"a": 3}, {"a": 4}]
+    assert _rows(nl.dataset(str(root / "tree" / "from_nano"))) == [{"a": 1}, {"a": 2}, {"a": 3}, {"a": 4}]
+    assert _rows(branch) == [{"a": 1}, {"a": 2}, {"a": 3}]
+    assert lance.dataset(str(root)).version == 2
+
+
+def test_inherited_indexes_answer_as_pylance(lance, tmp_path):
+    root = tmp_path / "ds"
+    rng = np.random.default_rng(0)
+    n = 300
+    vectors = rng.normal(size=(n, 8)).astype("float32")
+    table = pa.table({
+        "id": pa.array(range(n), pa.int64()),
+        "k": pa.array([f"k{i % 7}" for i in range(n)]),
+        "vec": pa.FixedSizeListArray.from_arrays(pa.array(vectors.ravel()), 8),
+    })
+    main = lance.write_dataset(table, root)
+    main.create_scalar_index("id", index_type="BTREE")
+    main.create_index("vec", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=4)
+    main = lance.dataset(str(root))
+    branch = main.create_branch("indexed", main.version)
+    # Rows appended on the branch are in a fragment the inherited indexes do not cover.
+    branch = lance.write_dataset(table.slice(0, 20), branch, mode="append")
+
+    branch_dir = str(root / "tree" / "indexed")
+    ours = nl.dataset(branch_dir)
+    theirs = lance.dataset(branch_dir)
+    assert sorted(i["name"] for i in ours.list_indices()) == sorted(i["name"] for i in theirs.list_indices())
+    assert all(i["base_id"] == 0 for i in ours.list_indices())
+
+    assert ours.to_table(filter="id = 5", columns=["id"]).to_pylist() == \
+        theirs.to_table(filter="id = 5", columns=["id"]).to_pylist()
+    assert ours.to_table(filter="id > 290", columns=["id"]).num_rows == \
+        theirs.to_table(filter="id > 290", columns=["id"]).num_rows
+    assert ours.take([0, 5, 299]).to_pylist() == theirs.take([0, 5, 299]).to_pylist()
+    query = [0.1] * 8
+    ours_near = ours.to_table(nearest={"column": "vec", "q": query, "k": 5}, columns=["id"])
+    theirs_near = theirs.to_table(nearest={"column": "vec", "q": query, "k": 5}, columns=["id"])
+    assert ours_near.column("id").to_pylist() == theirs_near.column("id").to_pylist()
+    assert ours.count_rows(filter="k = 'k3'") == theirs.count_rows(filter="k = 'k3'")
+
+
+def test_inherited_full_text_index_answers_as_pylance(lance, tmp_path):
+    root = tmp_path / "ds"
+    words = ["alpha beta", "gamma delta", "alpha gamma", "beta epsilon"] * 25
+    main = lance.write_dataset(pa.table({"id": range(len(words)), "text": words}), root)
+    main.create_scalar_index("text", index_type="INVERTED")
+    main = lance.dataset(str(root))
+    branch = main.create_branch("words", main.version)
+    lance.write_dataset(pa.table({"id": [1000], "text": ["alpha zeta"]}), branch, mode="append")
+
+    branch_dir = str(root / "tree" / "words")
+    ours = nl.dataset(branch_dir).to_table(full_text_query="alpha", columns=["id"])
+    theirs = lance.dataset(branch_dir).to_table(full_text_query="alpha", columns=["id"])
+    assert sorted(ours.column("id").to_pylist()) == sorted(theirs.column("id").to_pylist())
+    assert 1000 in ours.column("id").to_pylist()
+
+
+def test_inherited_deletions_read_as_pylance(lance, tmp_path):
+    root = tmp_path / "ds"
+    main = lance.write_dataset(pa.table({"a": list(range(10))}), root)
+    main = lance.dataset(str(root))
+    branch = main.create_branch("pruned", main.version)
+    branch.delete("a < 3")
+    branch = lance.dataset(str(root / "tree" / "pruned"))
+    expected = list(range(3, 10))
+    assert [r["a"] for r in _rows(branch)] == expected
+    assert [r["a"] for r in _rows(nl.dataset(str(root / "tree" / "pruned")))] == expected
+    assert nl.dataset(str(root)).count_rows() == 10
+
+
+def test_cleanup_keeps_the_versions_a_branch_forks_from(lance, tmp_path):
+    """pylance's cleanup keeps every version a branch forks from, and its files (measured: old_versions 0,
+    the branch still reads). nanolance's cleanup must do the same, for the main branch and for a branch."""
+    from datetime import timedelta
+
+    def build(root):
+        lance.write_dataset(pa.table({"a": [1, 2]}), root)
+        lance.dataset(str(root)).create_branch("keep", 1)
+        lance.write_dataset(pa.table({"a": [9]}), root, mode="overwrite")
+
+    ours_root = tmp_path / "ours"
+    theirs_root = tmp_path / "theirs"
+    build(ours_root)
+    build(theirs_root)
+
+    ours = nl.dataset(str(ours_root)).cleanup_old_versions(older_than=timedelta(0), delete_unverified=True)
+    theirs = lance.dataset(str(theirs_root)).cleanup_old_versions(older_than=timedelta(0), delete_unverified=True)
+    assert theirs.old_versions == 0
+    assert ours.old_versions == theirs.old_versions
+    assert ours.data_files_removed == theirs.data_files_removed == 0
+
+    branch_dir = str(ours_root / "tree" / "keep")
+    assert _rows(lance.dataset(branch_dir, version=1)) == [{"a": 1}, {"a": 2}]
+    assert _rows(nl.dataset(branch_dir, version=1)) == [{"a": 1}, {"a": 2}]
+    assert _rows(nl.dataset(str(ours_root))) == [{"a": 9}]
+    # main's version 1 is kept on disk, so it still reads.
+    assert [v["version"] for v in nl.dataset(str(ours_root)).versions()] == [1, 2]
+
+
+def test_cleanup_keeps_a_branch_made_from_a_relative_path(lance, tmp_path, monkeypatch):
+    """pylance records the parent root as the dataset was opened. A branch made from a relative path
+    names its parent by that relative text, which cannot be resolved from another directory: cleanup
+    there must still keep the files the branch uses."""
+    from datetime import timedelta
+
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    lance.write_dataset(pa.table({"a": [1, 2]}), "rel.lance")
+    lance.dataset("rel.lance").create_branch("keep", 1)
+    lance.write_dataset(pa.table({"a": [9]}), "rel.lance", mode="overwrite")
+    root = work / "rel.lance"
+    monkeypatch.chdir(tmp_path)  # cleanup runs elsewhere, with an absolute path
+    stats = nl.dataset(str(root)).cleanup_old_versions(older_than=timedelta(0), delete_unverified=True)
+    assert stats.data_files_removed == 0
+    monkeypatch.chdir(work)  # the branch's relative base path resolves from here again
+    assert _rows(lance.dataset("rel.lance/tree/keep", version=1)) == [{"a": 1}, {"a": 2}]
+
+
+# ── B2: creating, writing and deleting branches, from either engine ─────────────────────────────────
+
+def _pair(lance, tmp_path):
+    """Two identical datasets built by pylance: one for each engine to branch in."""
+    roots = (tmp_path / "ours", tmp_path / "theirs")
+    for root in roots:
+        lance.write_dataset(pa.table({"a": [1, 2, 3], "b": [4, 5, 6]}), root)
+        lance.write_dataset(pa.table({"a": [7], "b": [8]}), root, mode="append")
+    return roots
+
+
+def _refs_shape(root) -> dict:
+    """Each branch's reference without its ids and times: what must match pylance's file in every field."""
+    out = {}
+    for path in glob.glob(os.path.join(root, "_refs", "branches", "*.json")):
+        with open(path) as f:
+            ref = json.load(f)
+        assert set(ref) == {"parentBranch", "identifier", "parentVersion", "createAt", "manifestSize", "metadata"}
+        assert isinstance(ref["createAt"], int)
+        mapping = ref["identifier"]["version_mapping"]
+        assert all(len(i) == 32 and int(i, 16) >= 0 for _, i in mapping)
+        out[os.path.basename(path)] = {
+            "parentBranch": ref["parentBranch"],
+            "versions": [v for v, _ in mapping],
+            "parentVersion": ref["parentVersion"],
+            # manifestSize is checked against each root's own parent manifest: two roots' manifests can
+            # differ by a byte (the commit time's nanoseconds are a varint of 4 or 5 bytes).
+            "metadata": ref["metadata"],
+        }
+    return out
+
+
+def _layout(root) -> set:
+    """Every file outside the branches' own directories and the refs, relative to the root."""
+    found = set()
+    for dirpath, _, files in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        if rel.split(os.sep)[0] in ("tree", "_refs"):
+            continue
+        found.update(os.path.join(rel, f) for f in files)
+    return found
+
+
+def test_create_branch_writes_the_reference_pylance_writes(lance, tmp_path):
+    ours_root, theirs_root = _pair(lance, tmp_path)
+    before = _layout(ours_root)
+    main_versions = sorted(os.listdir(ours_root / "_versions"))
+    nl.dataset(str(ours_root)).create_branch("feat", 1)
+    lance.dataset(str(theirs_root)).create_branch("feat", 1)
+
+    assert _refs_shape(ours_root) == _refs_shape(theirs_root)
+    # Main's files and manifests: a branch adds nothing outside tree/ and _refs/ (pylance's own data files
+    # and transactions have their own names, so the two roots are compared by the names of their versions).
+    assert _layout(ours_root) == before
+    assert sorted(os.listdir(ours_root / "_versions")) == main_versions
+    assert _refs_shape(ours_root)["feat.json"]["parentBranch"] is None
+    # The branch's own first manifest holds the fork version, and main's files and manifests are untouched.
+    manifests = lambda root: sorted(f for f in os.listdir(root / "tree" / "feat" / "_versions") if f.endswith(".manifest"))
+    assert manifests(ours_root) == manifests(theirs_root)
+    # No latest_version_hint.json: pylance opens the branch without one, and datasets without branches gain no file.
+    assert not os.path.exists(ours_root / "tree" / "feat" / "_versions" / "latest_version_hint.json")
+    # The reference's manifest size is the size of the manifest it forks.
+    for root in (ours_root, theirs_root):
+        parent = root / "_versions" / f"{2**64 - 1 - 1}.manifest"
+        with open(root / "_refs" / "branches" / "feat.json") as f:
+            assert json.load(f)["manifestSize"] == os.path.getsize(parent)
+
+    feat = lance.dataset(str(ours_root / "tree" / "feat"))
+    assert feat.version == 1
+    assert feat.to_table().to_pylist() == [{"a": 1, "b": 4}, {"a": 2, "b": 5}, {"a": 3, "b": 6}]  # forked at v1
+
+
+def test_create_branch_every_reference_form(lance, tmp_path):
+    root = tmp_path / "ds"
+    lance.write_dataset(pa.table({"a": [1, 2]}), root)
+    main = nl.write_dataset(pa.table({"a": [3]}), str(root), mode="append")
+    main = nl.dataset(str(root))
+    main.tags.create("main_v1", 1)
+    feat = main.create_branch("feat", ("main", 1))
+    feat = nl.write_dataset(pa.table({"a": [4]}), feat, mode="append")
+    feat.tags.create("feat_latest", ("feat", None))
+
+    forms = {
+        "from_int": (main, 2),
+        "from_tag": (main, "main_v1"),
+        "from_tuple_main": (main, ("main", 1)),
+        "from_tuple_latest": (main, (None, None)),
+        "from_branch_tuple": (main, ("feat", None)),
+        "from_branch_tag": (main, "feat_latest"),
+        "from_branch_current": (nl.dataset(str(root / "tree" / "feat")), None),
+    }
+    expected_versions = {"from_int": 2, "from_tag": 1, "from_tuple_main": 1, "from_tuple_latest": 2,
+                         "from_branch_tuple": 2, "from_branch_tag": 2, "from_branch_current": 2}
+    for name, (dataset, reference) in forms.items():
+        branch = dataset.create_branch(name, reference)
+        assert branch.version == expected_versions[name], name
+        assert branch.uri == str(root / "tree" / name)
+        assert lance.dataset(str(root / "tree" / name)).version == expected_versions[name]
+
+    listed = nl.dataset(str(root)).branches.list()
+    assert listed["from_branch_tuple"]["parent_branch"] == "feat"
+    assert listed["from_tag"]["parent_version"] == 1
+    assert listed["from_branch_tag"]["parent_version"] == 2
+    assert len(listed["from_branch_tuple"]["branch_identifier"]) == 2
+    assert _refs_shape(root)["from_branch_current.json"]["parentBranch"] == "feat"
+    # Each engine lists the same branches with the same parents.
+    theirs = lance.dataset(str(root)).branches.list()
+    assert {n: (b["parent_branch"], b["parent_version"]) for n, b in listed.items()} == \
+        {n: (b["parent_branch"], b["parent_version"]) for n, b in theirs.items()}
+
+
+def test_nanolance_branch_of_branch_both_ways(lance, tmp_path):
+    root = tmp_path / "ds"
+    main, feat = _main_and_branch(lance, root)
+    nested = nl.dataset(str(root / "tree" / "feat")).create_branch("sub", feat.version)
+    nested = nl.write_dataset(pa.table({"a": [21], "b": [22]}), nested, mode="append")
+    expected = [{"a": 1, "b": 4}, {"a": 2, "b": 5}, {"a": 3, "b": 6}, {"a": 7, "b": 8}, {"a": 11, "b": 12},
+                {"a": 21, "b": 22}]
+    assert nested.version == 4  # forked from feat's version 3, then one append
+    assert _rows(lance.dataset(str(root / "tree" / "sub"))) == expected
+    assert _rows(nl.dataset(str(root / "tree" / "sub"))) == expected
+
+    # pylance branches the nanolance-made branch, and nanolance reads what it appends.
+    deeper = lance.dataset(str(root / "tree" / "sub")).create_branch("deep", 4)
+    deeper = lance.write_dataset(pa.table({"a": [31], "b": [32]}), deeper, mode="append")
+    assert _rows(nl.dataset(str(root / "tree" / "deep"))) == expected + [{"a": 31, "b": 32}]
+    assert nl.dataset(str(root)).branches.list()["deep"]["parent_branch"] == "sub"
+    assert _rows(nl.dataset(str(root))) == _rows(lance.dataset(str(root)))
+
+
+def test_branch_delete_refusals_and_removal(lance, tmp_path):
+    root = tmp_path / "ds"
+    main, feat = _main_and_branch(lance, root)
+    nested = nl.dataset(str(root / "tree" / "feat")).create_branch("sub", feat.version)
+    ours = nl.dataset(str(root))
+    with pytest.raises(OSError, match="Branch name cannot be 'main'"):
+        ours.branches.delete("main")
+    with pytest.raises(OSError, match="is referenced by"):
+        ours.branches.delete("feat")
+    assert "feat" in ours.branches.list()
+
+    nested_ds = nl.dataset(str(root / "tree" / "sub"))
+    nested_ds.tags.create("sub_tag", ("sub", None))
+    with pytest.raises(OSError, match="is referenced by tags"):
+        ours.branches.delete("sub")
+    nested_ds.tags.delete("sub_tag")
+
+    ours.branches.delete("sub")
+    assert "sub" not in ours.branches.list()
+    assert not os.path.exists(root / "tree" / "sub")
+    assert not os.path.exists(root / "_refs" / "branches" / "sub.json")
+    assert _rows(lance.dataset(str(root / "tree" / "feat"))) == _rows(feat)
+    ours.branches.delete("feat")
+    assert "feat" not in lance.dataset(str(root)).branches.list()
+    assert not os.path.exists(root / "tree" / "feat")
+    assert _rows(lance.dataset(str(root))) == _rows(main)
+
+
+def test_replace_branch_metadata(lance, tmp_path):
+    root = tmp_path / "ds"
+    main, _ = _main_and_branch(lance, root)
+    nl.dataset(str(root)).branches.replace_metadata("feat", {"description": "features"})
+    assert lance.dataset(str(root)).branches.list()["feat"]["metadata"] == {"description": "features"}
+    assert nl.dataset(str(root)).branches.list()["feat"]["metadata"] == {"description": "features"}
+    lance.dataset(str(root)).branches.replace_metadata("feat", {})
+    assert nl.dataset(str(root)).branches.list()["feat"]["metadata"] == {}
+    with pytest.raises(ValueError, match="does not exist"):
+        nl.dataset(str(root)).branches.replace_metadata("nope", {"x": "y"})
+
+
+def test_tags_on_branches_are_written_and_read_by_both(lance, tmp_path):
+    root = tmp_path / "ds"
+    main, feat = _main_and_branch(lance, root)
+    ours = nl.dataset(str(root / "tree" / "feat"))
+    ours.tags.create("feat_v2", 2)
+    ours.tags.create("main_v1", ("main", 1))
+    ours.tags.create("feat_now", None)
+    assert ours.tags.get_version("feat_v2") == 2
+    tags = ours.tags.list()
+    assert tags["feat_v2"]["branch"] == "feat"
+    assert tags["main_v1"]["branch"] is None
+    assert tags == lance.dataset(str(root)).tags.list()
+    assert _rows(nl.dataset(str(root), version="feat_v2")) == _rows(feat.checkout_version(2))
+    assert nl.dataset(str(root), version="main_v1").version == 1
+
+    ours.tags.update("feat_v2", ("main", 2))
+    assert nl.dataset(str(root)).tags.list()["feat_v2"]["branch"] is None
+    assert lance.dataset(str(root)).tags.list()["feat_v2"]["branch"] is None
+    ours.tags.update("feat_v2", ("feat", None))
+    assert lance.dataset(str(root)).tags.list()["feat_v2"]["branch"] == "feat"
+    assert nl.dataset(str(root)).tags.get_version("feat_v2") == 3
+
+    ours.tags.delete("feat_v2")
+    assert "feat_v2" not in lance.dataset(str(root)).tags.list()
+    ours.tags.replace_metadata("feat_now", {"note": "x"})
+    assert lance.dataset(str(root)).tags.list()["feat_now"]["metadata"] == {"note": "x"}
+    # pylance's tag on a nanolance-written branch resolves through the branch.
+    lance.dataset(str(root)).tags.create("pylance_on_feat", ("feat", 2))
+    assert nl.dataset(str(root), version="pylance_on_feat").version == 2
+
+
+def test_index_builds_on_a_branch_land_in_its_own_indices(lance, tmp_path):
+    root = tmp_path / "ds"
+    lance.write_dataset(pa.table({"a": list(range(50))}), root)
+    main = lance.dataset(str(root))
+    main.create_scalar_index("a", index_type="BTREE")
+    feat = nl.dataset(str(root)).create_branch("feat", main.version)
+    feat = nl.write_dataset(pa.table({"a": list(range(50, 60))}), feat, mode="append")
+    main_index_files = set(os.listdir(root / "_indices"))
+    main_index_dirs = {d: set(os.listdir(root / "_indices" / d)) for d in main_index_files}
+
+    branch = nl.dataset(str(root / "tree" / "feat"))
+    branch.optimize.optimize_indices()
+    assert set(os.listdir(root / "tree" / "feat" / "_indices")) != set()
+    # The branch's index is built in the branch's own directory; main's is untouched.
+    assert set(os.listdir(root / "_indices")) == main_index_files
+    assert {d: set(os.listdir(root / "_indices" / d)) for d in main_index_files} == main_index_dirs
+
+    theirs = lance.dataset(str(root / "tree" / "feat"))
+    assert [i["name"] for i in theirs.list_indices()] == [i["name"] for i in nl.dataset(str(root / "tree" / "feat")).list_indices()]
+    assert nl.dataset(str(root / "tree" / "feat")).count_rows(filter="a = 55") == 1
+    assert theirs.count_rows(filter="a = 55") == 1
+    assert lance.dataset(str(root)).count_rows(filter="a = 55") == 0
+
+
+def test_cleanup_on_a_branch_keeps_the_versions_its_branches_fork_from(lance, tmp_path):
+    from datetime import timedelta
+
+    def build(root):
+        lance.write_dataset(pa.table({"a": [1, 2]}), root)
+        feat = lance.dataset(str(root)).create_branch("feat", 1)
+        feat = lance.write_dataset(pa.table({"a": [3]}), feat, mode="append")
+        lance.dataset(str(root / "tree" / "feat")).create_branch("sub", 2)
+        lance.write_dataset(pa.table({"a": [9]}), str(root / "tree" / "feat"), mode="overwrite")
+
+    ours_root = tmp_path / "ours"
+    theirs_root = tmp_path / "theirs"
+    build(ours_root)
+    build(theirs_root)
+    ours = nl.dataset(str(ours_root / "tree" / "feat")).cleanup_old_versions(older_than=timedelta(0),
+                                                                            delete_unverified=True)
+    theirs = lance.dataset(str(theirs_root / "tree" / "feat")).cleanup_old_versions(older_than=timedelta(0),
+                                                                                    delete_unverified=True)
+    assert ours.old_versions == theirs.old_versions == 1
+    assert ours.data_files_removed == theirs.data_files_removed
+    sub = str(ours_root / "tree" / "sub")
+    assert _rows(lance.dataset(sub)) == [{"a": 1}, {"a": 2}, {"a": 3}]
+    assert _rows(nl.dataset(sub)) == [{"a": 1}, {"a": 2}, {"a": 3}]
+    assert _rows(nl.dataset(str(ours_root / "tree" / "feat"))) == [{"a": 9}]
+    assert _rows(lance.dataset(str(ours_root))) == [{"a": 1}, {"a": 2}]
+
+
+def test_create_branch_refuses_an_existing_name(lance, tmp_path):
+    root = tmp_path / "ds"
+    _main_and_branch(lance, root)
+    with pytest.raises(OSError, match="already exists"):
+        nl.dataset(str(root)).create_branch("feat", 1)
+    with pytest.raises(ValueError, match="Not found|not found"):
+        nl.dataset(str(root)).create_branch("x", ("nope", None))
+    with pytest.raises(OSError):
+        nl.dataset(str(root)).create_branch("main", 1)
+
+
+def test_index_segments_commit_on_a_branch(lance, tmp_path):
+    root = tmp_path / "ds"
+    lance.write_dataset(pa.table({"a": list(range(50))}), root)
+    feat = nl.dataset(str(root)).create_branch("feat", lance.dataset(str(root)).version)
+    feat = nl.write_dataset(pa.table({"a": list(range(50, 60))}), feat, mode="append")
+    branch = nl.dataset(str(root / "tree" / "feat"))
+    segment = branch.create_index_uncommitted("a", "BTREE", name="a_idx",
+                                              fragment_ids=[f.fragment_id for f in branch.get_fragments()])
+    branch = branch.commit_existing_index_segments("a_idx", "a", [segment])
+    assert branch.version == 3
+    assert [i["name"] for i in lance.dataset(str(root / "tree" / "feat")).list_indices()] == ["a_idx"]
+    assert lance.dataset(str(root / "tree" / "feat")).count_rows(filter="a = 55") == 1
+    assert os.listdir(root / "tree" / "feat" / "_indices") != []  # built in the branch's own directory
+    assert not os.path.exists(root / "_indices")
+    assert lance.dataset(str(root)).list_indices() == []
+
+
+# ── clones (B3): shallow and deep clones, as pylance writes them ──────────────────────────────────────
+
+
+def _varint(raw: bytes, i: int):
+    value = shift = 0
+    while True:
+        byte = raw[i]
+        i += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if byte < 0x80:
+            return value, i
+
+
+def _fields(raw: bytes) -> list:
+    """A protobuf message's (field, value) pairs: varints as ints, the other wire types as bytes."""
+    out, i = [], 0
+    while i < len(raw):
+        key, i = _varint(raw, i)
+        wire = key & 7
+        if wire == 0:
+            value, i = _varint(raw, i)
+        elif wire == 2:
+            size, i = _varint(raw, i)
+            value, i = raw[i:i + size], i + size
+        elif wire == 1:
+            value, i = raw[i:i + 8], i + 8
+        elif wire == 5:
+            value, i = raw[i:i + 4], i + 4
+        else:
+            raise ValueError(f"wire type {wire}")
+        out.append((key >> 3, value))
+    return out
+
+
+def _one(fields, number, default=None):
+    values = [v for f, v in fields if f == number]
+    return values[-1] if values else default
+
+
+def _text(fields, number):
+    value = _one(fields, number)
+    return None if value is None else value.decode()
+
+
+def _manifest_fields(path) -> list:
+    """A manifest file's Manifest message: its record follows the transaction record, at the position the footer
+    names (a 4-byte length, then the message)."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    pos = int.from_bytes(raw[-16:-8], "little")
+    size = int.from_bytes(raw[pos:pos + 4], "little")
+    return _fields(raw[pos + 4:pos + 4 + size])
+
+
+def _clone_shape(clone_root, source_root) -> dict:
+    """A clone's first manifest and its transaction, with ids, times and the roots' own paths left out: what
+    pylance writes, field for field. The clone's files are compared by their base ids, not their names."""
+
+    def here(text):
+        return text.replace(str(source_root), "<source>")
+
+    (name,) = [n for n in os.listdir(clone_root / "_versions") if n.endswith(".manifest")]
+    manifest = _manifest_fields(clone_root / "_versions" / name)
+    (txn_name,) = os.listdir(clone_root / "_transactions")
+    with open(clone_root / "_transactions" / txn_name, "rb") as f:
+        txn = _fields(f.read())
+    op = _fields(_one(txn, 113))
+    bases = []
+    for _, base in [(f, v) for f, v in manifest if f == 18]:
+        fields = _fields(base)
+        bases.append((_one(fields, 1, 0), _text(fields, 2), bool(_one(fields, 3, 0)), here(_text(fields, 4))))
+    # Sorted by id: pylance writes its base paths in an order that varies from run to run (measured: 10 of 12
+    # clones of a branch wrote base 0 first, 2 wrote base 1 first); the ids name them.
+    bases.sort()
+    fragments = []
+    for f, fragment in manifest:
+        if f == 2:
+            fields = _fields(fragment)
+            files = [_one(_fields(v), 7) for g, v in fields if g == 2]
+            fragments.append((files, _one(fields, 3) is not None))
+    return {
+        "version": 2**64 - 1 - int(name.split(".")[0]),
+        "flags": (_one(manifest, 9, 0), _one(manifest, 10, 0)),
+        "bases": bases,
+        "branch": _text(manifest, 20),
+        "fragments": fragments,
+        "read_version": _one(txn, 1),
+        "clone": {
+            "is_shallow": _one(op, 1, 0),
+            "ref_name": _text(op, 2),
+            "ref_version": _one(op, 3),
+            "target": here(_text(op, 4)),
+            "branch_name": _text(op, 5),
+        },
+        "layout": sorted(os.listdir(clone_root)),
+    }
+
+
+def _with_deletion_and_index(lance, root):
+    """main at v4: 12 rows over two fragments, row a=3 deleted (a deletion file), a BTree index on a."""
+    lance.write_dataset(pa.table({"a": list(range(10)), "b": list(range(10))}), root)
+    lance.write_dataset(pa.table({"a": [100, 101], "b": [1, 2]}), root, mode="append")
+    lance.dataset(str(root)).delete("a = 3")
+    lance.dataset(str(root)).create_scalar_index("a", index_type="BTREE")
+    return lance.dataset(str(root))
+
+
+def test_shallow_clone_writes_the_manifest_pylance_writes(lance, tmp_path):
+    ours_root, theirs_root = _pair(lance, tmp_path)
+    nl.dataset(str(ours_root)).shallow_clone(tmp_path / "ours_clone", 2)
+    lance.dataset(str(theirs_root)).shallow_clone(tmp_path / "theirs_clone", 2)
+
+    ours = _clone_shape(tmp_path / "ours_clone", ours_root)
+    assert ours == _clone_shape(tmp_path / "theirs_clone", theirs_root)
+    assert ours["version"] == 2 and ours["branch"] is None and ours["read_version"] == 2
+    assert ours["clone"] == {"is_shallow": 1, "ref_name": None, "ref_version": 2, "target": "<source>",
+                             "branch_name": None}
+    assert ours["bases"] == [(0, None, True, "<source>")]
+    assert ours["flags"] == (16, 16)
+    assert ours["fragments"] == [([0], False), ([0], False)]  # every file stays in the source
+    assert "data" not in ours["layout"]
+    assert "_indices" not in ours["layout"] and "_deletions" not in ours["layout"]
+
+
+def test_shallow_clone_of_a_branch_writes_the_manifest_pylance_writes(lance, tmp_path):
+    roots = _pair(lance, tmp_path)
+    shapes = {}
+    for label, engine, root in (("ours", nl, roots[0]), ("theirs", lance, roots[1])):
+        branch = engine.dataset(str(root)).create_branch("feat", 2)
+        branch = engine.write_dataset(pa.table({"a": [9], "b": [10]}), branch, mode="append")
+        assert branch.version == 3
+        branch.shallow_clone(tmp_path / f"{label}_clone", 3)
+        shapes[label] = _clone_shape(tmp_path / f"{label}_clone", root)
+
+    assert shapes["ours"] == shapes["theirs"]
+    ours = shapes["ours"]
+    # The branch's own file points at a new base path named for the branch (pylance's base 1), the inherited
+    # files keep main's base 0; the clone is a dataset of its own: no branch field, a clone of the branch.
+    assert ours["bases"] == [(0, None, True, "<source>"), (1, "feat", True, "<source>/tree/feat")]
+    assert ours["fragments"] == [([0], False), ([0], False), ([1], False)]
+    assert ours["branch"] is None
+    assert ours["clone"] == {"is_shallow": 1, "ref_name": "feat", "ref_version": 3,
+                             "target": "<source>/tree/feat", "branch_name": None}
+
+
+def test_deep_clone_writes_pylance_layout(lance, tmp_path):
+    ours_root, theirs_root = tmp_path / "ours", tmp_path / "theirs"
+    for root in (ours_root, theirs_root):
+        _with_deletion_and_index(lance, root)
+    nl.dataset(str(ours_root)).deep_clone(tmp_path / "ours_clone", 4)
+    lance.dataset(str(theirs_root)).deep_clone(tmp_path / "theirs_clone", 4)
+
+    ours = _clone_shape(tmp_path / "ours_clone", ours_root)
+    assert ours == _clone_shape(tmp_path / "theirs_clone", theirs_root)
+    # No base path to the source, no base on any file, the source's deletion flag kept, and no shallow Clone op.
+    assert ours["bases"] == [] and ours["flags"] == (1, 1)
+    assert ours["clone"] == {"is_shallow": 0, "ref_name": None, "ref_version": 4, "target": "<source>",
+                             "branch_name": None}
+    assert ours["fragments"] == [([None], True), ([None], False)]  # the deletion file of fragment 0 is copied
+    for label, root in (("ours", tmp_path / "ours_clone"), ("theirs", tmp_path / "theirs_clone")):
+        names = {d: sorted(os.listdir(root / d)) for d in ("data", "_deletions", "_indices")}
+        assert len(names["data"]) == 2 and len(names["_deletions"]) == 1 and len(names["_indices"]) == 1
+    assert sorted(os.listdir(tmp_path / "ours_clone")) == sorted(os.listdir(tmp_path / "theirs_clone"))
+
+
+def test_each_engine_reads_and_appends_to_the_others_clones(lance, tmp_path):
+    root = tmp_path / "ds"
+    expected = _with_deletion_and_index(lance, root).to_table().to_pylist()
+    nl.dataset(str(root)).shallow_clone(tmp_path / "nl_shallow", 4)
+    nl.dataset(str(root)).deep_clone(tmp_path / "nl_deep", 4)
+    lance.dataset(str(root)).shallow_clone(tmp_path / "lance_shallow", 4)
+    lance.dataset(str(root)).deep_clone(tmp_path / "lance_deep", 4)
+    for name in ("nl_shallow", "nl_deep", "lance_shallow", "lance_deep"):
+        clone = str(tmp_path / name)
+        assert nl.dataset(clone).to_table().to_pylist() == expected, name
+        assert lance.dataset(clone).to_table().to_pylist() == expected, name
+        assert nl.dataset(clone).to_table(filter="a > 50").num_rows == 2, name
+
+    # An append on a clone lands in the clone, as version 5, and the other engine reads it back.
+    nl.write_dataset(pa.table({"a": [7], "b": [8]}), str(tmp_path / "lance_shallow"), mode="append")
+    lance.write_dataset(pa.table({"a": [6], "b": [9]}), str(tmp_path / "nl_deep"), mode="append")
+    assert lance.dataset(str(tmp_path / "lance_shallow")).version == 5
+    assert nl.dataset(str(tmp_path / "nl_deep")).version == 5
+    assert len(lance.dataset(str(tmp_path / "lance_shallow")).to_table()) == len(expected) + 1
+    assert len(nl.dataset(str(tmp_path / "nl_deep")).to_table()) == len(expected) + 1
+    assert nl.dataset(str(root)).version == 4  # the source is untouched
+
+
+def test_deep_clone_reads_after_the_source_is_deleted(lance, tmp_path):
+    root = tmp_path / "ds"
+    expected = _with_deletion_and_index(lance, root).to_table().to_pylist()
+    nl.dataset(str(root)).deep_clone(tmp_path / "deep_nl", 4)
+    lance.dataset(str(root)).deep_clone(tmp_path / "deep_lance", 4)
+    shutil.rmtree(root)
+    for name in ("deep_nl", "deep_lance"):
+        clone = str(tmp_path / name)
+        assert nl.dataset(clone).to_table().to_pylist() == expected, name
+        assert lance.dataset(clone).to_table().to_pylist() == expected, name
+        assert nl.dataset(clone).to_table(filter="a > 50").num_rows == 2, name
+
+
+def test_shallow_clone_of_a_branch_keeps_inherited_indexes_readable(lance, tmp_path):
+    """The branch inherits main's BTree index (base 0). The shallow clone keeps that base, so both engines read it.
+    (pylance's own clone of a branch remaps the index to the branch's base path and cannot read it back.)"""
+    root = tmp_path / "ds"
+    _with_deletion_and_index(lance, root)
+    branch = nl.dataset(str(root)).create_branch("feat", 4)
+    branch.shallow_clone(tmp_path / "feat_clone", 4)
+    clone = str(tmp_path / "feat_clone")
+    assert nl.dataset(clone).to_table(filter="a = 100").num_rows == 1
+    assert lance.dataset(clone).to_table(filter="a = 100").num_rows == 1
+    assert nl.dataset(clone).to_table().to_pylist() == lance.dataset(clone).to_table().to_pylist()
+
+
+def test_clone_reference_forms_and_refusals(lance, tmp_path):
+    root = tmp_path / "ds"
+    lance.write_dataset(pa.table({"a": [1, 2]}), root)
+    lance.write_dataset(pa.table({"a": [3]}), root, mode="append")
+    main = nl.dataset(str(root))
+    main.tags.create("v1", 1)
+    feat = main.create_branch("feat", 2)
+    feat = nl.write_dataset(pa.table({"a": [4]}), feat, mode="append")
+
+    def rows(path):
+        return sorted(r["a"] for r in lance.dataset(str(path)).to_table().to_pylist())
+
+    assert main.shallow_clone(tmp_path / "by_int", 1).uri == str(tmp_path / "by_int")
+    assert rows(tmp_path / "by_int") == [1, 2]
+    main.deep_clone(tmp_path / "by_tag", "v1")
+    assert rows(tmp_path / "by_tag") == [1, 2]
+    main.shallow_clone(tmp_path / "by_pair", ("main", 2))
+    assert rows(tmp_path / "by_pair") == [1, 2, 3]
+    main.shallow_clone(tmp_path / "by_branch", ("feat", None))  # the branch's latest
+    assert rows(tmp_path / "by_branch") == [1, 2, 3, 4]
+    feat.shallow_clone(tmp_path / "from_feat", feat.version)  # a branch dataset clones its own version
+    assert rows(tmp_path / "from_feat") == [1, 2, 3, 4]
+
+    with pytest.raises(OSError, match="already exists"):
+        main.shallow_clone(tmp_path / "by_int", 1)
+    with pytest.raises(OSError, match="already exists"):
+        main.deep_clone(tmp_path / "by_int", 2)
+    with pytest.raises(OSError, match="was not found"):
+        main.shallow_clone(tmp_path / "no_version", 9)
+    with pytest.raises(OSError, match="does not exist"):
+        main.deep_clone(tmp_path / "no_tag", "nope")
+    with pytest.raises(OSError, match="was not found"):
+        main.shallow_clone(tmp_path / "no_branch", ("nob", 1))
+    assert not (tmp_path / "no_version").exists()
+    assert not (tmp_path / "no_tag").exists()
+    assert not (tmp_path / "no_branch").exists()
+

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 
 
 class NotSupportedError(NotImplementedError):
@@ -18,9 +19,36 @@ def unsupported(what: str) -> NotSupportedError:
     return NotSupportedError(f"nanolance.lance does not support {what}")
 
 
+def refuse_object_store_write(target, what: str) -> None:
+    """Writes to an object store are not implemented (Wave 3): a write to ``s3://`` names itself and
+    raises before anything is touched. ``target`` is a uri, a path or a dataset."""
+    if isinstance(target, str):
+        text = target
+    elif isinstance(target, os.PathLike):
+        text = os.fspath(target)
+    else:
+        text = str(getattr(target, "uri", "") or "")
+    if text.startswith("s3://"):
+        raise unsupported(f"object-store writes ({what} on {text})")
+
+
+# Manifest feature flags this build does not support, as pylance raises them. The native message carries
+# the prefix of the call that failed, so the message is cut down to pylance's text.
+_FEATURE_FLAG_ERRORS = (
+    ("Not supported: This dataset cannot be read by", ValueError),
+    ("Not supported: This dataset cannot be written by", OSError),
+    ("Encountered corrupt file manifest:", ValueError),
+)
+
+
 def translate(message: str) -> Exception:
     text = str(message)
     lower = text.lower()
+    for marker, kind in _FEATURE_FLAG_ERRORS:
+        if marker in text:
+            return kind(text[text.index(marker):])
+    if "Incompatible transaction:" in text:  # refused, not retried: pylance raises it as an OSError too
+        return OSError(text[text.index("Incompatible transaction:"):])
     # Filter errors, as pylance words them (DataFusion's planner behind "Invalid user input").
     import re
 
@@ -50,6 +78,8 @@ def translate(message: str) -> Exception:
         return OSError(text)
     if "merge insert failed" in lower:
         return OSError(text)
+    if "does not honour conditional writes" in lower:
+        return OSError(text)  # the object store is unsafe for concurrent commits: an I/O-level failure
     if "not found" in lower or "no manifest" in lower:
         return ValueError(text)
     if "not supported" in lower or "unsupported" in lower:
@@ -57,6 +87,23 @@ def translate(message: str) -> Exception:
     if "failed to open" in lower or "failed to read" in lower or "i/o" in lower:
         return OSError(text)
     return ValueError(text)
+
+
+def index_build(fn):
+    """pylance raises NotImplementedError, not OSError, when an index build meets a writer feature flag
+    it does not support (create_scalar_index and create_index; measured on pylance 12.0.0)."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except OSError as exc:
+            if str(exc).startswith("Not supported: This dataset cannot be written by"):
+                raise NotImplementedError(str(exc)) from None
+            raise
+
+    return wrapper
 
 
 @contextlib.contextmanager

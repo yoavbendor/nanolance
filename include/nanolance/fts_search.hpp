@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -19,6 +20,10 @@
 /// statistics for the rows it covers, and for rows in fragments it does not cover, from the index's
 /// statistics together with theirs (those rows are tokenized on the fly).
 namespace nano_lance {
+
+/// The unit treated as one full-text-search document: a row, or one element of a list column (Lance's
+/// DocumentGranularity; ROW is the default and is what an index written without it holds).
+enum class DocGranularity : std::uint8_t { Row = 0, ListElement = 1 };
 
 /// A full-text query: Lance's FtsQuery.
 struct FtsQuery {
@@ -38,6 +43,9 @@ struct FtsQuery {
     std::uint32_t prefix_length = 0;
     bool and_operator = false;  // Match / MultiMatch: every term must occur (else any)
     std::uint32_t slop = 0;     // Phrase
+    /// Match / Phrase: the document granularity asked for. Unset: the one index on the column decides
+    /// (and two indexes of different granularities are an error). A MultiMatch asks for Row.
+    std::optional<DocGranularity> granularity;
 
     /// Boost: the rows of `positive` (one query); those also matching `negative` (one query) score
     /// `positive - negative_boost * negative`.
@@ -54,8 +62,8 @@ struct FtsQuery {
 
 /// A query in JSON, as pylance's query objects describe themselves:
 ///   {"match": {"column": c, "terms": t, "boost": 1.0, "fuzziness": 0, "max_expansions": 50,
-///              "operator": "Or", "prefix_length": 0}}
-///   {"match_phrase": {"column": c, "terms": t, "slop": 0}}
+///              "operator": "Or", "prefix_length": 0, "granularity": "row" | "list_element"}}
+///   {"match_phrase": {"column": c, "terms": t, "slop": 0, "granularity": "list_element"}}
 ///   {"multi_match": {"query": t, "columns": [..], "boost": [..], "operator": "Or"}}
 ///   {"boost": {"positive": q, "negative": q, "negative_boost": 0.5}}
 ///   {"boolean": {"must": [q..], "should": [q..], "must_not": [q..]}}
@@ -84,6 +92,9 @@ struct FtsSearchRequest {
 struct FtsSearchResult {
     std::vector<std::uint64_t> row_ids;  // row addresses, best first (ties by row id)
     std::vector<float> scores;           // BM25
+    /// With a list-element index: the element (its position in the list) of each hit; empty otherwise.
+    bool has_doc_indices = false;        // list-element documents were searched: doc_indices has one per hit
+    std::vector<std::uint32_t> doc_indices;
     std::vector<std::string> plan;
 };
 
@@ -91,12 +102,21 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
                               FtsSearchResult& out, std::string& error);
 
 struct InvertedIndexOptions {
+    /// The version the index is built from (the handle's, as a commit's read version): latest when unset.
+    std::optional<std::uint64_t> read_version;
     std::string name;  // empty: <column>_idx
     /// An index of the same name is replaced; without `replace`, that is an error.
     bool replace = true;
     /// The analyzer: Lance's and LanceDB's defaults unless set. `with_position` stores every token's
     /// positions (Lance's shared-stream layout), which phrase queries need.
     fts::AnalyzerParams params;
+    /// ListElement: one document per element of a list<string> column (Lance's v3 docs layout).
+    DocGranularity granularity = DocGranularity::Row;
+    /// Where the build reports its stages (start, progress, complete: index_build::Progress); nothing when
+    /// empty. Called on the building thread, so a callback costs nothing when it is unset.
+    std::function<void(int event, const char* stage, std::uint64_t total, const char* unit,
+                       std::uint64_t completed)>
+        progress;
 };
 
 /// Build an INVERTED index on `column` (a string column) in Lance's format -- one pylance and LanceDB
@@ -109,5 +129,8 @@ bool dataset_create_inverted_index(const std::filesystem::path& dataset_path, co
 
 /// Whether an index's details type is an INVERTED index's.
 bool is_inverted_index_url(const std::string& url);
+
+/// The document granularity an INVERTED index's details (InvertedIndexDetails, field 14) record.
+DocGranularity inverted_details_granularity(const std::vector<std::uint8_t>& details);
 
 }  // namespace nano_lance

@@ -31,6 +31,8 @@
 namespace nano_lance {
 
 struct OptimizeIndicesOptions {
+    /// The version the index is built from (the handle's, as a commit's read version): latest when unset.
+    std::optional<std::uint64_t> read_version;
     /// The indexes to optimize, by name; empty: every index of the dataset.
     std::vector<std::string> index_names;
     std::optional<std::uint32_t> num_indices_to_merge;

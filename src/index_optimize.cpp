@@ -7,10 +7,12 @@
 // scalar segment (rebuild_scalar_segment) and, for a vector index, with the existing model, as its
 // default (non-retraining) merge assigns new rows to the existing partitions.
 
+#include "nanolance/frag_reuse.hpp"
 #include "nanolance/index_optimize.hpp"
 
 #include "index_build.hpp"
 #include "index_files.hpp"
+#include "nanolance/byte_source.hpp"
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/manifest_reader.hpp"
@@ -80,9 +82,8 @@ Kind kind_of(const std::filesystem::path& dataset_path, const pb::IndexMetadata&
     if (ends_with(url, "InvertedIndexDetails")) {
         return Kind::Inverted;
     }
-    std::error_code ec;
     if (ends_with(url, "VectorIndexDetails") ||
-        (url.empty() && std::filesystem::exists(segment_dir(dataset_path, index) / "index.idx", ec))) {
+        (url.empty() && io::exists((segment_dir(dataset_path, index) / "index.idx").string()))) {
         return Kind::Vector;
     }
     return Kind::Other;
@@ -186,9 +187,22 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
     for (const auto& f : manifest.fragments) {
         live.insert(f.id);
     }
+    // Coverage as Lance reads it: a deferred compaction moved the fragments an index covered.
+    std::shared_ptr<const FragReuse> frag_reuse;
+    if (!FragReuse::load(dataset_path, manifest, frag_reuse, error)) {
+        return false;
+    }
+    const auto coverage = [&](const pb::IndexMetadata& index) {
+        auto ids = index.fragment_ids;
+        if (frag_reuse != nullptr) {
+            frag_reuse->remap_coverage(ids);
+        }
+        return ids;
+    };
     std::set<std::uint64_t> covered;
     for (const auto* s : segments) {
-        covered.insert(s->fragment_ids.begin(), s->fragment_ids.end());
+        const auto ids = coverage(*s);
+        covered.insert(ids.begin(), ids.end());
     }
     std::vector<std::uint64_t> unindexed;
     for (const auto id : live) {
@@ -235,7 +249,7 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
     }
     std::set<std::uint64_t> target(unindexed.begin(), unindexed.end());
     for (const auto* s : replaced) {
-        for (const auto id : s->fragment_ids) {
+        for (const auto id : coverage(*s)) {
             if (live.count(id) != 0U) {
                 target.insert(id);
             }
@@ -336,6 +350,7 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
     case Kind::Inverted: {
         InvertedIndexOptions o;
         o.name = last.name;
+        o.granularity = inverted_details_granularity(last.details_value);  // a rebuild keeps the granularity
         // As Lance merges new rows into a segment: its documents stay (deleted rows too -- they count
         // in its statistics until a rebuild), the uncovered fragments' live rows are added.
         if (!retrain) {
@@ -410,7 +425,14 @@ bool optimize_indices_once(const std::filesystem::path& dataset_path, const Opti
 
 bool dataset_optimize_indices(const std::filesystem::path& dataset_path, const OptimizeIndicesOptions& options,
                               OptimizeIndicesResult& result, std::string& error) {
-    return retry_on_conflict([&] { return optimize_indices_once(dataset_path, options, result, error); }, error);
+    return retry_from_read_version(
+        options.read_version,
+        [&](ReadVersion from) {
+            OptimizeIndicesOptions o = options;
+            o.read_version = from;
+            return optimize_indices_once(dataset_path, o, result, error);
+        },
+        error);
 }
 
 bool optimize_indices_once(const std::filesystem::path& dataset_path, const OptimizeIndicesOptions& options,
@@ -419,7 +441,7 @@ bool optimize_indices_once(const std::filesystem::path& dataset_path, const Opti
     result = OptimizeIndicesResult{};
     pb::Manifest manifest;
     std::uint64_t version = 0;
-    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+    if (!load_read_version(dataset_path, options.read_version, manifest, version, error)) {
         return false;
     }
     result.version = version;
@@ -448,9 +470,8 @@ bool optimize_indices_once(const std::filesystem::path& dataset_path, const Opti
     std::vector<pb::IndexMetadata> built;
     std::set<const pb::IndexMetadata*> replaced_all;
     const auto cleanup = [&] {
-        std::error_code ec;
         for (const auto& b : built) {
-            std::filesystem::remove_all(segment_dir(dataset_path, b), ec);
+            index_files::remove_index_dir(segment_dir(dataset_path, b));
         }
     };
     for (const auto& name : names) {

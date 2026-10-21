@@ -29,6 +29,7 @@
 #include "nanolance/index_segments.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/manifest_reader.hpp"
+#include "nanolance/object_store.hpp"
 #include "nanolance/nano_lance_writer.h"
 #include "nanolance/path_safety.hpp"
 #include "nanolance/scalar_index.hpp"
@@ -94,12 +95,15 @@ struct SearchSettings {
     bool nearest = false;
     std::string column;
     std::vector<float> key;
+    bool key_uint8 = false;  // the query was given as uint8 (a binary column's query)
+    bool hamming = false;    // LANCE_METRIC_HAMMING: Hamming distance over uint8 vectors
     uint32_t k = 0;
     std::optional<uint32_t> minimum_nprobes;
     std::optional<uint32_t> maximum_nprobes;
     std::optional<uint32_t> refine_factor;
     std::optional<uint32_t> ef;
     int32_t query_parallelism = 0;
+    nano_lance::ApproxMode approx_mode = nano_lance::ApproxMode::Normal;
     std::vector<std::array<uint8_t, 16>> index_segments;  // nearest: only these segments
     std::vector<std::array<uint8_t, 16>> fts_index_segments;  // a prepared FTS query: only these
     std::optional<std::array<uint8_t, 16>> scalar_segment;      // a plain scan scoped by one segment
@@ -272,7 +276,8 @@ std::filesystem::path memory_root() {
 
 /// A dataset URI as a local path: file://, memory:// (a directory private to the process) and plain
 /// paths. Object stores are not supported.
-bool resolve_uri(const char* uri, std::filesystem::path& out) {
+// `allow_object_store`: an s3:// URI is taken as is (reads only; nanolance writes local datasets).
+bool resolve_uri(const char* uri, std::filesystem::path& out, bool allow_object_store = false) {
     if (uri == nullptr || uri[0] == '\0') {
         return invalid("uri must not be NULL or empty");
     }
@@ -289,8 +294,14 @@ bool resolve_uri(const char* uri, std::filesystem::path& out) {
         out = memory_root() / (rest.empty() ? std::string("_root") : rest);
         return true;
     }
+    if (allow_object_store && text.rfind("s3://", 0) == 0) {
+        out = text;
+        return true;
+    }
     if (text.find("://") != std::string::npos) {
-        set_error(LANCE_ERR_NOT_SUPPORTED, "nanolance reads local datasets only, not " + text);
+        set_error(LANCE_ERR_NOT_SUPPORTED, allow_object_store
+                                               ? "nanolance reads local and s3:// datasets only, not " + text
+                                               : "nanolance writes local datasets only, not " + text);
         return false;
     }
     out = text;
@@ -306,10 +317,27 @@ bool load_info(const std::filesystem::path& path, uint64_t version, nano_lance::
     return true;
 }
 
-LanceDataset* open_dataset(const char* uri, uint64_t version) {
+// `storage_opts`: Lance's storage-option pairs (["k1", "v1", ..., NULL]) for an s3:// dataset's bucket.
+LanceDataset* open_dataset(const char* uri, const char* const* storage_opts, uint64_t version) {
     std::filesystem::path path;
-    if (!resolve_uri(uri, path)) {
+    if (!resolve_uri(uri, path, true)) {
         return nullptr;
+    }
+    if (path.native().rfind("s3://", 0) == 0) {
+        std::vector<std::pair<std::string, std::string>> pairs;
+        for (auto* kv = storage_opts; kv != nullptr && kv[0] != nullptr; kv += 2) {
+            if (kv[1] == nullptr) {
+                invalid("storage_opts must hold key-value pairs");
+                return nullptr;
+            }
+            pairs.emplace_back(kv[0], kv[1]);
+        }
+        std::string error;
+        if (!nano_lance::io::set_object_store_options(path.native(), nano_lance::io::object_store_options_from(pairs),
+                                                      error)) {
+            set_error(code_for(error), error);
+            return nullptr;
+        }
     }
     auto ds = std::make_unique<LanceDataset>();
     ds->path = path;
@@ -589,6 +617,7 @@ LanceFtsQueryContext* prepare_fts(const LanceDataset* dataset, const char* colum
     }
     std::set<uint64_t> covered;
     std::string uuid;
+    std::optional<std::uint32_t> index_base;  // the base path the index's files are in, if any
     std::string name;  // the column's first INVERTED index: its segments
     bool found = false;
     for (const auto& index : indices) {
@@ -599,6 +628,7 @@ LanceFtsQueryContext* prepare_fts(const LanceDataset* dataset, const char* colum
             found = true;
             name = index.name;
             uuid = index.uuid;
+            index_base = index.base_id;
             covered.insert(index.fragment_ids.begin(), index.fragment_ids.end());
         }
     }
@@ -626,7 +656,12 @@ LanceFtsQueryContext* prepare_fts(const LanceDataset* dataset, const char* colum
     if (phrase) {
         // Phrase queries need positions.
         nano_lance::fts::AnalyzerParams params;
-        if (nano_lance::index_build::load_inverted_params(dataset->path / "_indices" / uuid, params, error) &&
+        std::filesystem::path index_dir;
+        if (!nano_lance::indices_dir(dataset->path, dataset->info.base_paths, index_base, index_dir, error)) {
+            fail(error);
+            return nullptr;
+        }
+        if (nano_lance::index_build::load_inverted_params(index_dir / uuid, params, error) &&
             !params.with_position) {
             invalid("FTS index for column '" + std::string(column) +
                     "' does not store token positions required by Phrase queries; recreate the index with positions "
@@ -746,8 +781,10 @@ bool open_search(const LanceScanner& scanner, ArrowArrayStream& out) {
         q.refine_factor = search.refine_factor;
         q.ef = search.ef;
         q.query_parallelism = search.query_parallelism;
+        q.approx_mode = search.approx_mode;
         q.segments = search.index_segments;
         q.metric = search.metric;
+        q.hamming = search.hamming;
         q.use_index = search.use_index;
         if (!scanner.filter.empty()) {
             q.filter = scanner.filter;
@@ -1346,7 +1383,7 @@ int32_t write_impl(const WriteRequest& req) {
         return -1;
     }
     if (req.out_dataset != nullptr) {
-        auto* ds = open_dataset(req.uri, version);
+        auto* ds = open_dataset(req.uri, nullptr, version);
         if (ds == nullptr) {
             return -1;
         }
@@ -1528,8 +1565,8 @@ int32_t lance_session_get_cache_stats(const LanceSession* session, LanceSessionC
 
 // ── dataset ─────────────────────────────────────────────────────────────────────────────────────
 
-LanceDataset* lance_dataset_open(const char* uri, const char* const* /*storage_opts*/, uint64_t version) {
-    return guarded<LanceDataset*>(nullptr, [&] { return open_dataset(uri, version); });
+LanceDataset* lance_dataset_open(const char* uri, const char* const* storage_opts, uint64_t version) {
+    return guarded<LanceDataset*>(nullptr, [&] { return open_dataset(uri, storage_opts, version); });
 }
 
 LanceDataset* lance_dataset_open_with_session(const char* uri, const char* const* storage_opts, uint64_t version,
@@ -4074,6 +4111,7 @@ int32_t lance_scanner_nearest(LanceScanner* scanner, const char* column, const v
         scanner->search.nearest = true;
         scanner->search.column = column;
         scanner->search.key = std::move(key);
+        scanner->search.key_uint8 = element_type == LANCE_DTYPE_UINT8;
         scanner->search.k = k;
         return true;
     });
@@ -4122,13 +4160,17 @@ int32_t lance_scanner_set_maximum_nprobes(LanceScanner* scanner, uint32_t maximu
         return true;
     });
 }
-// The approximation mode changes only binary-quantized searches in Lance; for the indexes nanolance
-// searches it changes nothing, as in Lance.
+// The approximation mode changes only IVF_RQ searches, as in Lance; the other kinds ignore it.
 int32_t lance_scanner_set_approx_mode(LanceScanner* scanner, LanceApproxMode approx_mode) {
     return before_scan(scanner, [&] {
         const auto mode = static_cast<int32_t>(approx_mode);
-        return (mode >= 0 && mode <= 2) ||
-               invalid("approx_mode must be 0 (FAST), 1 (NORMAL), or 2 (ACCURATE), got " + std::to_string(mode));
+        if (mode < 0 || mode > 2) {
+            return invalid("approx_mode must be 0 (FAST), 1 (NORMAL), or 2 (ACCURATE), got " + std::to_string(mode));
+        }
+        scanner->search.approx_mode = mode == LANCE_APPROX_MODE_FAST       ? nano_lance::ApproxMode::Fast
+                                      : mode == LANCE_APPROX_MODE_ACCURATE ? nano_lance::ApproxMode::Accurate
+                                                                           : nano_lance::ApproxMode::Normal;
+        return true;
     });
 }
 int32_t lance_scanner_set_query_parallelism(LanceScanner* scanner, int32_t query_parallelism) {
@@ -4156,10 +4198,28 @@ int32_t lance_scanner_set_ef(LanceScanner* scanner, uint32_t e) {
 int32_t lance_scanner_set_metric(LanceScanner* scanner, LanceMetricType metric) {
     return before_scan(scanner, [&] {
         switch (metric) {
-        case LANCE_METRIC_L2: scanner->search.metric = nano_lance::VectorMetric::L2; return true;
-        case LANCE_METRIC_COSINE: scanner->search.metric = nano_lance::VectorMetric::Cosine; return true;
-        case LANCE_METRIC_DOT: scanner->search.metric = nano_lance::VectorMetric::Dot; return true;
-        case LANCE_METRIC_HAMMING: not_supported("the hamming metric"); return false;
+        case LANCE_METRIC_L2:
+            scanner->search.metric = nano_lance::VectorMetric::L2;
+            scanner->search.hamming = false;
+            return true;
+        case LANCE_METRIC_COSINE:
+            scanner->search.metric = nano_lance::VectorMetric::Cosine;
+            scanner->search.hamming = false;
+            return true;
+        case LANCE_METRIC_DOT:
+            scanner->search.metric = nano_lance::VectorMetric::Dot;
+            scanner->search.hamming = false;
+            return true;
+        case LANCE_METRIC_HAMMING:
+            // Hamming searches uint8 queries over a uint8 column's Hamming index (or exact search); a float
+            // query is refused, as the Float32 distance check is.
+            if (scanner->search.nearest && !scanner->search.key_uint8) {
+                not_supported("the hamming metric for a float query");
+                return false;
+            }
+            scanner->search.metric.reset();
+            scanner->search.hamming = true;
+            return true;
         }
         return invalid("unknown metric " + std::to_string(static_cast<int>(metric)));
     });

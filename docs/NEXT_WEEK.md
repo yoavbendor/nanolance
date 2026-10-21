@@ -30,11 +30,31 @@ a user report can be matched to it.
 | Fuzzy FTS, accented query tokens | char-level distance | a rule not yet pinned down | measure first | same |
 | FTS / phrase cache hit-miss counts | right direction, other numbers | per page | small | ScanStatistics `indices_loaded`, `index_comparisons` are 0 |
 
+## Index plan for AI users (2026-10-19, revised)
+
+The plan, with each item's failing pylance tests, the Opus step, the Haiku sessions and the
+done-criteria, is in `docs/ROADMAP.md` ("Index plan for AI users"). Next, Wave 1, in order, each
+briefed by Opus and implemented by Haiku:
+
+0. **First, T1**: refuse manifests whose feature flags nanolance does not support, on open and on write.
+   Nothing checks them today, so a newer dataset can read as empty. 1 session.
+1. Full-text search on list columns: 5 tests, 1 session.
+2. Index build progress callbacks: 5 tests, 1 session. Also make the hybrid refusal pylance's exact message.
+3. Multivector search: 4 tests, 3 sessions (M1 flat, M2 search, M3 build) after Opus measures the format.
+4. Deferred index remap and the Fragment Reuse Index: 4 tests, 1-2 sessions.
+
+T4 (Arrow dictionary columns on write) is a one-session filler. Meanwhile Opus researches Wave 2:
+object-store reads, branches and clones (T3), IVF_RQ, the commit conflict rules (T2), binary IVF. Corrections to earlier
+summaries: CJK segmentation is not done. Hybrid search is refused by pylance too, so it is LanceDB's
+feature. Compaction already remaps indexes; the FRI only serves deferred remap.
+
 ## Features left, smallest first
 
 | item | pylance tests | size | notes |
 |---|---|---|---|
 | Write data storage versions 2.1 / 2.0 | 85 | format research (Opus) + sessions | the largest group of pylance failures; see the suite breakdown below |
+| `create_scalar_index(IndexConfig(index_type="inverted", parameters={...}))` ignores the parameters for INVERTED builds (only list-element builds read them); found in FTS_LISTS L2 | -- | small | string-column builds made this way change, so test against pylance |
+| Staged (distributed) INVERTED builds over list elements are refused; `infer_index_segment_details` would drop `document_granularity` (field 14) | -- | small | FTS_LISTS L2 |
 | `Compaction.plan`, `lance.debug.format_fragment`, `lance.util.KMeans`, `lance.pydantic.Vector` | 3-4 each | small each | |
 | lance-c prepared fuzzy FTS (`lance_dataset_prepare_fts_match_query` with fuzziness) | -- | small | the fuzzy query exists |
 | Expression leftovers: `l[1 + 1]`, projecting a struct element `ls[1]`, `array_element(...)`, `ts - arrow_cast(ts, 'Timestamp(..)')` (unit dropped), arrow_cast of a column to Duration, `coalesce(ts, ts_ms)` (coarser unit), `d32 - ts`, `dec + i32 * 1` (strict xfail), comparisons as projections keep old typing | ~0 directly | 1 session | `docs/tasks/EXPR_TYPES.md` outcomes A1-C3 |
@@ -162,3 +182,7 @@ optimization; compare engines within one run (ratios), never across days.
   `delete()`), a reader path that silently returned a short dictionary column, `__int128` breaking
   MSVC, a full-text change that needed an A/B timing to show it was not slower.
 - Run one full pytest at a time; two at once caused one spurious failure.
+- Compaction with `max_bytes_per_file`: pylance cuts files at batch granularity (`test_optimize_max_bytes` wants 2 fragments, nanolance writes 8); changes eager compaction output, decide first.
+- `list_indices()` / `describe_indices()`: pylance sorts by name and reports each index's own version; nanolance keeps manifest order and reports the dataset version.
+- `compact_files(defer_index_remap=True)` with stable row ids is refused; FRI details over 200 KB (external) are refused when writing.
+

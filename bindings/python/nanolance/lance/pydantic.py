@@ -29,6 +29,8 @@ def pydantic_to_schema(model) -> pa.Schema:
               datetime.datetime: pa.timestamp("us"), datetime.date: pa.date32()}
 
     def arrow_type(tp):
+        if isinstance(tp, type) and "_nl_arrow" in vars(tp):  # MultiVector(dim): its own Arrow type
+            return tp._nl_arrow, tp._nl_nullable
         origin = typing.get_origin(tp)
         args = typing.get_args(tp)
         if origin is typing.Union or (origin is not None and str(origin) == "types.UnionType"):
@@ -57,6 +59,29 @@ def pydantic_to_schema(model) -> pa.Schema:
         typ, optional = arrow_type(f.annotation)
         fields.append(pa.field(name, typ, nullable=optional))
     return pa.schema(fields)
+
+def MultiVector(dim: int, value_type: pa.DataType = pa.float32(), nullable: bool = True):
+    """Pydantic type for a list of fixed-size-list embedding vectors (ColBERT-style multivectors),
+    as pylance's ``lance.pydantic.MultiVector``: the field is ``list<fixed_size_list<value_type, dim>>``,
+    nullable unless ``nullable=False``."""
+    if int(dim) <= 0:
+        raise ValueError(f"MultiVector dimension must be positive, got {dim}")
+
+    class MultiVectorList(list):
+        _nl_arrow = pa.list_(pa.list_(value_type, int(dim)))
+        _nl_nullable = bool(nullable)
+
+        def __repr__(self):
+            return f"MultiVector(dim={dim})"
+
+        @classmethod
+        def __get_pydantic_core_schema__(cls, source, handler):  # pydantic validates it as a list of lists
+            from pydantic_core import core_schema
+
+            return core_schema.list_schema(core_schema.list_schema(core_schema.float_schema()))
+
+    return MultiVectorList
+
 
 def __getattr__(name: str):
     """pylance names this module does not implement import as placeholders (see _stubs.py)."""

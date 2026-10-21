@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/byte_sink.hpp"
 #include "nanolance/nano_lance_writer.h"
 
 #include "nanolance/array_accessor.hpp"
@@ -17,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <functional>
 #include <filesystem>
 #include <optional>
 #include <memory>
@@ -67,6 +69,10 @@ struct WriterState {
     /// Staged mode (NanoLanceWriteOptions::stage_fragments): a commit writes its data file and stages
     /// the fragment; nano_lance_writer_finish publishes them all as one version.
     bool stage = false;
+    /// A progress tracker's data-file events (writer_set_file_events): begin (0) when a file's first rows
+    /// are buffered, its name chosen then; complete (2) once the file is written.
+    std::function<void(int, const std::string&, std::uint64_t)> file_events;
+    std::string open_file_name;
     std::vector<nano_lance::NewFragment> staged;
     nano_lance::LanceSchemaMapping staged_schema;  // the on-disk schema the staged files were written with
     /// The Arrow schema metadata of the first batch, recorded in the manifest.
@@ -459,20 +465,22 @@ bool variable_column_dict_beneficial(nano_lance::ColumnValues& cv) {
     // reasonable predictor of the full-column ratio; only skip the full scan when the sample already
     // shows the ratio decisively blown (not merely close), to keep false negatives rare -- the cost of
     // a false negative here is a slightly larger encoding (falls back to zstd/plain), never wrong data.
-    // Sample distinct-count via sort+unique (one vector allocation total) rather than a hash set (one
-    // heap allocation per distinct element even for this small sample) -- no per-row allocation at all.
+    // Sample distinct-count via sort+unique of the values' 64-bit hashes (one vector allocation total, and
+    // integer compares instead of string compares) rather than a hash set (one heap allocation per
+    // distinct element even for this small sample). A collision could only undercount by one.
     constexpr std::size_t kSampleRows = 4096U;
     constexpr double kSampleRejectMargin = 1.5;  // require the sample ratio to exceed the real cutoff by 50%
     if (rows > kSampleRows * 4U) {
-        std::vector<std::string_view> sample;
+        std::vector<std::size_t> sample;
         sample.reserve(kSampleRows);
+        const std::hash<std::string_view> hash;
         for (std::size_t i = 0; i < kSampleRows; ++i) {
             const auto s = read_offset(i);
             const auto e = read_offset(i + 1);
             if (s < 0 || e < s || static_cast<std::size_t>(e) > data_size) {
                 return false;
             }
-            sample.emplace_back(base + s, static_cast<std::size_t>(e - s));
+            sample.push_back(hash(std::string_view(base + s, static_cast<std::size_t>(e - s))));
         }
         std::sort(sample.begin(), sample.end());
         const auto sample_distinct_count =
@@ -628,6 +636,13 @@ int nano_lance_writer_open(NanoLanceWriter* writer, const char* path, const Nano
     if (path == nullptr || path[0] == '\0') {
         return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "dataset path must not be empty");
     }
+    // Local paths and registered object stores (s3://); any other URI would become a local directory
+    // named after its scheme.
+    if (std::strstr(path, "://") != nullptr && !nano_lance::io::is_object_store_output(path)) {
+        return set_error(writer, NANO_LANCE_UNSUPPORTED,
+                         std::string("writes to this kind of URI are not supported (local paths and s3:// only): ") +
+                             path);
+    }
     if (opts.compression_level < 0 || opts.compression_level > 22) {
         return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "zstd compression level must be in range 0..22");
     }
@@ -675,7 +690,9 @@ int nano_lance_writer_open(NanoLanceWriter* writer, const char* path, const Nano
 
     if (opts.append) {
         std::error_code ec;
-        if (!std::filesystem::exists(state->dataset_path / "_versions", ec)) {
+        // An object store has no directories: loading the latest manifest below checks it there.
+        if (!nano_lance::io::is_object_store_output(state->dataset_path.string()) &&
+            !std::filesystem::exists(state->dataset_path / "_versions", ec)) {
             return set_error(writer, NANO_LANCE_IO_ERROR, "init_append requires an existing dataset with _versions");
         }
 
@@ -684,6 +701,10 @@ int nano_lance_writer_open(NanoLanceWriter* writer, const char* path, const Nano
         std::string load_error;
         if (!nano_lance::load_latest_manifest(state->dataset_path, manifest, manifest_version, load_error)) {
             return set_error(writer, NANO_LANCE_IO_ERROR, load_error);
+        }
+        // Refused here, before any data file is written (pylance leaves no file behind either).
+        if (!nano_lance::check_manifest_writable(manifest, nano_lance::WriteKind::Insert, load_error)) {
+            return set_error(writer, NANO_LANCE_UNSUPPORTED, load_error);
         }
         if (!nano_lance::lance_schema_mapping_from_manifest(manifest, state->schema_mapping, load_error)) {
             return set_error(writer, NANO_LANCE_UNSUPPORTED, load_error);
@@ -916,6 +937,10 @@ int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, st
         }
     }
 
+    if (state->file_events && state->pending_rows == 0 && batch->length > 0) {
+        state->open_file_name = new_data_file_name();
+        state->file_events(0, state->open_file_name, 0);
+    }
     ++state->pending_batches;
     state->pending_rows += static_cast<std::uint64_t>(batch->length);
     if (state->max_pending_bytes != 0U && state->pending_rows != 0U &&
@@ -970,7 +995,8 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     }
 
     std::error_code error;
-    if (is_append && !std::filesystem::exists(state->dataset_path, error)) {
+    const bool object_store = nano_lance::io::is_object_store_output(state->dataset_path.string());
+    if (is_append && !object_store && !std::filesystem::exists(state->dataset_path, error)) {
         return set_error(writer, NANO_LANCE_IO_ERROR, "append requested but dataset path does not exist");
     }
     if (!state->has_schema) {
@@ -978,7 +1004,7 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     }
 
     std::string writer_error;
-    if (!is_append) {
+    if (!is_append && !object_store) {
         std::filesystem::create_directories(state->dataset_path / "_versions", error);
         if (error) {
             return set_error(writer, NANO_LANCE_IO_ERROR, "failed to create dataset version directory: " + error.message());
@@ -1216,7 +1242,9 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     }
 
     nano_lance::DataFileResult data_file;
-    const auto data_file_name = new_data_file_name();
+    // A file a progress tracker began keeps its name.
+    const auto data_file_name = state->open_file_name.empty() ? new_data_file_name() : state->open_file_name;
+    state->open_file_name.clear();
     nano_lance::LanceFileExtras file_extras;
     file_extras.blob_pack_file_size = state->blob_pack_file_size;
     file_extras.schema_metadata = state->schema_metadata;  // Lance writes it into every data file
@@ -1247,6 +1275,9 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     if (state->stage) {
         state->staged.push_back(nano_lance::NewFragment{data_file, state->pending_rows, base_id});
         state->staged_schema = disk_schema;
+        if (state->file_events) {
+            state->file_events(2, data_file_name, state->pending_rows);
+        }
     } else {
         std::uint64_t version = 0;
         nano_lance::CommitExtras extras;
@@ -1313,7 +1344,9 @@ int nano_lance_writer_finish(NanoLanceWriter* writer, int mode, uint64_t* versio
     extras.transaction_properties = state->transaction_properties;
     extras.stable_row_ids = state->stable_row_ids;
     extras.initial_bases = state->initial_bases.empty() ? nullptr : &state->initial_bases;
-    std::filesystem::create_directories(state->dataset_path / "data", ec);
+    if (!nano_lance::io::is_object_store_output(state->dataset_path.string())) {
+        std::filesystem::create_directories(state->dataset_path / "data", ec);
+    }
     if (!nano_lance::commit_dataset_version(state->dataset_path, mapping, state->staged, commit_mode, version, error,
                                             extras)) {
         return set_error(writer, NANO_LANCE_IO_ERROR, error);
@@ -1507,6 +1540,17 @@ bool writer_project_append(NanoLanceWriter* writer, const std::vector<std::strin
     renumber_columns_for_one_file(projected);
     state->schema_mapping = std::move(projected);
     reset_column_values(*state);
+    return true;
+}
+
+bool writer_set_file_events(NanoLanceWriter* writer, std::function<void(int, const std::string&, std::uint64_t)> events,
+                            std::string& error) {
+    auto* state = state_from(writer);
+    if (state == nullptr || !state->stage) {
+        error = "not a staged writer";
+        return false;
+    }
+    state->file_events = std::move(events);
     return true;
 }
 

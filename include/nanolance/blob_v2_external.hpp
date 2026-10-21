@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include "nanolance/byte_sink.hpp"
+
+#include <memory>
 #include "nanolance/column_values.hpp"
 #include "nanolance/schema_mapper.hpp"
 
@@ -170,7 +173,7 @@ private:
     std::uint32_t pack_id_ = 0;  // 0: no pack open
     std::uint64_t pack_size_ = 0;
     std::uint64_t pack_max_ = 0;
-    std::ofstream pack_;
+    std::unique_ptr<io::OutputFile> pack_;  // the open pack (a local file or an object uploaded on finish)
 };
 
 /// A Blob v2 descriptor page's PageLayout (the inner ColumnEncoding message): Lance's FullZip of
