@@ -13,6 +13,7 @@ import subprocess
 import sys
 import textwrap
 import uuid
+from datetime import timedelta
 
 import numpy as np
 import pyarrow as pa
@@ -1176,3 +1177,177 @@ def test_drop_on_s3_removes_every_object_of_the_dataset_and_no_sibling():
     with pytest.raises(OSError, match="was not found"):
         nl.LanceDataset.drop(uri, storage_options=options())
     nl.LanceDataset.drop(uri, storage_options=options(), ignore_not_found=True)
+
+
+# ── cleanup_old_versions on s3:// ────────────────────────────────────────────────────────────────
+
+
+def _history(uri: str, storage) -> None:
+    """Versions 1-6 with every kind of file cleanup decides on: data, deletions, an index, transactions."""
+    nl.write_dataset(batch(0), uri, storage_options=storage)
+    nl.write_dataset(batch(100), uri, mode="append", storage_options=storage)
+    nl.dataset(uri, storage_options=storage).delete("id < 50")
+    nl.dataset(uri, storage_options=storage).create_scalar_index("id", "BTREE")
+    nl.write_dataset(batch(200), uri, mode="append", storage_options=storage)
+    nl.dataset(uri, storage_options=storage).update({"id": "id + 1000"}, where="id >= 250")
+    nl.dataset(uri, storage_options=storage).optimize.compact_files()  # old data and deletion files unreferenced
+
+
+def _local_files(path) -> list:
+    return sorted(str(p.relative_to(path)) for p in path.rglob("*") if p.is_file())
+
+
+def _relative_keys(uri: str) -> list:
+    prefix = uri[len(f"s3://{BUCKET}/"):].rstrip("/") + "/"
+    return [k[len(prefix):] for k in _keys(uri)]
+
+
+def _shape(names: list) -> list:
+    """The top directory of each file: names are random, so two datasets agree on how many files each holds."""
+    return sorted(n.split("/")[0] for n in names)
+
+
+CLEANUPS = {
+    "retain_versions": lambda ds: ds.cleanup_old_versions(retain_versions=2),
+    "older_than_unverified": lambda ds: ds.cleanup_old_versions(older_than=timedelta(0), delete_unverified=True),
+    "older_than_verified_only": lambda ds: ds.cleanup_old_versions(older_than=timedelta(0)),
+    "tagged_kept": lambda ds: (ds.tags.create("keep", 2),
+                               ds.cleanup_old_versions(older_than=timedelta(0), delete_unverified=True,
+                                                       error_if_tagged_old_versions=False))[1],
+}
+
+
+@pytest.mark.parametrize("name", list(CLEANUPS))
+def test_cleanup_on_s3_matches_the_local_copy(name, tmp_path):
+    s3_uri, local = fresh_uri(), tmp_path / "ds.lance"
+    stats = []
+    for uri, storage in ((s3_uri, options()), (str(local), None)):
+        _history(uri, storage)
+        stats.append(CLEANUPS[name](nl.dataset(uri, storage_options=storage)))
+    # Every count equal (bytes may not be: a manifest's size differs by a byte or two between locations).
+    counted = ("old_versions", "data_files_removed", "transaction_files_removed", "index_files_removed",
+               "deletion_files_removed")
+    assert [getattr(stats[0], c) for c in counted] == [getattr(stats[1], c) for c in counted]
+    assert stats[0].old_versions > 0 and stats[0].bytes_removed > 0
+    assert _shape(_relative_keys(s3_uri)) == _shape(_local_files(local))
+    assert len(_relative_keys(s3_uri)) == len(_local_files(local))
+    ours, theirs = nl.dataset(s3_uri, storage_options=options()), nl.dataset(str(local))
+    assert [v["version"] for v in ours.versions()] == [v["version"] for v in theirs.versions()]
+    for v in ours.versions():
+        got = nl.dataset(s3_uri, version=v["version"], storage_options=options()).to_table().sort_by("id")
+        assert got.equals(nl.dataset(str(local), version=v["version"]).to_table().sort_by("id"))
+
+
+def test_pylance_reads_what_nanolance_cleaned_on_s3():
+    lance = require_pylance()
+    uri = fresh_uri()
+    _history(uri, options())
+    ours = nl.dataset(uri, storage_options=options())
+    before, latest = ours.to_table().sort_by("id"), ours.version
+    ours.cleanup_old_versions(older_than=timedelta(0), delete_unverified=True)
+    theirs = lance.dataset(uri, storage_options=options())
+    assert [v["version"] for v in theirs.versions()] == [latest]
+    assert theirs.to_table().sort_by("id").equals(before)
+    assert theirs.list_indices()[0]["fields"] == ["id"]
+
+
+def test_nanolance_cleanup_of_a_pylance_dataset_on_s3_matches_pylance_cleanup():
+    lance = require_pylance()
+    ours_uri, theirs_uri = fresh_uri(), fresh_uri()
+    for uri in (ours_uri, theirs_uri):
+        lance.write_dataset(batch(0), uri, storage_options=options())
+        lance.write_dataset(batch(100), uri, mode="append", storage_options=options())
+        lance.dataset(uri, storage_options=options()).delete("id < 50")
+        lance.write_dataset(batch(200), uri, mode="append", storage_options=options())
+    ours = nl.dataset(ours_uri, storage_options=options()).cleanup_old_versions(
+        older_than=timedelta(0), delete_unverified=True)
+    theirs = lance.dataset(theirs_uri, storage_options=options()).cleanup_old_versions(
+        older_than=timedelta(0), delete_unverified=True)
+    assert ours.old_versions == theirs.old_versions == 3
+    assert _shape(_relative_keys(ours_uri)) == _shape(_relative_keys(theirs_uri))
+    assert lance.dataset(ours_uri, storage_options=options()).to_table().sort_by("id").equals(
+        lance.dataset(theirs_uri, storage_options=options()).to_table().sort_by("id"))
+
+
+def test_cleanup_on_s3_keeps_what_a_branch_forked_from(tmp_path):
+    s3_uri, local = fresh_uri(), tmp_path / "ds.lance"
+    for uri, storage in ((s3_uri, options()), (str(local), None)):
+        nl.write_dataset(batch(0), uri, storage_options=storage)
+        nl.write_dataset(batch(100), uri, mode="append", storage_options=storage)
+        nl.dataset(uri, storage_options=storage).create_branch("exp", 2)
+        nl.write_dataset(batch(200), uri, mode="overwrite", storage_options=storage)
+        nl.write_dataset(batch(300), uri, mode="append", storage_options=storage)
+        nl.dataset(uri, storage_options=storage).cleanup_old_versions(older_than=timedelta(0),
+                                                                      delete_unverified=True)
+    assert _shape(_relative_keys(s3_uri)) == _shape(_local_files(local))
+    branch = nl.dataset(f"{s3_uri}/tree/exp", storage_options=options())
+    assert branch.count_rows() == 200
+
+
+# ── races between the two engines on s3:// ────────────────────────────────────────────────────────
+
+ENGINE_CHILD = textwrap.dedent("""
+    import json, os, sys
+    if os.environ.get("NANOLANCE_TEST_CHILD_PRELUDE"):
+        exec(open(os.environ["NANOLANCE_TEST_CHILD_PRELUDE"]).read())
+    import pyarrow as pa
+    engine, op, uri, first, n, options = sys.argv[1:7]
+    first, n, options = int(first), int(n), json.loads(options)
+    if engine == "pylance":
+        import lance as m
+    else:
+        import nanolance.lance as m
+    ok, errors = 0, []
+    for i in range(n):
+        start = first + i * 100
+        try:
+            if op == "append":
+                t = pa.table({"id": pa.array(range(start, start + 100), pa.int64()),
+                              "name": pa.array([f"row {j}" for j in range(start, start + 100)])})
+                m.write_dataset(t, uri, mode="append", storage_options=options)
+            else:
+                m.dataset(uri, storage_options=options).delete(f"id >= {start} AND id < {start + 50}")
+            ok += 1
+        except (OSError, ValueError) as e:
+            errors.append(str(e))
+    print(json.dumps({"ok": ok, "errors": errors}))
+""")
+
+
+def start_engine(engine: str, op: str, uri: str, first: int, n: int) -> subprocess.Popen:
+    return subprocess.Popen([sys.executable, "-c", ENGINE_CHILD, engine, op, uri, str(first), str(n),
+                             json.dumps(options())], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def _every_version_opens_in_both(uri: str, lance) -> None:
+    latest = nl.dataset(uri, storage_options=options()).version
+    for v in range(1, latest + 1):
+        assert nl.dataset(uri, version=v, storage_options=options()).count_rows() == \
+            lance.dataset(uri, version=v, storage_options=options()).count_rows()
+
+
+def test_pylance_and_nanolance_racing_appends_lose_and_double_nothing():
+    lance = require_pylance()
+    uri = fresh_uri()
+    nl.write_dataset(batch(0), uri, storage_options=options())
+    procs = [start_engine("nanolance", "append", uri, 10_000, 5), start_engine("pylance", "append", uri, 50_000, 5)]
+    outcomes = [result(p) for p in procs]
+    assert [o["ok"] for o in outcomes] == [5, 5], outcomes
+    ids = sorted(nl.dataset(uri, storage_options=options()).to_table(columns=["id"])["id"].to_pylist())
+    assert ids == sorted(list(range(100)) + [s + j for s in (10_000, 50_000) for j in range(500)])
+    assert nl.dataset(uri, storage_options=options()).version == 11
+    _every_version_opens_in_both(uri, lance)
+
+
+def test_nanolance_deletes_racing_pylance_appends_on_s3():
+    lance = require_pylance()
+    uri = fresh_uri()
+    nl.write_dataset(batch(0, 1000), uri, storage_options=options())
+    procs = [start_engine("nanolance", "delete", uri, 0, 5), start_engine("pylance", "append", uri, 50_000, 5)]
+    outcomes = [result(p) for p in procs]
+    assert [o["ok"] for o in outcomes] == [5, 5], outcomes
+    deleted = {j for s in range(0, 500, 100) for j in range(s, s + 50)}
+    expected = sorted([i for i in range(1000) if i not in deleted] + list(range(50_000, 50_500)))
+    for ds in (nl.dataset(uri, storage_options=options()), lance.dataset(uri, storage_options=options())):
+        assert sorted(ds.to_table(columns=["id"])["id"].to_pylist()) == expected
+    _every_version_opens_in_both(uri, lance)

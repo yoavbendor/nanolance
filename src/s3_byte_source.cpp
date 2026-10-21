@@ -145,7 +145,7 @@ bool list_s3(const std::string& dir_uri, std::vector<DirEntry>& out, std::string
         if (object.key.size() <= key_prefix.size()) {
             continue;  // the "directory" object itself, if the store has one
         }
-        out.push_back(DirEntry{object.key.substr(key_prefix.size()), object.size, false});
+        out.push_back(DirEntry{object.key.substr(key_prefix.size()), object.size, false, object.last_modified_ns});
     }
     for (const auto& sub : common_prefixes) {
         auto name = sub.substr(key_prefix.size());

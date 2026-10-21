@@ -634,8 +634,6 @@ class LanceDataset(pa.dataset.Dataset):
 
     def _cleanup(self, older_than, retain_versions, delete_unverified, error_if_tagged, delete_rate_limit, versions,
                  execute, max_files):
-        if execute:
-            refuse_object_store_write(self._uri, "cleanup")
         if older_than is None and retain_versions is None and versions is None:
             older_than = timedelta(days=14)
         older_than_ns = None

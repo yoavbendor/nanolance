@@ -584,21 +584,63 @@ struct ForkProtection {
     ReferencedFiles files;
 };
 
+/// One file of a `_versions` directory.
+struct VersionFile {
+    fs::path path;
+    std::string name;
+    std::uint64_t size = 0;
+};
+
+/// The files of `versions_dir` with their sizes: one listing on an object store, directory_iterator locally.
+bool version_files(const fs::path& versions_dir, std::vector<VersionFile>& out, std::string& error) {
+    out.clear();
+    if (on_object_store(versions_dir)) {
+        std::vector<io::DirEntry> entries;
+        if (!io::list_dir(versions_dir.string(), entries, error, true)) {
+            error = "failed to list " + versions_dir.string() + ": " + error;
+            return false;
+        }
+        for (const auto& entry : entries) {
+            if (!entry.is_dir) {
+                out.push_back({versions_dir / entry.name, entry.name, entry.size});
+            }
+        }
+        return true;
+    }
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(versions_dir, ec)) {
+        std::error_code entry_ec;
+        if (!entry.is_regular_file(entry_ec)) {
+            continue;
+        }
+        out.push_back({entry.path(), entry.path().filename().string(),
+                       static_cast<std::uint64_t>(entry.file_size(entry_ec))});
+    }
+    if (ec) {
+        error = "failed to list " + versions_dir.string() + ": " + ec.message();
+        return false;
+    }
+    return true;
+}
+
 /// Scan every manifest of the branch `fork` and record what names files in `dataset_path`. A manifest
 /// that names one protects the version the branch forks from.
 bool protect_fork(const fs::path& dataset_path, const ForkedBranch& fork, ForkProtection& out, std::string& error) {
     const std::string own = canonical_text(dataset_path);
-    std::error_code ec;
-    for (const auto& entry : fs::directory_iterator(fork.dir / "_versions", ec)) {
-        const auto name = entry.path().filename().string();
+    std::vector<VersionFile> entries;
+    if (!version_files(fork.dir / "_versions", entries, error)) {
+        return false;
+    }
+    for (const auto& entry : entries) {
+        const auto& name = entry.name;
         std::uint64_t version = 0;
         const bool attached = parse_manifest_version(name, version);
         const bool detached = !attached && starts_with(name, "d") && ends_with(name, ".manifest");
-        if (!entry.is_regular_file(ec) || (!attached && !detached)) {
+        if (!attached && !detached) {
             continue;
         }
         pb::Manifest manifest;
-        if (!load_manifest_file(entry.path(), manifest, error)) {
+        if (!load_manifest_file(entry.path, manifest, error)) {
             error = "cannot clean up: a branch " + fork.name + " manifest could not be read: " + error;
             return false;
         }
@@ -642,10 +684,6 @@ bool protect_fork(const fs::path& dataset_path, const ForkedBranch& fork, ForkPr
         if (names_here) {
             out.versions.insert(fork.version);
         }
-    }
-    if (ec) {
-        error = "failed to list " + (fork.dir / "_versions").string() + ": " + ec.message();
-        return false;
     }
     return true;
 }
@@ -1660,27 +1698,29 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
     std::optional<std::int64_t> earliest_kept_ns;  // commit times, for Lance's listing cutoff
     std::optional<std::int64_t> latest_removed_ns;
     const auto versions_dir = dataset_path / "_versions";
-    std::error_code ec;
-    for (const auto& entry : fs::directory_iterator(versions_dir, ec)) {
-        const auto name = entry.path().filename().string();
+    std::vector<VersionFile> version_entries;
+    if (!version_files(versions_dir, version_entries, error)) {
+        return false;
+    }
+    for (const auto& entry : version_entries) {
+        const auto& name = entry.name;
         std::uint64_t version = 0;
         const bool attached = parse_manifest_version(name, version);
         const bool detached = !attached && starts_with(name, "d") && ends_with(name, ".manifest");
-        if (!entry.is_regular_file(ec) || (!attached && !detached)) {
+        if (!attached && !detached) {
             continue;
         }
         pb::Manifest manifest;
         std::string read_error;
-        if (!load_manifest_file(entry.path(), manifest, read_error)) {
-            std::error_code gone;
-            if (attached && version < read_version && !fs::exists(entry.path(), gone)) {
+        if (!load_manifest_file(entry.path, manifest, read_error)) {
+            if (attached && version < read_version && !path_exists(entry.path)) {
                 continue;  // another cleanup removed it after the listing
             }
-            error = "cannot clean up: " + entry.path().string() + ": " + read_error;
+            error = "cannot clean up: " + entry.path.string() + ": " + read_error;
             return false;
         }
         if (!manifest.index_section_error.empty()) {
-            error = "cannot clean up: the indices of " + entry.path().string() +
+            error = "cannot clean up: the indices of " + entry.path.string() +
                     " could not be read: " + manifest.index_section_error;
             return false;
         }
@@ -1703,13 +1743,8 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
             bound = ts;
         }
         if (!keep) {
-            old_manifests.push_back({fs::relative(entry.path(), dataset_path, ec).generic_string(), "manifest", false,
-                                     static_cast<std::uint64_t>(entry.file_size(ec))});
+            old_manifests.push_back({"_versions/" + name, "manifest", false, entry.size});
         }
-    }
-    if (ec) {
-        error = "failed to list " + versions_dir.string() + ": " + ec.message();
-        return false;
     }
     if (policy.error_if_tagged_old_versions && !tagged_old.empty()) {
         error = "Cleanup error: " + std::to_string(tagged_old.size()) +
@@ -1732,8 +1767,57 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
                             !(latest_removed_ns.has_value() && *latest_removed_ns > *earliest_kept_ns);
     const std::int64_t cutoff_ns = has_cutoff ? *earliest_kept_ns : 0;
     std::vector<CleanupCandidate> files;
+    const bool object_store = on_object_store(dataset_path);
     for (const char* dir : {"_versions", "_transactions", "data", "_indices", "_deletions"}) {
         const bool all = std::string_view(dir) == "_indices" || !has_cutoff;
+        // One file of the walk: its age (for the in-progress guard) and its modification time on the
+        // clock commit times are on (not now minus an age: two clocks read at different moments put a
+        // file written just after the earliest kept version before it whenever the walk is slow).
+        const auto consider = [&](File file, std::int64_t age, std::int64_t modified_ns) {
+            if (!all && modified_ns > cutoff_ns) {
+                return;  // modified after the earliest kept version
+            }
+            file.maybe_in_progress = !policy.delete_unverified && age < kUnverifiedThresholdNs;
+            bool unverified = false;
+            const auto kind = removable_kind(file, referenced, verified, unverified);
+            if (!kind.empty()) {
+                files.push_back({file.relative, kind, unverified, file.size});
+            }
+        };
+        if (object_store) {
+            // The store's LastModified. A store that does not report it dates the object now: never
+            // removed as old, and protected as possibly in progress (unless delete_unverified).
+            const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+            std::vector<std::pair<std::string, io::DirEntry>> objects;
+            std::vector<std::string> pending{dir};
+            while (!pending.empty()) {
+                const auto rel_dir = pending.back();
+                pending.pop_back();
+                std::vector<io::DirEntry> entries;
+                if (!io::list_dir((dataset_path / rel_dir).string(), entries, error, true)) {
+                    error = "failed to list " + (dataset_path / rel_dir).string() + ": " + error;
+                    return false;
+                }
+                for (auto& entry : entries) {
+                    const auto rel = rel_dir + "/" + entry.name;
+                    if (entry.is_dir) {
+                        pending.push_back(rel);
+                    } else {
+                        objects.emplace_back(rel, std::move(entry));
+                    }
+                }
+            }
+            for (const auto& [rel, entry] : objects) {
+                const std::int64_t modified_ns = entry.modified_ns != 0 ? entry.modified_ns : now_ns;
+                File file;
+                file.relative = rel;
+                file.size = entry.size;
+                consider(std::move(file), now_ns - modified_ns, modified_ns);
+            }
+            continue;
+        }
         std::error_code walk_ec;
         if (!fs::exists(dataset_path / dir, walk_ec)) {
             continue;
@@ -1750,20 +1834,11 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
             file.size = static_cast<std::uint64_t>(it->file_size(entry_ec));
             const auto modified = it->last_write_time(entry_ec);
             const auto age = std::chrono::duration_cast<std::chrono::nanoseconds>(file_now - modified).count();
-            // The modification time itself, on the clock commit times are on (not now minus an age:
-            // two clocks read at different moments put a file written just after the earliest kept
-            // version before it whenever the walk is slow).
             const auto modified_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          fs::file_time_type::clock::to_sys(modified).time_since_epoch())
                                          .count();
-            if (!all && modified_ns > cutoff_ns) {
-                continue;  // modified after the earliest kept version
-            }
-            file.maybe_in_progress = !policy.delete_unverified && age < kUnverifiedThresholdNs;
-            bool unverified = false;
-            const auto kind = removable_kind(file, referenced, verified, unverified);
-            if (!kind.empty() && !entry_ec) {
-                files.push_back({file.relative, kind, unverified, file.size});
+            if (!entry_ec) {
+                consider(std::move(file), age, modified_ns);
             }
         }
         if (walk_ec) {
@@ -1790,6 +1865,14 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
         if (pause.count() > 0) {
             std::this_thread::sleep_until(next);
             next = std::max(next + pause, std::chrono::steady_clock::now());
+        }
+        if (object_store) {
+            std::string remove_error;
+            if (!io::remove_output((dataset_path / file.path).string(), remove_error)) {
+                error = "failed to remove " + (dataset_path / file.path).string() + ": " + remove_error;
+                return false;
+            }
+            return true;  // no directories to tidy on a store
         }
         std::error_code remove_ec;
         fs::remove(dataset_path / file.path, remove_ec);
