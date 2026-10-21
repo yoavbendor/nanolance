@@ -25,12 +25,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <unordered_map>
+#include <string_view>
 #include <utility>
 
 namespace nano_lance {
@@ -302,6 +305,7 @@ constexpr std::size_t kBoundBlock = 128;
 struct BlockBounds {
     std::vector<float> max_weight;
     std::vector<std::uint32_t> order;
+    bool ascending = true;  // the posting's documents strictly ascending (what a pruned OR walks)
 };
 
 struct Posting {
@@ -725,6 +729,15 @@ float doc_weight_with_norm(std::uint32_t freq, float norm) {
     return (kK1 + 1.0F) * f / (f + norm);
 }
 
+/// Off with NANOLANCE_FTS_EXHAUSTIVE=1: every OR then scores every document (what tests compare against).
+bool pruning_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("NANOLANCE_FTS_EXHAUSTIVE");
+        return v == nullptr || std::string_view(v) != "1";
+    }();
+    return enabled;
+}
+
 std::shared_ptr<const BlockBounds> Posting::block_bounds(const float* norm, std::uint32_t key) const {
     std::lock_guard<std::mutex> lock(mutex);
     if (bounds == nullptr || bounds_key != key) {
@@ -734,6 +747,9 @@ std::shared_ptr<const BlockBounds> Posting::block_bounds(const float* norm, std:
         for (std::size_t k = 0; k < n; ++k) {
             float& m = b->max_weight[k / kBoundBlock];
             m = std::max(m, doc_weight_with_norm(freqs[k], norm[docs[k]]));
+        }
+        for (std::size_t k = 1; k < n && b->ascending; ++k) {
+            b->ascending = docs[k - 1] < docs[k];
         }
         b->order.resize(b->max_weight.size());
         for (std::uint32_t i = 0; i < b->order.size(); ++i) {
@@ -1141,6 +1157,12 @@ struct Search {
     /// A partition's scored documents with `need` marks, in row order, into `sink`; the buffers
     /// left zeroed.
     [[gnu::noinline]] void emit(const Partition& part, std::uint32_t need, HitSink& sink);
+    /// An OR of several words over a partition, the best rows only, with block-max MaxScore pruning;
+    /// false (nothing added) when it cannot be used, for the exhaustive pass to run instead.
+    [[gnu::noinline]] bool match_pruned(const Partition& part,
+                                        const std::vector<std::shared_ptr<const Posting>>& postings,
+                                        const std::vector<float>& weights, const std::vector<std::size_t>& order,
+                                        const float* norm, std::uint32_t key, HitSink& sink);
     /// A phrase over a partition: unmark the documents holding every term but not as the phrase
     /// does, so the plain match's emit loop drops them.
     [[gnu::noinline]] bool drop_non_phrases(const Partition& part,
@@ -1817,6 +1839,13 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
         const std::size_t n = part.row_ids.size();
         const auto norms = part.length_norms(avg);
         const float* norm = norms->data();
+        if (!flat_pass_ && nt > 1U && sink.limited() && !and_terms && !fuzzy && pruning_enabled()) {
+            std::uint32_t key;
+            std::memcpy(&key, &avg, sizeof(key));
+            if (match_pruned(part, postings[p], weights, order, norm, key, sink)) {
+                continue;
+            }
+        }
         if (!flat_pass_ && nt == 1U && sink.limited() && !check_phrase) {
             // One word, the best rows only: its runs best first, until no run can beat the rows
             // kept. (A word repeated in the query scores its weight that many times over, which
@@ -2000,6 +2029,172 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
     }
     sort_hits(hits);
     out = std::move(hits);
+    return true;
+}
+
+bool Search::match_pruned(const Partition& part, const std::vector<std::shared_ptr<const Posting>>& postings,
+                          const std::vector<float>& weights, const std::vector<std::size_t>& order,
+                          const float* norm, std::uint32_t key, HitSink& sink) {
+    // Lance answers these with block-max WAND; this is block-max MaxScore over the same bounds. Documents
+    // are visited in order. A word's bound is its weight times its best document weight (overall, or in
+    // the run of kBoundBlock entries a cursor is in), times its repeats in the query. Words whose bounds
+    // together cannot reach the worst row kept are "non-essential": only documents of the others are
+    // candidates, and those words are looked up for a candidate whose bound still can. A candidate is
+    // scored as the exhaustive pass scores it (its words in `order`, summed in float from 0), so rows and
+    // scores are the same; bounds are summed in double with a margin over float rounding, and a document
+    // is skipped only when its bound is below the worst kept, never equal (ties go to the lower row).
+    constexpr double kMargin = 1.0 + 1e-5;
+    constexpr std::size_t kMaxTerms = 64;
+    struct Term {
+        const Posting* posting = nullptr;
+        std::shared_ptr<const BlockBounds> bounds;
+        double scale = 0.0;  // weight times repeats
+        double bound = 0.0;  // scale times the best document weight
+        std::size_t cursor = 0;
+        std::size_t index = 0;  // into `weights`
+    };
+    std::vector<Term> terms;
+    std::vector<std::uint32_t> repeats(weights.size(), 0U);
+    for (const std::size_t t : order) {
+        ++repeats[t];
+    }
+    for (std::size_t t = 0; t < postings.size(); ++t) {
+        if (postings[t] == nullptr || postings[t]->docs.empty() || repeats[t] == 0U) {
+            continue;
+        }
+        Term term;
+        term.posting = postings[t].get();
+        term.bounds = postings[t]->block_bounds(norm, key);
+        if (!term.bounds->ascending || weights[t] < 0.0F) {
+            return false;
+        }
+        term.scale = static_cast<double>(weights[t]) * repeats[t];
+        const float best = *std::max_element(term.bounds->max_weight.begin(), term.bounds->max_weight.end());
+        term.bound = term.scale * best;
+        term.index = t;
+        terms.push_back(std::move(term));
+    }
+    if (terms.size() < 2U || terms.size() > kMaxTerms) {
+        return false;
+    }
+    // Ascending bounds: a prefix of them is the non-essential set.
+    std::sort(terms.begin(), terms.end(), [](const Term& a, const Term& b) { return a.bound < b.bound; });
+    const std::size_t n_terms = terms.size();
+    std::vector<double> prefix(n_terms + 1U, 0.0);
+    for (std::size_t i = 0; i < n_terms; ++i) {
+        prefix[i + 1U] = prefix[i] + terms[i].bound;
+    }
+    double threshold = -1.0;  // the worst row kept, once the sink is full
+    std::size_t first_essential = 0;
+    const auto refresh = [&] {
+        if (!sink.full()) {
+            return;
+        }
+        threshold = static_cast<double>(sink.worst());
+        while (first_essential < n_terms && prefix[first_essential + 1U] * kMargin < threshold) {
+            ++first_essential;
+        }
+    };
+    const auto at = [](const Term& t) { return t.posting->docs[t.cursor]; };
+    const auto live = [](const Term& t) { return t.cursor < t.posting->docs.size(); };
+    // Moves `t` to its first document at or after `d`.
+    const auto seek = [](Term& t, std::uint32_t d) {
+        const auto& docs = t.posting->docs;
+        if (t.cursor < docs.size() && docs[t.cursor] < d) {
+            t.cursor = static_cast<std::size_t>(
+                std::lower_bound(docs.begin() + static_cast<std::ptrdiff_t>(t.cursor), docs.end(), d) - docs.begin());
+        }
+    };
+    const auto* part_cover = cover_of(part);
+    std::vector<float> contribution(weights.size(), 0.0F);
+    std::vector<std::uint8_t> present(weights.size(), 0U);
+    refresh();
+    while (first_essential < n_terms) {
+        std::uint32_t d = std::numeric_limits<std::uint32_t>::max();
+        for (std::size_t i = first_essential; i < n_terms; ++i) {
+            if (live(terms[i])) {
+                d = std::min(d, at(terms[i]));
+            }
+        }
+        if (d == std::numeric_limits<std::uint32_t>::max()) {
+            break;  // every essential word is exhausted: no other document can reach the rows kept
+        }
+        if (threshold >= 0.0) {
+            // The run each essential cursor is in bounds every document up to the run's last one.
+            double bound = prefix[first_essential];
+            std::uint32_t window_end = std::numeric_limits<std::uint32_t>::max();
+            for (std::size_t i = first_essential; i < n_terms; ++i) {
+                const Term& t = terms[i];
+                if (!live(t)) {
+                    continue;
+                }
+                const std::size_t run = t.cursor / kBoundBlock;
+                bound += t.scale * t.bounds->max_weight[run];
+                const std::size_t last = std::min(t.posting->docs.size(), (run + 1U) * kBoundBlock) - 1U;
+                window_end = std::min(window_end, t.posting->docs[last]);
+            }
+            if (bound * kMargin < threshold) {
+                // No document up to window_end can beat the rows kept.
+                const std::uint32_t next = window_end == std::numeric_limits<std::uint32_t>::max() ? window_end
+                                                                                                   : window_end + 1U;
+                for (std::size_t i = first_essential; i < n_terms; ++i) {
+                    if (next == std::numeric_limits<std::uint32_t>::max()) {
+                        terms[i].cursor = terms[i].posting->docs.size();
+                    } else {
+                        seek(terms[i], next);
+                    }
+                }
+                continue;
+            }
+        }
+        // The candidate's essential words, then the others while they can still lift it past the worst.
+        double partial = 0.0;
+        for (std::size_t i = first_essential; i < n_terms; ++i) {
+            Term& t = terms[i];
+            if (live(t) && at(t) == d) {
+                const float dw = doc_weight_with_norm(t.posting->freqs[t.cursor], norm[d]);
+                contribution[t.index] = dw;
+                present[t.index] = 1U;
+                partial += t.scale * dw;
+            }
+        }
+        bool skip = false;
+        for (std::size_t i = first_essential; i-- > 0;) {
+            if (threshold >= 0.0 && (partial + prefix[i + 1U]) * kMargin < threshold) {
+                skip = true;
+                break;
+            }
+            Term& t = terms[i];
+            seek(t, d);
+            if (live(t) && at(t) == d) {
+                const float dw = doc_weight_with_norm(t.posting->freqs[t.cursor], norm[d]);
+                contribution[t.index] = dw;
+                present[t.index] = 1U;
+                partial += t.scale * dw;
+            }
+        }
+        if (!skip) {
+            float score = 0.0F;
+            for (const std::size_t t : order) {
+                if (present[t] != 0U) {
+                    score += weights[t] * contribution[t];
+                }
+            }
+            const std::uint64_t row = part.row_ids[d];
+            if (mask.allows(row, part_cover)) {
+                sink.add(row, part.element_of(d), score);
+            }
+        }
+        for (std::size_t t = 0; t < present.size(); ++t) {
+            present[t] = 0U;
+        }
+        for (std::size_t i = first_essential; i < n_terms; ++i) {
+            if (live(terms[i]) && at(terms[i]) == d) {
+                ++terms[i].cursor;
+            }
+        }
+        refresh();
+    }
     return true;
 }
 

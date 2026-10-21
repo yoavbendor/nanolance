@@ -170,10 +170,15 @@ def test_selection_rules(lance, tmp_path):
 def test_vector_model_kept_or_retrained(lance, tmp_path):
     path = str(tmp_path / "v.lance")
     nl.write_dataset(_table(3_000), path, max_rows_per_file=1_000)
-    # A target of 750 rows a partition: 4 partitions, and none to split or join after the append.
-    nl.dataset(path).create_index("vec", "IVF_PQ", target_partition_size=750, num_sub_vectors=4)
+    # A target of 750 rows a partition: 4 partitions, and none to split or join after the append. Seeded:
+    # unseeded k-means now and then left a partition under the join threshold (a quarter of the target),
+    # which optimize then joined (3 centroids where 4 were expected).
+    nl.dataset(path).create_index("vec", "IVF_PQ", target_partition_size=750, num_sub_vectors=4, seed=1)
     uuid0 = lance.dataset(path).describe_indices()[0].segments[0].uuid
-    centroids0 = lance.dataset(path).stats.index_stats("vec_idx")["indices"][0]["centroids"]
+    built = lance.dataset(path).stats.index_stats("vec_idx")["indices"][0]
+    centroids0 = built["centroids"]
+    sizes = [p["size"] for p in built["partitions"]]
+    assert len(sizes) == 4 and min(sizes) > 750 // 4 and max(sizes) + 1_000 < 4 * 750, sizes
     nl.write_dataset(_table(1_000, start=3_000), path, mode="append")
     nl.dataset(path).optimize.optimize_indices()
     stats = lance.dataset(path).stats.index_stats("vec_idx")
