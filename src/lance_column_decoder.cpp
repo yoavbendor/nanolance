@@ -2068,6 +2068,7 @@ ColumnEncodingPlan classify_column_encoding(const pb::Field& field, const pb::Co
 
 /// Bytes a pooled scratch object holds on to.
 std::size_t scratch_bytes(const std::vector<std::uint8_t>& v) { return v.capacity(); }
+std::size_t scratch_bytes(const std::vector<std::uint16_t>& v) { return v.capacity() * sizeof(std::uint16_t); }
 std::size_t scratch_bytes(const std::vector<MiniBlockChunkView>& chunks) {
     std::size_t bytes = chunks.capacity() * sizeof(MiniBlockChunkView);
     for (const auto& c : chunks) {
@@ -3919,12 +3920,19 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
     std::uint64_t items_total = 0;
     std::vector<bool> shape;  // per layer, innermost first: is it a list? Must agree across pages.
 
-    std::vector<std::uint8_t> control;
-    std::vector<std::uint8_t> payload;
+    // Pooled per thread: a large list column is decoded window by window, and fresh buffers each time
+    // made glibc grow and trim its heap around every window (a nanolance-written list<int64> read 45%
+    // slower than with a retaining malloc).
+    PageScratch control_scratch;
+    PageScratch payload_scratch;
+    auto& control = control_scratch.get();
+    auto& payload = payload_scratch.get();
     Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
     auto& chunks = chunks_scratch.get();
-    std::vector<std::uint16_t> rep;
-    std::vector<std::uint16_t> def;
+    Scratch<std::vector<std::uint16_t>> rep_scratch;
+    Scratch<std::vector<std::uint16_t>> def_scratch;
+    auto& rep = rep_scratch.get();
+    auto& def = def_scratch.get();
     std::uint64_t rows_total = 0;
     for (const auto& page : column_metadata.pages) {
         rows_total += page.length;  // only guides reserve_projected; overflow would just skip it
@@ -3976,6 +3984,16 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
                 error = where + std::to_string(chunks.size()) + " chunks but " + std::to_string(items.size()) +
                         " metadata words";
                 return false;
+            }
+            std::size_t page_levels = 0;
+            for (const auto& chunk : chunks) {
+                page_levels += chunk.num_levels;
+            }
+            if (has_rep) {
+                rep.reserve(page_levels);
+            }
+            if (chunk_shape.has_definition) {
+                def.reserve(page_levels);
             }
             for (const auto& chunk : chunks) {
                 const auto n = chunk.num_levels;
