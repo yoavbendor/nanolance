@@ -135,7 +135,10 @@ No credentials in tests or logs beyond moto's `testing` keys.
 
 ## 7. Later, not now
 
-- Streaming multipart uploads from memory (no temp file) for the Lance file writer.
+- Streaming multipart uploads from memory (no temp file) for the Lance file writer, so parts go up while
+  the file is still being encoded. Measured 2026-10-21 on moto (`bench/s3_upload_speed.py`): 512 MiB in
+  4.6 s vs pylance's 4.3 s with 8 parts in flight (4.7 / 6.7 s before, with 4); 16 MiB in 0.19 s vs
+  0.12 s, the encode-then-upload gap this would close.
 - Parallel uploads of a commit's files (index builds write many).
 - `gs://` and `az://` native clients (today S3-compatible endpoints only).
 

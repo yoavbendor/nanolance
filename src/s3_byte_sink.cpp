@@ -20,6 +20,10 @@ namespace {
 // Objects up to this size are uploaded from memory in one PUT; a larger one spills to a temporary file
 // and goes up with put_file (multipart from 64 MiB), so memory stays bounded whatever is written.
 constexpr std::size_t kMemoryLimit = 8U * 1024U * 1024U;
+// Parts of one multipart upload in flight (16 MiB each). Measured on moto against pylance writing 512 MiB:
+// 4 in flight 0.71x its speed, 8 0.91x, 16 0.98x; 8 keeps the memory in flight at 128 MiB (Lance uploads
+// about 10 parts at once).
+constexpr unsigned kPartsInFlight = 8U;
 
 std::filesystem::path temp_dir() {
     if (const char* dir = std::getenv("NANOLANCE_TMPDIR"); dir != nullptr && *dir != '\0') {
@@ -145,7 +149,9 @@ public:
         }
         bool ok = false;
         if (buf_.spilled()) {
-            ok = client_->put_file(uri_, buf_.file_path().string(), nanos3reader::FileUploadOptions{}, nullptr, error);
+            nanos3reader::FileUploadOptions upload;
+            upload.part_concurrency = kPartsInFlight;
+            ok = client_->put_file(uri_, buf_.file_path().string(), upload, nullptr, error);
         } else {
             const auto& m = buf_.memory();
             ok = client_->put(uri_, reinterpret_cast<const std::uint8_t*>(m.data()), m.size(),
