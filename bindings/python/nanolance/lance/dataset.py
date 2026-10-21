@@ -3155,7 +3155,54 @@ def _expression_sql(expr) -> str:
     text = "".join(part if i % 2 else temporal(part) for i, part in enumerate(parts))
     # pyarrow quotes strings with double quotes; SQL uses single.
     text = re.sub(r'"((?:[^"\\]|\\.)*)"', lambda m: "'" + m.group(1).replace("'", "''") + "'", text)
-    return text
+    return _drop_null_guards(text)
+
+
+def _split_call(text: str, start: int):
+    """The arguments of the call whose "(" is at ``start`` (top-level commas, quotes respected) and the
+    index just past its ")"; None when unbalanced."""
+    depth, quote, args, begin = 0, False, [], start + 1
+    for i in range(start, len(text)):
+        c = text[i]
+        if c == "'":
+            quote = not quote
+        elif quote:
+            continue
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                args.append(text[begin:i].strip())
+                return args, i + 1
+        elif c == "," and depth == 1:
+            args.append(text[begin:i].strip())
+            begin = i + 1
+    return None
+
+
+def _drop_null_guards(text: str) -> str:
+    """DuckDB (2.0) pushes ``s IN (...)`` down as ``if_else(is_valid(s), (s IN (...)), null[bool])``. That
+    is exactly ``s IN (...)`` (NULL when s is NULL either way), so it becomes that. Any other if_else
+    is left as is, for the parser to refuse."""
+    import re
+
+    out, pos = [], 0
+    for m in re.finditer(r"\bif_else\(", text):
+        if m.start() < pos:
+            continue
+        split = _split_call(text, m.end() - 1)
+        if split is None:
+            break
+        args, end = split
+        guard = re.fullmatch(r"is_valid\((\w+)\)", args[0]) if len(args) == 3 else None
+        if guard and re.fullmatch(r"null\[\w+\]", args[2]) and \
+                re.fullmatch(r"\(\s*" + re.escape(guard.group(1)) + r" IN \(.*\)\s*\)", args[1], re.S):
+            out.append(text[pos:m.start()])
+            out.append(args[1])
+            pos = end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 class MergeInsertBuilder:
