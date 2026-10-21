@@ -77,3 +77,12 @@ Tails of: `cd build && ctest -j8 | tail -3`; the object-store tests against moto
 tests/test_object_store_commits.py`); `python3 tools/pylance_suite.py | tail -4`; last, once, the full
 bindings suite. Report under 40 lines: questions first, then files, per-operation status, tails,
 decisions, `df -h /`.
+
+**W4 outcome (2026-10-21): object-store writes done.** cleanup_old_versions (branch-aware), drop, branches
+(create with a create-only ref, delete removes `tree/<B>/`, replace_metadata, tags on branches), shallow and
+deep clones (local <-> s3 both ways; deep clones stream each object in 8 MiB chunks) work on `s3://`. Drop
+on S3 keeps the local rule: nothing is deleted unless a readable manifest proves the prefix is a dataset.
+Where an object-store listing fails, existence is assumed (refuse rather than overwrite). Local paths keep
+their std::filesystem calls unchanged. The session stopped at its usage limit after the object-store tests
+(141 passed); the reviewer ran ctest, the object-store and branch tests (172 passed), the pylance suite and
+the full bindings suite. Only `migrate_manifest_paths_v2` stays local-only.

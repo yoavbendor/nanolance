@@ -87,6 +87,151 @@ bool read_text(const fs::path& path, std::string& out) {
     return true;
 }
 
+// ── object stores ──────────────────────────────────────────────────────────────────────────────────
+// An object store (s3://) has no directories: a directory is the set of objects under its prefix, and
+// removing or copying one is one request per object. Local paths keep their filesystem calls.
+
+bool on_object_store(const fs::path& path) { return io::is_object_store_output(path.string()); }
+
+/// Whether anything is at `path`: an object, or any object under it as a prefix. A listing that fails
+/// counts as present, so nothing is removed on a doubt.
+bool path_exists(const fs::path& path) {
+    if (!on_object_store(path)) {
+        std::error_code ec;
+        return fs::exists(path, ec);
+    }
+    if (io::exists(path.string())) {
+        return true;
+    }
+    std::vector<io::DirEntry> entries;
+    std::string error;
+    return !io::list_dir(path.string(), entries, error) || !entries.empty();
+}
+
+/// Every object under `dir` on a store, walking its sub-prefixes (a listing is one level).
+bool objects_under(const fs::path& dir, std::vector<fs::path>& out, std::string& error) {
+    std::vector<io::DirEntry> entries;
+    if (!io::list_dir(dir.string(), entries, error)) {
+        return false;
+    }
+    for (const auto& entry : entries) {
+        const fs::path child = dir / entry.name;
+        if (!entry.is_dir) {
+            out.push_back(child);
+        } else if (!objects_under(child, out, error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Removes the directory `dir` and everything under it: fs::remove_all locally, one DELETE per object on a
+/// store. A missing directory is not an error.
+bool remove_tree(const fs::path& dir, std::string& error) {
+    if (!on_object_store(dir)) {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        if (ec) {
+            error = ec.message();
+            return false;
+        }
+        return true;
+    }
+    std::vector<fs::path> objects;
+    if (!objects_under(dir, objects, error)) {
+        return false;
+    }
+    for (const auto& object : objects) {
+        if (!io::remove_output(object.string(), error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Removes one file (a ref); a missing one is not an error.
+bool remove_file_at(const fs::path& path, std::string& error) {
+    if (on_object_store(path)) {
+        return io::remove_output(path.string(), error);
+    }
+    std::error_code ec;
+    fs::remove(path, ec);
+    if (ec) {
+        error = ec.message();
+        return false;
+    }
+    return true;
+}
+
+/// Makes a local directory (an object store has none to make).
+void make_local_dir(const fs::path& dir) {
+    if (!on_object_store(dir)) {
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+    }
+}
+
+/// Copies one object (or file, either side) in chunks, so no whole file sits in memory.
+bool copy_stream(const fs::path& src, const fs::path& dst, std::string& error) {
+    constexpr std::uint64_t kChunk = 8ULL << 20;
+    const auto source = io::open_source(src.string(), error);
+    if (!source) {
+        return false;
+    }
+    auto out = io::open_output(dst.string(), error);
+    if (!out) {
+        return false;
+    }
+    std::vector<std::uint8_t> chunk;
+    for (std::uint64_t offset = 0; offset < source->size(); offset += kChunk) {
+        const auto n = std::min(kChunk, source->size() - offset);
+        chunk.resize(static_cast<std::size_t>(n));
+        if (!source->read_at(offset, n, chunk.data(), error)) {
+            return false;
+        }
+        out->write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(n));
+    }
+    return out->commit(error);
+}
+
+/// Copies one file: fs::copy_file when both sides are local (as before), else a streamed copy.
+bool copy_one(const fs::path& src, const fs::path& dst, std::string& error) {
+    if (!on_object_store(src) && !on_object_store(dst)) {
+        std::error_code ec;
+        fs::copy_file(src, dst, fs::copy_options::none, ec);
+        if (ec) {
+            error = ec.message();
+            return false;
+        }
+        return true;
+    }
+    return copy_stream(src, dst, error);
+}
+
+/// Copies every file under `src_dir` into `dst_dir`: fs::copy (recursive) when both are local, else one
+/// streamed copy per object.
+bool copy_tree(const fs::path& src_dir, const fs::path& dst_dir, std::string& error) {
+    if (!on_object_store(src_dir) && !on_object_store(dst_dir)) {
+        std::error_code ec;
+        fs::copy(src_dir, dst_dir, fs::copy_options::recursive, ec);
+        if (ec) {
+            error = ec.message();
+            return false;
+        }
+        return true;
+    }
+    std::vector<fs::path> objects;
+    if (!objects_under(src_dir, objects, error)) {
+        return false;
+    }
+    for (const auto& object : objects) {
+        if (!copy_stream(object, dst_dir / object.lexically_relative(src_dir), error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// Write `bytes` to `path` through a temp file: replacing whatever is there (`replace`), or failing
 /// when it exists (`!replace`, Lance's put_if_absent).
 bool write_file(const fs::path& path, const std::string& bytes, bool replace, bool& existed, std::string& error) {
@@ -137,9 +282,9 @@ bool write_file(const fs::path& path, const std::string& bytes, bool replace, bo
     return true;
 }
 
-/// A tag file. Local paths: write_file. An object store (s3://): a plain PUT replaces the file; without
-/// `replace` the PUT is create-only (If-None-Match), as write_file's hard link is locally.
-bool write_tag_file(const fs::path& path, const std::string& bytes, bool replace, bool& existed,
+/// A ref file (a tag or a branch). Local paths: write_file. An object store (s3://): a plain PUT replaces
+/// the file; without `replace` the PUT is create-only (If-None-Match), as write_file's hard link is locally.
+bool write_ref_file(const fs::path& path, const std::string& bytes, bool replace, bool& existed,
                     std::string& error) {
     if (!io::is_object_store_output(path.string())) {
         return write_file(path, bytes, replace, existed, error);
@@ -987,29 +1132,42 @@ struct CloneDirs {
 
 CloneDirs remember_clone_dirs(const fs::path& target) {
     CloneDirs dirs;
-    std::error_code ec;
     for (std::size_t i = 0; i < CloneDirs::names.size(); ++i) {
-        dirs.existed[i] = fs::exists(target / CloneDirs::names[i], ec);
+        dirs.existed[i] = path_exists(target / CloneDirs::names[i]);
     }
     return dirs;
 }
 
 /// Remove what a failed clone created in `target` (the target itself when this clone created it).
 void undo_clone(const fs::path& target, bool target_existed, const CloneDirs& dirs) {
-    std::error_code ec;
+    std::string ignored;
     if (!target_existed) {
-        fs::remove_all(target, ec);
+        remove_tree(target, ignored);
         return;
     }
     for (std::size_t i = 0; i < CloneDirs::names.size(); ++i) {
         if (!dirs.existed[i]) {
-            fs::remove_all(target / CloneDirs::names[i], ec);
+            remove_tree(target / CloneDirs::names[i], ignored);
         }
     }
 }
 
 /// Whether `target` already holds a dataset (a manifest in its `_versions`).
 bool holds_dataset(const fs::path& target) {
+    if (on_object_store(target)) {
+        std::vector<io::DirEntry> entries;
+        std::string error;
+        if (!io::list_dir((target / "_versions").string(), entries, error)) {
+            return true;  // unknown: refuse the clone rather than write over a dataset that may be there
+        }
+        for (const auto& entry : entries) {
+            std::uint64_t v = 0;
+            if (!entry.is_dir && parse_manifest_version(entry.name, v)) {
+                return true;
+            }
+        }
+        return false;
+    }
     std::error_code ec;
     for (const auto& entry : fs::directory_iterator(target / "_versions", ec)) {
         std::uint64_t v = 0;
@@ -1039,17 +1197,15 @@ bool deep_manifest(const fs::path& source_dir, std::uint64_t version, const fs::
         return false;
     }
     // Copy first, with the source's bases still in the manifest: every file is resolved against them.
-    std::error_code ec;
     for (const auto& fragment : manifest.fragments) {
         for (const auto& file : fragment.files) {
             fs::path dir;
             if (!data_file_dir(source_dir, bases, file, dir, error)) {
                 return false;
             }
-            fs::create_directories(target / "data", ec);
-            fs::copy_file(dir / file.path, target / "data" / file.path, fs::copy_options::none, ec);
-            if (ec) {
-                error = "failed to copy data file " + file.path + ": " + ec.message();
+            make_local_dir(target / "data");
+            if (!copy_one(dir / file.path, target / "data" / file.path, error)) {
+                error = "failed to copy data file " + file.path + ": " + error;
                 return false;
             }
         }
@@ -1059,10 +1215,9 @@ bool deep_manifest(const fs::path& source_dir, std::uint64_t version, const fs::
                 return false;
             }
             const auto name = fs::path(deletion_file_name(fragment)).filename();
-            fs::create_directories(target / "_deletions", ec);
-            fs::copy_file(dir / name, target / "_deletions" / name, fs::copy_options::none, ec);
-            if (ec) {
-                error = "failed to copy deletion file " + name.string() + ": " + ec.message();
+            make_local_dir(target / "_deletions");
+            if (!copy_one(dir / name, target / "_deletions" / name, error)) {
+                error = "failed to copy deletion file " + name.string() + ": " + error;
                 return false;
             }
         }
@@ -1073,10 +1228,9 @@ bool deep_manifest(const fs::path& source_dir, std::uint64_t version, const fs::
             return false;
         }
         const auto dst = target / "_indices" / pb::uuid_string(index.uuid);
-        fs::create_directories(dst.parent_path(), ec);
-        fs::copy(dir, dst, fs::copy_options::recursive, ec);
-        if (ec) {
-            error = "failed to copy index " + pb::uuid_string(index.uuid) + ": " + ec.message();
+        make_local_dir(dst.parent_path());
+        if (!copy_tree(dir, dst, error)) {
+            error = "failed to copy index " + pb::uuid_string(index.uuid) + ": " + error;
             return false;
         }
     }
@@ -1114,8 +1268,7 @@ bool clone_version(const fs::path& root, const std::string& source_branch, std::
         error = "Dataset already exists: " + target.string();
         return false;
     }
-    std::error_code ec;
-    const bool target_existed = fs::exists(target, ec);
+    const bool target_existed = path_exists(target);
     const auto dirs = remember_clone_dirs(target);
     pb::Manifest manifest;
     std::uint64_t manifest_size = 0;
@@ -1156,8 +1309,7 @@ bool create_branch(const fs::path& root, const std::string& name, const std::str
     if (!list_branches(root, branches, error)) {
         return false;
     }
-    std::error_code ec;
-    if (find_branch(branches, name) != nullptr || fs::exists(branch_ref_path(root, name), ec)) {
+    if (find_branch(branches, name) != nullptr || path_exists(branch_ref_path(root, name))) {
         error = "Ref conflict error: branch " + name + " already exists";
         return false;
     }
@@ -1193,7 +1345,7 @@ bool create_branch(const fs::path& root, const std::string& name, const std::str
     branch.create_at = static_cast<std::uint64_t>(now_ns() / 1000000000LL);
     branch.manifest_size = manifest_size;
     bool existed = false;
-    if (!write_file(branch_ref_path(root, name), branch_json(branch), false, existed, error)) {
+    if (!write_ref_file(branch_ref_path(root, name), branch_json(branch), false, existed, error)) {
         if (existed) {
             error = "Ref conflict error: branch " + name + " already exists";
         }
@@ -1278,11 +1430,17 @@ bool delete_branch(const fs::path& root, const std::string& name, std::string& e
                 ", can not delete";
         return false;
     }
-    std::error_code ec;
-    fs::remove(branch_ref_path(root, name), ec);
-    if (ec) {
-        error = "failed to delete the reference of branch " + name + ": " + ec.message();
+    if (!remove_file_at(branch_ref_path(root, name), error)) {
+        error = "failed to delete the reference of branch " + name + ": " + error;
         return false;
+    }
+    if (on_object_store(root)) {
+        // A store has no directories above the branch's: its objects are all there is to remove.
+        if (!remove_tree(branch_location(root, name), error)) {
+            error = "failed to delete branch " + name + ": " + error;
+            return false;
+        }
+        return true;
     }
     remove_branch_dirs(branch_location(root, name), root / "tree");
     return true;
@@ -1306,7 +1464,7 @@ bool replace_branch_metadata(const fs::path& root, const std::string& name,
     BranchInfo branch = *found;
     branch.metadata = metadata;
     bool existed = false;
-    return write_file(branch_ref_path(root, name), branch_json(branch), true, existed, error);
+    return write_ref_file(branch_ref_path(root, name), branch_json(branch), true, existed, error);
 }
 
 bool get_tag(const fs::path& dataset_path, const std::string& name, TagInfo& out, std::string& error) {
@@ -1328,7 +1486,7 @@ bool create_tag(const fs::path& root, const std::string& name, const std::string
     tag.name = name;
     tag.created_at = tag.updated_at = rfc3339(now_ns());
     bool existed = false;
-    if (!write_tag_file(tags_dir(root) / (name + ".json"), tag_json(tag), false, existed, error)) {
+    if (!write_ref_file(tags_dir(root) / (name + ".json"), tag_json(tag), false, existed, error)) {
         if (existed) {
             error = "Ref conflict error: tag " + name + " already exists";
         }
@@ -1352,7 +1510,7 @@ bool update_tag(const fs::path& root, const std::string& name, const std::string
     }
     tag.updated_at = rfc3339(now_ns());
     bool existed = false;
-    return write_tag_file(tags_dir(root) / (name + ".json"), tag_json(tag), true, existed, error);
+    return write_ref_file(tags_dir(root) / (name + ".json"), tag_json(tag), true, existed, error);
 }
 
 bool delete_tag(const fs::path& dataset_path, const std::string& name, std::string& error) {
@@ -1387,7 +1545,7 @@ bool replace_tag_metadata(const fs::path& dataset_path, const std::string& name,
     }
     tag.metadata = metadata;
     bool existed = false;
-    return write_tag_file(tags_dir(dataset_path) / (name + ".json"), tag_json(tag), true, existed, error);
+    return write_ref_file(tags_dir(dataset_path) / (name + ".json"), tag_json(tag), true, existed, error);
 }
 
 // ── cleanup ────────────────────────────────────────────────────────────────────────────────────────
@@ -1771,8 +1929,69 @@ void run_auto_cleanup(const fs::path& dataset_path, std::uint64_t committed_vers
 
 // ── drop ───────────────────────────────────────────────────────────────────────────────────────────
 
+namespace {
+
+/// The refusal of a drop whose path holds no manifest that reads (a parent directory given by mistake).
+std::string not_a_dataset_error(const fs::path& dataset_path) {
+    return "Invalid user input: Refusing to drop '" + dataset_path.generic_string() +
+           "': no readable Lance manifest was found under '_versions', so this is not a dataset root. "
+           "Check that the path points at a dataset and not at a parent directory, and check the logs for "
+           "manifests that could not be read. A path holding only data files, or only manifests that cannot "
+           "be read, needs an explicit storage-level delete instead: such leftovers neither block re-creating "
+           "the dataset nor survive cleanup.";
+}
+
+/// drop on an object store: the dataset is what is under its prefix (a store has no empty directory), and
+/// the same evidence as locally is required before anything is deleted.
+bool drop_object_store_dataset(const fs::path& dataset_path, bool ignore_not_found, std::string& error) {
+    std::vector<fs::path> objects;
+    if (!objects_under(dataset_path, objects, error)) {
+        return false;
+    }
+    if (objects.empty()) {
+        if (ignore_not_found) {
+            return true;
+        }
+        error = "Dataset at path " + dataset_path.string() + " was not found";
+        return false;
+    }
+    bool qualifies = path_exists(dataset_path / ".lance-reserved") ||
+                     path_exists(dataset_path / ".lance-deregistered");
+    std::vector<io::DirEntry> entries;
+    if (!qualifies && !io::list_dir((dataset_path / "_versions").string(), entries, error)) {
+        return false;
+    }
+    for (const auto& entry : entries) {
+        if (qualifies) {
+            break;
+        }
+        std::uint64_t version = 0;
+        const bool detached = starts_with(entry.name, "d") && ends_with(entry.name, ".manifest");
+        if (entry.is_dir || !(parse_manifest_version(entry.name, version) || detached)) {
+            continue;
+        }
+        pb::Manifest manifest;
+        std::string read_error;
+        qualifies = load_manifest_file_unchecked(dataset_path / "_versions" / entry.name, manifest, read_error);
+    }
+    if (!qualifies) {
+        error = not_a_dataset_error(dataset_path);
+        return false;
+    }
+    if (!remove_tree(dataset_path, error)) {
+        error = "failed to drop " + dataset_path.string() + ": " + error;
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
 bool drop_dataset(const fs::path& dataset_path, bool ignore_not_found, std::string& error) {
     error.clear();
+    if (on_object_store(dataset_path)) {
+        return drop_object_store_dataset(dataset_path, ignore_not_found, error);
+    }
     std::error_code ec;
     if (!fs::exists(dataset_path, ec)) {
         if (ignore_not_found) {
@@ -1800,12 +2019,7 @@ bool drop_dataset(const fs::path& dataset_path, bool ignore_not_found, std::stri
         qualifies = load_manifest_file_unchecked(entry.path(), manifest, read_error);
     }
     if (!qualifies) {
-        error = "Invalid user input: Refusing to drop '" + dataset_path.generic_string() +
-                "': no readable Lance manifest was found under '_versions', so this is not a dataset root. "
-                "Check that the path points at a dataset and not at a parent directory, and check the logs for "
-                "manifests that could not be read. A path holding only data files, or only manifests that cannot "
-                "be read, needs an explicit storage-level delete instead: such leftovers neither block re-creating "
-                "the dataset nor survive cleanup.";
+        error = not_a_dataset_error(dataset_path);
         return false;
     }
     fs::remove_all(dataset_path, ec);

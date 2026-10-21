@@ -946,3 +946,211 @@ def test_conflicting_hand_built_commits_match_the_local_copy(tmp_path):
     assert s3_outcomes == local_outcomes
     assert _snapshot(s3_uri, options()) == _snapshot(local, None)
 
+
+
+# ── W4: drop, branches and clones on s3:// ───────────────────────────────────────────────────────────
+
+def _keys(uri: str) -> list:
+    """Every object key under the prefix of ``uri`` (the dataset directory), by ListObjectsV2 with no
+    credentials, the store taking an unsigned listing (moto does; the proxy is bypassed)."""
+    import urllib.parse
+    import urllib.request
+    import xml.etree.ElementTree as ET
+
+    prefix = uri[len(f"s3://{BUCKET}/"):].rstrip("/") + "/"
+    url = f"{ENDPOINT}/{BUCKET}?list-type=2&prefix={urllib.parse.quote(prefix)}"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(url, timeout=60) as resp:
+        root = ET.fromstring(resp.read())
+    assert root.findtext("{*}IsTruncated") == "false", "listing truncated"
+    return sorted(key.text for key in root.findall(".//{*}Key"))
+
+
+def _put_unsigned(uri: str, body: bytes) -> None:
+    """One PUT of ``body`` at ``uri`` with no credentials (moto takes it), for an object nanolance did not write."""
+    import urllib.request
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    key = uri[len(f"s3://{BUCKET}/"):]
+    request = urllib.request.Request(f"{ENDPOINT}/{BUCKET}/{key}", data=body, method="PUT")
+    opener.open(request, timeout=60).close()
+
+
+def test_drop_on_s3_refuses_a_prefix_with_no_manifest():
+    uri = fresh_uri()
+    _put_unsigned(uri + "/data/junk.lance", b"not a dataset")
+    with pytest.raises(ValueError, match="Refusing to drop"):
+        nl.LanceDataset.drop(uri, storage_options=options())
+    assert _keys(uri) == [uri[len(f"s3://{BUCKET}/"):] + "/data/junk.lance"]
+
+
+def _versions_and_rows(view, kinds: bool = True) -> dict:
+    """pylance's view of one version line: its versions, each one's rows and (on main) its transaction kind.
+    pylance 12 cannot read a branch's transactions (read_transaction panics there, locally as on S3)."""
+    out = {}
+    for v in (info["version"] for info in view.versions()):
+        table = view.checkout_version(v).to_table().sort_by("id").to_pydict()
+        out[v] = (type(view.read_transaction(v).operation).__name__, table) if kinds else table
+    return out
+
+
+def _branch_snapshot(uri: str, storage) -> dict:
+    """What pylance reads of a dataset's branches (names, forks, metadata, each branch's versions, kinds
+    and rows) and of its tags. Branch identifiers (random ids) and create times are left out."""
+    lance = require_pylance()
+    main = lance.dataset(uri, storage_options=storage)
+    branches = {}
+    for name, info in main.branches.list().items():
+        branches[name] = {"parent_branch": info["parent_branch"], "parent_version": info["parent_version"],
+                          "metadata": info["metadata"],
+                          "versions": _versions_and_rows(main.checkout_version((name, None)), kinds=False)}
+    return {"main": _versions_and_rows(main), "branches": branches,
+            "tags": sorted((name, info["version"]) for name, info in main.tags.list().items())}
+
+
+def _branch_on(root: str, name: str, storage, rows, mode="append") -> None:
+    """A write on branch ``name`` of the dataset at ``root``: nanolance's write, at ``<root>/tree/<name>``."""
+    nl.write_dataset(rows, f"{root}/tree/{name}", mode=mode, storage_options=storage)
+
+
+BRANCH_OPS = {
+    "create_and_write_and_tag": lambda main, root, storage: (
+        main.create_branch("feat"),
+        _branch_on(root, "feat", storage, batch(1000, 50)),
+        main.tags.create("feat_latest", ("feat", None))),
+    "fork_of_a_branch": lambda main, root, storage: (
+        main.create_branch("feat"),
+        _branch_on(root, "feat", storage, batch(1000, 50)),
+        main.create_branch("sub", ("feat", None)),
+        _branch_on(root, "sub", storage, batch(2000, 10))),
+    "replace_metadata": lambda main, root, storage: (
+        main.create_branch("feat"),
+        main.branches.replace_metadata("feat", {"owner": "w4"})),
+    "overwrite_on_branch": lambda main, root, storage: (
+        main.create_branch("feat"),
+        _branch_on(root, "feat", storage, batch(3000, 5), mode="overwrite")),
+}
+
+
+@pytest.mark.parametrize("name", list(BRANCH_OPS))
+def test_branch_operation_on_s3_matches_the_local_copy(name, tmp_path):
+    s3_uri, local = fresh_uri(), str(tmp_path / "ds.lance")
+    for uri, storage in ((s3_uri, options()), (local, None)):
+        nl.write_dataset(batch(0), uri, storage_options=storage)
+        BRANCH_OPS[name](nl.dataset(uri, storage_options=storage), uri, storage)
+    assert _branch_snapshot(s3_uri, options()) == _branch_snapshot(local, None)
+
+
+def test_branch_delete_on_s3_removes_its_objects_as_locally(tmp_path):
+    s3_uri, local = fresh_uri(), str(tmp_path / "ds.lance")
+    for uri, storage in ((s3_uri, options()), (local, None)):
+        nl.write_dataset(batch(0), uri, storage_options=storage)
+        main = nl.dataset(uri, storage_options=storage)
+        main.create_branch("gone")
+        _branch_on(uri, "gone", storage, batch(1000, 50))
+        main.create_branch("kept")
+        main.branches.delete("gone")
+    assert sorted(_branch_snapshot(s3_uri, options())["branches"]) == ["kept"]
+    assert _branch_snapshot(s3_uri, options()) == _branch_snapshot(local, None)
+    assert not [k for k in _keys(s3_uri) if "/tree/gone/" in k]
+    assert any("/tree/kept/" in k for k in _keys(s3_uri))
+    assert not (tmp_path / "ds.lance" / "tree" / "gone").exists()
+
+
+def test_branch_created_by_pylance_is_written_and_deleted_by_nanolance_on_s3():
+    lance = require_pylance()
+    uri = fresh_uri()
+    main = lance.write_dataset(batch(0), uri, storage_options=options())
+    branch = main.create_branch("feat")
+    lance.write_dataset(batch(1000, 50), branch.uri, mode="append", storage_options=options())
+    nl.write_dataset(batch(2000, 10), f"{uri}/tree/feat", mode="append", storage_options=options())
+    theirs = lance.dataset(uri, storage_options=options()).checkout_version(("feat", None))
+    assert theirs.count_rows() == 160
+    assert sorted(theirs.to_table(columns=["id"])["id"].to_pylist())[-1] == 2009
+    nl.dataset(uri, storage_options=options()).branches.delete("feat")
+    assert lance.dataset(uri, storage_options=options()).branches.list() == {}
+    assert not [k for k in _keys(uri) if "/tree/feat/" in k]
+
+
+def test_racing_branch_creates_lose_and_double_nothing():
+    """Two processes create the same branch: one wins, the other is refused, and the branch reads back."""
+    uri = fresh_uri()
+    nl.write_dataset(batch(0), uri, storage_options=options())
+    racer = textwrap.dedent("""
+        import json, sys
+        import nanolance.lance as nl
+        uri, options = sys.argv[1], json.loads(sys.argv[2])
+        try:
+            nl.dataset(uri, storage_options=options).create_branch("race")
+            print(json.dumps({"created": True}))
+        except (OSError, ValueError) as e:  # a loser's manifest publish is a commit conflict
+            print(json.dumps({"created": False, "error": str(e)}))
+    """)
+    procs = [subprocess.Popen([sys.executable, "-c", racer, uri, json.dumps(options())], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) for _ in range(4)]
+    outcomes = [result(p) for p in procs]
+    assert sum(o["created"] for o in outcomes) == 1, outcomes
+    assert all("already exists" in o["error"] or "committed concurrently" in o["error"]
+               for o in outcomes if not o["created"]), outcomes
+    lance = require_pylance()
+    assert list(lance.dataset(uri, storage_options=options()).branches.list()) == ["race"]
+
+
+CLONE_KINDS = {"shallow": "shallow_clone", "deep": "deep_clone"}
+
+
+@pytest.mark.parametrize("kind", list(CLONE_KINDS))
+@pytest.mark.parametrize("source_side", ["s3", "local"])
+@pytest.mark.parametrize("target_side", ["s3", "local"])
+def test_clone_on_s3_reads_as_the_source_version(kind, source_side, target_side, tmp_path):
+    lance = require_pylance()
+    src_storage = options() if source_side == "s3" else None
+    source = fresh_uri() if source_side == "s3" else str(tmp_path / "src.lance")
+    nl.write_dataset(batch(0), source, storage_options=src_storage)
+    nl.write_dataset(batch(100), source, mode="append", storage_options=src_storage)
+    expected = lance.dataset(source, storage_options=src_storage).to_table().sort_by("id").to_pydict()
+    target_storage = options() if target_side == "s3" else None
+    target = fresh_uri() if target_side == "s3" else str(tmp_path / "clone.lance")
+    clone = getattr(nl.dataset(source, storage_options=src_storage), CLONE_KINDS[kind])
+    clone(target, 2, storage_options=target_storage)
+    theirs = lance.dataset(target, storage_options=options())  # a shallow clone's base path is an s3:// URI
+    assert theirs.to_table().sort_by("id").to_pydict() == expected
+    assert theirs.count_rows() == 200
+
+
+def test_deep_clone_on_s3_reads_after_its_source_is_dropped():
+    uri, target = fresh_uri(), fresh_uri()
+    nl.write_dataset(batch(0), uri, storage_options=options())
+    nl.dataset(uri, storage_options=options()).deep_clone(target, 1, storage_options=options())
+    nl.LanceDataset.drop(uri, storage_options=options())
+    assert not _keys(uri)
+    assert nl.dataset(target, storage_options=options()).count_rows() == 100
+
+
+def test_pylance_clones_on_s3_are_read_by_nanolance():
+    lance = require_pylance()
+    uri, shallow, deep = fresh_uri(), fresh_uri(), fresh_uri()
+    ds = lance.write_dataset(batch(0), uri, storage_options=options())
+    ds.shallow_clone(shallow, 1, storage_options=options())
+    ds.deep_clone(deep, 1, storage_options=options())
+    for target in (shallow, deep):
+        mine = nl.dataset(target, storage_options=options())
+        assert mine.count_rows() == 100 and mine.version == 1
+        assert sorted(mine.to_table(columns=["id"])["id"].to_pylist()) == list(range(100))
+
+
+def test_drop_on_s3_removes_every_object_of_the_dataset_and_no_sibling():
+    uri = fresh_uri()
+    sibling = uri + "2"  # a prefix that starts with the dataset's own name
+    nl.write_dataset(batch(0), uri, storage_options=options())
+    nl.dataset(uri, storage_options=options()).create_branch("feat")
+    _branch_on(uri, "feat", options(), batch(1000, 50))
+    nl.write_dataset(batch(0), sibling, storage_options=options())
+    before = _keys(sibling)
+    assert any("/tree/feat/" in k for k in _keys(uri))
+    nl.LanceDataset.drop(uri, storage_options=options())
+    assert _keys(uri) == []
+    assert _keys(sibling) == before
+    with pytest.raises(OSError, match="was not found"):
+        nl.LanceDataset.drop(uri, storage_options=options())
+    nl.LanceDataset.drop(uri, storage_options=options(), ignore_not_found=True)

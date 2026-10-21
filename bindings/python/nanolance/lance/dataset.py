@@ -656,7 +656,7 @@ class LanceDataset(pa.dataset.Dataset):
              ignore_not_found: Optional[bool] = None) -> None:
         """Delete the dataset and everything under ``base_uri``. Refused (ValueError) unless the path
         holds a manifest that reads, as Lance refuses, so a parent directory given by mistake survives."""
-        refuse_object_store_write(base_uri, "drop")
+        _register_storage(base_uri, storage_options)
         with _ref_errors():
             _nanolance._ds_drop(_path_of(base_uri), bool(ignore_not_found))
 
@@ -669,7 +669,6 @@ class LanceDataset(pa.dataset.Dataset):
         """Create branch ``name`` forked from ``reference``: this dataset's version on its branch (``None``), an
         int version of it, a tag, or ``(branch, version)`` (``"main"`` or None is main; a None version is that
         branch's latest). Returns the branch at its first version, opened at ``<root>/tree/<name>``."""
-        refuse_object_store_write(self._root, "create branch")
         branch, version = _reference(self, reference, (self._branch, self._version))
         if version == 0:
             version = _latest_of(self._root, branch)
@@ -692,7 +691,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def _clone(self, target_path, reference, deep: bool, storage_options, kwargs) -> "LanceDataset":
         target = _path_of(target_path)
-        refuse_object_store_write(target, "deep clone" if deep else "shallow clone")
+        _register_storage(target, storage_options)
         if isinstance(reference, str):
             branch, version = _tag_target(self._root, reference, OSError)
         else:
@@ -2625,12 +2624,10 @@ class Branches:
     def delete(self, name: str) -> None:
         """Delete a branch and its versions. Refused (OSError) for main, for a branch another branch forks from, and
         for a branch a tag names."""
-        refuse_object_store_write(self._ds._root, "delete branch")
         with _branch_errors():
             _nanolance._ds_delete_branch(self._ds._root, str(name))
 
     def replace_metadata(self, name: str, metadata: Dict[str, str]) -> None:
-        refuse_object_store_write(self._ds._root, "replace branch metadata")
         with _branch_errors():
             _nanolance._ds_replace_branch_metadata(self._ds._root, str(name),
                                                    {str(k): str(v) for k, v in metadata.items()})
