@@ -74,14 +74,20 @@ def test_matches_pylance_from_its_index(lance, indexed, metric, deleted):
         for o in OPTIONS:
             for flt, pre in FILTERS:
                 nearest = {"column": "vec", "q": q, **o}
-                ref = theirs.to_table(nearest=nearest, columns=["id"], filter=flt, prefilter=pre)
                 got = ours.to_table(nearest=nearest, columns=["id"], filter=flt, prefilter=pre)
-                rd, gd = ref.column("_distance").to_numpy(), got.column("_distance").to_numpy()
-                assert len(rd) == len(gd), (o, flt, pre)
+                gd = got.column("_distance").to_numpy()
                 if metric == "dot" and flt is not None:
-                    # A race between partitions in pylance: compare what any run could return.
-                    assert np.all(np.isfinite(gd) == np.isfinite(rd)), (o, flt, pre)
+                    # A race between partitions in pylance: its row count with a filter varies run to run
+                    # (a k=1 postfilter has returned 0 and 1 rows). Compare what some run of it returns.
+                    runs = [theirs.to_table(nearest=nearest, columns=["id"], filter=flt, prefilter=pre)
+                            for _ in range(8)]
+                    same = [r for r in runs if r.num_rows == len(gd)]
+                    assert same, (o, flt, pre, len(gd), [r.num_rows for r in runs])
+                    assert np.all(np.isfinite(gd) == np.isfinite(same[0].column("_distance").to_numpy())), (o, flt, pre)
                     continue
+                ref = theirs.to_table(nearest=nearest, columns=["id"], filter=flt, prefilter=pre)
+                rd = ref.column("_distance").to_numpy()
+                assert len(rd) == len(gd), (o, flt, pre)
                 assert np.allclose(rd, gd, rtol=1e-5, atol=1e-6), (o, flt, pre, rd[:5], gd[:5])
                 assert ref.column("id").to_pylist() == got.column("id").to_pylist(), (o, flt, pre)
 
