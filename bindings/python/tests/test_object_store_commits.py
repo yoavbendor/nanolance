@@ -102,6 +102,28 @@ def test_create_append_overwrite_read_by_pylance():
     assert theirs.to_table().to_pydict() == batch(0, 10).to_pydict()
 
 
+def test_a_data_file_larger_than_the_memory_buffer_uploads_whole():
+    # Objects over 8 MiB spill to a temporary file before the upload; that path once uploaded 0 bytes.
+    lance = require_pylance()
+    uri = fresh_uri()
+    rows = 400_000
+    table = pa.table({"id": pa.array(range(rows), pa.int64()),
+                      "payload": pa.array([i.to_bytes(8, "little") * 4 for i in range(rows)], pa.binary())})
+    nl.write_dataset(table, uri, storage_options=options())
+    for ds in (nl.dataset(uri, storage_options=options()), lance.dataset(uri, storage_options=options())):
+        assert ds.to_table().sort_by("id").equals(table)
+
+
+def test_packed_and_dedicated_blobs_read_back_from_s3():
+    # Blobs above the inline limit live in sidecar files, which were once opened with std::ifstream only.
+    uri = fresh_uri()
+    blobs = [bytes([1]) * 100, bytes([2]) * 70_000, bytes([3]) * 5_000_000]  # inline, packed, dedicated
+    nl.write_dataset(pa.table({"id": pa.array([0, 1, 2], pa.int64()), "blob": nl.blob_array(blobs)}), uri,
+                     storage_options=options())
+    files = nl.dataset(uri, storage_options=options()).take_blobs("blob", indices=[0, 1, 2])
+    assert [f.read() for f in files] == blobs
+
+
 def test_pylance_and_nanolance_append_to_one_dataset():
     lance = require_pylance()
     uri = fresh_uri()

@@ -39,7 +39,7 @@ public:
     SpillBuffer& operator=(const SpillBuffer&) = delete;
 
     std::uint64_t written() const { return written_; }
-    bool spilled() const { return file_ != nullptr; }
+    bool spilled() const { return !file_path_.empty(); }  // also after finish() closed the file
     const std::vector<char>& memory() const { return memory_; }
     const std::filesystem::path& file_path() const { return file_path_; }
     bool failed() const { return failed_; }

@@ -546,7 +546,7 @@ write.
 
 | # | Item | Failing pylance tests | Who | Why for AI users | Done when |
 |---|---|---|---|---|---|
-| 8 | **Object-store writes** with atomic commits (conditional put) | -- | Opus design, then sessions | write training sets straight to object storage | concurrent commits on the test endpoint behave as pylance's |
+| 8 | **Object-store writes** with atomic commits (conditional put) (W1-W4 done 2026-10-21, `docs/OBJECT_STORE_WRITES.md`: every write on `s3://` but `cleanup_old_versions` (its C++ walks `_versions/` with `std::filesystem`: still refused) and `migrate_manifest_paths_v2` (local only by design); `tools/s3_real_check.py` exercises it all on a real bucket. Found by that script on 2026-10-21 and fixed: objects over 8 MiB uploaded as 0 bytes (the spill path), packed / dedicated blobs not readable from S3. Left: cleanup on S3, W5) | -- | Opus design, then sessions | write training sets straight to object storage | concurrent commits on the test endpoint behave as pylance's |
 | 9 | **Multi-word top-k (WAND / MaxScore)** | 0 (speed only) | Opus: design and verdict; Haiku for mechanical parts | multi-term queries (already about 2x pylance) | same results and scores; reviewer's A/B faster |
 | 10 | ~~**INVERTED on nested fields**~~ (done 2026-10-20, `docs/tasks/WAVE3_SMALL.md` N; +2 pylance tests) | not counted | Haiku after a short measurement | nested metadata | results equal pylance's |
 | 11 | **icu / jieba / lindera tokenizers** | 20 | Opus: licences (copied from the source trees, never from memory) and dictionary packaging; then 2-3 sessions | multilingual RAG | the 20 pass |

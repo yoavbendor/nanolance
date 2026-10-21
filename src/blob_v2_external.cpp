@@ -3,6 +3,7 @@
 
 #include "nanolance/work_stats.hpp"
 #include "nanolance/blob_v2_external.hpp"
+#include "nanolance/byte_source.hpp"
 
 #include "nanolance/array_accessor.hpp"
 #include "nanolance/blob_builder.hpp"
@@ -12,7 +13,6 @@
 
 #include <algorithm>
 #include <filesystem>
-#include <fstream>
 #include <cstring>
 #include <limits>
 
@@ -1139,27 +1139,25 @@ bool blob_v2_read(const BlobV2Location& location, const std::uint64_t offset, co
         }
         return true;
     }
-    std::ifstream in(location.file, std::ios::binary);
-    std::error_code ec;
-    const auto file_size = std::filesystem::file_size(location.file, ec);
-    if (!in || ec) {
-        error = "cannot open blob file " + location.file;
+    // Through ByteSource: the blob file may be local or on an object store.
+    auto source = io::open_source(location.file, error);
+    if (!source) {
+        error = "cannot open blob file " + location.file + ": " + error;
         out.clear();
         return false;
     }
+    const auto file_size = source->size();
     if (at > file_size || length > file_size - at) {
         error = "blob range is past the end of " + location.file;
         out.clear();
         return false;
     }
-    in.seekg(static_cast<std::streamoff>(at));
-    in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(length));
-    work_stats::count_read(length);
-    if (!in) {
-        error = "cannot read blob file " + location.file;
+    if (!source->read_at(at, length, out.data(), error)) {
+        error = "cannot read blob file " + location.file + ": " + error;
         out.clear();
         return false;
     }
+    work_stats::count_read(length);
     return true;
 }
 
