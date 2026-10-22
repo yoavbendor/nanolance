@@ -137,9 +137,11 @@ def junit_failures(path: Path) -> tuple[dict, list]:
     """Counts and [(test id, message)] from a pytest junit file."""
     counts = {"passed": 0, "failed": 0, "skipped": 0}
     failures = []
-    if not path.exists():
+    try:
+        cases = list(ET.parse(path).iter("testcase"))
+    except (OSError, ET.ParseError):  # no report: pytest died before writing it (the log says why)
         return counts, failures
-    for case in ET.parse(path).iter("testcase"):
+    for case in cases:
         tid = f"{case.get('classname', '')}::{case.get('name', '')}"
         state = "passed"
         for child in case:
@@ -294,20 +296,29 @@ def main(argv=None) -> int:
                 e.update({"AWS_ACCESS_KEY_ID": "testing", "AWS_SECRET_ACCESS_KEY": "testing", "AWS_REGION": "us-east-1"})
                 e.pop("AWS_SESSION_TOKEN", None)
                 e.pop("AWS_PROFILE", None)
-            code, secs = run.sh(name, [py, "-m", "pytest", "-m", "not bench", "-q", "-o", "addopts=", "-p",
-                                       "no:cacheprovider", "--timeout", "1800", f"--junitxml={junit}", "tests"],
+            # Its own temporary directory, removed afterwards: a run leaves gigabytes of test datasets.
+            basetemp = out / f"tmp-{name}"
+            code, secs = run.sh(name, [py, "-m", "pytest", "-m", "not bench", "-q", "-rs", "-o", "addopts=", "-p",
+                                       "no:cacheprovider", "--timeout", "1800", f"--basetemp={basetemp}",
+                                       f"--junitxml={junit}", "tests"],
                                 f"{name}.log", cwd=pydir, env=e, timeout=4 * 3600)
+            shutil.rmtree(basetemp, ignore_errors=True)
             counts, _ = junit_failures(junit)
-            run.record(name, "ok" if code == 0 else "FAIL", secs, f"{name}.log",
-                       f"{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped")
+            detail = f"{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped"
+            if not any(counts.values()):
+                detail = "no test report (see the end of the log)"
+            run.record(name, "ok" if code == 0 else "FAIL", secs, f"{name}.log", detail)
     finally:
         if moto:
             os.killpg(moto.pid, signal.SIGTERM)
 
     if "pylance" not in skip:
+        # TMPDIR, not --basetemp: any extra pytest argument turns off the suite's expected-pass verdict.
+        (out / "tmp-pylance").mkdir()
         code, secs = run.sh("pylance", [py, str(ROOT / "tools" / "pylance_suite.py"), "--report",
-                                        str(out / "pylance-suite.json")], "pylance.log", env=base_env,
-                            timeout=4 * 3600)
+                                        str(out / "pylance-suite.json")], "pylance.log",
+                            env=dict(base_env, TMPDIR=str(out / "tmp-pylance")), timeout=4 * 3600)
+        shutil.rmtree(out / "tmp-pylance", ignore_errors=True)
         last = [l for l in (out / "pylance.log").read_text(errors="replace").splitlines() if "test suite against" in l]
         run.record("pylance", "ok" if code == 0 else "FAIL", secs, "pylance.log", last[-1].strip() if last else "")
 
@@ -355,6 +366,10 @@ def finish(run: Run, env_info: dict, args) -> int:
             details += [f"  {tid}" for tid, _ in failures]
             for tid, text in failures[:60]:
                 details.append(f"\n--- {name} {tid}\n{text[-4000:]}")
+    for name in ("pytest", "stress"):
+        skipped = [l for l in tail(out / f"{name}.log", 200000).splitlines() if l.startswith("SKIPPED")]
+        if skipped:
+            details.append(f"\n===== {name}: skip reasons =====\n" + "\n".join(skipped[:80]))
     for path, label in ((out / "pylance-suite.json", "pylance suite report"), (out / "s3-check.json", "S3 check report")):
         if path.exists():
             details.append(f"\n===== {label} =====\n{path.read_text(errors='replace')[:40000]}")
