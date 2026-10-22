@@ -1351,3 +1351,18 @@ def test_nanolance_deletes_racing_pylance_appends_on_s3():
     for ds in (nl.dataset(uri, storage_options=options()), lance.dataset(uri, storage_options=options())):
         assert sorted(ds.to_table(columns=["id"])["id"].to_pylist()) == expected
     _every_version_opens_in_both(uri, lance)
+
+
+def test_auto_cleanup_on_commit_on_s3_as_pylance():
+    """Lance's auto cleanup hook runs after a commit on an object store too (it once ran only locally)."""
+    lance = require_pylance()
+    versions = []
+    for engine in (nl, lance):
+        uri = fresh_uri()
+        engine.write_dataset(pa.table({"a": [0]}), uri, storage_options=options(),
+                             auto_cleanup_options={"interval": 2, "older_than_seconds": 0})
+        for i in range(1, 5):
+            engine.write_dataset(pa.table({"a": [i]}), uri, mode="append", storage_options=options())
+        versions.append([v["version"] for v in engine.dataset(uri, storage_options=options()).versions()])
+        assert sorted(nl.dataset(uri, storage_options=options()).to_table()["a"].to_pylist()) == [0, 1, 2, 3, 4]
+    assert versions[0] == versions[1] == [3, 4, 5]

@@ -269,7 +269,8 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
     work_stats::count_written_file(final_path);
     drop_transaction.committed = true;
     // (A store that ignores If-None-Match is refused before the first publish: the s3 backend probes it.)
-    if (!object_store && (manifest.version & (1ULL << 63U)) == 0U) {
+    // Auto cleanup runs on object stores too, as Lance's does (cleanup_old_versions works there by listing).
+    if ((manifest.version & (1ULL << 63U)) == 0U) {
         run_auto_cleanup(dataset_path, manifest.version, manifest.config);
     }
     return true;
