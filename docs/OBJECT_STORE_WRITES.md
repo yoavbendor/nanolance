@@ -3,7 +3,7 @@
 Status: W1-W4 done (2026-10-20/21); every write works on `s3://` except `migrate_manifest_paths_v2`
 (local only, 3.2). `cleanup_old_versions` dates objects by the listing's LastModified (nanos3reader
 `ObjectInfo::last_modified_ns`); an object the store does not date is treated as just written (kept).
-Auto cleanup on commit still runs only on local datasets. W5 (race and fault suite in CI, upload speed) is left.
+Auto cleanup on commit runs on object stores too (2026-10-22, as Lance's). W5: races and the S3 checker are in CI; uploading while encoding is left (section 7).
 
 ## 1. Goal
 
