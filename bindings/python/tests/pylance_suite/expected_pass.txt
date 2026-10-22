@@ -1042,6 +1042,7 @@ tests/test_scalar_index.py::test_index_after_merge_insert
 tests/test_scalar_index.py::test_index_combination
 tests/test_scalar_index.py::test_index_take_batch_size
 tests/test_scalar_index.py::test_indexed_filter_with_fts_index
+tests/test_scalar_index.py::test_indexed_filter_with_fts_index_with_lindera_ipadic_jp_tokenizer
 tests/test_scalar_index.py::test_indexed_vector_scan_postfilter
 tests/test_scalar_index.py::test_jieba_invalid_main_dict_tokenizer
 tests/test_scalar_index.py::test_jieba_invalid_user_dict_tokenizer
@@ -1060,6 +1061,12 @@ tests/test_scalar_index.py::test_label_list_segment_index[list]
 tests/test_scalar_index.py::test_large_string_scalar_index[BITMAP]
 tests/test_scalar_index.py::test_large_string_scalar_index[BTREE]
 tests/test_scalar_index.py::test_large_string_scalar_index[ZONEMAP]
+tests/test_scalar_index.py::test_lindera_ipadic_jp_tokenizer_bin_user_dict
+tests/test_scalar_index.py::test_lindera_ipadic_jp_tokenizer_csv_user_dict
+tests/test_scalar_index.py::test_lindera_ipadic_jp_tokenizer_csv_user_dict_without_type
+tests/test_scalar_index.py::test_lindera_ipadic_jp_tokenizer_invalid_user_dict_path
+tests/test_scalar_index.py::test_lindera_load_config_fallback
+tests/test_scalar_index.py::test_lindera_load_config_priority
 tests/test_scalar_index.py::test_merge_index_metadata_btree_soft_break
 tests/test_scalar_index.py::test_merge_index_metadata_inverted_index_progress_callback
 tests/test_scalar_index.py::test_multi_index_create

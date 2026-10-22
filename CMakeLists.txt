@@ -333,6 +333,7 @@ add_library(nanolance STATIC
     src/index_segments.cpp
     src/fts_tokenizer.cpp
     src/fts_jieba.cpp
+    src/fts_lindera.cpp
     src/fts_fst.cpp
     src/fts_posting.cpp
     src/fts_search.cpp

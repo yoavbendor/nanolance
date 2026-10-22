@@ -81,11 +81,12 @@ struct Token {
 };
 
 class Jieba;
+class Lindera;
 
 class Analyzer {
 public:
     /// False (with `error`) for settings nanolance's analyzer does not implement: base tokenizers
-    /// other than simple / whitespace / raw / code / ngram / jieba (a missing or malformed jieba model too), an ngram length range Lance rejects, stemming
+    /// other than simple / whitespace / raw / code / ngram / jieba / lindera (a model that does not load too), an ngram length range Lance rejects, stemming
     /// or built-in stop words in a language other than English, JSON documents.
     bool init(const AnalyzerParams& params, std::string& error);
 
@@ -100,6 +101,7 @@ private:
     AnalyzerParams params_;
     std::unordered_set<std::string> stop_words_;
     std::shared_ptr<const Jieba> jieba_;  // base_tokenizer "jieba/<model>": the loaded model
+    std::shared_ptr<const Lindera> lindera_;  // base_tokenizer "lindera/<model>": the loaded tokenizer
 };
 
 }  // namespace nano_lance::fts

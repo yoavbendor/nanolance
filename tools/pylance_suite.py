@@ -97,6 +97,11 @@ def main(argv=None) -> int:
     version = api_version()
     tests = fetch(version, args.cache)
     work = tests.parent
+    # Lance runs its suite from its python/ directory: the lindera model configs name their dictionaries
+    # "./python/tests/models/...". A link makes that path resolve from here too.
+    link = work / "python"
+    if not link.exists():
+        link.symlink_to(".", target_is_directory=True)
     junit = work / ("real.xml" if args.real_pylance else "nanolance.xml")
     cmd = [sys.executable, "-m", "pytest", "tests", "-q", "-p", "no:cacheprovider", f"--junitxml={junit}",
            "-o", "junit_family=xunit1"]

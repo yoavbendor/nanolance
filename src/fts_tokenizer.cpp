@@ -7,6 +7,7 @@
 
 #include "nanolance/fts_tokenizer.hpp"
 #include "nanolance/fts_jieba.hpp"
+#include "nanolance/fts_lindera.hpp"
 
 #include "fts_json.hpp"
 
@@ -369,7 +370,21 @@ std::string params_json(const AnalyzerParams& p) {
 bool Analyzer::init(const AnalyzerParams& params, std::string& error) {
     params_ = params;
     jieba_.reset();
+    lindera_.reset();
     const bool jieba = params.base_tokenizer == "jieba" || params.base_tokenizer.rfind("jieba/", 0) == 0;
+    const bool lindera = params.base_tokenizer.rfind("lindera/", 0) == 0;
+    if (lindera) {
+        // Lance's build_base_tokenizer: "lindera/<model>" is a directory under the model home.
+        const auto home = language_model_home();
+        if (home.empty()) {
+            error = "Invalid user input: unknown base tokenizer " + params.base_tokenizer;
+            return false;
+        }
+        lindera_ = Lindera::load(home / params.base_tokenizer, error);
+        if (lindera_ == nullptr) {
+            return false;
+        }
+    }
     if (jieba) {
         // Lance's build_base_tokenizer: "jieba" is "jieba/default", a directory under the model home.
         const auto home = language_model_home();
@@ -382,7 +397,7 @@ bool Analyzer::init(const AnalyzerParams& params, std::string& error) {
             return false;
         }
     }
-    if (!jieba && params.base_tokenizer != "simple" && params.base_tokenizer != "whitespace" &&
+    if (!jieba && !lindera && params.base_tokenizer != "simple" && params.base_tokenizer != "whitespace" &&
         params.base_tokenizer != "raw" && params.base_tokenizer != "code" && params.base_tokenizer != "ngram") {
         // Lance's other base tokenizers (icu, jieba, lindera) exist, nanolance does not implement them.
         const std::string& base = params.base_tokenizer;
@@ -595,6 +610,15 @@ void Analyzer::tokenize(std::string_view text, std::vector<Token>& out) const {
         jieba_->tokenize_search(text, tokens);
         for (const auto& t : tokens) {
             emit(text.substr(t.byte_start, t.byte_end - t.byte_start), t.char_start, out);
+        }
+        return;
+    }
+    if (lindera_ != nullptr) {
+        // Lance's LinderaTokenizer: each token at Lindera's position.
+        std::vector<LinderaToken> tokens;
+        lindera_->tokenize(text, tokens);
+        for (const auto& t : tokens) {
+            emit(t.surface, t.position, out);
         }
         return;
     }
