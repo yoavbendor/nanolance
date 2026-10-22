@@ -10,6 +10,7 @@ What it does, each step in its own log under .validate/<time>/ (nothing outside 
   env        compilers, cmake, Python, uv, OS, CPU and memory, the commit and whether the tree is clean
   venv       a new virtualenv (from --python, default this interpreter); no global packages
   cpp        a clean CMake build (Release) and ctest
+  s3build    lance-c's S3 reader, built with -DNANOLANCE_ENABLE_S3=ON (the object-store tests use it)
   install    the Python binding built in a new build directory (never bindings/python/build), editable,
              with its test dependencies
   pytest     the binding's tests, as CI runs them (with a local moto S3 server when moto installs)
@@ -256,6 +257,21 @@ def main(argv=None) -> int:
             detail = f"ctest: {m[-1][1]} failed of {m[-1][2]}" if m else "ctest did not report"
         run.record("cpp", "ok" if code == 0 else "FAIL", secs, "cpp.log", detail)
 
+    # lance-c's reader of s3:// datasets, built with S3 as CI builds it; the object-store tests use it.
+    s3_reader = None
+    if "cpp" not in skip and "pytest" not in skip:
+        build_s3 = out / "build-s3"
+        code, secs = run.sh("s3build", ["cmake", "-S", str(ROOT), "-B", str(build_s3), "-DCMAKE_BUILD_TYPE=Release",
+                                        "-DNANOLANCE_ENABLE_S3=ON"], "s3build.log", env=base_env)
+        if code == 0:
+            c2, s2 = run.sh("s3build", ["cmake", "--build", str(build_s3), "-j", str(args.jobs), "--target",
+                                        "lance_c_s3_read"], "s3build.log", env=base_env)
+            code, secs = c2, secs + s2
+        exe = build_s3 / "lance_c_s3_read"
+        if code == 0 and exe.exists():
+            s3_reader = str(exe)
+        run.record("s3build", "ok" if s3_reader else "FAIL", secs, "s3build.log", "lance_c_s3_read")
+
     # The binding: a new build directory, editable (the tests import tests/ next to it), with test deps.
     pybuild = out / "build-python"
     code, secs = run.sh("install", [py, "-m", "pip", "install", "--no-cache-dir", "-v", "-e",
@@ -280,6 +296,8 @@ def main(argv=None) -> int:
         moto, endpoint = start_moto(run, venv)
         run.record("moto", "ok" if moto else "skip", 0, "moto.log", endpoint)
     test_env = dict(base_env)
+    if s3_reader:
+        test_env["NANOLANCE_LANCE_C_S3_READ"] = s3_reader
     if moto:
         test_env.update({"NANOLANCE_S3_TEST_ENDPOINT": endpoint, "NO_PROXY": "127.0.0.1,localhost",
                          "no_proxy": "127.0.0.1,localhost"})

@@ -30,6 +30,7 @@ What it runs, in order (each step's log in `.validate/<time>/`):
 | env | compilers, CMake, Python, uv, OS, CPUs, memory, commit, uncommitted files |
 | venv | a new virtualenv, nothing from the system site-packages |
 | cpp | a clean Release build and `ctest` |
+| s3build | lance-c's S3 reader (`-DNANOLANCE_ENABLE_S3=ON`), used by the object-store tests |
 | install | the Python binding, built in `.validate/<time>/build-python`, with its test dependencies and pylance 12.0.0 |
 | moto | a local S3 server for the object-store tests (its own venv; skipped if it cannot be installed) |
 | pytest | the binding's tests, as CI runs them |
