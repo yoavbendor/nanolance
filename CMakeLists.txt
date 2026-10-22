@@ -80,6 +80,7 @@ option(NANOLANCE_ENABLE_S3 "S3 external blob support (needs NANOLANCE_S3_TARGET 
 # pack_1024/unpack_1024 kernels (and whatever else the compiler can auto-vectorize wider) when the
 # *whole* translation unit is compiled at this target -- unlike a scoped per-function target attribute,
 # which was measured to give no benefit here since it blocks inlining across the attribute boundary.
+option(NANOLANCE_TARGET_CLONES "Build the k-means kernel for AVX2 too, picked at load time (GCC on Linux x86-64)" ON)
 option(NANOLANCE_ENABLE_AVX2 "Compile with -march=haswell (AVX2+BMI2+FMA); raises minimum CPU requirement" OFF)
 
 set(NANOLANCE_S3_TARGET "" CACHE STRING "Target for S3 reads (e.g. stream_helper_s3)")
@@ -459,6 +460,9 @@ if(NANOLANCE_ENABLE_AVX2)
     target_compile_options(nanolance_proto PRIVATE -march=haswell)
     target_compile_options(nanolance_reader PRIVATE -march=haswell)
     target_compile_options(nanolance PRIVATE -march=haswell)
+endif()
+if(NOT NANOLANCE_TARGET_CLONES)
+    target_compile_definitions(nanolance PRIVATE NANOLANCE_NO_TARGET_CLONES=1)
 endif()
 
 # ── libFuzzer harness over the untrusted decode path (opt-in, Clang only) ─────────────────────────

@@ -167,7 +167,8 @@ struct Rows {
 /// products into `acc` ([4][k], zeroed) and their squared norms into `xnorm`. Built for AVX2 too where the
 /// compiler can pick a version at load time; never with FMA, so every multiply and add rounds as in the
 /// baseline build and the results are bit-identical on every machine.
-#if defined(__x86_64__) && defined(__linux__) && defined(__GLIBC__) && defined(__GNUC__) && !defined(__clang__)
+#if defined(__x86_64__) && defined(__linux__) && defined(__GLIBC__) && defined(__GNUC__) && !defined(__clang__) && \
+    !defined(NANOLANCE_NO_TARGET_CLONES)
 __attribute__((target_clones("avx2", "default")))
 #endif
 void dot_block4(const float* x0, std::size_t d, const float* ct, std::size_t k, float* acc, float* xnorm) {

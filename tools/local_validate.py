@@ -212,6 +212,8 @@ def main(argv=None) -> int:
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--max-kb", type=int, default=190, help="cap on report.txt (default 190 KB)")
     args = ap.parse_args(argv)
+    if args.s3 and not re.match(r"^s3://[^/]+(/|$)", args.s3):
+        ap.error(f"--s3 must look like s3://bucket/prefix (got {args.s3!r})")
     skip = {s.strip() for s in args.skip.split(",") if s.strip()}
     if args.quick:
         skip.add("stress")
@@ -384,6 +386,19 @@ def finish(run: Run, env_info: dict, args) -> int:
             details += [f"  {tid}" for tid, _ in failures]
             for tid, text in failures[:60]:
                 details.append(f"\n--- {name} {tid}\n{text[-4000:]}")
+    # pylance's suite: the failure text of each expected test that did not pass (its junit file).
+    lost = re.findall(r"^  - (tests/\S+): failed", tail(out / "pylance.log", 400000), re.M)
+    junit_dirs = sorted((ROOT / ".deps" / "pylance-tests").glob("v*/nanolance.xml"))
+    if lost and junit_dirs:
+        _, failures = junit_failures(junit_dirs[-1])
+        by_name = {}
+        for tid, text in failures:
+            cls, _, name = tid.partition("::")
+            by_name[name] = text
+        details.append(f"\n===== pylance suite: failure text of lost tests (first 60 of {len(lost)}) =====")
+        for node in lost[:60]:
+            text = by_name.get(node.split("::")[-1], "(no junit entry)")
+            details.append(f"\n--- {node}\n{text[-2500:]}")
     for name in ("pytest", "stress"):
         skipped = [l for l in tail(out / f"{name}.log", 200000).splitlines() if l.startswith("SKIPPED")]
         if skipped:
