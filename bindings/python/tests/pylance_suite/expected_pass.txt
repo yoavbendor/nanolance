@@ -1015,6 +1015,7 @@ tests/test_scalar_index.py::test_fragment_ids_parameter_validation
 tests/test_scalar_index.py::test_fts_all_deleted
 tests/test_scalar_index.py::test_fts_boolean_query
 tests/test_scalar_index.py::test_fts_boost_query
+tests/test_scalar_index.py::test_fts_custom_stop_words
 tests/test_scalar_index.py::test_fts_deleted_rows
 tests/test_scalar_index.py::test_fts_deleted_rows_with_stable_row_ids
 tests/test_scalar_index.py::test_fts_flat_fallback_matches_wand
@@ -1042,6 +1043,10 @@ tests/test_scalar_index.py::test_index_combination
 tests/test_scalar_index.py::test_index_take_batch_size
 tests/test_scalar_index.py::test_indexed_filter_with_fts_index
 tests/test_scalar_index.py::test_indexed_vector_scan_postfilter
+tests/test_scalar_index.py::test_jieba_invalid_main_dict_tokenizer
+tests/test_scalar_index.py::test_jieba_invalid_user_dict_tokenizer
+tests/test_scalar_index.py::test_jieba_tokenizer
+tests/test_scalar_index.py::test_jieba_user_dict_tokenizer
 tests/test_scalar_index.py::test_json_index
 tests/test_scalar_index.py::test_json_index_non_exact_floats
 tests/test_scalar_index.py::test_label_list_index

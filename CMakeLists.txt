@@ -304,6 +304,15 @@ elseif(NANOLANCE_ENABLE_S3)
     set(NANOLANCE_S3_NANOS3READER_ACTIVE ON)
 endif()
 
+# The jieba base tokenizer (base_tokenizer "jieba/<model>") compiles in jieba-rs's HMM model (about 170 KB,
+# zstd-compressed). Off in the wasm build, where a jieba index is refused by name.
+if(EMSCRIPTEN)
+    set(_nanolance_jieba_default OFF)
+else()
+    set(_nanolance_jieba_default ON)
+endif()
+option(NANOLANCE_WITH_JIEBA "Build the jieba tokenizer (embeds its HMM model)" ${_nanolance_jieba_default})
+
 add_library(nanolance STATIC
     src/version.cpp
     src/array_accessor.cpp
@@ -323,6 +332,7 @@ add_library(nanolance STATIC
     src/hnsw_build.cpp
     src/index_segments.cpp
     src/fts_tokenizer.cpp
+    src/fts_jieba.cpp
     src/fts_fst.cpp
     src/fts_posting.cpp
     src/fts_search.cpp
@@ -378,6 +388,9 @@ target_link_libraries(nanolance PUBLIC
     "${NANOLANCE_ZSTD_TARGET}"
 )
 target_link_libraries(nanolance PRIVATE nanolance_nanom)
+if(NANOLANCE_WITH_JIEBA)
+    target_compile_definitions(nanolance PRIVATE NANOLANCE_WITH_JIEBA=1)
+endif()
 
 add_library(nanolance::nanolance ALIAS nanolance)
 
