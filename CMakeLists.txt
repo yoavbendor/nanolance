@@ -354,6 +354,7 @@ add_library(nanolance STATIC
     src/dataset_transaction.cpp
     src/dataset_operation.cpp
     src/commit_conflicts.cpp
+    src/mem_wal.cpp
     src/dataset_stitcher.cpp
     src/schema_mapper.cpp
     src/writer.cpp

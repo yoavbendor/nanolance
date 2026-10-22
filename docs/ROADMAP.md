@@ -550,7 +550,7 @@ write.
 | 9 | ~~**Multi-word top-k (WAND / MaxScore)**~~ (done 2026-10-21: block-max MaxScore for OR queries with a limit, `Search::match_pruned` in `src/fts_search.cpp`; on 500k Zipf documents a query with a common word took 6-9 ms, 0.2-0.5x pylance (the "about 2x" was measured on rare words), now 0.4-2.2 ms, 1.8-6x pylance (`bench/fts_or_queries.py`); rows and scores bit-identical to the exhaustive search (`tests/test_fts_pruning.py`, which a too-tight bound fails); AND, phrase and fuzzy queries still score exhaustively) | 0 (speed only) | Opus: design and verdict; Haiku for mechanical parts | multi-term queries | same results and scores; reviewer's A/B faster |
 | 10 | ~~**INVERTED on nested fields**~~ (done 2026-10-20, `docs/tasks/WAVE3_SMALL.md` N; +2 pylance tests) | not counted | Haiku after a short measurement | nested metadata | results equal pylance's |
 | 11 | **icu / jieba / lindera tokenizers** | 20 | Opus: licences (copied from the source trees, never from memory) and dictionary packaging; then 2-3 sessions | multilingual RAG | the 20 pass |
-| 12 | **MemWAL** | 20 | Opus design (a subsystem) | real-time agent memory | the 20 pass |
+| 12 | **MemWAL** (M1 done 2026-10-22 on the high-risk branch, `docs/tasks/MEMWAL_M1.md`: initialize_mem_wal, the `__lance_mem_wal` index, sharding specs; +13 pylance tests. Left: M2, the LSM write and read path, 7 tests) | 20 | Opus design (a subsystem) | real-time agent memory | the 20 pass |
 | 13 | MinHash LSH, FM-index, RTree | -- | when a user asks | dedup, substring, spatial | -- |
 
 ### Table-format items (T1 is above)

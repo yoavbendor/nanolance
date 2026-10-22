@@ -12,6 +12,7 @@
 #include <nanolance/dataset_refs.hpp>
 #include <nanolance/dataset_transaction.hpp>
 #include <nanolance/manifest_writer.hpp>
+#include <nanolance/mem_wal.hpp>
 #include <nanolance/expr.hpp>
 #include <nanolance/jsonb.hpp>
 #include <nanolance/fts_search.hpp>
@@ -2148,6 +2149,26 @@ NB_MODULE(_nanolance, m) {
             out.append(d);
         }
         return out;
+    });
+    m.def("_ds_mem_wal_details", [](const std::filesystem::path& path, std::optional<std::uint64_t> version)
+              -> std::optional<nb::bytes> {
+        std::optional<std::vector<std::uint8_t>> details;
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_mem_wal_details(path, version.has_value(), version.value_or(0), details, e);
+        });
+        if (!details) {
+            return std::nullopt;
+        }
+        return nb::bytes(reinterpret_cast<const char*>(details->data()), details->size());
+    });
+    m.def("_ds_initialize_mem_wal", [](const std::filesystem::path& path, std::uint64_t base_version,
+                                       const nb::bytes& details) {
+        std::uint64_t version = 0;
+        const auto encoded = vec_of(details);
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_initialize_mem_wal(path, base_version, encoded, version, e);
+        });
+        return version;
     });
     m.def("_ds_fields", [](const std::filesystem::path& path, std::optional<std::uint64_t> version) {
         std::vector<nano_lance::DatasetField> fields;
