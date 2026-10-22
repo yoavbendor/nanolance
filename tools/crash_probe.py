@@ -8,8 +8,9 @@
 It builds the Python binding several ways, each in a new build directory, and runs the vector-index tests
 against each build:
   default     as tools/local_validate.py builds it
-  no-clones   -DNANOLANCE_TARGET_CLONES=OFF: the k-means kernel without its load-time AVX2 variant
+  no-clones   -DNANOLANCE_TARGET_CLONES=OFF: the k-means kernel built without its AVX2 variant
   threads1    the default build, every operation on one thread (NANOLANCE_THREADS=1)
+  no-avx2     the default build with the k-means kernel's AVX2 build turned off (NANOLANCE_NO_AVX2=1)
   cxx         the default build with --cxx (only when given)
 It also prints the native backtrace of the first crash under gdb, when gdb is installed, and which
 libstdc++ / libgcc the process loads. Report: .validate/probe-<time>/probe.txt (at most 60 KB).
@@ -76,7 +77,7 @@ def main() -> int:
     run([py, "-m", "pip", "install", "--quiet", "--upgrade", "pip"], out / "setup.log", env=env)
     first = True
     variants = [("default", {}, []), ("no-clones", {}, ["-C", "cmake.define.NANOLANCE_TARGET_CLONES=OFF"]),
-                ("threads1", {"NANOLANCE_THREADS": "1"}, None)]
+                ("threads1", {"NANOLANCE_THREADS": "1"}, None), ("no-avx2", {"NANOLANCE_NO_AVX2": "1"}, None)]
     if args.cxx:
         variants.append(("cxx", {"CXX": args.cxx}, []))
     pydir = ROOT / "bindings" / "python"
@@ -93,7 +94,7 @@ def main() -> int:
             if code != 0:
                 report.append(f"\n== {name}: BUILD FAILED\n{tail(log, 6000)}")
                 continue
-        if name == "threads1":
+        if build_args is None:
             run([py, "-m", "pip", "install", "--no-cache-dir", "--no-deps", "-e", str(pydir), "-C",
                  f"build-dir={out / 'build-default'}"], log, env=e)
         basetemp = out / f"tmp-{name}"

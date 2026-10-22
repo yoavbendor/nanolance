@@ -80,7 +80,7 @@ option(NANOLANCE_ENABLE_S3 "S3 external blob support (needs NANOLANCE_S3_TARGET 
 # pack_1024/unpack_1024 kernels (and whatever else the compiler can auto-vectorize wider) when the
 # *whole* translation unit is compiled at this target -- unlike a scoped per-function target attribute,
 # which was measured to give no benefit here since it blocks inlining across the attribute boundary.
-option(NANOLANCE_TARGET_CLONES "Build the k-means kernel for AVX2 too, picked at load time (GCC on Linux x86-64)" ON)
+option(NANOLANCE_TARGET_CLONES "Build the k-means kernel for AVX2 too, picked by a CPU check at run time (GCC, x86-64)" ON)
 option(NANOLANCE_ENABLE_AVX2 "Compile with -march=haswell (AVX2+BMI2+FMA); raises minimum CPU requirement" OFF)
 
 set(NANOLANCE_S3_TARGET "" CACHE STRING "Target for S3 reads (e.g. stream_helper_s3)")
