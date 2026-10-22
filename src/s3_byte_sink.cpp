@@ -3,6 +3,8 @@
 
 #include "s3_byte_sink.hpp"
 
+#include "nanolance/work_stats.hpp"
+
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -157,6 +159,9 @@ public:
             ok = client_->put(uri_, reinterpret_cast<const std::uint8_t*>(m.data()), m.size(),
                               nanos3reader::PutOptions{}, nullptr, error);
         }
+        if (ok) {
+            work_stats::count_write(buf_.written());  // the local tally stats a file, which a store has not
+        }
         buf_.discard();
         return ok;
     }
@@ -240,6 +245,9 @@ SinkBackend s3_sink_backend() {
         bool precondition_failed = false;
         const bool ok = client->put(uri, bytes.data(), bytes.size(), options, nullptr, error, &precondition_failed);
         already_exists = !ok && precondition_failed;
+        if (ok) {
+            work_stats::count_write(bytes.size());
+        }
         return ok;
     };
     b.remove = [](const std::string& uri, std::string& error) {

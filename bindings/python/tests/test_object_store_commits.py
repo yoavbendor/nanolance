@@ -1366,3 +1366,18 @@ def test_auto_cleanup_on_commit_on_s3_as_pylance():
         versions.append([v["version"] for v in engine.dataset(uri, storage_options=options()).versions()])
         assert sorted(nl.dataset(uri, storage_options=options()).to_table()["a"].to_pylist()) == [0, 1, 2, 3, 4]
     assert versions[0] == versions[1] == [3, 4, 5]
+
+
+def test_io_stats_count_what_a_write_to_s3_puts(tmp_path):
+    """Written bytes and write operations on s3:// are counted as on a local copy (the local tally stats
+    finished files, which an object store does not have; the S3 sink counts each upload)."""
+    stats = []
+    for uri, storage in ((fresh_uri(), options()), (str(tmp_path / "ds.lance"), None)):
+        nl.write_dataset(batch(0, 1000), uri, storage_options=storage)
+        ds = nl.dataset(uri, storage_options=storage)
+        ds.io_stats_incremental()
+        ds.delete("id % 7 = 0")
+        stats.append(ds.io_stats_incremental())
+    s3, local = stats
+    assert s3.write_iops == local.write_iops > 0
+    assert abs(s3.written_bytes - local.written_bytes) <= 16 and s3.written_bytes > 0  # manifests differ by a byte or two
