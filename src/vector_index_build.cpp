@@ -41,6 +41,7 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -164,13 +165,13 @@ struct Rows {
 };
 
 /// Four rows (consecutive, `d` floats each, from `x0`) against every centroid of `ct` ([d][k]): their dot
-/// products into `acc` ([4][k], zeroed) and their squared norms into `xnorm`. Built for AVX2 too where the
-/// compiler can pick a version at load time; never with FMA, so every multiply and add rounds as in the
-/// baseline build and the results are bit-identical on every machine.
-#if defined(__x86_64__) && defined(__linux__) && defined(__GLIBC__) && defined(__GNUC__) && !defined(__clang__)
-__attribute__((target_clones("avx2", "default")))
+/// products into `acc` ([4][k], zeroed) and their squared norms into `xnorm`. Also built for AVX2 (below);
+/// never with FMA, so every multiply and add rounds as in the baseline build and the results are
+/// bit-identical on every machine.
+#if defined(__GNUC__)
+__attribute__((always_inline))
 #endif
-void dot_block4(const float* x0, std::size_t d, const float* ct, std::size_t k, float* acc, float* xnorm) {
+inline void dot_block4_body(const float* x0, std::size_t d, const float* ct, std::size_t k, float* acc, float* xnorm) {
     const float* x1 = x0 + d;
     const float* x2 = x1 + d;
     const float* x3 = x2 + d;
@@ -219,6 +220,37 @@ void dot_block4(const float* x0, std::size_t d, const float* ct, std::size_t k, 
         }
     }
 }
+
+// The AVX2 build is picked by a CPU check on first use, not by target_clones: its load-time resolver (an
+// IFUNC) crashed in vector index builds on a machine whose process loads another GCC's libgcc_s
+// (2026-10-22, tools/crash_probe.py: the same code without target_clones passed). NANOLANCE_NO_AVX2=1
+// keeps the baseline build.
+#if defined(__x86_64__) && defined(__GNUC__) && !defined(__clang__) && !defined(NANOLANCE_NO_TARGET_CLONES)
+__attribute__((target("avx2"))) void dot_block4_avx2(const float* x0, std::size_t d, const float* ct, std::size_t k,
+                                                     float* acc, float* xnorm) {
+    dot_block4_body(x0, d, ct, k, acc, xnorm);
+}
+
+void dot_block4_baseline(const float* x0, std::size_t d, const float* ct, std::size_t k, float* acc, float* xnorm) {
+    dot_block4_body(x0, d, ct, k, acc, xnorm);
+}
+
+void dot_block4(const float* x0, std::size_t d, const float* ct, std::size_t k, float* acc, float* xnorm) {
+    static const bool avx2 = [] {
+        const char* off = std::getenv("NANOLANCE_NO_AVX2");
+        if (off != nullptr && *off != '\0' && *off != '0') {
+            return false;
+        }
+        __builtin_cpu_init();
+        return __builtin_cpu_supports("avx2") != 0;
+    }();
+    (avx2 ? dot_block4_avx2 : dot_block4_baseline)(x0, d, ct, k, acc, xnorm);
+}
+#else
+void dot_block4(const float* x0, std::size_t d, const float* ct, std::size_t k, float* acc, float* xnorm) {
+    dot_block4_body(x0, d, ct, k, acc, xnorm);
+}
+#endif
 
 /// Each of `x`'s rows' nearest centroid: smallest squared L2, or (dot) largest dot product.
 /// `dist` (optional) gets the squared L2 distance, or 1 - dot.
