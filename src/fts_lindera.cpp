@@ -86,7 +86,8 @@ std::string file_stamp(const std::filesystem::path& p) {
     std::error_code ec;
     const auto size = std::filesystem::file_size(p, ec);
     const auto time = std::filesystem::last_write_time(p, ec).time_since_epoch().count();
-    return p.string() + ":" + std::to_string(ec ? 0U : size) + ":" + std::to_string(time);
+    return p.string() + ":" + std::to_string(ec ? 0ULL : static_cast<unsigned long long>(size)) + ":" +
+           std::to_string(static_cast<long long>(time));
 }
 
 // ---------------------------------------------------------------------------------------------------
