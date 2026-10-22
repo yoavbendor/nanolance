@@ -1,5 +1,18 @@
 [
  {
+  "id": "20261022-041331-4d252e0",
+  "date": "2026-10-22 04:13 UTC",
+  "branch": "claude/nanolance-optimization-review-h3rxi7",
+  "commit": "4d252e0",
+  "gate": "pass",
+  "record": "runs/20261022-041331-4d252e0.json",
+  "run_url": "https://github.com/yoavbendor/nanolance/actions/runs/39717725928",
+  "matrix_read_cpp_mt": 3.7809637786161248,
+  "scalar_query": 4.230915915299319,
+  "vector_search": 3.21152523547855,
+  "fts_search": 13.63605246472226
+ },
+ {
   "id": "20261022-035856-856604a",
   "date": "2026-10-22 03:58 UTC",
   "branch": "claude/nanolance-optimization-review-h3rxi7-highrisk",
