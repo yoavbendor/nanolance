@@ -5126,16 +5126,23 @@ Condition Expression::conditions() const {
                     const auto& v = n.args[1]->literal;
                     Predicate p;
                     p.column_ = n.args[0]->column.path;
+                    // A NULL needle is left to the scan, as Lance leaves it (the LABEL_LIST index has no NULL
+                    // label to look up; the filter's NULL semantics come from evaluating it).
                     if (any || all) {
                         if (v.kind != Kind::List) {
                             return c;
+                        }
+                        for (const auto& item : *v.items) {
+                            if (item.kind == Kind::Null) {
+                                return c;
+                            }
                         }
                         p.test_ = any ? Predicate::Test::HasAny : Predicate::Test::HasAll;
                         for (const auto& item : *v.items) {
                             p.constants_.push_back(literal_node(item));
                         }
                     } else {
-                        if (v.kind == Kind::List) {
+                        if (v.kind == Kind::List || v.kind == Kind::Null) {
                             return c;
                         }
                         p.test_ = Predicate::Test::Has;
