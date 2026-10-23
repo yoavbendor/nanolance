@@ -4635,6 +4635,8 @@ class LanceScanner(pa.dataset.Scanner):
         late = self._late_columns()
         tail = f", metrics=[{', '.join(read_metrics)}]" if read_metrics else ""
         if not late:
+            # The read takes the filter's columns too (Lance's LanceRead lists them, even under columns=[]).
+            names = names + [n for n in self._filter_columns() if n not in names]
             return [f"  LanceRead: projection=[{', '.join(names)}]{tail}"]
         eager = [n for n in names if n not in late]
         return [f"  LanceRead: projection=[{', '.join(eager)}]{tail}",

@@ -356,8 +356,10 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
         o.name = last.name;
         o.granularity = inverted_details_granularity(last.details_value);  // a rebuild keeps the granularity
         // As Lance merges new rows into a segment: its documents stay (deleted rows too -- they count
-        // in its statistics until a rebuild), the uncovered fragments' live rows are added.
-        if (!retrain) {
+        // in its statistics until a rebuild), the uncovered fragments' live rows are added. Under stable
+        // row ids a row id is not an address (its high bits do not name a fragment), so the segment is
+        // rebuilt over the fragments it covers instead, as an NGram one is.
+        if (!retrain && (manifest.reader_feature_flags & pb::kFlagStableRowIds) == 0U) {
             for (const auto* s : replaced) {
                 std::vector<std::uint64_t> rows;
                 if (!index_build::load_inverted_rows(segment_dir(dataset_path, *s), rows, error)) {

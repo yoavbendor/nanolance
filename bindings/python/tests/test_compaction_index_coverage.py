@@ -58,3 +58,17 @@ def test_remap_row_addrs(tmp_path):
     old = dict(zip(before["id"].to_pylist(), before["_rowaddr"].to_pylist()))
     got = ds.remap_row_addrs(pa.array([old[i] for i in (0, 5, 137, 999)], pa.uint64())).to_pylist()
     assert got == [new[0], None, new[137], new[999]]
+
+
+def test_fts_optimize_after_compaction_with_stable_row_ids(tmp_path):
+    """optimize_indices after a compaction, stable row ids: the inverted segment keeps every document
+    (its merge used to keep old rows by address, which a row id is not, and dropped them all)."""
+    path = str(tmp_path / "ds")
+    words = ["alpha", "beta", "gamma", "delta"]
+    t = pa.table({"id": range(40), "text": [f"{words[i % 4]} doc{i}" for i in range(40)]})
+    ds = nl.write_dataset(t.slice(0, 30), path, enable_stable_row_ids=True, max_rows_per_file=10)
+    ds.create_scalar_index("text", "INVERTED")
+    ds.optimize.compact_files(target_rows_per_fragment=100)
+    ds = nl.write_dataset(t.slice(30, 10), path, mode="append")
+    ds.optimize.optimize_indices()
+    assert sorted(nl.dataset(path).to_table(full_text_query="gamma")["id"].to_pylist()) == list(range(2, 40, 4))
