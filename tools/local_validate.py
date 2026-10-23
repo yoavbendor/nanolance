@@ -5,6 +5,11 @@
     python3 tools/local_validate.py                                  # everything but real S3
     python3 tools/local_validate.py --s3 s3://my-bucket/scratch/nl   # plus a real bucket
     python3 tools/local_validate.py --quick                          # skip the slow repeats
+    python3 tools/local_validate.py --fast                           # a short, comprehensive subset (see below)
+
+--fast: the smoke C++ tests only (their targets are built, not everything), the curated binding test files and
+pylance test files listed in tools/validate_fast.txt (each entry says what it covers), no stress repeat, no
+lance-c suite. It is the run to repeat while working; the full run is the one to send back before a release.
 
 What it does, each step in its own log under .validate/<time>/ (nothing outside the checkout is changed):
   env        compilers, cmake, Python, uv, OS, CPU and memory, the commit and whether the tree is clean
@@ -60,6 +65,57 @@ def scrub(text: str) -> str:
         if value and len(value) >= 4:
             text = text.replace(value, f"<{name}>")
     return text
+
+
+FAST_LIST = ROOT / "tools" / "validate_fast.txt"
+
+
+def read_fast_list(path: Path = FAST_LIST) -> dict[str, list[str]]:
+    """The --fast lists: '[section]' headers, one item per line; '#' starts a comment (on its own line or after
+    an item)."""
+    sections: dict[str, list[str]] = {}
+    current = None
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = re.split(r"\s+#|^#", raw, maxsplit=1)[0].strip()
+        if not line:
+            continue
+        header = re.fullmatch(r"\[(\w+)\]", line)
+        if header:
+            current = header.group(1)
+            sections[current] = []
+        elif current is None:
+            raise SystemExit(f"{path}: an item before the first [section]: {line}")
+        else:
+            sections[current].append(line)
+    return sections
+
+
+def smoke_targets(build: Path) -> list[str]:
+    """The CMake targets that the `smoke` ctest label runs. Building these instead of `all` skips lance-c, the
+    examples and the tools the smoke tests do not use.
+
+    The executables come from the add_test lines of the generated CTestTestfile.cmake: ctest only lists a test's
+    command once its executable exists, which is not yet true when this runs."""
+    listed = subprocess.run(["ctest", "--test-dir", str(build), "-L", "smoke", "-N"], capture_output=True, text=True,
+                            check=True).stdout
+    smoke = set(re.findall(r"Test\s+#\d+:\s+(\S+)", listed))
+    prefix = str(build) + os.sep
+    files = set()
+    for testfile in build.rglob("CTestTestfile.cmake"):  # a subdirectory's tests are in its own file
+        for line in testfile.read_text(errors="replace").splitlines():
+            m = re.match(r"add_test\((?:\[=\[(.+?)\]=\]|(\S+))", line)
+            if m and (m.group(1) or m.group(2)) in smoke:
+                files.update(Path(p).name for p in re.findall(r'"([^"]+)"', line) if p.startswith(prefix))
+    # The target that links each executable: its CMakeFiles/<target>.dir/link.txt names the output with -o.
+    # (The file name can differ from the target name: OUTPUT_NAME nanolance is target nanolance_cli.)
+    target_of = {}
+    for link in build.rglob("link.txt"):  # a subdirectory's targets have their CMakeFiles in that subdirectory
+        if link.parent.name.endswith(".dir") and link.parent.parent.name == "CMakeFiles":
+            m = re.search(r"-o (\S+)", link.read_text(errors="replace"))
+            if m:
+                target_of.setdefault(Path(m.group(1)).name, link.parent.name[: -len(".dir")])
+    # A file that no target links is written by a test (golden data): nothing to build for it.
+    return sorted({target_of[f] for f in files if f in target_of})
 
 
 class Run:
@@ -210,6 +266,9 @@ def main(argv=None) -> int:
     ap.add_argument("--s3-region")
     ap.add_argument("--s3-allow-http", action="store_true")
     ap.add_argument("--quick", action="store_true", help="skip the stress repeat of the binding tests")
+    ap.add_argument("--fast", action="store_true",
+                    help="the short profile: smoke C++ tests, the curated test files in tools/validate_fast.txt, "
+                         "no stress and no lance-c")
     ap.add_argument("--skip", default="", help="steps to skip, comma-separated (cpp,stress,pylance,lance_c,...)")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--max-kb", type=int, default=190, help="cap on report.txt (default 190 KB)")
@@ -221,6 +280,9 @@ def main(argv=None) -> int:
     skip = {s.strip() for s in args.skip.split(",") if s.strip()}
     if args.quick:
         skip.add("stress")
+    fast = read_fast_list() if args.fast else None
+    if args.fast:
+        skip |= {"stress", "lance_c"}
 
     out = ROOT / ".validate" / dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True)
@@ -253,12 +315,15 @@ def main(argv=None) -> int:
         code, secs = run.sh("cpp", ["cmake", "-S", str(ROOT), "-B", str(build), "-DCMAKE_BUILD_TYPE=Release"],
                             "cpp.log", env=base_env)
         if code == 0:
-            c2, s2 = run.sh("cpp", ["cmake", "--build", str(build), "-j", str(args.jobs)], "cpp.log", env=base_env)
+            only = ["--target", *smoke_targets(build)] if args.fast else []
+            c2, s2 = run.sh("cpp", ["cmake", "--build", str(build), "-j", str(args.jobs), *only], "cpp.log",
+                            env=base_env)
             code, secs = c2, secs + s2
         detail = "build failed" if code != 0 else ""
         if code == 0:
+            label = ["-L", "smoke"] if args.fast else []
             c2, s2 = run.sh("cpp", ["ctest", "--test-dir", str(build), "-j", str(args.jobs), "--output-on-failure",
-                                    "--timeout", "900"], "cpp.log", env=base_env)
+                                    "--timeout", "900", *label], "cpp.log", env=base_env)
             code, secs = c2, secs + s2
             m = re.findall(r"(\d+)% tests passed, (\d+) tests failed out of (\d+)", (out / "cpp.log").read_text(errors="replace"))
             detail = f"ctest: {m[-1][1]} failed of {m[-1][2]}" if m else "ctest did not report"
@@ -300,8 +365,9 @@ def main(argv=None) -> int:
 
     moto, endpoint = (None, "")
     if "moto" not in skip and "pytest" not in skip:
+        start = time.time()
         moto, endpoint = start_moto(run, venv)
-        run.record("moto", "ok" if moto else "skip", 0, "moto.log", endpoint)
+        run.record("moto", "ok" if moto else "skip", time.time() - start, "moto.log", endpoint)
     test_env = dict(base_env)
     if s3_reader:
         test_env["NANOLANCE_LANCE_C_S3_READ"] = s3_reader
@@ -325,7 +391,7 @@ def main(argv=None) -> int:
             basetemp = scratch / f"tmp-{name}"
             code, secs = run.sh(name, [py, "-m", "pytest", "-m", "not bench", "-q", "-rs", "-o", "addopts=", "-p",
                                        "no:cacheprovider", "--timeout", "1800", f"--basetemp={basetemp}",
-                                       f"--junitxml={junit}", "tests"],
+                                       f"--junitxml={junit}", *(fast["pytest"] if fast else ["tests"])],
                                 f"{name}.log", cwd=pydir, env=e, timeout=4 * 3600)
             shutil.rmtree(basetemp, ignore_errors=True)
             counts, _ = junit_failures(junit)
@@ -343,8 +409,9 @@ def main(argv=None) -> int:
         # At most 32 workers: with one per core on a very large machine, tests that time out at 300 s (a
         # 300 MB file read 105 times) starve each other.
         workers = str(min(os.cpu_count() or 4, 32))
+        only = ["--files", *fast["pylance"]] if fast else []
         code, secs = run.sh("pylance", [py, str(ROOT / "tools" / "pylance_suite.py"), "--workers", workers,
-                                        "--report", str(out / "pylance-suite.json")], "pylance.log",
+                                        "--report", str(out / "pylance-suite.json"), *only], "pylance.log",
                             env=dict(base_env, TMPDIR=str(scratch / "tmp-pylance")), timeout=4 * 3600)
         shutil.rmtree(scratch / "tmp-pylance", ignore_errors=True)
         last = [l for l in (out / "pylance.log").read_text(errors="replace").splitlines() if "test suite against" in l]
@@ -381,7 +448,11 @@ def finish(run: Run, env_info: dict, args) -> int:
     parts = []
     failed = [s for s in run.steps if s["status"] == "FAIL"]
     head = [f"nanolance local validation: {'ALL OK' if not failed else str(len(failed)) + ' step(s) FAILED'}",
-            f"commit {env_info.get('git_commit', '?')} ({env_info.get('git_branch', '?')})", ""]
+            f"commit {env_info.get('git_commit', '?')} ({env_info.get('git_branch', '?')})"]
+    if args.fast:
+        total = sum(s["seconds"] for s in run.steps)
+        head.append(f"profile: fast (the curated subset in tools/validate_fast.txt; {total:.0f} s in all steps)")
+    head.append("")
     for s in run.steps:
         head.append(f"  {s['status']:>4}  {s['step']:<8} {s['seconds']:8.1f} s  {s['detail']}")
     head += ["", "environment:"] + [f"  {k}: {v}" for k, v in env_info.items()]
