@@ -13,6 +13,7 @@
 #include "encoding/values/bitpack.hpp"
 #include "encoding/values/general.hpp"
 #include "encoding/values/byte_stream_split.hpp"
+#include "encoding/values/scalar_value.hpp"
 #include "nanolance/column_slice.hpp"
 #include <nanom/fastlanes.hpp>
 #include "nanolance/fsst.hpp"
@@ -632,57 +633,6 @@ bool decode_variable_width_page(const std::vector<std::uint8_t>& chunk_bytes, co
 
 
 
-
-
-/// Inverse of the writer's encode_scalar_variable_value: a Lance scalar value buffer holding a
-/// length-1 array, laid out as [u32 num_buffers][u32 buffer_len ...][buffers]. For utf8/binary that
-/// is two buffers -- offsets [0, len] and the data -- and the value we want is the data buffer whole;
-/// for a fixed-width value it is one buffer, the value. Every length is untrusted, so each is bounds-checked before use.
-[[nodiscard]] bool decode_scalar_variable_value(const std::vector<std::uint8_t>& buffer,
-                                                std::vector<std::uint8_t>& out, std::string& error) {
-    if (buffer.size() < 4U) {
-        error = "constant value buffer shorter than its header";
-        return false;
-    }
-    const auto num_buffers = load_le<std::uint32_t>(buffer.data());
-    // A fixed-width value too wide to inline in the descriptor (a fixed_size_binary(33) constant) is
-    // the same layout with ONE buffer: the value's bytes.
-    if (num_buffers == 1U) {
-        if (buffer.size() < 8U) {
-            error = "constant value buffer shorter than its header";
-            return false;
-        }
-        const auto len = load_le<std::uint32_t>(buffer.data() + 4U);
-        if (len > buffer.size() - 8U) {
-            error = "constant value buffer's data range exceeds the buffer";
-            return false;
-        }
-        out.assign(buffer.begin() + 8, buffer.begin() + 8 + static_cast<std::ptrdiff_t>(len));
-        return true;
-    }
-    if (num_buffers != 2U) {
-        error = "constant value buffer declares " + std::to_string(num_buffers) +
-                " buffers; expected 1 (a fixed-width value) or 2 (offsets + data)";
-        return false;
-    }
-    std::uint64_t header = 0;
-    if (!checked_mul(num_buffers, 4U, header) || !checked_add(header, 4U, header) || header > buffer.size()) {
-        error = "constant value buffer header exceeds the buffer";
-        return false;
-    }
-    const auto offsets_len = load_le<std::uint32_t>(buffer.data() + 4U);
-    const auto data_len = load_le<std::uint32_t>(buffer.data() + 8U);
-    std::uint64_t data_start = 0;
-    std::uint64_t data_end = 0;
-    if (!checked_add(header, offsets_len, data_start) || !checked_add(data_start, data_len, data_end) ||
-        data_end > buffer.size()) {
-        error = "constant value buffer's data range exceeds the buffer";
-        return false;
-    }
-    out.assign(buffer.begin() + static_cast<std::ptrdiff_t>(data_start),
-               buffer.begin() + static_cast<std::ptrdiff_t>(data_end));
-    return true;
-}
 
 
 /// Turn `count` decoded levels into validity bits. Rows accumulate across chunks into one contiguous
@@ -2359,7 +2309,7 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
             std::vector<std::uint8_t> scalar_buffer;
             if (!io.read(page.buffer_offsets[0], page.buffer_sizes[0],
                                             scalar_buffer, error) ||
-                !decode_scalar_variable_value(scalar_buffer, constant_value, error)) {
+                !scalar_value::decode_variable(scalar_buffer, constant_value, error)) {
                 return false;
             }
             value = &constant_value;
@@ -3857,7 +3807,7 @@ bool decode_nested_column(const EncodingsIo& io, const pb::Field& on_disk_field,
                     return false;
                 }
                 if (variable) {
-                    if (!decode_scalar_variable_value(control, value, error)) {
+                    if (!scalar_value::decode_variable(control, value, error)) {
                         error = where + error;
                         return false;
                     }

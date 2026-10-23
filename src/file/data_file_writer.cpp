@@ -7,6 +7,7 @@
 #include "encoding/values/bitpack.hpp"
 #include "encoding/values/general.hpp"
 #include "encoding/values/byte_stream_split.hpp"
+#include "encoding/values/scalar_value.hpp"
 #include "nanolance/parallel.hpp"
 #include "nanolance/work_stats.hpp"
 
@@ -745,36 +746,6 @@ std::vector<std::uint8_t> page_layout_bytes_dict_rle(std::uint32_t num_distinct,
     m.num_dictionary_items = num_distinct;
     miniblock_tail(m, num_items, 2U);
     return descriptor::page_encoding(m);
-}
-
-// Lance scalar value buffer for a length-1 string/binary array: [u32 num_buffers][u32 buf_len...]
-// [buffers]. A utf8/binary value is 2 buffers (offsets [0,len] + data). See lance-arrow scalar.rs.
-std::vector<std::uint8_t> encode_scalar_variable_value(const std::vector<std::uint8_t>& value, bool large) {
-    std::vector<std::uint8_t> out;
-    auto write_u32 = [&](std::uint32_t v) {
-        for (int i = 0; i < 4; ++i) {
-            out.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xFFU));
-        }
-    };
-    const std::uint32_t offsets_len = large ? 16U : 8U;
-    write_u32(2U);                                          // num_buffers (offsets + data)
-    write_u32(offsets_len);                                // buffer 0: offsets
-    write_u32(static_cast<std::uint32_t>(value.size()));   // buffer 1: data
-    if (large) {
-        const std::uint64_t start = 0;
-        const std::uint64_t end = value.size();
-        for (int i = 0; i < 8; ++i) {
-            out.push_back(static_cast<std::uint8_t>((start >> (8 * i)) & 0xFFU));
-        }
-        for (int i = 0; i < 8; ++i) {
-            out.push_back(static_cast<std::uint8_t>((end >> (8 * i)) & 0xFFU));
-        }
-    } else {
-        write_u32(0U);
-        write_u32(static_cast<std::uint32_t>(value.size()));
-    }
-    out.insert(out.end(), value.begin(), value.end());
-    return out;
 }
 
 // PageLayout = ConstantLayout. Fixed-width constants store the value inline in the descriptor (zero
@@ -2453,7 +2424,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             if (lance_field_is_variable_width(field.logical_type)) {
                 const bool large =
                     lance_logical_type_has_large_offsets(field.logical_type);
-                const auto scalar_buffer = encode_scalar_variable_value(value, large);
+                const auto scalar_buffer = scalar_value::encode_variable(value, large);
                 align64(out);
                 const auto value_offset = pos(out);
                 out.write(reinterpret_cast<const char*>(scalar_buffer.data()),
