@@ -407,6 +407,7 @@ add_library(nanolance::nanolance ALIAS nanolance)
 option(NANOLANCE_BUILD_LANCE_C "Build liblance_c, lance-c's C API over nanolance" ON)
 if(NANOLANCE_BUILD_LANCE_C)
     add_library(lance_c STATIC src/api/lance_c.cpp)
+    target_include_directories(lance_c PRIVATE "${NANOLANCE_PRIVATE_INCLUDE}")
     target_compile_features(lance_c PUBLIC cxx_std_20)
     target_include_directories(lance_c PUBLIC
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/compat/lance-c/include>")
