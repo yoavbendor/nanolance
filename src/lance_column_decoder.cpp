@@ -3844,6 +3844,12 @@ bool append_leaf_values(ColumnValues& dst, ColumnValues& src, std::string& error
     const auto width = static_cast<std::size_t>(src.variable.large ? 8U : 4U);
     const auto base = read_list_offset(dst.variable.offsets, dst.variable.offsets.size() / width - 1U, dst.variable.large);
     const auto first = read_list_offset(src.variable.offsets, 0, src.variable.large);
+    if (dst.variable.data.empty() && dst.variable.offsets.size() == width && base == 0 && first == 0) {
+        // Nothing appended yet: take the page's buffers, as the fixed-width case does, instead of copying them.
+        std::swap(dst.variable.data, src.variable.data);
+        std::swap(dst.variable.offsets, src.variable.offsets);
+        return true;
+    }
     for (std::size_t i = 1; i < src.variable.offsets.size() / width; ++i) {
         append_list_offset(dst.variable.offsets, base + read_list_offset(src.variable.offsets, i, src.variable.large) - first,
                            dst.variable.large);
@@ -4199,8 +4205,15 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
             }
             page_values.kind = out.kind;
             page_values.variable.large = out.variable.large;
+            // The expanded size is known: reserve it, rather than letting a page of large repeated values
+            // (300 KB x 1,009 rows) reallocate and copy its way up to hundreds of megabytes.
             if (variable) {
+                page_values.variable.data.reserve(static_cast<std::size_t>(total));
+                page_values.variable.offsets.reserve(static_cast<std::size_t>(page_items + 1U) *
+                                                     (out.variable.large ? 8U : 4U));
                 append_list_offset(page_values.variable.offsets, 0, out.variable.large);
+            } else {
+                page_values.fixed.reserve(static_cast<std::size_t>(total));
             }
             for (std::uint64_t i = 0; i < page_items; ++i) {
                 if (variable) {
