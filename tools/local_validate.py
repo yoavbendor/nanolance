@@ -340,8 +340,11 @@ def main(argv=None) -> int:
     if "pylance" not in skip:
         # TMPDIR, not --basetemp: any extra pytest argument turns off the suite's expected-pass verdict.
         (scratch / "tmp-pylance").mkdir()
-        code, secs = run.sh("pylance", [py, str(ROOT / "tools" / "pylance_suite.py"), "--report",
-                                        str(out / "pylance-suite.json")], "pylance.log",
+        # At most 32 workers: with one per core on a very large machine, tests that time out at 300 s (a
+        # 300 MB file read 105 times) starve each other.
+        workers = str(min(os.cpu_count() or 4, 32))
+        code, secs = run.sh("pylance", [py, str(ROOT / "tools" / "pylance_suite.py"), "--workers", workers,
+                                        "--report", str(out / "pylance-suite.json")], "pylance.log",
                             env=dict(base_env, TMPDIR=str(scratch / "tmp-pylance")), timeout=4 * 3600)
         shutil.rmtree(scratch / "tmp-pylance", ignore_errors=True)
         last = [l for l in (out / "pylance.log").read_text(errors="replace").splitlines() if "test suite against" in l]

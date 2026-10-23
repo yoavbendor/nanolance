@@ -573,6 +573,14 @@ a deletion generation the threads check, or a shared, lock-protected handle cach
 purge (it must not close a handle another thread is reading through). Needs its own change and a
 read-speed check; the cleanup test ignores `.nfs*` meanwhile.
 
+### Known gap: reading files of large binary values (found 2026-10-23)
+
+`LanceFileReader.read_all` of a file of 1,009 rows of 300 KB binary values (pylance's
+`test_file.py::test_batch_sizes`): 0.57 s a read warm, 3 s cold, against pylance's 0.09 s (6x); the test
+takes 55 s against 20 s, most of it system time (large buffers allocated and faulted in per read). On a
+192-core machine running 192 test workers it hit the suite's 300 s timeout. Profile the decode path of
+large binary pages (copies between page buffer, decode and Arrow builder).
+
 ### When the Lance pin moves past 12.0
 
 Not scheduled; T1 refuses each one until then. Roughly by size:
