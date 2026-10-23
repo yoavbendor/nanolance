@@ -148,14 +148,12 @@ int main() {
                 "a size for a file under the base is served");
         checks += 6;
 
-        // KNOWN (reported, not failing): the jail is checked only when a file is first opened. The outside file
-        // was opened before the variable was set, so this thread's cached handle still serves it, while a size
-        // request for the same URI is refused. The header says a file:// path must lie under the base when set.
+        // The jail holds for a URI whose handle was opened before the variable was set (it used to be checked
+        // only when a handle opened, so this thread's cached handle still served the outside file).
         const auto cached = fetch(outside_uri, 0, kAll, status, error);
-        if (status == io::BlobStatus::Ok && cached == "out") {
-            std::cout << "KNOWN: a file:// URI opened before NANO_LANCE_BLOB_BASE_DIR was set is still read "
-                         "from its cached handle, outside the base dir (size request refused for the same URI)\n";
-        }
+        require(status == io::BlobStatus::InvalidArgument && cached.empty(),
+                "a cached handle outside NANO_LANCE_BLOB_BASE_DIR is refused once it is set");
+        checks += 1;
     }
     unsetenv("NANO_LANCE_BLOB_BASE_DIR");
     {

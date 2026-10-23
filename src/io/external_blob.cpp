@@ -149,6 +149,15 @@ BlobStatus fetch_external_blob(const std::string& suri, std::uint64_t position, 
         return BlobStatus::IoError;
     }
 
+    // A file:// path is checked on every read, not only when its handle opens: NANO_LANCE_BLOB_BASE_DIR may
+    // have been set since (a cached handle must not read outside it).
+    if (is_file) {
+        std::string reject_reason;
+        if (!file_blob_path_allowed(file_uri_to_path(suri), reject_reason)) {
+            error = reject_reason;
+            return BlobStatus::InvalidArgument;
+        }
+    }
     // Reuse an open handle for this URI, or open one and cache it.
     BlobHandle* handle = find_handle(suri);
     if (handle == nullptr) {
@@ -156,11 +165,6 @@ BlobStatus fetch_external_blob(const std::string& suri, std::uint64_t position, 
         if (is_file) {
             fresh->is_s3 = false;
             const std::string fpath = file_uri_to_path(suri);
-            std::string reject_reason;
-            if (!file_blob_path_allowed(fpath, reject_reason)) {
-                error = reject_reason;
-                return BlobStatus::InvalidArgument;
-            }
             fresh->file.open(fpath, std::ios::binary);
             if (!fresh->file) {
                 error = "failed to open file:// path";

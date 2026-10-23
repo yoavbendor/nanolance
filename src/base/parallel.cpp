@@ -199,8 +199,19 @@ void set_worker_scope(void (*run)(const std::function<void()>& work)) {
 void for_each(std::size_t n, const std::function<void(std::size_t)>& task) {
     const auto width = std::min(threads(), n);
     if (width <= 1U) {
+        // As with a pool: every task runs, and the first exception (in index order) is rethrown at the end.
+        std::exception_ptr first;
         for (std::size_t i = 0; i < n; ++i) {
-            task(i);
+            try {
+                task(i);
+            } catch (...) {
+                if (!first) {
+                    first = std::current_exception();
+                }
+            }
+        }
+        if (first) {
+            std::rethrow_exception(first);
         }
         return;
     }

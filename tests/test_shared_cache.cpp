@@ -99,9 +99,7 @@ int main() {
         ++checks;
     }
 
-    // KNOWN (reported, not failing): put() checks the size before it looks at the key, so replacing a key
-    // that is already present in a full cache evicts an unrelated entry first. Correctness is unaffected
-    // (it is a cache), but an update in a full cache loses one entry it did not need to.
+    // Replacing a key in a full cache keeps every other entry (put used to evict one before it looked at the key).
     {
         nano_lance::SharedCache<int> cache;
         for (int i = 0; i < 64; ++i) {
@@ -112,10 +110,9 @@ int main() {
         for (int i = 0; i < 64; ++i) {
             present += cache.find("k" + std::to_string(i)) != nullptr ? 1 : 0;
         }
-        if (present != 64) {
-            std::cout << "KNOWN: replacing an existing key in a full cache evicted another entry ("
-                      << present << " of 64 keys remain)\n";
-        }
+        require(present == 64, "replacing a key in a full cache keeps all 64 keys (" + std::to_string(present) + " remain)");
+        require(*cache.find("k0") == 100, "the replaced key holds its new value");
+        checks += 2;
     }
 
     std::cout << "shared_cache: " << checks << " checks passed\n";

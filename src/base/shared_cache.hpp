@@ -24,7 +24,8 @@ public:
     }
     void put(const std::string& key, std::shared_ptr<const T> value) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (entries_.size() >= 64U) {
+        // Replacing a key leaves the size as it is; only a new key over the bound evicts another.
+        if (entries_.size() >= 64U && entries_.find(key) == entries_.end()) {
             entries_.erase(entries_.begin());
         }
         entries_[key] = std::move(value);

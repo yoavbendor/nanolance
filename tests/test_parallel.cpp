@@ -129,8 +129,7 @@ int main() {
     }
 
     // Exception with one thread: the same exception reaches the caller.
-    // KNOWN (reported, not failing): the header says the exception is rethrown once all tasks are done, but
-    // with one thread (or n <= 1) for_each is a plain loop, so it stops at the throw and later tasks never run.
+    // As with a pool, every task runs before the exception is rethrown (the plain loop used to stop at it).
     {
         nano_lance::parallel::set_threads(1);
         std::vector<std::atomic<int>> ran(10);
@@ -150,11 +149,8 @@ int main() {
         for (std::size_t i = 4; i < 10; ++i) {
             later += ran[i].load();
         }
-        if (later == 0) {
-            std::cout << "KNOWN: with one thread, tasks after a throwing task are skipped, although the header "
-                         "says the exception is rethrown once all tasks are done\n";
-        }
-        checks += 1;
+        require(later == 6, "with one thread, the tasks after a throwing one still run");
+        checks += 2;
     }
 
     // A worker scope: once registered, pool threads run their share inside it, so it is called; with one
