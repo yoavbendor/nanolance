@@ -53,9 +53,10 @@ run. The steps keep their order, each with less in it:
 
 | Step | In `--fast` |
 |---|---|
-| cpp | the 46 executables behind the 58 `smoke` tests, then `ctest -L smoke`; lance-c and the examples, and the tools the smoke tests do not use, are not built |
-| s3build, install, moto | as in the full run (the object-store tests need them) |
-| pytest | the entries of `tools/validate_fast.txt` [pytest]: 2,282 tests, one after another, as CI runs them |
+| cpp | configured with S3 on: the 46 executables behind the 58 `smoke` tests and `lance_c_s3_read`, then `ctest -L smoke`; lance-c and the examples, and the tools the smoke tests do not use, are not built |
+| s3build | nothing more: the S3 reader comes from the cpp tree (the full run builds it in a tree of its own) |
+| install, moto | as in the full run (the object-store tests need them) |
+| pytest | the entries of `tools/validate_fast.txt` [pytest]: 2,282 tests, on up to 16 workers (`--dist loadgroup`) |
 | stress | skipped |
 | pylance | 10 of pylance 12's test files (`tools/pylance_suite.py --files`); the verdict covers their expected-pass tests |
 | lance_c | skipped |
@@ -63,9 +64,9 @@ run. The steps keep their order, each with less in it:
 
 `tools/validate_fast.txt` lists what each entry covers and what it costs. The report's header says `profile: fast`.
 
-Measured here, on a 4-core machine that other work shared (the build steps were slower for it): 1036 s in all steps,
-about 17 minutes. The builds are most of it: cpp 269 s, s3build 357 s, install 188 s. The rest: moto 32 s, pytest
-148 s, pylance 35 s. The full binding suite alone takes about 17 minutes here (serially), before the stress repeat.
+Measured here, on a 4-core machine with 15 GB: 507 s in all steps, about 8.5 minutes: cpp 243 s, install 138 s,
+moto 31 s, pytest 58 s, pylance 32 s. The two builds are most of it, so a machine with many cores is much faster.
+(The full binding suite alone takes about 17 minutes here serially, before the stress repeat.)
 
 Use `--fast` while changing code. Before you send a report back, run the full run (or `--quick`, which skips only the
 stress repeat).
