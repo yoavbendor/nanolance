@@ -4122,7 +4122,30 @@ class LanceScanner(pa.dataset.Scanner):
             taken = self._ds._take(addrs.tolist(), late, addresses=True, blob_handling=self._blob_handling)
         return pa.table({n: (taken.column(n) if n in late else head.column(n)) for n in self._scan_names()})
 
+    def _restrict_to_indexed_fragments(self) -> None:
+        """fast_search on a filtered scan: when the filter is answered through scalar indexes (Lance's
+        index expression, which the explain lines name), only the fragments every one of those indexes
+        covers are read, as Lance skips the unindexed ones. Without such an index nothing changes."""
+        if not self._fast_search or self._filter is None or not self._use_scalar_index or \
+                getattr(self, "_fast_fragments_done", False):
+            return
+        self._fast_fragments_done = True
+        with native():
+            lines = _nanolance._ds_explain_filter(self._ds.uri, self._ds.version, self._filter)
+        used = set(re.findall(r"@([^\s(@\]]+)\(", " ".join(l for l in lines if "ScalarIndexQuery" in l)))
+        if not used:
+            return
+        covered = None
+        for index in self._ds.list_indices():
+            if index["name"] in used:
+                covered = set(index["fragment_ids"]) if covered is None else covered & set(index["fragment_ids"])
+        if covered is None:
+            return
+        ids = [f.fragment_id for f in self._ds.get_fragments()] if self._fragment_ids is None else self._fragment_ids
+        self._fragment_ids = [i for i in ids if i in covered]
+
     def _read(self, stream: bool):
+        self._restrict_to_indexed_fragments()
         if self._include_deleted:
             return self._read_with_deleted()
         late = self._late_columns()
@@ -4501,6 +4524,7 @@ class LanceScanner(pa.dataset.Scanner):
     def count_rows(self) -> int:
         if self._fts is not None:
             return len(self._fts_search()[0][self._offset:])
+        self._restrict_to_indexed_fragments()
         counted = self._count_from_index()
         if counted is not None:
             return counted[0] + counted[3]

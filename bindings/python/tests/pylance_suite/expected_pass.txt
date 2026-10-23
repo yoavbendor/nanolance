@@ -352,6 +352,7 @@ tests/test_dataset.py::test_empty_structs
 tests/test_dataset.py::test_enable_disable_auto_cleanup
 tests/test_dataset.py::test_enable_stable_row_ids
 tests/test_dataset.py::test_explain_cleanup_old_versions
+tests/test_dataset.py::test_fast_search_scalar_index_skips_unindexed_fragments
 tests/test_dataset.py::test_field_metadata_multiple_fields
 tests/test_dataset.py::test_field_metadata_updates
 tests/test_dataset.py::test_filter
