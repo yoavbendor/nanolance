@@ -53,6 +53,7 @@ tests/test_bitmap.py::test_in_place_set_operators[__ior__-expected1]
 tests/test_bitmap.py::test_in_place_set_operators[__isub__-expected2]
 tests/test_bitmap.py::test_in_place_set_operators[__ixor__-expected3]
 tests/test_bitmap.py::test_is_registered_as_a_set
+tests/test_bitmap.py::test_iter_is_lazy
 tests/test_bitmap.py::test_len_iter_contains
 tests/test_bitmap.py::test_mutation_is_copy_on_write
 tests/test_bitmap.py::test_named_set_methods[difference-expected2]
@@ -66,6 +67,8 @@ tests/test_bitmap.py::test_reflected_set_operators[ror]
 tests/test_bitmap.py::test_reflected_set_operators[rsub]
 tests/test_bitmap.py::test_reflected_set_operators[rxor]
 tests/test_bitmap.py::test_remove_pop_clear
+tests/test_bitmap.py::test_repr
+tests/test_bitmap.py::test_repr_truncates_long_bitmaps
 tests/test_bitmap.py::test_set_operator_with_incompatible_type_raises
 tests/test_bitmap.py::test_set_operators[bitmap-and]
 tests/test_bitmap.py::test_set_operators[bitmap-or]
@@ -929,6 +932,7 @@ tests/test_optimize.py::test_optimize_indices_second_call_is_noop
 tests/test_order_by.py::test_all_order_by_support_functions
 tests/test_order_by.py::test_one_column_order_by
 tests/test_order_by.py::test_two_column_order_by
+tests/test_pydantic.py::test_defaulted_non_optional_field_is_not_nullable
 tests/test_pydantic.py::test_int_enum_uses_native_type
 tests/test_pydantic.py::test_multi_vector_field
 tests/test_pydantic.py::test_naive_datetime_field
@@ -936,6 +940,10 @@ tests/test_pydantic.py::test_nested_model_becomes_struct
 tests/test_pydantic.py::test_optional_field_is_nullable
 tests/test_pydantic.py::test_scalar_and_optional_and_list_unchanged
 tests/test_pydantic.py::test_string_enum_is_dictionary_encoded
+tests/test_pydantic.py::test_tz_aware_datetime_field
+tests/test_pydantic.py::test_v1_style_field_nullable_vector_overrides_allow_none
+tests/test_pydantic.py::test_vector_field
+tests/test_pydantic.py::test_vector_field_not_nullable
 tests/test_row_addr_prefilter.py::test_allowlist_and_blocklist_combine
 tests/test_row_addr_prefilter.py::test_builder_setter_matches_the_kwarg
 tests/test_row_addr_prefilter.py::test_empty_allowlist_selects_nothing
