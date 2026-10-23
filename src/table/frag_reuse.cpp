@@ -6,7 +6,8 @@
 
 #include "nanolance/byte_source.hpp"
 #include "nanolance/roaring_bitmap.hpp"
-#include "index/index_files.hpp"
+#include "base/shared_cache.hpp"
+#include "base/uuid.hpp"
 #include "base/proto_wire.hpp"
 
 #include <algorithm>
@@ -351,7 +352,7 @@ bool FragReuse::load(const std::filesystem::path& dataset_path, const pb::Manife
         return true;
     }
     // Immutable per index (a new FRI gets a new uuid), so cached by dataset and uuid.
-    static index_files::IndexCache<FragReuse> cache;
+    static SharedCache<FragReuse> cache;
     const auto key = dataset_path.string() + "\n" + pb::uuid_string(newest->uuid);
     if ((out = cache.find(key)) != nullptr) {
         return true;
@@ -485,7 +486,7 @@ bool fragment_reuse_index_entry(const pb::IndexMetadata* prior, std::uint64_t ve
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::system_clock::now().time_since_epoch()).count();
-    out = pb::make_index_metadata(index_files::new_uuid(), {}, kFragReuseName, version, ids,
+    out = pb::make_index_metadata(new_uuid(), {}, kFragReuseName, version, ids,
                                   std::string("/lance.table.") + kFragReuseDetails, 3,  // index_version 3, as pylance
                                   static_cast<std::uint64_t>(now), {}, details);
     return true;

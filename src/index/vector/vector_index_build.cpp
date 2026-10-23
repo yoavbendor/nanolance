@@ -23,7 +23,11 @@
 #include "base/float16.hpp"
 #include "base/float_text.hpp"
 #include "index/vector/hnsw_build.hpp"
+#include "arrow/arrow_owned.hpp"
+#include "base/bytes.hpp"
+#include "base/uuid.hpp"
 #include "index/index_files.hpp"
+#include "table/index_location.hpp"
 
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/lance_file_writer.hpp"
@@ -53,14 +57,12 @@
 namespace nano_lance {
 namespace {
 
-using index_files::OwnedArray;
-using index_files::OwnedBatches;
-using index_files::OwnedSchema;
+using arrow_owned::OwnedArray;
+using arrow_owned::OwnedBatches;
+using arrow_owned::OwnedSchema;
 using index_files::WrittenFile;
-using index_files::bytes_of;
-using index_files::find_field;
-using index_files::new_uuid;
-using index_files::struct_batch;
+using index_location::find_field;
+using arrow_owned::struct_batch;
 using index_files::write_file;
 
 constexpr std::size_t kMaxPartitions = 4096;  // Lance's recommended_num_partitions cap
@@ -644,7 +646,7 @@ bool table_schema(std::vector<ArrowSchema>& children, ArrowSchema& out) {
 
 bool u64_array(const std::vector<std::uint64_t>& values, ArrowArray& out) {
     std::string ignored;
-    return index_files::uint_array(NANOARROW_TYPE_UINT64, values.data(), static_cast<std::int64_t>(values.size()), 8, out,
+    return arrow_owned::uint_array(NANOARROW_TYPE_UINT64, values.data(), static_cast<std::int64_t>(values.size()), 8, out,
                                    ignored);
 }
 
@@ -2101,12 +2103,12 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     // The files.
     const auto uuid = target != nullptr && target->uuid != nullptr ? *target->uuid : new_uuid();
     const auto dir = dataset_path / "_indices" / pb::uuid_string(uuid);
-    if (!index_files::create_index_dir(dir, error)) {
+    if (!index_location::create_index_dir(dir, error)) {
         return false;
     }
     const auto fail = [&](const std::string& why) {
         error = why;
-        index_files::remove_index_dir(dir);
+        index_location::remove_index_dir(dir);
         return false;
     };
     const std::string metric_name = vector_metric_name(options.metric);
@@ -2248,7 +2250,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         if (!scalar_schema("__vector_id", NANOARROW_TYPE_UINT32, true, children[0]) ||
             !list_schema("__neighbors", NANOARROW_TYPE_UINT32, children[1]) ||
             !list_schema("_distance", NANOARROW_TYPE_FLOAT, children[2]) || !table_schema(children, schema.s) ||
-            !index_files::uint_array(NANOARROW_TYPE_UINT32, vector_ids.data(),
+            !arrow_owned::uint_array(NANOARROW_TYPE_UINT32, vector_ids.data(),
                                      static_cast<std::int64_t>(vector_ids.size()), 4, ids_array.a, ignored) ||
             !list_array(NANOARROW_TYPE_UINT32, 4, list_offsets, neighbor_ids.data(), neighbors_array.a) ||
             !list_array(NANOARROW_TYPE_FLOAT, 4, list_offsets, neighbor_dists.data(), dists_array.a) ||
@@ -2410,7 +2412,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     }
     manifest.indices.push_back(std::move(entry));
     if (!commit_next_version(dataset_path, std::move(manifest), new_version, error)) {
-        index_files::remove_index_dir(dir);
+        index_location::remove_index_dir(dir);
         return false;
     }
     return true;

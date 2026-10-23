@@ -23,6 +23,7 @@
 #include "index/index_build.hpp"
 #include "base/fts_json.hpp"
 #include "index/index_files.hpp"
+#include "base/shared_cache.hpp"
 
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/expr.hpp"
@@ -85,7 +86,6 @@ const char* vector_metric_name(VectorMetric metric) {
 namespace {
 
 using index_files::FileTable;
-using index_files::IndexCache;
 using index_files::file_key;
 using index_files::read_table;
 using index_files::schema_metadata;
@@ -1035,7 +1035,7 @@ bool parse_index_metric(const std::string& name, VectorMetric& out) {
 
 bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>& out, std::string& error,
               bool use_cache = true) {
-    static IndexCache<IvfIndex> cache;
+    static SharedCache<IvfIndex> cache;
     const auto index_path = dir / "index.idx";
     const auto aux_path = dir / "auxiliary.idx";
     const auto key = file_key(index_path) + "|" + file_key(aux_path);

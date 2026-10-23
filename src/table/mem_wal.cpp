@@ -3,7 +3,7 @@
 
 #include "nanolance/mem_wal.hpp"
 
-#include "index/index_files.hpp"
+#include "base/uuid.hpp"
 #include "lance_minimal.pb.hpp"
 #include "nanolance/dataset_transaction.hpp"
 #include "nanolance/manifest_reader.hpp"
@@ -87,7 +87,7 @@ bool dataset_initialize_mem_wal(const std::filesystem::path& dataset_path, std::
     const auto created_at = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
             .count());
-    const auto index = encode_mem_wal_index(index_files::new_uuid(), base_version, details, created_at);
+    const auto index = encode_mem_wal_index(new_uuid(), base_version, details, created_at);
     std::vector<std::uint8_t> operation;  // lance.table.CreateIndex { repeated IndexMetadata new_indices = 1 }
     proto_wire::put_bytes_field(operation, 1, index);
 

@@ -12,6 +12,7 @@
 
 #include "index/index_build.hpp"
 #include "index/index_files.hpp"
+#include "table/index_location.hpp"
 #include "nanolance/byte_source.hpp"
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/index_maintenance.hpp"
@@ -318,7 +319,7 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
         if (ends_with(last.details_type_url, "JsonIndexDetails")) {
             // The new segment's values are extracted at the path, from the rows of every fragment it covers.
             std::string path;
-            if (!index_files::json_index_path(last.details_value, path)) {
+            if (!index_location::json_index_path(last.details_value, path)) {
                 error = "index '" + last.name + "': malformed JsonIndexDetails";
                 return false;
             }
@@ -477,7 +478,7 @@ bool optimize_indices_once(const std::filesystem::path& dataset_path, const Opti
     std::set<const pb::IndexMetadata*> replaced_all;
     const auto cleanup = [&] {
         for (const auto& b : built) {
-            index_files::remove_index_dir(segment_dir(dataset_path, b));
+            index_location::remove_index_dir(segment_dir(dataset_path, b));
         }
     };
     for (const auto& name : names) {

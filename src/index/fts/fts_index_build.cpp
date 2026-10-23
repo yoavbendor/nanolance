@@ -13,7 +13,11 @@
 #include "index/fts/fts_fst.hpp"
 #include "base/fts_json.hpp"
 #include "index/fts/fts_posting.hpp"
+#include "arrow/arrow_owned.hpp"
+#include "base/bytes.hpp"
+#include "base/uuid.hpp"
 #include "index/index_files.hpp"
+#include "table/index_location.hpp"
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/manifest_reader.hpp"
@@ -38,8 +42,8 @@
 namespace nano_lance {
 namespace {
 
-using index_files::OwnedArray;
-using index_files::OwnedSchema;
+using arrow_owned::OwnedArray;
+using arrow_owned::OwnedSchema;
 using index_files::WrittenFile;
 
 constexpr float kK1 = 1.2F;
@@ -513,7 +517,7 @@ bool write_docs(const std::filesystem::path& dir, const Built& b, std::vector<Wr
     }
     LanceFileExtras extras;
     extras.bitpack_integers = true;
-    extras.schema_metadata["total_tokens"] = index_files::bytes_of(std::to_string(b.total_tokens));
+    extras.schema_metadata["total_tokens"] = bytes_of(std::to_string(b.total_tokens));
     return index_files::write_file(dir, "part_0_docs.lance", schema.s, batch.a, extras, files, error);
 }
 
@@ -707,14 +711,14 @@ bool write_postings(const std::filesystem::path& dir, const Built& b, std::vecto
     }
     LanceFileExtras extras;
     extras.bitpack_integers = true;
-    extras.schema_metadata["format_version"] = index_files::bytes_of(std::to_string(b.format_version));
-    extras.schema_metadata["posting_block_size"] = index_files::bytes_of(std::to_string(b.block_size));
+    extras.schema_metadata["format_version"] = bytes_of(std::to_string(b.format_version));
+    extras.schema_metadata["posting_block_size"] = bytes_of(std::to_string(b.block_size));
     if (b.format_version >= 2U) {  // format 1's invert.lance has no posting_tail_codec
-        extras.schema_metadata["posting_tail_codec"] = index_files::bytes_of(posting_tail_codec(b.format_version));
+        extras.schema_metadata["posting_tail_codec"] = bytes_of(posting_tail_codec(b.format_version));
     }
     if (with_positions && !legacy) {
-        extras.schema_metadata["positions_layout"] = index_files::bytes_of("shared_stream_v2");
-        extras.schema_metadata["positions_codec"] = index_files::bytes_of("packed_delta_v1");
+        extras.schema_metadata["positions_layout"] = bytes_of("shared_stream_v2");
+        extras.schema_metadata["positions_codec"] = bytes_of("packed_delta_v1");
     }
     return index_files::write_file(dir, "part_0_invert.lance", schema.s, batch.a, extras, files, error);
 }
@@ -735,16 +739,16 @@ bool write_metadata(const std::filesystem::path& dir, const fts::AnalyzerParams&
     }
     LanceFileExtras extras;
     extras.bitpack_integers = true;
-    extras.schema_metadata["partitions"] = index_files::bytes_of("[0]");
-    extras.schema_metadata["token_set_format"] = index_files::bytes_of("fst");
-    extras.schema_metadata["params"] = index_files::bytes_of(fts::params_json(params));
+    extras.schema_metadata["partitions"] = bytes_of("[0]");
+    extras.schema_metadata["token_set_format"] = bytes_of("fst");
+    extras.schema_metadata["params"] = bytes_of(fts::params_json(params));
     const std::uint32_t format = fts::resolved_format_version(params);
-    extras.schema_metadata["format_version"] = index_files::bytes_of(std::to_string(format));
-    extras.schema_metadata["posting_tail_codec"] = index_files::bytes_of(posting_tail_codec(format));
-    extras.schema_metadata["posting_block_size"] = index_files::bytes_of(std::to_string(params.block_size));
+    extras.schema_metadata["format_version"] = bytes_of(std::to_string(format));
+    extras.schema_metadata["posting_tail_codec"] = bytes_of(posting_tail_codec(format));
+    extras.schema_metadata["posting_block_size"] = bytes_of(std::to_string(params.block_size));
     if (params.with_position && format >= 2) {  // format 1 keeps its positions in the legacy _position
-        extras.schema_metadata["positions_layout"] = index_files::bytes_of("shared_stream_v2");
-        extras.schema_metadata["positions_codec"] = index_files::bytes_of("packed_delta_v1");
+        extras.schema_metadata["positions_layout"] = bytes_of("shared_stream_v2");
+        extras.schema_metadata["positions_codec"] = bytes_of("packed_delta_v1");
     }
     return index_files::write_file(dir, "metadata.lance", schema.s, batch.a, extras, files, error);
 }
@@ -793,7 +797,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
         return false;
     }
     std::vector<std::string> parts;
-    const auto* f = index_files::find_field(manifest, column, parts);
+    const auto* f = index_location::find_field(manifest, column, parts);
     if (f == nullptr) {
         error = column.find('[') != std::string::npos
                     ? "FTS field path '" + column + "' does not exist in the dataset schema"  // a list element path
@@ -854,9 +858,9 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     const bool old_rows = target != nullptr && target->rows != nullptr && !target->rows->empty();
     const bool scan = request.fragment_ids == nullptr || !request.fragment_ids->empty();
     OwnedSchema taken;
-    index_files::OwnedBatches rows;
+    arrow_owned::OwnedBatches rows;
     OwnedSchema scanned;
-    index_files::OwnedBatches batches;
+    arrow_owned::OwnedBatches batches;
     report(0, "load_data", 0, "rows", 0);
     if (old_rows) {
         // An old segment's documents first, deleted or not.
@@ -909,16 +913,16 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     report(2, "tokenize_docs", 0, "rows", tokenized);
 
     // The files: the partition's (copy_partitions), then the metadata (write_metadata).
-    const auto uuid = target != nullptr && target->uuid != nullptr ? *target->uuid : index_files::new_uuid();
+    const auto uuid = target != nullptr && target->uuid != nullptr ? *target->uuid : new_uuid();
     const auto dir = dataset_path / "_indices" / pb::uuid_string(uuid);
-    if (!index_files::create_index_dir(dir, error)) {
+    if (!index_location::create_index_dir(dir, error)) {
         return false;
     }
     std::vector<WrittenFile> files;
     report(0, "copy_partitions", 1, "partitions", 0);
     if (!(write_postings(dir, built, files, error) && write_tokens(dir, built, files, error) &&
           write_docs(dir, built, files, error))) {
-        index_files::remove_index_dir(dir);
+        index_location::remove_index_dir(dir);
         return false;
     }
     report(1, "copy_partitions", 1, "partitions", 1);
@@ -926,7 +930,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
 
     report(0, "write_metadata", 1, "files", 0);
     if (!write_metadata(dir, params, files, error)) {
-        index_files::remove_index_dir(dir);
+        index_location::remove_index_dir(dir);
         return false;
     }
     report(1, "write_metadata", 1, "files", 1);
@@ -966,7 +970,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     }
     manifest.indices.push_back(std::move(entry));
     if (!commit_next_version(dataset_path, std::move(manifest), new_version, error)) {
-        index_files::remove_index_dir(dir);
+        index_location::remove_index_dir(dir);
         return false;
     }
     return true;

@@ -37,7 +37,8 @@
 #include "nanolance/work_stats.hpp"
 
 #include "index/index_build.hpp"
-#include "index/index_files.hpp"
+#include "base/uuid.hpp"
+#include "table/index_location.hpp"
 
 #include "lance_minimal.pb.hpp"
 
@@ -2209,7 +2210,7 @@ struct Model {
     Provenance provenance;
 };
 
-std::string random_uuid_text() { return nano_lance::pb::uuid_string(nano_lance::index_files::new_uuid()); }
+std::string random_uuid_text() { return nano_lance::pb::uuid_string(nano_lance::new_uuid()); }
 
 bool parse_uuid(const std::string& text, std::array<uint8_t, 16>& out) {
     std::string hex;
@@ -2426,7 +2427,7 @@ bool load_snapshot(const LanceDataset& dataset, nano_lance::pb::Manifest& manife
 /// The dimension of the float32 vector column `column`.
 bool vector_dim(const nano_lance::pb::Manifest& manifest, const std::string& column, std::size_t& dim) {
     std::vector<std::string> parts;
-    const auto* field = nano_lance::index_files::find_field(manifest, column, parts);
+    const auto* field = nano_lance::index_location::find_field(manifest, column, parts);
     if (field == nullptr) {
         return invalid("column '" + column + "' does not exist");
     }
@@ -2604,7 +2605,7 @@ std::string details_kind(const std::string& url) {
 /// on this column already holds it.
 bool resolve_name(LanceIndexSegmentBuilder& b, const std::string& kind) {
     std::vector<std::string> parts;
-    const auto* field = nano_lance::index_files::find_field(b.manifest, b.column, parts);
+    const auto* field = nano_lance::index_location::find_field(b.manifest, b.column, parts);
     if (field == nullptr) {
         return invalid("column '" + b.column + "' does not exist");
     }

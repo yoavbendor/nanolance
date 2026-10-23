@@ -13,6 +13,8 @@
 #include "index/fts/fts_posting.hpp"
 #include "index/index_build.hpp"
 #include "index/index_files.hpp"
+#include "base/shared_cache.hpp"
+#include "table/index_location.hpp"
 #include "nanolance/expr.hpp"
 #include "nanolance/fts_tokenizer.hpp"
 #include "nanolance/lance_table_reader.hpp"
@@ -778,8 +780,8 @@ std::shared_ptr<const std::vector<float>> Partition::length_norms(float avg) con
     return norms;
 }
 
-index_files::IndexCache<InvertedIndex>& index_cache() {
-    static index_files::IndexCache<InvertedIndex> cache;
+SharedCache<InvertedIndex>& index_cache() {
+    static SharedCache<InvertedIndex> cache;
     return cache;
 }
 
@@ -1322,7 +1324,7 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
     }
     // The column's documents: the text leaf below the struct fields of the top-level column the scan reads.
     std::vector<std::string> parts;
-    if (index_files::find_field(manifest, c.name, parts) == nullptr) {
+    if (index_location::find_field(manifest, c.name, parts) == nullptr) {
         error = "Column " + c.name + " not found in the dataset";
         return false;
     }
@@ -1608,7 +1610,7 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
         it = unindexed.find(key);
         if (it == unindexed.end()) {
             std::vector<std::string> parts;
-            if (index_files::find_field(manifest, column, parts) == nullptr) {
+            if (index_location::find_field(manifest, column, parts) == nullptr) {
                 error = "Column " + column + " not found in the dataset";
                 return false;
             }

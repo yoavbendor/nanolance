@@ -31,7 +31,9 @@
 #include "nanolance/index_search.hpp"
 #include "nanolance/work_stats.hpp"
 
+#include "base/shared_cache.hpp"
 #include "index/index_files.hpp"
+#include "table/index_location.hpp"
 
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/fts_tokenizer.hpp"
@@ -65,7 +67,6 @@ namespace {
 // ── loaded index files ──────────────────────────────────────────────────────────────────────────
 
 using index_files::FileTable;
-using index_files::IndexCache;
 using index_files::file_key;
 using index_files::read_table;
 using index_files::schema_metadata;
@@ -85,7 +86,7 @@ struct BitmapIndex {
 };
 
 bool load_btree(const std::filesystem::path& dir, std::shared_ptr<const BTreeIndex>& out, std::string& error) {
-    static IndexCache<BTreeIndex> cache;
+    static SharedCache<BTreeIndex> cache;
     const auto lookup_path = dir / "page_lookup.lance";
     const auto key = file_key(lookup_path);
     if ((out = cache.find(key)) != nullptr) {
@@ -126,7 +127,7 @@ bool load_btree(const std::filesystem::path& dir, std::shared_ptr<const BTreeInd
 
 bool load_bitmap(const std::filesystem::path& dir, std::shared_ptr<const BitmapIndex>& out, bool& cached,
                  std::string& error) {
-    static IndexCache<BitmapIndex> cache;
+    static SharedCache<BitmapIndex> cache;
     const auto path = dir / "bitmap_page_lookup.lance";
     const auto key = file_key(path);
     if ((out = cache.find(key)) != nullptr) {
@@ -167,7 +168,7 @@ struct ZoneMapIndex {
 };
 
 bool load_zonemap(const std::filesystem::path& dir, std::shared_ptr<const ZoneMapIndex>& out, std::string& error) {
-    static IndexCache<ZoneMapIndex> cache;
+    static SharedCache<ZoneMapIndex> cache;
     const auto path = dir / "zonemap.lance";
     const auto key = file_key(path);
     if ((out = cache.find(key)) != nullptr) {
@@ -614,7 +615,7 @@ bool search_json(const std::filesystem::path& dir, const pb::IndexMetadata& inde
                  RowSet& out, bool& answered, std::string& error) {
     answered = false;
     std::string path;
-    if (!index_files::json_index_path(index.details_value, path)) {
+    if (!index_location::json_index_path(index.details_value, path)) {
         error = "json index: malformed JsonIndexDetails";
         return false;
     }
@@ -687,7 +688,7 @@ struct BloomFilterIndex {
 
 bool load_bloomfilter(const std::filesystem::path& dir, std::shared_ptr<const BloomFilterIndex>& out,
                       std::string& error) {
-    static IndexCache<BloomFilterIndex> cache;
+    static SharedCache<BloomFilterIndex> cache;
     const auto path = dir / "bloomfilter.lance";
     const auto key = file_key(path);
     if ((out = cache.find(key)) != nullptr) {
@@ -905,7 +906,7 @@ struct NGramIndex {
 };
 
 bool load_ngram(const std::filesystem::path& dir, std::shared_ptr<const NGramIndex>& out, std::string& error) {
-    static IndexCache<NGramIndex> cache;
+    static SharedCache<NGramIndex> cache;
     const auto path = dir / "ngram_postings.lance";
     const auto key = file_key(path);
     if ((out = cache.find(key)) != nullptr) {

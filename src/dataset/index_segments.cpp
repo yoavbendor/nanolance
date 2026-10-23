@@ -9,7 +9,7 @@
 #include "nanolance/byte_source.hpp"
 
 #include "index/index_build.hpp"
-#include "index/index_files.hpp"
+#include "table/index_location.hpp"
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/scalar_index.hpp"
@@ -205,7 +205,7 @@ bool dataset_commit_index_segments(const std::filesystem::path& dataset_path, co
         return false;
     }
     std::vector<std::string> parts;
-    const auto* field = index_files::find_field(manifest, column, parts);
+    const auto* field = index_location::find_field(manifest, column, parts);
     if (field == nullptr) {
         return fail(error, kind, SegmentErrorKind::Index, "CreateIndex: column '" + column + "' does not exist");
     }
@@ -673,7 +673,7 @@ bool dataset_build_index_segment(const std::filesystem::path& dataset_path, cons
         return false;
     }
     std::vector<std::string> parts;
-    const auto* field = index_files::find_field(manifest, column, parts);
+    const auto* field = index_location::find_field(manifest, column, parts);
     if (field == nullptr) {
         return fail(error, kind, SegmentErrorKind::Index, "column '" + column + "' does not exist");
     }
@@ -987,7 +987,7 @@ bool infer_index_segment_details(const std::filesystem::path& dataset_path, cons
             return false;
         }
         std::vector<std::string> parts;
-        const auto* field = index_files::find_field(manifest, column, parts);
+        const auto* field = index_location::find_field(manifest, column, parts);
         const bool list = field != nullptr && (field->logical_type.rfind("list", 0) == 0 ||
                                                field->logical_type.rfind("large_list", 0) == 0);
         type_url = list ? "/lance.table.LabelListIndexDetails" : "/lance.table.BitmapIndexDetails";

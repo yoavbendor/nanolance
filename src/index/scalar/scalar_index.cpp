@@ -13,7 +13,11 @@
 #include "nanolance/scalar_index.hpp"
 #include "nanolance/vector_search.hpp"
 
+#include "arrow/arrow_owned.hpp"
+#include "base/bytes.hpp"
+#include "base/uuid.hpp"
 #include "index/index_files.hpp"
+#include "table/index_location.hpp"
 
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/deletion_vector.hpp"
@@ -58,18 +62,16 @@ constexpr std::uint64_t kBTreePageRows = 4096;  // Lance's DEFAULT_BTREE_BATCH_S
 
 // ── Arrow ownership ─────────────────────────────────────────────────────────────────────────────
 
-using index_files::OwnedArray;
-using index_files::OwnedBatches;
-using index_files::OwnedSchema;
-using index_files::OwnedViews;
+using arrow_owned::OwnedArray;
+using arrow_owned::OwnedBatches;
+using arrow_owned::OwnedSchema;
+using arrow_owned::OwnedViews;
 using index_files::WrittenFile;
-using index_files::bytes_of;
-using index_files::find_field;
-using index_files::new_uuid;
-using index_files::struct_batch;
-using index_files::struct_schema;
-using index_files::type_schema;
-using index_files::uint_array;
+using index_location::find_field;
+using arrow_owned::struct_batch;
+using arrow_owned::struct_schema;
+using arrow_owned::type_schema;
+using arrow_owned::uint_array;
 using index_files::write_file;
 
 // ── the values to index ─────────────────────────────────────────────────────────────────────────
@@ -1784,7 +1786,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
 
     const auto uuid = target != nullptr && target->uuid != nullptr ? *target->uuid : new_uuid();
     const auto dir = dataset_path / "_indices" / pb::uuid_string(uuid);
-    if (!index_files::create_index_dir(dir, error)) {
+    if (!index_location::create_index_dir(dir, error)) {
         return false;
     }
     std::vector<WrittenFile> files;
@@ -1838,7 +1840,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         break;
     }
     if (!written) {
-        index_files::remove_index_dir(dir);
+        index_location::remove_index_dir(dir);
         return false;
     }
     if (progress != nullptr) {
@@ -1877,7 +1879,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     }
     manifest.indices.push_back(std::move(entry));
     if (!commit_next_version(dataset_path, std::move(manifest), new_version, error)) {
-        index_files::remove_index_dir(dir);
+        index_location::remove_index_dir(dir);
         return false;
     }
     return true;

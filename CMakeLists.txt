@@ -333,6 +333,9 @@ add_library(nanolance STATIC
     src/index/scalar/bloom_filter.cpp
     src/dataset/index_search.cpp
     src/index/index_files.cpp
+    src/base/uuid.cpp
+    src/arrow/arrow_owned.cpp
+    src/table/index_location.cpp
     src/index/vector/vector_search.cpp
     src/index/vector/vector_index_build.cpp
     src/index/vector/hnsw_build.cpp
