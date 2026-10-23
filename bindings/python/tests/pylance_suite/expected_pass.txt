@@ -273,6 +273,8 @@ tests/test_create_empty_index.py::test_create_empty_vector_index
 tests/test_datagen.py::test_import_error
 tests/test_dataset.py::test_access_config
 tests/test_dataset.py::test_add_null_columns
+tests/test_dataset.py::test_add_null_columns_with_conflict_names
+tests/test_dataset.py::test_all_files
 tests/test_dataset.py::test_analyze_filtered_scan
 tests/test_dataset.py::test_append_with_commit
 tests/test_dataset.py::test_asof_checkout
@@ -414,6 +416,7 @@ tests/test_dataset.py::test_merge_search
 tests/test_dataset.py::test_merge_separate_dataset
 tests/test_dataset.py::test_merge_with_commit
 tests/test_dataset.py::test_merge_with_schema_holes
+tests/test_dataset.py::test_metadata
 tests/test_dataset.py::test_metadata_apis_return_post_image
 tests/test_dataset.py::test_metadata_cache_size
 tests/test_dataset.py::test_migrate_manifest
@@ -447,6 +450,7 @@ tests/test_dataset.py::test_shallow_clone
 tests/test_dataset.py::test_sharded_iterator_batches
 tests/test_dataset.py::test_sharded_iterator_fragments
 tests/test_dataset.py::test_sharded_iterator_non_full_batch
+tests/test_dataset.py::test_slice[stable]
 tests/test_dataset.py::test_stats
 tests/test_dataset.py::test_strict_overwrite
 tests/test_dataset.py::test_system_columns
@@ -472,6 +476,8 @@ tests/test_dataset.py::test_take_with_projection
 tests/test_dataset.py::test_tensor_type
 tests/test_dataset.py::test_tilde_paths
 tests/test_dataset.py::test_to_batches
+tests/test_dataset.py::test_to_batches_with_partial_last_batch
+tests/test_dataset.py::test_tracked_files
 tests/test_dataset.py::test_truncate_table
 tests/test_dataset.py::test_update_by_rowid
 tests/test_dataset.py::test_update_by_rowid_in_list

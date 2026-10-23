@@ -17,7 +17,7 @@ import os
 import re
 import uuid
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, TypedDict, Union
 
@@ -578,6 +578,59 @@ class LanceDataset(pa.dataset.Dataset):
 
     # ── versions ──────────────────────────────────────────────────────────────────────────────────
 
+    def tracked_files(self, progress=None) -> pa.RecordBatchReader:
+        """Every file the dataset's versions reference: each version's manifest, transaction, data and
+        deletion files. Schema: version (int64), base_uri, path (relative to base_uri), type. The order
+        is not defined."""
+        manifest_name = lambda version: f"_versions/{2**64 - 1 - version}.manifest"  # Lance's v2 names
+        txn_dir = os.path.join(self._uri, "_transactions")
+        txns = {}  # the version a transaction file commits: its read version + 1
+        for name in (os.listdir(txn_dir) if os.path.isdir(txn_dir) else []):
+            head = name.split("-", 1)[0]
+            if head.isdigit():
+                txns.setdefault(int(head) + 1, []).append(name)
+        rows = []  # (version, path, type)
+        for entry in self._versions_raw():
+            version = int(entry["version"])
+            with native():
+                info = _nanolance._ds_info(self._uri, version)
+            rows.append((version, manifest_name(version), "manifest"))
+            rows += [(version, f"_transactions/{name}", "transaction file") for name in txns.get(version, [])]
+            for fragment in info["fragments"]:
+                rows += [(version, f"data/{fi['path']}", "data file") for fi in fragment["files"]]
+                if fragment["deletion_file"]:
+                    rows.append((version, fragment["deletion_file"], "deletion file"))
+        schema = pa.schema([pa.field("version", pa.int64()), pa.field("base_uri", _DICT_I32),
+                            pa.field("path", pa.utf8()), pa.field("type", _DICT_I8)])
+        batch = pa.RecordBatch.from_arrays(
+            [pa.array([r[0] for r in rows], pa.int64()), _dictionary([self._uri] * len(rows), pa.int32()),
+             pa.array([r[1] for r in rows], pa.utf8()), _dictionary([r[2] for r in rows], pa.int8())],
+            schema=schema)
+        return pa.RecordBatchReader.from_batches(schema, [batch])
+
+    def all_files(self) -> pa.RecordBatchReader:
+        """Every file physically present under the dataset's root (the primary store only). Schema:
+        base_uri, path (relative to base_uri), size_bytes, last_modified (UTC)."""
+        rows = []
+        for dirpath, _, names in os.walk(self._uri):
+            for name in names:
+                full = os.path.join(dirpath, name)
+                stat = os.stat(full)
+                rows.append((os.path.relpath(full, self._uri).replace(os.sep, "/"), stat.st_size,
+                             datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)))
+        schema = pa.schema([pa.field("base_uri", _DICT_I32), pa.field("path", pa.utf8()),
+                            pa.field("size_bytes", pa.int64()),
+                            pa.field("last_modified", pa.timestamp("us", tz="UTC"))])
+        batch = pa.RecordBatch.from_arrays(
+            [_dictionary([self._uri] * len(rows), pa.int32()), pa.array([r[0] for r in rows], pa.utf8()),
+             pa.array([r[1] for r in rows], pa.int64()),
+             pa.array([r[2] for r in rows], pa.timestamp("us", tz="UTC"))], schema=schema)
+        return pa.RecordBatchReader.from_batches(schema, [batch])
+
+    def _versions_raw(self) -> List[dict]:
+        with native():
+            return _nanolance._ds_versions(self._uri)
+
     def versions(self) -> List[Version]:
         with native():
             raw = _nanolance._ds_versions(self._uri)
@@ -872,12 +925,15 @@ class LanceDataset(pa.dataset.Dataset):
                    *, prefilter=None, with_row_id=None, with_row_address=None, use_stats=None, full_text_query=None,
                    io_buffer_size=None, late_materialization=None, use_scalar_index=None,
                    strict_batch_size=None, order_by=None, **kwargs) -> Iterator[pa.RecordBatch]:
-        return self.scanner(
+        scanner = self.scanner(
             columns=columns, filter=filter, limit=limit, offset=offset, nearest=nearest, batch_size=batch_size,
             batch_size_bytes=batch_size_bytes,
             full_text_query=full_text_query, with_row_id=with_row_id, with_row_address=with_row_address,
             order_by=order_by, use_scalar_index=use_scalar_index, prefilter=prefilter, **kwargs,
-        ).to_batches()
+        )
+        if strict_batch_size and batch_size:  # every batch of the size asked, the last one shorter
+            return scanner._rebatch(scanner.to_table(), strict=True)
+        return scanner.to_batches()
 
     def to_pandas(self, columns=None, filter=None, limit=None, offset=None, nearest=None, batch_size=None,
                   batch_readahead=None, fragment_readahead=None, scan_in_order=None, *, prefilter=None,
@@ -898,6 +954,10 @@ class LanceDataset(pa.dataset.Dataset):
         return self.to_table(limit=num_rows, **kwargs)
 
     def slice(self, start: int, end: int, columns=None) -> pa.Table:
+        if start < 0:
+            raise ValueError(f"start must be non-negative, got {start}")
+        if end < start:
+            raise ValueError(f"end ({end}) must be >= start ({start})")
         n = self.count_rows()
         start, end, _ = slice(start, end).indices(n)
         return self.to_table(columns=columns, offset=start, limit=max(end - start, 0))
@@ -1163,12 +1223,14 @@ class LanceDataset(pa.dataset.Dataset):
         Schema), or data (a table / reader with one row per row of the dataset)."""
         if isinstance(transforms, dict):
             columns = [(str(k), str(v)) for k, v in transforms.items()]
+            self._check_new_columns([(name, None) for name, _ in columns])
             with native():
                 _nanolance._ds_add_columns_sql(self._uri, columns, self._version)
         elif isinstance(transforms, (pa.Field, pa.Schema)) or (
             isinstance(transforms, list) and transforms and all(isinstance(f, pa.Field) for f in transforms)
         ):
             fields = [transforms] if isinstance(transforms, pa.Field) else list(transforms)
+            self._check_new_columns([(f.name, f.type) for f in fields])
             with native():
                 _nanolance._ds_add_columns_nulls(self._uri, pa.schema(fields), self._version)
         elif callable(transforms):
@@ -1176,9 +1238,23 @@ class LanceDataset(pa.dataset.Dataset):
             return
         else:
             reader = _coerce_reader(transforms, reader_schema)
+            self._check_new_columns([(f.name, f.type) for f in reader.schema])
             with native():
                 _nanolance._ds_add_columns_stream(self._uri, reader, self._version)
         self._refresh_latest("Merge")
+
+    def _check_new_columns(self, columns) -> None:
+        """Refuses new columns named as a column of the dataset, as pylance does: the same type is
+        "already exists", another type a conflict. ``columns`` is (name, type), the type None for a SQL
+        expression, whose type is not known yet."""
+        existing = {f.name: f.type for f in self._data_schema}
+        for name, new_type in columns:
+            if name not in existing:
+                continue
+            if new_type is None or new_type == existing[name]:
+                raise OSError(f"Invalid user input: Column {name} already exists in the dataset")
+            raise OSError(f"Invalid user input: Type conflicts between {name}({_arrow_display(existing[name])}) "
+                          f"and {name}({_arrow_display(new_type)})")
 
     def _add_columns_udf(self, transforms, read_columns, batch_size) -> None:
         """New columns computed by a function of each batch: a new data file per fragment, then one
@@ -2334,7 +2410,7 @@ class LanceDataset(pa.dataset.Dataset):
         path = _path_of(base_uri)
         if detached:
             if _exists(path) and not _uses_v2_manifest_paths(path):
-                raise OSError("Invalid user input: Detached commits cannot be used with v1 manifest paths")
+                raise OSError("Not supported: detached commits cannot be used with v1 manifest paths")
             if read_version is None or not _exists(path):
                 raise OSError("Invalid user input: a detached commit needs a dataset and a read version")
             field, message = encode_operation(operation)
@@ -4539,11 +4615,13 @@ class LanceScanner(pa.dataset.Scanner):
         table = self.to_table()
         return pa.RecordBatchReader.from_batches(table.schema, self._rebatch(table))
 
-    def _rebatch(self, table: pa.Table) -> Iterator[pa.RecordBatch]:
+    def _rebatch(self, table: pa.Table, strict: bool = False) -> Iterator[pa.RecordBatch]:
         size = self._batch_size or os.environ.get("LANCE_DEFAULT_BATCH_SIZE")
         if not size and self._batch_size_bytes and table.num_rows:
             # About that many bytes a batch, by the rows' average in-memory size.
             size = max(1, self._batch_size_bytes * table.num_rows // max(table.nbytes, 1))
+        if size and strict:  # batches of exactly `size` rows: one chunk per column, so no batch stops at one
+            return iter(table.combine_chunks().to_batches(max_chunksize=int(size)))
         if size:
             return iter(table.to_batches(max_chunksize=int(size)))
         return iter(table.to_batches())
@@ -4828,6 +4906,29 @@ def _json_out(table: pa.Table) -> pa.Table:
     return pa.Table.from_arrays(columns, schema=_json_out_schema(table.schema))
 
 
+_ARROW_DISPLAY = {"int8": "Int8", "int16": "Int16", "int32": "Int32", "int64": "Int64", "uint8": "UInt8",
+                  "uint16": "UInt16", "uint32": "UInt32", "uint64": "UInt64", "halffloat": "Float16",
+                  "float": "Float32", "double": "Float64", "string": "Utf8", "large_string": "LargeUtf8",
+                  "bool": "Boolean", "binary": "Binary", "large_binary": "LargeBinary"}
+
+
+def _arrow_display(tp: pa.DataType) -> str:
+    """An Arrow type as pylance's errors name it (Int64, Float32, Utf8, ...)."""
+    return _ARROW_DISPLAY.get(str(tp), str(tp))
+
+
+_DICT_I32 = pa.dictionary(pa.int32(), pa.utf8())
+_DICT_I8 = pa.dictionary(pa.int8(), pa.utf8())
+
+
+def _dictionary(values: List[str], index_type: pa.DataType) -> pa.DictionaryArray:
+    """A dictionary-encoded string column of `values`, with indices of `index_type`."""
+    uniques = list(dict.fromkeys(values))
+    where = {v: i for i, v in enumerate(uniques)}
+    return pa.DictionaryArray.from_arrays(pa.array([where[v] for v in values], index_type),
+                                          pa.array(uniques, pa.utf8()))
+
+
 def _coerce_reader(data_obj: ReaderLike, schema: Optional[pa.Schema] = None) -> pa.RecordBatchReader:
     """Any of the inputs pylance's write_dataset takes, as a RecordBatchReader, with JSON columns
     (arrow.json) as the JSONB Lance stores (lance.json)."""
@@ -5009,6 +5110,12 @@ def write_dataset(
         if initial_bases or target_bases or target_all_bases:
             raise unsupported("base paths on object stores")
     reader = _coerce_reader(data_obj, schema)
+    for key, value in (reader.schema.metadata or {}).items():
+        try:
+            value.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError(f"Metadata key {key!r} is not valid utf8. "
+                             "Consider base64 encode for generic binary metadata.") from None
     exists = _exists(path)
     in_memory = not isinstance(uri, LanceDataset) and os.fspath(uri).startswith("memory://")
     if mode == "create" and exists and in_memory:
