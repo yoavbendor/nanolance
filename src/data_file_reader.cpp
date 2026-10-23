@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/data_file_reader.hpp"
+#include "nanolance/byte_sink.hpp"
 #include "nanolance/byte_source.hpp"
 #include "nanolance/work_stats.hpp"
 
@@ -216,6 +217,11 @@ void close_data_files_under(const std::string& path_or_prefix) {
         });
     }
 }
+
+namespace {
+// remove_output (in the library below this one) closes the handles of what it removes through this hook.
+[[maybe_unused]] const bool g_output_removed_hook_set = (io::set_output_removed_hook(&close_data_files_under), true);
+}  // namespace
 
 DataFileReadScope::DataFileReadScope() : saved_(g_read_epoch) { g_read_epoch = g_next_read_epoch++; }
 

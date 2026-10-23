@@ -2,7 +2,6 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/byte_sink.hpp"
-#include "nanolance/data_file_reader.hpp"
 
 #include <atomic>
 #include <filesystem>
@@ -159,6 +158,14 @@ bool put_if_absent(const std::string& path_or_uri, const std::vector<std::uint8_
     return true;
 }
 
+namespace {
+std::atomic<void (*)(const std::string&)> g_output_removed_hook{nullptr};
+}  // namespace
+
+void set_output_removed_hook(void (*hook)(const std::string& path)) {
+    g_output_removed_hook.store(hook, std::memory_order_release);
+}
+
 bool remove_output(const std::string& path_or_uri, std::string& error) {
     error.clear();
     SinkBackend backend;
@@ -167,7 +174,9 @@ bool remove_output(const std::string& path_or_uri, std::string& error) {
     }
     std::error_code ec;
     std::filesystem::remove(path_or_uri, ec);
-    close_data_files_under(path_or_uri);
+    if (const auto hook = g_output_removed_hook.load(std::memory_order_acquire)) {
+        hook(path_or_uri);
+    }
     if (ec) {
         error = "failed to remove " + path_or_uri + ": " + ec.message();
         return false;
