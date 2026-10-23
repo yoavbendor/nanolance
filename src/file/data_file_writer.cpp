@@ -3,6 +3,8 @@
 
 #include "nanolance/byte_sink.hpp"
 #include "nanolance/data_file_writer.hpp"
+
+#include "encoding/values/bitpack.hpp"
 #include "nanolance/parallel.hpp"
 #include "nanolance/work_stats.hpp"
 
@@ -804,61 +806,6 @@ std::vector<std::uint8_t> page_layout_bytes_inline_bitpacking(std::uint8_t uncom
     return descriptor::page_encoding(m);
 }
 
-// Bit width (0..bits) needed to represent the largest of `count` little-endian values of `width_bytes`.
-unsigned chunk_bit_width(const std::uint8_t* src, std::size_t count, std::size_t width_bytes) {
-    std::uint64_t max_value = 0;
-    for (std::size_t i = 0; i < count; ++i) {
-        std::uint64_t v = 0;
-        std::memcpy(&v, src + i * width_bytes, width_bytes);
-        max_value |= v;
-    }
-    unsigned bits = 0;
-    while (max_value != 0U) {
-        ++bits;
-        max_value >>= 1U;
-    }
-    return bits;
-}
-
-// Build one bitpacked chunk buffer: [bit_width as one width_bytes word][FastLanes packed 1024 values],
-// into `out`. `count` (<=1024) values are read from `src`; the rest of the 1024-block is zero-padded.
-// Every byte of `out` is unconditionally overwritten, so callers reusing `out` across chunks pay no
-// per-chunk allocation or zero-fill. Staging into `in` is one bulk memcpy (src is contiguous typed
-// data), zeroing only the tail of the final partial chunk instead of the whole 1024-block every call.
-template <class T>
-void build_bitpacked_chunk_typed(const std::uint8_t* src, std::size_t count, std::vector<std::uint8_t>& out) {
-    T in[1024];
-    std::memcpy(in, src, count * sizeof(T));
-    if (count < 1024U) {
-        std::memset(in + count, 0, (1024U - count) * sizeof(T));
-    }
-    unsigned width = chunk_bit_width(src, count, sizeof(T));
-    // thread_local + resize (not a fresh zero-filled vector per chunk): bounded by <=1024 words, fully
-    // overwritten by pack_1024 below -- same reuse precedent as unpack_bitpacked_page on the read side.
-    thread_local std::vector<T> packed;
-    packed.resize(::nanom::columnar::fastlanes::packed_words_1024<T>(width));
-    ::nanom::columnar::fastlanes::pack_1024_unchecked<T>(width, in, packed.data());
-    out.resize(sizeof(T) * (1U + packed.size()));
-    const T width_word = static_cast<T>(width);
-    std::memcpy(out.data(), &width_word, sizeof(T));
-    if (!packed.empty()) {
-        std::memcpy(out.data() + sizeof(T), packed.data(), packed.size() * sizeof(T));
-    }
-}
-
-void build_bitpacked_chunk(const std::uint8_t* src, std::size_t count, std::size_t width_bytes,
-                           std::vector<std::uint8_t>& out) {
-    switch (width_bytes) {
-        case 1U:
-            return build_bitpacked_chunk_typed<std::uint8_t>(src, count, out);
-        case 2U:
-            return build_bitpacked_chunk_typed<std::uint16_t>(src, count, out);
-        case 4U:
-            return build_bitpacked_chunk_typed<std::uint32_t>(src, count, out);
-        default:
-            return build_bitpacked_chunk_typed<std::uint64_t>(src, count, out);
-    }
-}
 
 // Frame a raw buffer as Lance's general-compression payload: [u64 LE uncompressed size][zstd frame].
 bool zstd_frame_buffer(const std::vector<std::uint8_t>& raw, int level, std::vector<std::uint8_t>& out,
@@ -1244,7 +1191,7 @@ bool gather_chunk_values(const LanceField& field, const ColumnValues& values, It
     }
     if (encoding == ItemEncoding::kBitpacked) {
         thread_local std::vector<std::uint8_t> packed;
-        build_bitpacked_chunk(chunk, count, width, packed);
+        bitpack::encode_block(chunk, count, width, packed);
         out.insert(out.end(), packed.begin(), packed.end());
         return true;
     }
@@ -1723,7 +1670,7 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
         }
         if (dictionary) {
             // The chunk holds its items' dictionary indices, bit-packed like any u32 column.
-            build_bitpacked_chunk(reinterpret_cast<const std::uint8_t*>(indices.data() + item_at), values_here, 4U,
+            bitpack::encode_block(reinterpret_cast<const std::uint8_t*>(indices.data() + item_at), values_here, 4U,
                                   value_bytes);
         }
         // Chunk: [u16 levels][u16 rep bytes][u16 def bytes][u32 value bytes] padded to 8, then each
@@ -2777,7 +2724,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 const auto count = std::min<std::size_t>(1024U, indices.size() - off);
                 MiniblockChunk chunk;
                 chunk.value_count = count;
-                build_bitpacked_chunk(reinterpret_cast<const std::uint8_t*>(indices.data() + off), count, 4U,
+                bitpack::encode_block(reinterpret_cast<const std::uint8_t*>(indices.data() + off), count, 4U,
                                       chunk.bytes);
                 index_chunks.push_back(std::move(chunk));
             }
@@ -2937,7 +2884,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 const auto count = std::min(step, total - off);
                 if (bitpack) {
                     // Each chunk buffer = [bit_width][FastLanes packed 1024 values].
-                    build_bitpacked_chunk(values.fixed_data() + off * fixed_bytes_per_value, count,
+                    bitpack::encode_block(values.fixed_data() + off * fixed_bytes_per_value, count,
                                           fixed_bytes_per_value, scratch);
                 } else if (bool_pack) {
                     // Bit-pack LSB-first, ceil(count/8) bytes; no zstd on top (stock Lance doesn't

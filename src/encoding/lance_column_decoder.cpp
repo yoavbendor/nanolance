@@ -10,6 +10,7 @@
 
 #include "nanolance/blob_v2_layout.hpp"
 #include "nanolance/bool_bitpack.hpp"
+#include "encoding/values/bitpack.hpp"
 #include "nanolance/column_slice.hpp"
 #include <nanom/fastlanes.hpp>
 #include "nanolance/fsst.hpp"
@@ -721,237 +722,10 @@ bool decode_variable_width_page(const std::vector<std::uint8_t>& chunk_bytes, co
     return true;
 }
 
-// Decode one bitpacked page chunk ([bit_width word][FastLanes packed 1024]) into `num_values`
-// little-endian fixed-width values appended to out_fixed.
-template <class T>
-bool unpack_bitpacked_page(const std::vector<std::uint8_t>& chunk, std::uint64_t num_values,
-                           std::vector<std::uint8_t>& out_fixed, std::string& error) {
-    if (chunk.size() < sizeof(T)) {
-        error = "bitpacked chunk shorter than width header";
-        return false;
-    }
-    T width_word = 0;
-    std::memcpy(&width_word, chunk.data(), sizeof(T));
-    const unsigned width = static_cast<unsigned>(width_word);
-    if (width > sizeof(T) * 8U) {
-        error = "bitpacked chunk has invalid bit width";
-        return false;
-    }
-    const auto packed_words = ::nanom::columnar::fastlanes::packed_words_1024<T>(width);
-    if (chunk.size() != sizeof(T) * (1U + packed_words)) {
-        error = "bitpacked chunk size does not match bit width";
-        return false;
-    }
-    // thread_local + resize (not a fresh (packed_words, 0)-initialized vector every call): packed_words is
-    // bounded by <=1024 (one FastLanes block), so this reused buffer's capacity converges after the first
-    // max-sized call, and resize() only zero-inits a growing delta rather than the whole buffer every time
-    // — the memcpy right below unconditionally overwrites all packed_words elements regardless.
-    thread_local std::vector<T> packed;
-    packed.resize(packed_words);
-    if (packed_words != 0U) {
-        std::memcpy(packed.data(), chunk.data() + sizeof(T), packed_words * sizeof(T));
-    }
-    // A FastLanes chunk unpacks into exactly 1024 values. `num_values` is attacker-controlled (it comes
-    // from page.length on the untrusted read path), so it MUST NOT exceed the block size — otherwise the
-    // copy below over-reads the `values` stack buffer. The last chunk legitimately emits fewer.
-    if (num_values > 1024U) {
-        error = "bitpacked chunk value count exceeds FastLanes block size";
-        return false;
-    }
-    T values[1024];
-    ::nanom::columnar::fastlanes::unpack_1024_unchecked<T>(width, packed.data(), values);
-    const auto bytes = static_cast<std::size_t>(num_values) * sizeof(T);
-    const auto* p = reinterpret_cast<const std::uint8_t*>(values);
-    out_fixed.insert(out_fixed.end(), p, p + bytes);
-    return true;
-}
-
-bool unpack_bitpacked_page_dispatch(const std::vector<std::uint8_t>& chunk, std::uint64_t num_values,
-                                    std::size_t bytes_per_value, std::vector<std::uint8_t>& out_fixed,
-                                    std::string& error) {
-    switch (bytes_per_value) {
-        case 1U:
-            return unpack_bitpacked_page<std::uint8_t>(chunk, num_values, out_fixed, error);
-        case 2U:
-            return unpack_bitpacked_page<std::uint16_t>(chunk, num_values, out_fixed, error);
-        case 4U:
-            return unpack_bitpacked_page<std::uint32_t>(chunk, num_values, out_fixed, error);
-        default:
-            return unpack_bitpacked_page<std::uint64_t>(chunk, num_values, out_fixed, error);
-    }
-}
 
 
 
-/// Unpack a buffer that is a SERIES of inline-bitpacked FastLanes blocks into `count` values.
-///
-/// `unpack_bitpacked_page` above decodes exactly one block, because that is what a miniblock chunk
-/// carries -- the chunk splitter has already cut the buffer up. A dictionary buffer has no such
-/// splitter: it is one buffer holding however many blocks its entries need, each with its own bit
-/// width word, so the blocks have to be walked. Widths differ per block, so the block size cannot be
-/// computed up front; the position advances as each header is read.
-template <class T>
-[[nodiscard]] bool unpack_inline_bitpacked_series(const std::vector<std::uint8_t>& buffer, std::size_t count,
-                                                  std::vector<std::uint8_t>& out, std::string& error) {
-    out.clear();
-    // `count` is the descriptor's; the buffer is what exists. Every block costs at least its width
-    // word and yields at most 1024 values, so reserve no more than the buffer could produce -- a
-    // reserve of the declared count alone asked for 4 GiB from a small page (fuzz_column_decode).
-    const std::size_t producible = (buffer.size() / sizeof(T)) * 1024U;
-    out.reserve(std::min(count, producible) * sizeof(T));
-    thread_local std::vector<T> packed;
-    T values[1024];
-    std::size_t at = 0;
-    std::size_t done = 0;
-    while (done < count) {
-        if (buffer.size() - at < sizeof(T)) {
-            error = "inline-bitpacked dictionary ends before its " + std::to_string(count) + " entries do";
-            return false;
-        }
-        T width_word = 0;
-        std::memcpy(&width_word, buffer.data() + at, sizeof(T));
-        at += sizeof(T);
-        const auto width = static_cast<unsigned>(width_word);
-        if (width > sizeof(T) * 8U) {
-            error = "inline-bitpacked dictionary block has invalid bit width " + std::to_string(width);
-            return false;
-        }
-        const auto packed_words = ::nanom::columnar::fastlanes::packed_words_1024<T>(width);
-        const std::size_t block_bytes = packed_words * sizeof(T);
-        if (buffer.size() - at < block_bytes) {
-            error = "inline-bitpacked dictionary block is truncated";
-            return false;
-        }
-        packed.resize(packed_words != 0U ? packed_words : 1U);
-        if (packed_words != 0U) {
-            std::memcpy(packed.data(), buffer.data() + at, block_bytes);
-        }
-        at += block_bytes;
-        ::nanom::columnar::fastlanes::unpack_1024_unchecked<T>(width, packed.data(), values);
-        // A block always holds 1024 values; the last one is only partly used.
-        const std::size_t take = std::min<std::size_t>(1024U, count - done);
-        const auto* p = reinterpret_cast<const std::uint8_t*>(values);
-        out.insert(out.end(), p, p + take * sizeof(T));
-        done += take;
-    }
-    return true;
-}
 
-/// Unpack an OUT-OF-LINE bitpacked buffer: `count` values of `T` packed at `width` bits, with the
-/// width taken from the DESCRIPTOR (`Bitpacked{uncompressed_bits, Flat(width)}`) rather than from a
-/// word at the head of each block. Writes exactly `count` values to `dest`.
-///
-/// The buffer is a run of whole FastLanes blocks followed by a tail, and the tail has two legal
-/// spellings: packed-and-padded, or raw `T` words. Lance's `unpack_out_of_line`
-/// (`rust/lance-encoding/src/encodings/physical/bitpacking.rs`) tells them apart by the buffer's
-/// total LENGTH -- the encoder pads only when padding costs fewer bits than packing saves -- and this
-/// mirrors that arithmetic exactly rather than approximating it:
-///
-///     whole_blocks = count / 1024              tail = count % 1024
-///     raw  <=>  words == whole_blocks * packed_words + tail
-///
-/// `what` names the buffer in any error, since both definition levels and dictionaries come here.
-template <class T>
-[[nodiscard]] bool unpack_out_of_line_bitpacked(const std::vector<std::uint8_t>& buffer, std::size_t count,
-                                                unsigned width, T* dest, const char* what, std::string& error) {
-    // Width 0 is legal, not a malformed descriptor: it is how an all-zero buffer packs, and Lance
-    // has no guard against producing it. `unpack_1024` emits zeros for it and the size arithmetic
-    // below stays well defined (`packed_words` is 0), so refusing it would reject a file Lance can
-    // write. Only a width wider than the element itself is nonsense.
-    if (width > sizeof(T) * 8U) {
-        error = std::string(what) + " declares an unsupported width of " + std::to_string(width) + " bits";
-        return false;
-    }
-    if (buffer.size() % sizeof(T) != 0U) {
-        error = std::string(what) + " is not a whole number of " + std::to_string(sizeof(T) * 8U) + "-bit words";
-        return false;
-    }
-    const auto packed_words = ::nanom::columnar::fastlanes::packed_words_1024<T>(width);
-    const auto words = buffer.size() / sizeof(T);
-    const std::size_t whole_blocks = count / 1024U;
-    const std::size_t tail = count % 1024U;
-    const std::size_t full_words = whole_blocks * packed_words;
-    const bool tail_is_raw = tail != 0U && words == full_words + tail;
-    const std::size_t expected_words =
-        tail_is_raw ? full_words + tail : full_words + (tail != 0U ? packed_words : 0U);
-    if (words != expected_words) {
-        error = std::string(what) + " is " + std::to_string(buffer.size()) + " bytes, expected " +
-                std::to_string(expected_words * sizeof(T)) + " for " + std::to_string(count) +
-                " values at " + std::to_string(width) + " bits";
-        return false;
-    }
-
-    thread_local std::vector<T> packed;
-    packed.resize(packed_words != 0U ? packed_words : 1U);
-    T block[1024];
-    std::size_t word_at = 0;
-    // At width 0 there are no packed words and the buffer may be empty, with a null data(): memcpy
-    // from null is undefined even for zero bytes, so the copies are skipped rather than made empty.
-    for (std::size_t b = 0; b < whole_blocks; ++b) {
-        if (packed_words != 0U) {
-            std::memcpy(packed.data(), buffer.data() + word_at * sizeof(T), packed_words * sizeof(T));
-        }
-        ::nanom::columnar::fastlanes::unpack_1024_unchecked<T>(width, packed.data(), block);
-        std::memcpy(dest + b * 1024U, block, 1024U * sizeof(T));
-        word_at += packed_words;
-    }
-    if (tail != 0U) {
-        if (tail_is_raw) {
-            std::memcpy(dest + whole_blocks * 1024U, buffer.data() + word_at * sizeof(T), tail * sizeof(T));
-        } else {
-            if (packed_words != 0U) {
-                std::memcpy(packed.data(), buffer.data() + word_at * sizeof(T), packed_words * sizeof(T));
-            }
-            ::nanom::columnar::fastlanes::unpack_1024_unchecked<T>(width, packed.data(), block);
-            std::memcpy(dest + whole_blocks * 1024U, block, tail * sizeof(T));
-        }
-    }
-    return true;
-}
-
-[[nodiscard]] bool unpack_out_of_line_bitpacked_dispatch(const std::vector<std::uint8_t>& buffer,
-                                                         std::size_t count, unsigned width,
-                                                         std::size_t bytes_per_value, std::uint8_t* dest,
-                                                         const char* what, std::string& error) {
-    switch (bytes_per_value) {
-        case 1U:
-            return unpack_out_of_line_bitpacked<std::uint8_t>(buffer, count, width, dest, what, error);
-        case 2U:
-            return unpack_out_of_line_bitpacked<std::uint16_t>(buffer, count, width,
-                                                               reinterpret_cast<std::uint16_t*>(dest), what, error);
-        case 4U:
-            return unpack_out_of_line_bitpacked<std::uint32_t>(buffer, count, width,
-                                                               reinterpret_cast<std::uint32_t*>(dest), what, error);
-        case 8U:
-            return unpack_out_of_line_bitpacked<std::uint64_t>(buffer, count, width,
-                                                               reinterpret_cast<std::uint64_t*>(dest), what, error);
-        default:
-            error = std::string(what) + " has " + std::to_string(bytes_per_value) +
-                    "-byte values, which has no FastLanes kernel";
-            return false;
-    }
-}
-
-[[nodiscard]] bool unpack_inline_bitpacked_series_dispatch(const std::vector<std::uint8_t>& buffer,
-                                                           std::size_t count, std::size_t bytes_per_value,
-                                                           std::vector<std::uint8_t>& out, std::string& error) {
-    switch (bytes_per_value) {
-        case 1U:
-            return unpack_inline_bitpacked_series<std::uint8_t>(buffer, count, out, error);
-        case 2U:
-            return unpack_inline_bitpacked_series<std::uint16_t>(buffer, count, out, error);
-        case 4U:
-            return unpack_inline_bitpacked_series<std::uint32_t>(buffer, count, out, error);
-        case 8U:
-            return unpack_inline_bitpacked_series<std::uint64_t>(buffer, count, out, error);
-        default:
-            // FastLanes kernels exist for 8/16/32/64-bit lanes only. A 16-byte decimal is never
-            // inline-bitpacked by Lance for exactly that reason; refuse by width rather than guess.
-            error = "inline-bitpacked dictionary entries are " + std::to_string(bytes_per_value) +
-                    " bytes, which has no FastLanes kernel";
-            return false;
-    }
-}
 
 /// Inverse of the writer's encode_scalar_variable_value: a Lance scalar value buffer holding a
 /// length-1 array, laid out as [u32 num_buffers][u32 buffer_len ...][buffers]. For utf8/binary that
@@ -1181,7 +955,7 @@ bool zero_width_levels(const page_layout::Compressive& encoding) {
         }
         thread_local std::vector<std::uint8_t> unpacked;
         unpacked.clear();
-        if (!unpack_bitpacked_page<std::uint16_t>(bytes, count, unpacked, error)) {
+        if (!bitpack::decode_block(bytes, count, 2U, unpacked, error)) {
             return false;
         }
         std::memcpy(levels, unpacked.data(), unpacked.size());
@@ -1204,12 +978,12 @@ bool zero_width_levels(const page_layout::Compressive& encoding) {
         error = "unsupported level encoding: " + page_layout::describe_encoding(encoding);
         return false;
     }
-    // `unpack_out_of_line_bitpacked` rejects a width of 0 or one wider than the element, so there is
+    // `bitpack::decode_out_of_line` rejects a width of 0 or one wider than the element, so there is
     // no second bound to keep in step here. Two cases this has to keep getting right: a 20000-row
     // nullable binary column from pylance ends in a 32-value chunk whose 64-byte level buffer is raw,
     // and a 1025-row bool column is one whole packed block (128 bytes) plus a single raw u16.
-    return unpack_out_of_line_bitpacked<std::uint16_t>(bytes, count, encoding.values->bits_per_value, levels,
-                                                       "level buffer", error);
+    return bitpack::decode_out_of_line(bytes, count, encoding.values->bits_per_value, 2U,
+                                       reinterpret_cast<std::uint8_t*>(levels), "level buffer", error);
 }
 
 /// Decode one chunk's definition-level buffer, appending one bit per row to `out_validity` (an
@@ -1430,7 +1204,7 @@ struct DictionaryBlock {
         }
         if (plan.dict_out_of_line_bitpacked) {
             std::vector<std::uint8_t> unpacked(static_cast<std::size_t>(needed));
-            if (!unpack_out_of_line_bitpacked_dispatch(out.bytes, out.count, plan.dict_packed_width,
+            if (!bitpack::decode_out_of_line(out.bytes, out.count, plan.dict_packed_width,
                                                        out.value_bytes, unpacked.data(), "dictionary block",
                                                        error)) {
                 return false;
@@ -1441,10 +1215,10 @@ struct DictionaryBlock {
         if (plan.dict_inline_bitpacked) {
             // The count is what bounds the walk, and the buffer is what bounds the count: a series of
             // packed blocks is far smaller than the values it yields, so the size check below cannot
-            // be applied to the stored bytes. `unpack_inline_bitpacked_series` refuses a count the
+            // be applied to the stored bytes. `bitpack::decode_series` refuses a count the
             // buffer cannot actually supply, which is the same guarantee from the other direction.
             std::vector<std::uint8_t> unpacked;
-            if (!unpack_inline_bitpacked_series_dispatch(out.bytes, out.count, out.value_bytes, unpacked, error)) {
+            if (!bitpack::decode_series(out.bytes, out.count, out.value_bytes, unpacked, error)) {
                 return false;
             }
             out.bytes = std::move(unpacked);
@@ -3027,7 +2801,7 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
                     // then widened to the u32 the expansion below reads.
                     const std::size_t iw = encoding_plan.dict_index_bits / 8U;
                     std::vector<std::uint8_t> narrow;
-                    if (!unpack_bitpacked_page_dispatch(chunk.values, count, iw, narrow, error)) {
+                    if (!bitpack::decode_block(chunk.values, count, iw, narrow, error)) {
                         return false;
                     }
                     const auto base = indices_bytes.size();
@@ -3042,7 +2816,7 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
                         const auto index32 = static_cast<std::uint32_t>(index);
                         std::memcpy(indices_bytes.data() + base + i * 4U, &index32, 4U);
                     }
-                } else if (!unpack_bitpacked_page_dispatch(chunk.values, count, 4U, indices_bytes, error)) {
+                } else if (!bitpack::decode_block(chunk.values, count, 4U, indices_bytes, error)) {
                     return false;
                 }
                 rows_remaining -= count;
@@ -3583,7 +3357,7 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
         internal_type = "utf8";
     }
     const auto bytes_per_value = lance_logical_type_value_bytes(internal_type);
-    // Reserve the whole column upfront: unpack_bitpacked_page() (and the plain-copy branch below) grow
+    // Reserve the whole column upfront: bitpack::decode_block() (and the plain-copy branch below) grow
     // out.fixed one FastLanes chunk (<=1024 values) at a time via insert(), so without this a column of
     // many chunks reallocates and re-copies everything already written on almost every chunk.
     std::uint64_t reserve_bytes = 0;
@@ -3706,7 +3480,7 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
                 validity_rows = end;
             }
             if (bitpacked) {
-                if (!unpack_bitpacked_page_dispatch(chunk.values, chunk_values, bytes_per_value, out.fixed,
+                if (!bitpack::decode_block(chunk.values, chunk_values, bytes_per_value, out.fixed,
                                                     error)) {
                     return false;
                 }
