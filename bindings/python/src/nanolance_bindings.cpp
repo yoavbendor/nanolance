@@ -15,6 +15,7 @@
 #include <nanolance/mem_wal.hpp>
 #include <nanolance/expr.hpp>
 #include <nanolance/jsonb.hpp>
+#include <nanolance/frag_reuse.hpp>
 #include <nanolance/fts_search.hpp>
 #include <nanolance/fts_tokenizer.hpp>
 #include <nanolance/index_optimize.hpp>
@@ -2294,6 +2295,34 @@ NB_MODULE(_nanolance, m) {
             return nano_lance::dataset_explain_filter(path, version.has_value(), version.value_or(0), filter, lines, e);
         });
         return lines;
+    });
+    m.def("_ds_remap_row_addrs", [](const std::filesystem::path& path, std::optional<std::uint64_t> version,
+                                    const std::vector<std::uint64_t>& addresses) -> nb::object {
+        // Each address through the fragment-reuse index: its address now, or None for a row a compaction
+        // dropped. None for the whole call when the dataset has no fragment-reuse index.
+        std::shared_ptr<const nano_lance::FragReuse> reuse;
+        run_op([&](std::string& e) {
+            nano_lance::pb::Manifest manifest;
+            std::uint64_t at = 0;
+            if (version.has_value() ? !nano_lance::load_manifest_version(path, *version, manifest, e)
+                                    : !nano_lance::load_latest_manifest(path, manifest, at, e)) {
+                return false;
+            }
+            return nano_lance::FragReuse::load(path, manifest, reuse, e);
+        });
+        if (reuse == nullptr) {
+            return nb::none();
+        }
+        nb::list out;
+        for (const auto address : addresses) {
+            std::uint64_t now = 0;
+            if (reuse->resolve(address, now)) {
+                out.append(now);
+            } else {
+                out.append(nb::none());
+            }
+        }
+        return out;
     });
     m.def("_ds_count_from_index", [](const std::filesystem::path& path, std::optional<std::uint64_t> version,
                                      const std::string& filter) {

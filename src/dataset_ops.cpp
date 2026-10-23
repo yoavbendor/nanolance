@@ -2255,6 +2255,7 @@ bool dataset_compact_commit(const std::filesystem::path& dataset_path, const Com
         manifest.writer_feature_flags &= ~pb::kFlagDeletionFiles;
     }
     std::vector<std::string> affected;
+    std::map<std::string, std::set<std::uint64_t>> take_back_by_index;
     if (options.defer_index_remap) {
         // Lance's deferred remap, in the rewrite's own version: the groups (surviving row addresses and digests)
         // go into the fragment reuse index, and each index's coverage moves to the new fragments as the reader
@@ -2331,9 +2332,29 @@ bool dataset_compact_commit(const std::filesystem::path& dataset_path, const Com
             const bool touched = std::any_of(index.fragment_ids.begin(), index.fragment_ids.end(), [&](std::uint32_t id) {
                 return std::find(rewritten_ids.begin(), rewritten_ids.end(), id) != rewritten_ids.end();
             });
-            if (touched && !is_system_index(index) &&
+            // Lance does not remap a zone map: the rewritten fragments leave it until optimize_indices.
+            const bool zone_map = index.details_type_url.find("ZoneMap") != std::string::npos;
+            if (touched && !is_system_index(index) && !zone_map &&
                 std::find(affected.begin(), affected.end(), index.name) == affected.end()) {
                 affected.push_back(index.name);
+            }
+            // The new fragments of each rewrite whose old fragments this index covered all of (Lance remaps
+            // just those into it; the planner does not mix covered and uncovered fragments in one rewrite).
+            if (touched && !is_system_index(index)) {
+                auto& take_back = take_back_by_index[index.name];
+                const std::set<std::uint32_t> had(index.fragment_ids.begin(), index.fragment_ids.end());
+                std::size_t at = 0;
+                for (std::size_t r = 0; r < rewrites.size(); ++r) {
+                    const auto& old_ids = rewrites[r].old_fragment_ids;
+                    const bool all = std::all_of(old_ids.begin(), old_ids.end(), [&](std::uint64_t id) {
+                        return had.count(static_cast<std::uint32_t>(id)) != 0U;
+                    });
+                    for (std::size_t k = 0; k < created_per_rewrite[r]; ++k, ++at) {
+                        if (all) {
+                            take_back.insert(manifest.fragments[manifest.fragments.size() - created.size() + at].id);
+                        }
+                    }
+                }
             }
         }
         drop_fragments_from_indices(manifest.indices, rewritten_ids);
@@ -2349,6 +2370,7 @@ bool dataset_compact_commit(const std::filesystem::path& dataset_path, const Com
     // cannot be rebuilt (its coverage then stays narrower; the rows are scanned, never lost).
     OptimizeIndicesOptions reindex;
     reindex.index_names = affected;
+    reindex.only_fragments = take_back_by_index;
     OptimizeIndicesResult done;
     std::string why;
     if (dataset_optimize_indices(dataset_path, reindex, done, why)) {

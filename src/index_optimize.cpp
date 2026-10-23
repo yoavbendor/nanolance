@@ -204,11 +204,15 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
         const auto ids = coverage(*s);
         covered.insert(ids.begin(), ids.end());
     }
+    const auto only = options.only_fragments.find(last.name);
     std::vector<std::uint64_t> unindexed;
     for (const auto id : live) {
-        if (covered.count(id) == 0U) {
+        if (covered.count(id) == 0U && (only == options.only_fragments.end() || only->second.count(id) != 0U)) {
             unindexed.push_back(id);
         }
+    }
+    if (only != options.only_fragments.end() && unindexed.empty()) {
+        return false;  // nothing of what was asked to fold in
     }
 
     const bool retrain = options.retrain && kind == Kind::Vector;

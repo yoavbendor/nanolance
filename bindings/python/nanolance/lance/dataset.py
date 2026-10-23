@@ -1981,6 +1981,15 @@ class LanceDataset(pa.dataset.Dataset):
             details["runtime_hints"] = dict(hints)
         return details
 
+    def remap_row_addrs(self, row_addrs) -> Optional[pa.Array]:
+        """Row addresses from before a deferred-remap compaction, followed to where those rows are now
+        (null for a row the compaction dropped). None when the dataset has no fragment-reuse index."""
+        addresses = pa.array(row_addrs, pa.uint64()).to_pylist() if not isinstance(row_addrs, pa.Array) else \
+            row_addrs.cast(pa.uint64()).to_pylist()
+        with native():
+            mapped = _nanolance._ds_remap_row_addrs(self.uri, self._version, addresses)
+        return None if mapped is None else pa.array(mapped, pa.uint64())
+
     def describe_indices(self) -> List["IndexDescription"]:
         from datetime import timezone
 

@@ -1348,7 +1348,11 @@ struct Search {
                     }
                 }
             }
-            if (answered_all) {
+            // An index that covers none of the live fragments (a compaction rewrote them all and Lance does not
+            // remap a zone map) is not used: the plan is a plain scan, as Lance's.
+            const bool covers_live = std::any_of(manifest.fragments.begin(), manifest.fragments.end(),
+                                                 [&](const pb::DataFragment& f) { return set.covered.count(f.id) != 0U; });
+            if (answered_all && covers_live) {
                 const auto& url = segments.front()->details_type_url;
                 std::string type = url.substr(url.rfind('.') + 1);
                 type = type.substr(0, type.size() - std::string("IndexDetails").size());
