@@ -412,6 +412,12 @@ bool map_field(const ArrowSchema& field,
                 "': a list or map needs exactly one child";
         return false;
     }
+    // Lance has no sorted map: keys_sorted=true is refused, as Lance refuses it.
+    if (parsed.logical_type == "map" && (field.flags & ARROW_FLAG_MAP_KEYS_SORTED) != 0) {
+        error = "column '" + std::string(field.name == nullptr ? "<unnamed>" : field.name) +
+                "': Unsupported map field with keys_sorted=true";
+        return false;
+    }
     // Lance spells a list of structs "list.struct".
     if (is_list && parsed.logical_type != "map" && field.children[0]->format != nullptr &&
         std::strcmp(field.children[0]->format, "+s") == 0) {

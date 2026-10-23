@@ -728,6 +728,7 @@ tests/test_map_type.py::test_list_of_maps
 tests/test_map_type.py::test_map_append_data
 tests/test_map_type.py::test_map_different_key_types
 tests/test_map_type.py::test_map_keys_cannot_be_null
+tests/test_map_type.py::test_map_keys_sorted_unsupported
 tests/test_map_type.py::test_map_large_entries
 tests/test_map_type.py::test_map_projection_list_of_maps
 tests/test_map_type.py::test_map_projection_multiple_value_types
