@@ -69,6 +69,14 @@ class LanceFileStatistics:
     columns: List[LanceColumnStatistics] = field(default_factory=list)
 
 
+@dataclass
+class ListResult:
+    """Mirrors ``lance.file.ListResult``: the immediate children of one directory level."""
+
+    common_prefixes: List[str]
+    objects: List[str]
+
+
 class ReaderResults:
     def __init__(self, reader: pa.RecordBatchReader):
         self._reader = reader
@@ -317,6 +325,18 @@ class LanceFileSession:
             for f in files:
                 out.append(os.path.relpath(os.path.join(dirpath, f), self._base))
         return sorted(out)
+
+    def list_with_delimiter(self, path: Optional[str] = None) -> ListResult:
+        """Non-recursive listing of one directory level: child directories and direct child files."""
+        root = self._p(path) if path else self._base
+        prefixes: List[str] = []
+        objects: List[str] = []
+        if os.path.isdir(root):
+            for name in sorted(os.listdir(root)):
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, self._base).replace(os.sep, "/")
+                (prefixes if os.path.isdir(full) else objects).append(rel)
+        return ListResult(common_prefixes=prefixes, objects=objects)
 
     def read_range(self, path: str, offset: int, length: int) -> bytes:
         with open(self._p(path), "rb") as f:

@@ -513,6 +513,7 @@ tests/test_file.py::test_schema_only
 tests/test_file.py::test_session_contains
 tests/test_file.py::test_session_delete_file
 tests/test_file.py::test_session_list_all_files
+tests/test_file.py::test_session_list_with_delimiter
 tests/test_file.py::test_session_list_with_prefix
 tests/test_file.py::test_session_list_with_trailing_slash
 tests/test_file.py::test_session_read_range
