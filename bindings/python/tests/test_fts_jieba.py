@@ -76,7 +76,14 @@ def _search(engine, path, query, phrase):
 # back in position (a word after its own sub-words), on its own index and on nanolance's alike. Its answers
 # are taken in a child process, restarted after such a query.
 PYLANCE_CHILD = textwrap.dedent("""
-    import json, sys
+    import json, resource, sys
+    # That allocation fails (and pylance aborts) only where memory runs out first: with a terabyte of RAM it
+    # succeeds and the query crawls for many minutes. Capping the child's address space makes it fail
+    # everywhere.
+    cap = 64 << 30  # below the 96 GiB request; room for many threads' malloc arenas
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    if hard == resource.RLIM_INFINITY or hard > cap:
+        resource.setrlimit(resource.RLIMIT_AS, (cap, hard))
     import lance
     from lance.query import PhraseQuery
     path, cases, skip = sys.argv[1], json.loads(sys.argv[2]), int(sys.argv[3])
