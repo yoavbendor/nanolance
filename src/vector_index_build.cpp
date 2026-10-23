@@ -549,6 +549,8 @@ void hamming_assign(const ByteRows& x, const std::vector<std::uint8_t>& centroid
 /// of its cluster's vectors have it set (a tie is 0), bits least significant first within each byte.
 /// Initial centroids are k sampled rows, as the float k-means; an empty cluster keeps its centroid.
 /// Stops after `max_iters` or when the loss changes by less than kTolerance of itself.
+constexpr int kKmodesStarts = 4;
+
 std::vector<std::uint8_t> kmodes(const ByteRows& x, std::size_t k, std::uint32_t max_iters, std::mt19937_64& rng,
                                  double& loss) {
     const std::size_t d = x.d;
@@ -1781,7 +1783,17 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
             } else {
                 const auto train =
                     gather_bytes(binary_rows, training_sample(std::size_t{options.sample_rate} * partitions));
-                binary_centroids = kmodes(train, partitions, options.max_iters, rng, loss);
+                // Several starts, the one of least loss kept: one start from k sampled rows lands in a poor
+                // local optimum often enough to cost recall (pylance's builds averaged 3 points more at
+                // nprobes=1). Training on binary rows is cheap, so a few starts cost little.
+                for (int start = 0; start < kKmodesStarts; ++start) {
+                    double start_loss = 0;
+                    auto candidate = kmodes(train, partitions, options.max_iters, rng, start_loss);
+                    if (start == 0 || start_loss < loss) {
+                        loss = start_loss;
+                        binary_centroids = std::move(candidate);
+                    }
+                }
             }
             return true;
         }
