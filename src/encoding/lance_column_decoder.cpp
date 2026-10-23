@@ -8,10 +8,9 @@
 
 #include "nanolance/page_layout.hpp"
 
-#include "nanolance/blob_v2_external.hpp"
+#include "nanolance/blob_v2_layout.hpp"
 #include "nanolance/bool_bitpack.hpp"
 #include "nanolance/column_slice.hpp"
-#include "nanolance/data_file_reader.hpp"
 #include <nanom/fastlanes.hpp>
 #include "nanolance/fsst.hpp"
 #include "nanolance/lz4_block.hpp"
@@ -2119,7 +2118,7 @@ private:
 };
 using PageScratch = Scratch<std::vector<std::uint8_t>>;
 
-bool read_page_buffers(const std::filesystem::path& path, const pb::ColumnPage& page, bool blob_layout,
+bool read_page_buffers(const EncodingsIo& io, const pb::ColumnPage& page, bool blob_layout,
                        std::vector<std::uint8_t>& first, std::vector<std::uint8_t>& second, std::string& error) {
     if (page.buffer_offsets.size() < 2U || page.buffer_sizes.size() < 2U) {
         error = "column page is missing buffer offsets";
@@ -2129,10 +2128,10 @@ bool read_page_buffers(const std::filesystem::path& path, const pb::ColumnPage& 
     const auto first_size = page.buffer_sizes[blob_layout ? 1U : 0U];
     const auto second_offset = page.buffer_offsets[blob_layout ? 0U : 1U];
     const auto second_size = page.buffer_sizes[blob_layout ? 0U : 1U];
-    if (!read_lance_data_file_bytes(path, first_offset, first_size, first, error)) {
+    if (!io.read(first_offset, first_size, first, error)) {
         return false;
     }
-    return read_lance_data_file_bytes(path, second_offset, second_size, second, error);
+    return io.read(second_offset, second_size, second, error);
 }
 
 
@@ -2264,11 +2263,11 @@ bool legacy_blob_inner_shape(const std::vector<std::uint8_t>& encoding, MiniBloc
 
 /// A format 2.1 legacy blob column: every page's (position, size) rows, as descriptor rows of
 /// bytes in this data file. A non-zero position with no size is a null, as Lance reads it.
-bool decode_legacy_blob_column(const std::filesystem::path& path, const pb::Field& field,
+bool decode_legacy_blob_column(const EncodingsIo& io, const pb::Field& field,
                                const pb::ColumnMetadata& column, ColumnValues& out, std::string& error) {
     out = ColumnValues{};
     out.kind = ColumnValues::Kind::BlobV2External;
-    out.blob_v2.data_file = path;
+    out.blob_v2.data_file = io.name();
     std::vector<std::uint8_t> control;
     std::vector<std::uint8_t> payload;
     Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
@@ -2283,7 +2282,7 @@ bool decode_legacy_blob_column(const std::filesystem::path& path, const pb::Fiel
             error = "column '" + field.name + "': " + why;
             return false;
         }
-        if (!read_page_buffers(path, page, false, control, payload, error) ||
+        if (!read_page_buffers(io, page, false, control, payload, error) ||
             !split_miniblock_payload(payload, shape, chunks, error)) {
             return false;
         }
@@ -2430,7 +2429,7 @@ bool decode_legacy_blob_column(const std::filesystem::path& path, const pb::Fiel
 /// carries a value goes through `ConstantPageScheduler`, which borrows the buffer as a u16 slice and
 /// nothing else. `num_def_values` is likewise not populated on this path -- pylance leaves it 0 --
 /// so the row count is what says how many levels there are.
-[[nodiscard]] bool apply_constant_definition_levels(const std::filesystem::path& data_file_path,
+[[nodiscard]] bool apply_constant_definition_levels(const EncodingsIo& io,
                                                     const pb::ColumnPage& page, bool has_inline_value,
                                                     std::uint64_t rows_already_appended, ColumnValues& out,
                                                     std::string& error) {
@@ -2458,7 +2457,7 @@ bool decode_legacy_blob_column(const std::filesystem::path& path, const pb::Fiel
         return false;
     }
     std::vector<std::uint8_t> levels;
-    if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[static_cast<std::size_t>(def_index)],
+    if (!io.read(page.buffer_offsets[static_cast<std::size_t>(def_index)],
                                     page.buffer_sizes[static_cast<std::size_t>(def_index)], levels, error)) {
         return false;
     }
@@ -2489,7 +2488,7 @@ namespace {
 
 /// The whole decoder for one physical column. `item_view` is set only for a list column's second
 /// pass (decode_list_column), which reads the leaf values as a flat column of items.
-bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
                         const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
                         const std::shared_ptr<ItemView>& item_view) {
     error.clear();
@@ -2516,17 +2515,17 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
     // below does not model -- classifying first would refuse the library's headline feature.
     const bool blob_packed = field_metadata_is_true(on_disk_field, "lance-encoding:blob");
     if (blob_packed && (on_disk_field.logical_type == "large_binary" || on_disk_field.logical_type == "binary")) {
-        return decode_legacy_blob_column(data_file_path, on_disk_field, column_metadata, out, error);
+        return decode_legacy_blob_column(io, on_disk_field, column_metadata, out, error);
     }
     if (blob_packed) {
         out.kind = ColumnValues::Kind::BlobV2External;
-        out.blob_v2.data_file = data_file_path;
+        out.blob_v2.data_file = io.name();
         // Hoisted out of the loop (not freshly declared per page): read_lance_data_file_bytes reuses
         // whatever capacity/bytes are already here rather than re-zeroing a fresh buffer every page.
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> values;
         for (const auto& page : column_metadata.pages) {
-            if (!read_page_buffers(data_file_path, page, true, control, values, error)) {
+            if (!read_page_buffers(io, page, true, control, values, error)) {
                 return false;
             }
             std::vector<std::uint32_t> row_sizes;
@@ -2677,7 +2676,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                    !column_metadata.pages.front().buffer_sizes.empty()) {
             const auto& page = column_metadata.pages.front();
             std::vector<std::uint8_t> scalar_buffer;
-            if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[0], page.buffer_sizes[0],
+            if (!io.read(page.buffer_offsets[0], page.buffer_sizes[0],
                                             scalar_buffer, error) ||
                 !decode_scalar_variable_value(scalar_buffer, constant_value, error)) {
                 return false;
@@ -2699,7 +2698,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
         if (encoding_plan.constant_declares_levels) {
             std::uint64_t rows_so_far = 0;
             for (const auto& page : column_metadata.pages) {
-                if (!apply_constant_definition_levels(data_file_path, page,
+                if (!apply_constant_definition_levels(io, page,
                                                       encoding_plan.constant_inline_value.has_value(), rows_so_far,
                                                       out, error)) {
                     return false;
@@ -2764,7 +2763,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
         auto& chunks = chunks_scratch.get();
         std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
-            if (!read_page_buffers(data_file_path, page, false, control, data, error)) {
+            if (!read_page_buffers(io, page, false, control, data, error)) {
                 return false;
             }
             // Shared chunk split, not a second hand-rolled one. This branch used to parse the chunk
@@ -2831,9 +2830,9 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                 error = "dict-rle page missing buffers";
                 return false;
             }
-            if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[1], page.buffer_sizes[1], payload,
+            if (!io.read(page.buffer_offsets[1], page.buffer_sizes[1], payload,
                                             error) ||
-                !read_lance_data_file_bytes(data_file_path, page.buffer_offsets[2], page.buffer_sizes[2], dict_stored,
+                !io.read(page.buffer_offsets[2], page.buffer_sizes[2], dict_stored,
                                             error)) {
                 return false;
             }
@@ -2968,9 +2967,9 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                 error = "dict page missing buffers";
                 return false;
             }
-            if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[1], page.buffer_sizes[1], payload,
+            if (!io.read(page.buffer_offsets[1], page.buffer_sizes[1], payload,
                                             error) ||
-                !read_lance_data_file_bytes(data_file_path, page.buffer_offsets[2], page.buffer_sizes[2], dict_stored,
+                !io.read(page.buffer_offsets[2], page.buffer_sizes[2], dict_stored,
                                             error)) {
                 return false;
             }
@@ -3166,7 +3165,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                 error = "column '" + on_disk_field.name + "': FullZip page has no data buffer";
                 return false;
             }
-            if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[0], page.buffer_sizes[0], data, error)) {
+            if (!io.read(page.buffer_offsets[0], page.buffer_sizes[0], data, error)) {
                 return false;
             }
             if (item_view && item_view->full_zip_window) {
@@ -3359,7 +3358,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
         std::vector<std::uint8_t> raw;
         std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
-            if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
+            if (!read_page_buffers(io, page, false, control, payload, error)) {
                 return false;
             }
             if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, chunks, validity_rows,
@@ -3407,7 +3406,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
         auto& chunks = chunks_scratch.get();
         std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
-            if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
+            if (!read_page_buffers(io, page, false, control, payload, error)) {
                 return false;
             }
             if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, chunks, validity_rows,
@@ -3490,7 +3489,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                                                   ? plan->variable_offset_bits == 64U
                                                   : out.variable.large;
             const auto offset_width = static_cast<std::uint64_t>(stored_offsets_large ? 8U : 4U);
-            if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
+            if (!read_page_buffers(io, page, false, control, payload, error)) {
                 return false;
             }
             if (!read_page_chunks_with_validity(payload, *plan, page.length, chunks, validity_rows, out, error)) {
@@ -3645,7 +3644,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
         }
         const bool bitpacked = plan->kind == ColumnEncodingKind::kBitpack;
         const bool nullable = plan->repdef != nullptr;
-        if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
+        if (!read_page_buffers(io, page, false, control, payload, error)) {
             return false;
         }
         if (!split_miniblock_payload(payload, plan->chunk_shape, chunks, error) ||
@@ -3902,7 +3901,7 @@ struct NestedPageWindow {
     std::uint64_t rows = 0;                  // out: rows (fragments included) the window decoded to
 };
 
-bool decode_nested_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+bool decode_nested_column(const EncodingsIo& io, const pb::Field& on_disk_field,
                         const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
                         std::vector<NestedPageWindow>* windows = nullptr) {
     const auto& logical_type = on_disk_field.logical_type;
@@ -3976,7 +3975,7 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
             chunk_shape.has_definition = mb.repdef_compression != nullptr;
             chunk_shape.large_buffer_sizes = mb.has_large_chunk;
             chunk_shape.num_buffers = mb.num_buffers != 0U ? mb.num_buffers : 2U;
-            if (!read_page_buffers(data_file_path, page, false, control, payload, error) ||
+            if (!read_page_buffers(io, page, false, control, payload, error) ||
                 !split_miniblock_payload(payload, chunk_shape, chunks, error) ||
                 (window == nullptr &&
                  !chunk_items_from_metadata(control, mb.has_large_chunk, mb.num_items, items, error))) {
@@ -4069,9 +4068,9 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
                 return false;
             }
             const std::size_t rep_at = buffers == 3U ? 1U : 0U;
-            if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[rep_at], page.buffer_sizes[rep_at],
+            if (!io.read(page.buffer_offsets[rep_at], page.buffer_sizes[rep_at],
                                             control, error) ||
-                !read_lance_data_file_bytes(data_file_path, page.buffer_offsets[rep_at + 1U],
+                !io.read(page.buffer_offsets[rep_at + 1U],
                                             page.buffer_sizes[rep_at + 1U], payload, error) ||
                 !decode_level_buffer(control, c.rep_compression.get(), c.num_rep_values, rep, error) ||
                 !decode_level_buffer(payload, c.def_compression.get(), c.num_def_values, def, error)) {
@@ -4104,7 +4103,7 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
             one_page.pages.push_back(page);
             auto view = std::make_shared<ItemView>();
             view->full_zip_window = window != nullptr;
-            if (!decode_column_impl(data_file_path, on_disk_field, one_page, full_zip_values, error, view)) {
+            if (!decode_column_impl(io, on_disk_field, one_page, full_zip_values, error, view)) {
                 return false;
             }
             if (window != nullptr) {
@@ -4164,7 +4163,7 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
             one_page.pages.back().length = page_items;
             auto view = std::make_shared<ItemView>();
             view->page_chunk_items.push_back(std::move(items));
-            if (!decode_column_impl(data_file_path, on_disk_field, one_page, page_values, error, view)) {
+            if (!decode_column_impl(io, on_disk_field, one_page, page_values, error, view)) {
                 return false;
             }
         } else if (page_items != 0U) {
@@ -4172,7 +4171,7 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
             const auto& c = layout.constant;
             std::vector<std::uint8_t> value;
             if (page.buffer_offsets.size() == 3U) {  // [value, rep, def]
-                if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[0], page.buffer_sizes[0], control,
+                if (!io.read(page.buffer_offsets[0], page.buffer_sizes[0], control,
                                                 error)) {
                     return false;
                 }
@@ -4360,7 +4359,7 @@ bool full_zip_row_addressable(const pb::ColumnPage& page, page_layout::PageLayou
 }
 
 /// Fixed-width `take_full_zip_rows`: row k of the page is at k * (control word + value slot).
-bool take_full_zip_fixed_rows(const std::filesystem::path& path, const std::string& column,
+bool take_full_zip_fixed_rows(const EncodingsIo& io, const std::string& column,
                               const pb::ColumnPage& page, const FullZipPageParams& params,
                               const std::vector<std::uint64_t>& rows, std::size_t begin, std::size_t end,
                               std::uint64_t page_first, ColumnValues& out, std::uint64_t& out_row,
@@ -4377,7 +4376,7 @@ bool take_full_zip_fixed_rows(const std::filesystem::path& path, const std::stri
         }
         const auto first_local = rows[i] - page_first;
         const auto count = rows[j - 1U] - rows[i] + 1U;
-        if (!read_lance_data_file_bytes(path, page.buffer_offsets[0] + first_local * stride, count * stride, bytes,
+        if (!io.read(page.buffer_offsets[0] + first_local * stride, count * stride, bytes,
                                         error)) {
             return false;
         }
@@ -4411,12 +4410,12 @@ bool take_full_zip_fixed_rows(const std::filesystem::path& path, const std::stri
 
 /// Append rows `[begin, end)` of `rows` -- all inside `page`, as page-local row numbers relative to
 /// `page_first` -- reading each row's bytes through the page's repetition index.
-bool take_full_zip_rows(const std::filesystem::path& path, const std::string& column, const pb::ColumnPage& page,
+bool take_full_zip_rows(const EncodingsIo& io, const std::string& column, const pb::ColumnPage& page,
                         const FullZipPageParams& params, const std::vector<std::uint64_t>& rows, std::size_t begin,
                         std::size_t end, std::uint64_t page_first, ColumnValues& out, std::uint64_t& out_row,
                         std::string& error) {
     if (params.length_bytes == 0U) {
-        return take_full_zip_fixed_rows(path, column, page, params, rows, begin, end, page_first, out, out_row, error);
+        return take_full_zip_fixed_rows(io, column, page, params, rows, begin, end, page_first, out, out_row, error);
     }
     const auto index_size = page.buffer_sizes[1];
     const auto entries = page.length + 1U;
@@ -4431,7 +4430,7 @@ bool take_full_zip_rows(const std::filesystem::path& path, const std::string& co
     }
     thread_local std::vector<std::uint8_t> index;
     thread_local std::vector<std::uint8_t> bytes;
-    if (!read_lance_data_file_bytes(path, page.buffer_offsets[1], index_size, index, error)) {
+    if (!io.read(page.buffer_offsets[1], index_size, index, error)) {
         return false;
     }
     const auto entry = [&](std::uint64_t k) {
@@ -4454,7 +4453,7 @@ bool take_full_zip_rows(const std::filesystem::path& path, const std::string& co
             error = "column '" + column + "': FullZip repetition index points past the page";
             return false;
         }
-        if (!read_lance_data_file_bytes(path, page.buffer_offsets[0] + start, stop - start, bytes, error)) {
+        if (!io.read(page.buffer_offsets[0] + start, stop - start, bytes, error)) {
             return false;
         }
         reserve_full_zip_values(out.variable.data, params, bytes.size());
@@ -4568,7 +4567,7 @@ constexpr std::uint64_t kSmallColumnBytes = std::uint64_t{1} << 20U;
 /// copy from then on. A copy that would overflow the budget is admitted only by dropping copies unused for a
 /// while; otherwise it is not kept -- clearing the cache for it made a working set over the budget
 /// decode every column whole on every take.
-std::shared_ptr<const ColumnValues> cached_whole_column(const std::filesystem::path& path, const pb::Field& field,
+std::shared_ptr<const ColumnValues> cached_whole_column(const EncodingsIo& io, const pb::Field& field,
                                                        const pb::ColumnMetadata& column, std::string& error,
                                                        CacheFill fill) {
     using Clock = std::chrono::steady_clock;
@@ -4586,10 +4585,10 @@ std::shared_ptr<const ColumnValues> cached_whole_column(const std::filesystem::p
     constexpr auto kIdle = std::chrono::seconds(10);
     std::uint64_t size = 0;
     std::int64_t mtime = 0;
-    if (!data_file_identity(path, size, mtime)) {
+    if (!io.identity(size, mtime)) {
         return nullptr;
     }
-    const auto key = path.string() + '#' + std::to_string(field.id);
+    const auto key = io.name() + '#' + std::to_string(field.id);
     {
         const std::lock_guard<std::mutex> lock(mutex);
         const auto it = cache.find(key);
@@ -4616,7 +4615,7 @@ std::shared_ptr<const ColumnValues> cached_whole_column(const std::filesystem::p
         }
     }
     auto whole = std::make_shared<ColumnValues>();
-    if (!decode_lance_physical_column(path, field, column, *whole, error)) {
+    if (!decode_lance_physical_column(io, field, column, *whole, error)) {
         return nullptr;
     }
     const auto bytes = decoded_bytes(*whole);
@@ -4649,7 +4648,7 @@ std::shared_ptr<const ColumnValues> cached_whole_column(const std::filesystem::p
 
 /// Rows of flat MiniBlock pages, decoding only the chunks that hold them (as a range read does for
 /// its rows). False with no error when a touched page is not one.
-bool take_flat_miniblock_chunks(const std::filesystem::path& path, const pb::Field& field,
+bool take_flat_miniblock_chunks(const EncodingsIo& io, const pb::Field& field,
                                 const pb::ColumnMetadata& column, const std::vector<std::uint64_t>& rows,
                                 const std::vector<std::pair<std::size_t, std::pair<std::size_t, std::size_t>>>& touched,
                                 const std::vector<std::uint64_t>& page_first, std::size_t value_bytes,
@@ -4668,7 +4667,7 @@ struct MiniBlockPageIndex {
 /// Pages with fewer chunks are decoded whole: a window would save little.
 constexpr std::size_t kMinWindowChunks = 8;
 
-std::shared_ptr<const MiniBlockPageIndex> miniblock_page_index(const std::filesystem::path& path,
+std::shared_ptr<const MiniBlockPageIndex> miniblock_page_index(const EncodingsIo& io,
                                                                const pb::ColumnPage& page,
                                                                const page_layout::MiniBlock& mb, std::string& error) {
     static std::mutex mutex;
@@ -4691,10 +4690,10 @@ std::shared_ptr<const MiniBlockPageIndex> miniblock_page_index(const std::filesy
     }
     std::uint64_t size = 0;
     std::int64_t mtime = 0;
-    if (!data_file_identity(path, size, mtime)) {
+    if (!io.identity(size, mtime)) {
         return nullptr;
     }
-    const auto key = path.string() + '#' + std::to_string(size) + '#' + std::to_string(mtime) + '#' + std::to_string(page.buffer_offsets[0]);
+    const auto key = io.name() + '#' + std::to_string(size) + '#' + std::to_string(mtime) + '#' + std::to_string(page.buffer_offsets[0]);
     {
         const std::lock_guard<std::mutex> lock(mutex);
         const auto it = cache.find(key);
@@ -4705,9 +4704,9 @@ std::shared_ptr<const MiniBlockPageIndex> miniblock_page_index(const std::filesy
     std::vector<std::uint8_t> control;
     std::vector<std::uint8_t> rep_index;
     auto index = std::make_shared<MiniBlockPageIndex>();
-    if (!read_lance_data_file_bytes(path, page.buffer_offsets[0], page.buffer_sizes[0], control, error) ||
+    if (!io.read(page.buffer_offsets[0], page.buffer_sizes[0], control, error) ||
         (!flat &&
-         !read_lance_data_file_bytes(path, page.buffer_offsets[rep_at], page.buffer_sizes[rep_at], rep_index, error))) {
+         !io.read(page.buffer_offsets[rep_at], page.buffer_sizes[rep_at], rep_index, error))) {
         return nullptr;
     }
     std::string why;  // metadata that does not add up: no index, the page is decoded whole
@@ -4746,7 +4745,7 @@ std::shared_ptr<const MiniBlockPageIndex> miniblock_page_index(const std::filesy
 /// Where each row of a FullZip list page starts in its data buffer, and where the last ends: the
 /// page's repetition index (buffer 1, one entry per row and one more, 1 to 8 bytes each). Read once
 /// per page and kept, as miniblock_page_index is. Null when the page has none that adds up.
-std::shared_ptr<const std::vector<std::uint64_t>> full_zip_row_starts(const std::filesystem::path& path,
+std::shared_ptr<const std::vector<std::uint64_t>> full_zip_row_starts(const EncodingsIo& io,
                                                                      const pb::ColumnPage& page,
                                                                      std::string& error) {
     static std::mutex mutex;
@@ -4762,10 +4761,10 @@ std::shared_ptr<const std::vector<std::uint64_t>> full_zip_row_starts(const std:
     }
     std::uint64_t size = 0;
     std::int64_t mtime = 0;
-    if (!data_file_identity(path, size, mtime)) {
+    if (!io.identity(size, mtime)) {
         return nullptr;
     }
-    const auto key = path.string() + '#' + std::to_string(size) + '#' + std::to_string(mtime) +
+    const auto key = io.name() + '#' + std::to_string(size) + '#' + std::to_string(mtime) +
                      '#' + std::to_string(page.buffer_offsets[1]);
     {
         const std::lock_guard<std::mutex> lock(mutex);
@@ -4775,7 +4774,7 @@ std::shared_ptr<const std::vector<std::uint64_t>> full_zip_row_starts(const std:
         }
     }
     std::vector<std::uint8_t> raw;
-    if (!read_lance_data_file_bytes(path, page.buffer_offsets[1], index_size, raw, error)) {
+    if (!io.read(page.buffer_offsets[1], index_size, raw, error)) {
         return nullptr;
     }
     auto starts = std::make_shared<std::vector<std::uint64_t>>(static_cast<std::size_t>(entries));
@@ -4807,7 +4806,7 @@ bool full_zip_list_page(const page_layout::PageLayout& layout) {
 /// repetition index and many chunks (pylance writes a column of audio clips as one 150 MB page),
 /// just the runs of chunks holding the requested rows. The i-th output page comes from page
 /// `page_of[i]`, and its first decoded row is that page's row `first_row[i]`.
-bool take_windows(const std::filesystem::path& path, const pb::ColumnMetadata& column,
+bool take_windows(const EncodingsIo& io, const pb::ColumnMetadata& column,
                   const std::vector<std::uint64_t>& rows,
                   const std::vector<std::pair<std::size_t, std::pair<std::size_t, std::size_t>>>& touched,
                   const std::vector<std::uint64_t>& page_first, pb::ColumnMetadata& subset,
@@ -4824,7 +4823,7 @@ bool take_windows(const std::filesystem::path& path, const pb::ColumnMetadata& c
         std::shared_ptr<const MiniBlockPageIndex> index;
         const bool laid_out = page_layout::decode_page_layout(page.encoding, layout, why);
         if (laid_out && layout.kind == page_layout::LayoutKind::kMiniBlock) {
-            index = miniblock_page_index(path, page, layout.mini_block, error);
+            index = miniblock_page_index(io, page, layout.mini_block, error);
             if (index == nullptr && !error.empty()) {
                 return false;
             }
@@ -4833,7 +4832,7 @@ bool take_windows(const std::filesystem::path& path, const pb::ColumnMetadata& c
         // starts, so a run of requested rows is one read of just their bytes.
         std::shared_ptr<const std::vector<std::uint64_t>> starts;
         if (laid_out && full_zip_list_page(layout)) {
-            starts = full_zip_row_starts(path, page, error);
+            starts = full_zip_row_starts(io, page, error);
             if (starts == nullptr && !error.empty()) {
                 return false;
             }
@@ -4965,7 +4964,7 @@ void append_page_windows(const MiniBlockPageIndex& index, const pb::ColumnPage& 
 /// Rows [begin, end) of a list column. A page the range covers only in part, or one too large to
 /// hold whole (see scan_window_bytes), is read as windows of its chunks when it carries a
 /// repetition index; other pages are decoded whole and trimmed.
-bool decode_nested_rows(const std::filesystem::path& path, const pb::Field& field, const pb::ColumnMetadata& column,
+bool decode_nested_rows(const EncodingsIo& io, const pb::Field& field, const pb::ColumnMetadata& column,
                         std::uint64_t begin, std::uint64_t end, ColumnValues& out, std::string& error) {
     pb::ColumnMetadata subset;
     std::vector<NestedPageWindow> windows;
@@ -4989,9 +4988,9 @@ bool decode_nested_rows(const std::filesystem::path& path, const pb::Field& fiel
         if (page.buffer_sizes.size() >= 2U && page_layout::decode_page_layout(page.encoding, layout, why)) {
             if (layout.kind == page_layout::LayoutKind::kMiniBlock &&
                 (partial || page.buffer_sizes[1] > 4U * scan_window_bytes())) {
-                index = miniblock_page_index(path, page, layout.mini_block, error);
+                index = miniblock_page_index(io, page, layout.mini_block, error);
             } else if (full_zip_list_page(layout) && (partial || page.buffer_sizes[0] > 4U * scan_window_bytes())) {
-                starts = full_zip_row_starts(path, page, error);
+                starts = full_zip_row_starts(io, page, error);
             }
             if (index == nullptr && starts == nullptr && !error.empty()) {
                 return false;
@@ -5030,14 +5029,14 @@ bool decode_nested_rows(const std::filesystem::path& path, const pb::Field& fiel
         page_begin = page_end;
     }
     if (!trimmed) {
-        return decode_nested_column(path, field, column, out, error);
+        return decode_nested_column(io, field, column, out, error);
     }
     if (subset.pages.empty()) {  // no rows: the column's shape only
         subset.pages.push_back(column.pages.front());
         windows.emplace_back();
         keep_rows.emplace_back(0, 0);
     }
-    if (!decode_nested_column(path, field, subset, out, error, &windows)) {
+    if (!decode_nested_column(io, field, subset, out, error, &windows)) {
         return false;
     }
     std::vector<std::uint8_t> keep;
@@ -5062,10 +5061,10 @@ bool decode_nested_rows(const std::filesystem::path& path, const pb::Field& fiel
 
 namespace {
 
-bool decode_flat_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+bool decode_flat_column(const EncodingsIo& io, const pb::Field& on_disk_field,
                         const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error);
 
-bool take_flat_miniblock_chunks(const std::filesystem::path& path, const pb::Field& field,
+bool take_flat_miniblock_chunks(const EncodingsIo& io, const pb::Field& field,
                                 const pb::ColumnMetadata& column, const std::vector<std::uint64_t>& rows,
                                 const std::vector<std::pair<std::size_t, std::pair<std::size_t, std::size_t>>>& touched,
                                 const std::vector<std::uint64_t>& page_first, std::size_t value_bytes,
@@ -5082,7 +5081,7 @@ bool take_flat_miniblock_chunks(const std::filesystem::path& path, const pb::Fie
             layout.kind != page_layout::LayoutKind::kMiniBlock || layout.mini_block.has_repetition) {
             return true;
         }
-        const auto index = miniblock_page_index(path, page, layout.mini_block, error);
+        const auto index = miniblock_page_index(io, page, layout.mini_block, error);
         if (index == nullptr) {
             return error.empty();
         }
@@ -5115,7 +5114,7 @@ bool take_flat_miniblock_chunks(const std::filesystem::path& path, const pb::Fie
             i = j;
         }
     }
-    if (!decode_flat_column(path, field, subset, out, error) ||
+    if (!decode_flat_column(io, field, subset, out, error) ||
         !compact_column_values(out, keep, keep.size(), value_bytes, error)) {
         return false;
     }
@@ -5142,7 +5141,7 @@ const pb::Field& dictionary_value_field(const pb::Field& field, pb::Field& scrat
 
 }  // namespace
 
-bool lance_column_dictionary_entries(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field_in,
+bool lance_column_dictionary_entries(const EncodingsIo& io, const pb::Field& on_disk_field_in,
                                      const pb::ColumnMetadata& column_metadata, std::vector<std::string>& out,
                                      std::string& error) {
     pb::Field value_field_scratch;
@@ -5160,7 +5159,7 @@ bool lance_column_dictionary_entries(const std::filesystem::path& data_file_path
             continue;
         }
         DictionaryBlock dict;
-        if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[2], page.buffer_sizes[2], stored, error) ||
+        if (!io.read(page.buffer_offsets[2], page.buffer_sizes[2], stored, error) ||
             !decode_dictionary_block(plan, on_disk_field.logical_type, stored, dict, error)) {
             return false;
         }
@@ -5175,14 +5174,14 @@ bool lance_column_dictionary_entries(const std::filesystem::path& data_file_path
 }
 
 
-static bool decode_lance_physical_column_rows_impl(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field_in,
+static bool decode_lance_physical_column_rows_impl(const EncodingsIo& io, const pb::Field& on_disk_field_in,
                                        const pb::ColumnMetadata& column_metadata,
                                        const std::vector<std::uint64_t>& rows, std::size_t value_bytes,
                                        ColumnValues& out, std::string& error) {
     pb::Field value_field_scratch;
     const pb::Field& on_disk_field = dictionary_value_field(on_disk_field_in, value_field_scratch);
     if (v20::is_v20_column(column_metadata)) {
-        return v20::decode_column_rows(data_file_path, on_disk_field, column_metadata, nullptr, rows, value_bytes,
+        return v20::decode_column_rows(io, on_disk_field, column_metadata, nullptr, rows, value_bytes,
                                        out, error);
     }
     error.clear();
@@ -5244,7 +5243,7 @@ static bool decode_lance_physical_column_rows_impl(const std::filesystem::path& 
         std::uint64_t out_row = 0;
         for (std::size_t t = 0; t < touched.size(); ++t) {
             const auto& [p, span] = touched[t];
-            if (!take_full_zip_rows(data_file_path, on_disk_field.name, column_metadata.pages[p], params[t], rows,
+            if (!take_full_zip_rows(io, on_disk_field.name, column_metadata.pages[p], params[t], rows,
                                     span.first, span.second, page_first[p], out, out_row, error)) {
                 return false;
             }
@@ -5289,7 +5288,7 @@ static bool decode_lance_physical_column_rows_impl(const std::filesystem::path& 
                   layout.kind == page_layout::LayoutKind::kMiniBlock &&
                   layout.mini_block.has_repetition == nested;
         if (chunked) {
-            const auto index = miniblock_page_index(data_file_path, page, layout.mini_block, error);
+            const auto index = miniblock_page_index(io, page, layout.mini_block, error);
             if (index == nullptr) {
                 if (!error.empty()) {
                     return false;
@@ -5318,7 +5317,7 @@ static bool decode_lance_physical_column_rows_impl(const std::filesystem::path& 
     // A few chunks are read even when the column is cached: picking rows out of the copy walks all
     // of its rows (a list column's layers among them).
     if (!rows.empty() && !full_zip_lists && !few_chunks && take_cache_budget() != 0U && encoded <= kCacheColumnBytes) {
-        const auto whole = cached_whole_column(data_file_path, on_disk_field, column_metadata, error,
+        const auto whole = cached_whole_column(io, on_disk_field, column_metadata, error,
                                                encoded <= kSmallColumnBytes ? CacheFill::FirstTake
                                                : chunked                    ? CacheFill::Never
                                                : nested                     ? CacheFill::SecondTake
@@ -5338,7 +5337,7 @@ static bool decode_lance_physical_column_rows_impl(const std::filesystem::path& 
 
     if (chunked && !nested) {
         bool done = false;
-        if (!take_flat_miniblock_chunks(data_file_path, on_disk_field, column_metadata, rows, touched, page_first,
+        if (!take_flat_miniblock_chunks(io, on_disk_field, column_metadata, rows, touched, page_first,
                                         value_bytes, out, done, error)) {
             return false;
         }
@@ -5353,14 +5352,14 @@ static bool decode_lance_physical_column_rows_impl(const std::filesystem::path& 
         std::vector<NestedPageWindow> windows;
         std::vector<std::uint64_t> first_row;
         std::vector<std::size_t> page_of;
-        if (!take_windows(data_file_path, column_metadata, rows, touched, page_first, subset, windows, first_row,
+        if (!take_windows(io, column_metadata, rows, touched, page_first, subset, windows, first_row,
                           page_of, error)) {
             return false;
         }
         const bool any_window =
             std::any_of(windows.begin(), windows.end(), [](const NestedPageWindow& w) { return w.active; });
         if (any_window) {
-            if (!decode_nested_column(data_file_path, on_disk_field, subset, out, error, &windows)) {
+            if (!decode_nested_column(io, on_disk_field, subset, out, error, &windows)) {
                 return false;
             }
             // Keep each requested row: windows come in row order, as do the requests. A window's
@@ -5406,7 +5405,7 @@ static bool decode_lance_physical_column_rows_impl(const std::filesystem::path& 
         keep.assign(static_cast<std::size_t>(column_metadata.pages.front().length), 0U);
         subset_rows = column_metadata.pages.front().length;
     }
-    if (!decode_lance_physical_column(data_file_path, on_disk_field, subset, out, error)) {
+    if (!decode_lance_physical_column(io, on_disk_field, subset, out, error)) {
         return false;
     }
     return compact_column_values(out, keep, subset_rows, value_bytes, error);
@@ -5511,10 +5510,10 @@ bool append_flat_values(ColumnValues& dst, std::uint64_t dst_rows, ColumnValues&
 }
 
 /// decode_column_impl for a flat column, one page at a time when its pages need plans of their own.
-bool decode_flat_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+bool decode_flat_column(const EncodingsIo& io, const pb::Field& on_disk_field,
                         const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {
     if (pages_share_one_plan(on_disk_field, column_metadata)) {
-        return decode_column_impl(data_file_path, on_disk_field, column_metadata, out, error, nullptr);
+        return decode_column_impl(io, on_disk_field, column_metadata, out, error, nullptr);
     }
     out = ColumnValues{};
     std::uint64_t rows = 0;
@@ -5522,7 +5521,7 @@ bool decode_flat_column(const std::filesystem::path& data_file_path, const pb::F
         pb::ColumnMetadata one_page = column_metadata;
         one_page.pages.assign(1U, page);
         ColumnValues part;
-        if (!decode_column_impl(data_file_path, on_disk_field, one_page, part, error, nullptr) ||
+        if (!decode_column_impl(io, on_disk_field, one_page, part, error, nullptr) ||
             !append_flat_values(out, rows, part, page.length, error)) {
             return false;
         }
@@ -5605,12 +5604,12 @@ bool decompress_general_buffer(const std::string& scheme, const std::uint8_t* da
     return true;
 }
 
-static bool decode_lance_physical_column_impl(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field_in,
+static bool decode_lance_physical_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field_in,
                                   const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {
     pb::Field value_field_scratch;
     const pb::Field& on_disk_field = dictionary_value_field(on_disk_field_in, value_field_scratch);
     if (v20::is_v20_column(column_metadata)) {
-        return v20::decode_column(data_file_path, on_disk_field, column_metadata, nullptr, out, error);
+        return v20::decode_column(io, on_disk_field, column_metadata, nullptr, out, error);
     }
     if (column_is_nested(column_metadata)) {
         error.clear();
@@ -5619,9 +5618,9 @@ static bool decode_lance_physical_column_impl(const std::filesystem::path& data_
         for (const auto& page : column_metadata.pages) {
             rows += page.length;
         }
-        return decode_nested_rows(data_file_path, on_disk_field, column_metadata, 0, rows, out, error);
+        return decode_nested_rows(io, on_disk_field, column_metadata, 0, rows, out, error);
     }
-    return decode_flat_column(data_file_path, on_disk_field, column_metadata, out, error);
+    return decode_flat_column(io, on_disk_field, column_metadata, out, error);
 }
 
 std::uint32_t lance_page_list_depth(const pb::ColumnPage& page) {
@@ -5689,14 +5688,14 @@ bool lance_page_row_addressable(const pb::ColumnPage& page) {
     return mb.repetition_index_depth != 0U && page.buffer_offsets.size() > rep_at;
 }
 
-static bool decode_lance_physical_column_range_impl(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field_in,
+static bool decode_lance_physical_column_range_impl(const EncodingsIo& io, const pb::Field& on_disk_field_in,
                                         const pb::ColumnMetadata& column_metadata, std::uint64_t first,
                                         std::uint64_t count, std::size_t value_bytes, ColumnValues& out,
                                         std::string& error) {
     pb::Field value_field_scratch;
     const pb::Field& on_disk_field = dictionary_value_field(on_disk_field_in, value_field_scratch);
     if (v20::is_v20_column(column_metadata)) {
-        return v20::decode_column_range(data_file_path, on_disk_field, column_metadata, nullptr, first, count,
+        return v20::decode_column_range(io, on_disk_field, column_metadata, nullptr, first, count,
                                         value_bytes, out, error);
     }
     error.clear();
@@ -5711,10 +5710,10 @@ static bool decode_lance_physical_column_range_impl(const std::filesystem::path&
         return false;
     }
     if (column_metadata.pages.empty()) {
-        return decode_lance_physical_column(data_file_path, on_disk_field, column_metadata, out, error);
+        return decode_lance_physical_column(io, on_disk_field, column_metadata, out, error);
     }
     if (column_is_nested(column_metadata)) {
-        return decode_nested_rows(data_file_path, on_disk_field, column_metadata, first, first + count, out, error);
+        return decode_nested_rows(io, on_disk_field, column_metadata, first, first + count, out, error);
     }
     // Large values in FullZip pages: just the rows, through each page's per-row index.
     {
@@ -5734,7 +5733,7 @@ static bool decode_lance_physical_column_range_impl(const std::filesystem::path&
             for (std::uint64_t r = 0; r < count; ++r) {
                 rows[static_cast<std::size_t>(r)] = first + r;
             }
-            return decode_lance_physical_column_rows(data_file_path, on_disk_field, column_metadata, rows,
+            return decode_lance_physical_column_rows(io, on_disk_field, column_metadata, rows,
                                                      value_bytes, out, error);
         }
     }
@@ -5755,7 +5754,7 @@ static bool decode_lance_physical_column_range_impl(const std::filesystem::path&
             std::string why;
             if ((r0 != 0U || r1 != page.length) && page_layout::decode_page_layout(page.encoding, layout, why) &&
                 layout.kind == page_layout::LayoutKind::kMiniBlock && !layout.mini_block.has_repetition) {
-                index = miniblock_page_index(data_file_path, page, layout.mini_block, error);
+                index = miniblock_page_index(io, page, layout.mini_block, error);
                 if (index == nullptr && !error.empty()) {
                     return false;
                 }
@@ -5791,7 +5790,7 @@ static bool decode_lance_physical_column_range_impl(const std::filesystem::path&
         subset_first = first;
         subset_rows = column_metadata.pages.front().length;
     }
-    if (!decode_flat_column(data_file_path, on_disk_field, subset, out, error)) {
+    if (!decode_flat_column(io, on_disk_field, subset, out, error)) {
         return false;
     }
     if (first == subset_first && count == subset_rows) {
@@ -5804,13 +5803,13 @@ static bool decode_lance_physical_column_range_impl(const std::filesystem::path&
 namespace {
 
 /// An Arrow dictionary column keeps its stored dictionary next to its values (ColumnValues::dictionary).
-bool attach_dictionary(const std::filesystem::path& path, const pb::Field& field, const pb::ColumnMetadata& column,
+bool attach_dictionary(const EncodingsIo& io, const pb::Field& field, const pb::ColumnMetadata& column,
                        ColumnValues& out, std::string& error) {
     if (field.logical_type.rfind("dict:", 0) != 0) {
         return true;
     }
     auto entries = std::make_shared<std::vector<std::string>>();
-    if (!lance_column_dictionary_entries(path, field, column, *entries, error)) {
+    if (!lance_column_dictionary_entries(io, field, column, *entries, error)) {
         return false;
     }
     if (!entries->empty()) {
@@ -5829,7 +5828,7 @@ namespace {
 /// ([u32 length][kind, position, size, blob_id, uri]). Returns false with `handled` unset when the
 /// column is not one.
 template <class Decode>
-bool decode_nested_blob_column(const std::filesystem::path& data_file_path, const pb::Field& field,
+bool decode_nested_blob_column(const EncodingsIo& io, const pb::Field& field,
                                const pb::ColumnMetadata& column_metadata, ColumnValues& out,
                                [[maybe_unused]] std::string& error, bool& handled, Decode&& decode) {
     handled = field.logical_type == "struct" && field_metadata_is_true(field, "lance-encoding:blob") &&
@@ -5851,7 +5850,7 @@ bool decode_nested_blob_column(const std::filesystem::path& data_file_path, cons
     const auto items = bytes.variable.large ? bytes.variable.offsets.size() / 8U : bytes.variable.offsets.size() / 4U;
     out = ColumnValues{};
     out.kind = ColumnValues::Kind::BlobV2External;
-    out.blob_v2.data_file = data_file_path;
+    out.blob_v2.data_file = io.name();
     out.layers = std::move(bytes.layers);
     out.validity = std::move(bytes.validity);
     out.null_count = bytes.null_count;
@@ -5889,55 +5888,55 @@ bool decode_nested_blob_column(const std::filesystem::path& data_file_path, cons
 
 }  // namespace
 
-bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+bool decode_lance_physical_column_rows(const EncodingsIo& io, const pb::Field& on_disk_field,
                                        const pb::ColumnMetadata& column_metadata,
                                        const std::vector<std::uint64_t>& rows, std::size_t value_bytes,
                                        ColumnValues& out, std::string& error) {
     bool blob = false;
-    const bool ok = decode_nested_blob_column(data_file_path, on_disk_field, column_metadata, out, error, blob,
+    const bool ok = decode_nested_blob_column(io, on_disk_field, column_metadata, out, error, blob,
                                               [&](const pb::Field& f, ColumnValues& v) {
                                                   return decode_lance_physical_column_rows_impl(
-                                                      data_file_path, f, column_metadata, rows, 0, v, error);
+                                                      io, f, column_metadata, rows, 0, v, error);
                                               });
     if (blob) {
         return ok;
     }
-    return decode_lance_physical_column_rows_impl(data_file_path, on_disk_field, column_metadata, rows, value_bytes,
+    return decode_lance_physical_column_rows_impl(io, on_disk_field, column_metadata, rows, value_bytes,
                                                   out, error) &&
-           attach_dictionary(data_file_path, on_disk_field, column_metadata, out, error);
+           attach_dictionary(io, on_disk_field, column_metadata, out, error);
 }
 
-bool decode_lance_physical_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+bool decode_lance_physical_column(const EncodingsIo& io, const pb::Field& on_disk_field,
                                   const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {
     bool blob = false;
-    const bool ok = decode_nested_blob_column(data_file_path, on_disk_field, column_metadata, out, error, blob,
+    const bool ok = decode_nested_blob_column(io, on_disk_field, column_metadata, out, error, blob,
                                               [&](const pb::Field& f, ColumnValues& v) {
-                                                  return decode_lance_physical_column_impl(data_file_path, f,
+                                                  return decode_lance_physical_column_impl(io, f,
                                                                                            column_metadata, v, error);
                                               });
     if (blob) {
         return ok;
     }
-    return decode_lance_physical_column_impl(data_file_path, on_disk_field, column_metadata, out, error) &&
-           attach_dictionary(data_file_path, on_disk_field, column_metadata, out, error);
+    return decode_lance_physical_column_impl(io, on_disk_field, column_metadata, out, error) &&
+           attach_dictionary(io, on_disk_field, column_metadata, out, error);
 }
 
-bool decode_lance_physical_column_range(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+bool decode_lance_physical_column_range(const EncodingsIo& io, const pb::Field& on_disk_field,
                                         const pb::ColumnMetadata& column_metadata, std::uint64_t first,
                                         std::uint64_t count, std::size_t value_bytes, ColumnValues& out,
                                         std::string& error) {
     bool blob = false;
-    const bool ok = decode_nested_blob_column(data_file_path, on_disk_field, column_metadata, out, error, blob,
+    const bool ok = decode_nested_blob_column(io, on_disk_field, column_metadata, out, error, blob,
                                               [&](const pb::Field& f, ColumnValues& v) {
                                                   return decode_lance_physical_column_range_impl(
-                                                      data_file_path, f, column_metadata, first, count, 0, v, error);
+                                                      io, f, column_metadata, first, count, 0, v, error);
                                               });
     if (blob) {
         return ok;
     }
-    return decode_lance_physical_column_range_impl(data_file_path, on_disk_field, column_metadata, first, count,
+    return decode_lance_physical_column_range_impl(io, on_disk_field, column_metadata, first, count,
                                                    value_bytes, out, error) &&
-           attach_dictionary(data_file_path, on_disk_field, column_metadata, out, error);
+           attach_dictionary(io, on_disk_field, column_metadata, out, error);
 }
 
 }  // namespace nano_lance

@@ -5,6 +5,8 @@
 
 #include "nanolance/byte_sink.hpp"
 
+#include "nanolance/blob_v2_layout.hpp"
+
 #include <memory>
 #include "nanolance/column_values.hpp"
 #include "nanolance/schema_mapper.hpp"
@@ -53,15 +55,6 @@ private:
     std::int64_t len_ = 0;
 };
 
-/// Materialized external blob v2 descriptor (`kind = 3`) before Lance packed encoding.
-struct BlobV2ExternalDescriptor {
-    std::uint8_t kind = 3;
-    std::uint64_t position = 0;
-    std::uint64_t size = 0;
-    std::uint32_t blob_id = 0;
-    std::string blob_uri;
-};
-
 /// Validate one write-side blob row (`data`, `uri`, `position`, `size`) as external-only.
 bool preprocess_blob_v2_external_row(const ArrowArray& data,
                                      const ArrowArray& uri,
@@ -70,14 +63,6 @@ bool preprocess_blob_v2_external_row(const ArrowArray& data,
                                      std::int64_t row_index,
                                      BlobV2ExternalDescriptor& out,
                                      std::string& error);
-
-/// Pack one external descriptor into the Lance 2.2 blob v2 per-row record bytes.
-std::vector<std::uint8_t> blob_v2_pack_descriptor_row(const BlobV2ExternalDescriptor& descriptor);
-
-/// One row of a legacy (v1) blob column -- (position, size) of bytes in `out.blob_v2.data_file` --
-/// appended as a descriptor row of kind inline, so every blob read shape serves it. `null` marks
-/// the row null (format 2.1's reading of a non-zero position with no size).
-void blob_append_legacy_row(ColumnValues& out, std::uint64_t position, std::uint64_t size, bool null);
 
 /// Unpack one per-row record (inverse of `blob_v2_pack_descriptor_row`) for tests.
 bool blob_v2_unpack_descriptor_row(const std::vector<std::uint8_t>& row_bytes,
@@ -119,22 +104,6 @@ const std::vector<std::uint8_t>& blob_v2_column_page_encoding();
 
 /// Build Lance control buffer for packed external blob row boundaries.
 std::vector<std::uint8_t> blob_v2_build_control_buffer(const std::vector<std::uint32_t>& row_packed_sizes);
-
-/// Parse a Lance blob v2 control buffer into per-row packed sizes (`num_rows` must match the on-disk fragment row count).
-bool blob_v2_control_buffer_to_row_sizes(const std::vector<std::uint8_t>& control, std::uint64_t num_rows,
-                                           std::vector<std::uint32_t>& row_packed_sizes, std::string& error);
-
-/// Lance's Blob v2 storage kinds (the descriptor's `kind`).
-constexpr std::uint8_t kBlobKindInline = 0;     // in the data file, at `position`
-constexpr std::uint8_t kBlobKindPacked = 1;     // in a sidecar file shared with other blobs, at `position`
-constexpr std::uint8_t kBlobKindDedicated = 2;  // a sidecar file of its own
-constexpr std::uint8_t kBlobKindExternal = 3;   // at `blob_uri`, `position`
-/// Writer-side only, never on disk: a blob given as bytes, placed (inline, packed or dedicated) when
-/// its data file is written. The row's trailing bytes -- a URI's place -- are the blob itself.
-constexpr std::uint8_t kBlobKindPendingData = 0xFF;
-/// Writer-side only, never on disk: a blob given as inline bytes by a descriptor (kind 0). Placed like
-/// kBlobKindPendingData but always inline, whatever its size.
-constexpr std::uint8_t kBlobKindPendingInline = 0xFE;
 
 /// Lance's storage thresholds for a Blob v2 field, from its field metadata
 /// (`lance-encoding:blob-{inline,dedicated,pack-file}-size-threshold`): a blob of more than `inline_max`

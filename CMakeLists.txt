@@ -359,6 +359,7 @@ add_library(nanolance STATIC
     src/encoding/lz4_block.cpp
     src/encoding/lance_column_decoder.cpp
     src/encoding/lance_v20_decoder.cpp
+    src/encoding/blob_v2_layout.cpp
     src/scan/lance_table_reader.cpp
     src/base/parallel.cpp
     src/encoding/repdef.cpp

@@ -1,7 +1,2 @@
 # Known layering violations: 'A -> B' means module A includes module B from a higher layer.
 # Maintained by tools/check_layers.py --write-allowlist. This list may only shrink.
-
-lance_column_decoder -> blob_v2_external  # encoding -> file
-lance_column_decoder -> data_file_reader  # encoding -> file
-lance_v20_decoder -> blob_v2_external  # encoding -> file
-lance_v20_decoder -> data_file_reader  # encoding -> file

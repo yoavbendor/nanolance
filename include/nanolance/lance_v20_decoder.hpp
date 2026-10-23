@@ -5,6 +5,7 @@
 
 #include "lance_minimal.pb.hpp"
 #include "nanolance/column_values.hpp"
+#include "nanolance/encodings_io.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -55,16 +56,16 @@ struct LeafContext {
 };
 
 /// The whole column. `context` may be null for a leaf with no list above it.
-bool decode_column(const std::filesystem::path& path, const pb::Field& field, const pb::ColumnMetadata& column,
+bool decode_column(const EncodingsIo& io, const pb::Field& field, const pb::ColumnMetadata& column,
                    const LeafContext* context, ColumnValues& out, std::string& error);
 
 /// Rows [first, first + count) of the column's top-level rows: the pages they touch, then sliced.
-bool decode_column_range(const std::filesystem::path& path, const pb::Field& field, const pb::ColumnMetadata& column,
+bool decode_column_range(const EncodingsIo& io, const pb::Field& field, const pb::ColumnMetadata& column,
                          const LeafContext* context, std::uint64_t first, std::uint64_t count,
                          std::size_t value_bytes, ColumnValues& out, std::string& error);
 
 /// The rows listed (strictly ascending): the pages holding them, then compacted to them.
-bool decode_column_rows(const std::filesystem::path& path, const pb::Field& field, const pb::ColumnMetadata& column,
+bool decode_column_rows(const EncodingsIo& io, const pb::Field& field, const pb::ColumnMetadata& column,
                         const LeafContext* context, const std::vector<std::uint64_t>& rows,
                         std::size_t value_bytes, ColumnValues& out, std::string& error);
 

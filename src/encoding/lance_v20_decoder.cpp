@@ -5,10 +5,9 @@
 // `array_encoding` module (the 2.0 decoders), which Lance keeps for reading these files.
 
 #include "nanolance/lance_v20_decoder.hpp"
-#include "nanolance/blob_v2_external.hpp"
+#include "nanolance/blob_v2_layout.hpp"
 
 #include "nanolance/column_slice.hpp"
-#include "nanolance/data_file_reader.hpp"
 #include <nanom/fastlanes.hpp>
 #include "nanolance/fsst.hpp"
 #include "nanolance/lance_column_decoder.hpp"
@@ -332,13 +331,13 @@ std::uint64_t count_clear(const std::vector<std::uint8_t>& bits, std::uint64_t n
 /// kept; a part of an uncompressed one is read on its own, so a range or a take reads only the bytes
 /// its rows need.
 struct PageReader {
-    const std::filesystem::path& path;
+    const EncodingsIo& io;
     const pb::ColumnPage& page;
     const pb::ColumnMetadata& column;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::string>, std::vector<std::uint8_t>> whole;
 
-    PageReader(const std::filesystem::path& p, const pb::ColumnPage& pg, const pb::ColumnMetadata& c)
-        : path(p), page(pg), column(c) {}
+    PageReader(const EncodingsIo& file, const pb::ColumnPage& pg, const pb::ColumnMetadata& c)
+        : io(file), page(pg), column(c) {}
 
     bool locate(const BufferRef& ref, std::uint64_t& offset, std::uint64_t& size, std::string& error) const {
         if (!ref.present) {
@@ -372,7 +371,7 @@ struct PageReader {
         std::uint64_t offset = 0;
         std::uint64_t size = 0;
         std::vector<std::uint8_t> raw;
-        if (!locate(ref, offset, size, error) || !read_lance_data_file_bytes(path, offset, size, raw, error)) {
+        if (!locate(ref, offset, size, error) || !io.read(offset, size, raw, error)) {
             return false;
         }
         auto& slot = whole[key];
@@ -412,7 +411,7 @@ struct PageReader {
             out.clear();
             return true;
         }
-        return read_lance_data_file_bytes(path, offset + at, len, out, error);
+        return io.read(offset + at, len, out, error);
     }
 };
 
@@ -1086,7 +1085,7 @@ bool append_page(ColumnValues& out, const LeafType& t, Arr& a, const std::string
 }
 
 /// Rows [start, start + count) of one page.
-bool decode_page(const std::filesystem::path& path, const pb::ColumnMetadata& column, const pb::ColumnPage& page,
+bool decode_page(const EncodingsIo& io, const pb::ColumnMetadata& column, const pb::ColumnPage& page,
                  std::uint64_t start, std::uint64_t count, Arr& out, std::string& error) {
     if (start > page.length || count > page.length - start) {
         error = "rows " + std::to_string(start) + "+" + std::to_string(count) + " past the page's " +
@@ -1097,8 +1096,8 @@ bool decode_page(const std::filesystem::path& path, const pb::ColumnMetadata& co
     if (!parse_page_encoding(page.encoding, enc, error)) {
         return false;
     }
-    PageReader io(path, page, column);
-    return decode(enc, start, count, io, out, error);
+    PageReader reader(io, page, column);
+    return decode(enc, start, count, reader, out, error);
 }
 
 /// Is this a 2.0 blob column? Its own encoding: Any { /lance.encodings.ColumnEncoding, { blob = 3 } }.
@@ -1119,14 +1118,14 @@ bool is_blob_column(const pb::ColumnMetadata& column) {
 /// A 2.0 blob page's rows as legacy blob descriptor rows (blob_append_legacy_row): the bytes stay in
 /// the data file until a read asks for them, and a description reads back as Lance's (position,
 /// size) -- a null among them as Lance writes it, (1, 0).
-bool append_blob_descriptions(const std::filesystem::path& path, const Arr& a, ColumnValues& out,
+bool append_blob_descriptions(const EncodingsIo& io, const Arr& a, ColumnValues& out,
                               const std::string& name, std::string& error) {
     if (a.shape != Arr::Shape::kFixed || a.packed != std::vector<std::uint32_t>{8U, 8U}) {
         error = "column '" + name + "': a format 2.0 blob page that is not (position, size) descriptions";
         return false;
     }
     out.kind = ColumnValues::Kind::BlobV2External;
-    out.blob_v2.data_file = path;
+    out.blob_v2.data_file = io.name();
     for (std::uint64_t i = 0; i < a.n; ++i) {
         std::uint64_t position = 0;
         std::uint64_t size = 0;
@@ -1179,7 +1178,7 @@ void start_column(ColumnValues& out, const LeafType& t) {
 }
 
 /// The values of pages [p0, p1) of a column.
-bool decode_pages(const std::filesystem::path& path, const pb::Field& field, const pb::ColumnMetadata& column,
+bool decode_pages(const EncodingsIo& io, const pb::Field& field, const pb::ColumnMetadata& column,
                   const LeafContext* context, std::size_t p0, std::size_t p1, ColumnValues& out,
                   std::string& error) {
     LeafType t;
@@ -1190,7 +1189,7 @@ bool decode_pages(const std::filesystem::path& path, const pb::Field& field, con
     const bool blob = t.variable && is_blob_column(column);
     if (blob) {
         out.kind = ColumnValues::Kind::BlobV2External;
-        out.blob_v2.data_file = path;
+        out.blob_v2.data_file = io.name();
     }
     for (std::size_t p = p0; p < p1; ++p) {
         const auto& page = column.pages[p];
@@ -1198,12 +1197,12 @@ bool decode_pages(const std::filesystem::path& path, const pb::Field& field, con
             continue;
         }
         Arr a;
-        if (!decode_page(path, column, page, 0, page.length, a, error)) {
+        if (!decode_page(io, column, page, 0, page.length, a, error)) {
             error = "column '" + field.name + "' page " + std::to_string(p) + ": " + error;
             return false;
         }
         if (blob) {
-            if (!append_blob_descriptions(path, a, out, field.name, error)) {
+            if (!append_blob_descriptions(io, a, out, field.name, error)) {
                 return false;
             }
             continue;
@@ -1217,7 +1216,7 @@ bool decode_pages(const std::filesystem::path& path, const pb::Field& field, con
 
 /// A list column: its offsets and validity, one entry per list. Each page's offsets count from that
 /// page's first item; a null list's is raised by the page's `null_offset_adjustment`.
-bool decode_list_layer(const std::filesystem::path& path, const Ancestor& list, ColumnValues::NestedLayer& layer,
+bool decode_list_layer(const EncodingsIo& io, const Ancestor& list, ColumnValues::NestedLayer& layer,
                        std::string& error) {
     layer = ColumnValues::NestedLayer{};
     layer.is_list = true;
@@ -1236,10 +1235,10 @@ bool decode_list_layer(const std::filesystem::path& path, const Ancestor& list, 
             error = "list '" + list.name + "' page " + std::to_string(p) + " is not a format 2.0 List page";
             return false;
         }
-        PageReader io(path, page, *list.column);
+        PageReader reader(io, page, *list.column);
         Arr offsets_arr;
         std::vector<std::uint64_t> offsets;
-        if (!decode(*enc.a, 0, page.length, io, offsets_arr, error) || !as_u64(offsets_arr, offsets, error)) {
+        if (!decode(*enc.a, 0, page.length, reader, offsets_arr, error) || !as_u64(offsets_arr, offsets, error)) {
             error = "list '" + list.name + "' page " + std::to_string(p) + ": " + error;
             return false;
         }
@@ -1285,7 +1284,7 @@ bool decode_list_layer(const std::filesystem::path& path, const Ancestor& list, 
 }
 
 /// A string an older writer stored as list<uint8>: the list column's offsets, the next column's bytes.
-bool decode_binary_as_list(const std::filesystem::path& path, const pb::Field& field, const pb::ColumnMetadata& column,
+bool decode_binary_as_list(const EncodingsIo& io, const pb::Field& field, const pb::ColumnMetadata& column,
                            const pb::ColumnMetadata& items, ColumnValues& out, std::string& error) {
     LeafType t;
     if (!leaf_type(field, t, error)) {
@@ -1296,14 +1295,14 @@ bool decode_binary_as_list(const std::filesystem::path& path, const pb::Field& f
     as_list.name = field.name;
     as_list.column = &column;
     ColumnValues::NestedLayer layer;
-    if (!decode_list_layer(path, as_list, layer, error)) {
+    if (!decode_list_layer(io, as_list, layer, error)) {
         return false;
     }
     pb::Field bytes_field;
     bytes_field.name = field.name;
     bytes_field.logical_type = "uint8";
     ColumnValues bytes;
-    if (!decode_pages(path, bytes_field, items, nullptr, 0, items.pages.size(), bytes, error)) {
+    if (!decode_pages(io, bytes_field, items, nullptr, 0, items.pages.size(), bytes, error)) {
         return false;
     }
     if (bytes.fixed.size() != static_cast<std::size_t>(layer.offsets.back())) {
@@ -1336,16 +1335,16 @@ bool decode_binary_as_list(const std::filesystem::path& path, const pb::Field& f
 }
 
 /// Rows [start, start + count) of page `p`, appended to `out`.
-bool append_rows(const std::filesystem::path& path, const pb::Field& field, const pb::ColumnMetadata& column,
+bool append_rows(const EncodingsIo& io, const pb::Field& field, const pb::ColumnMetadata& column,
                  const LeafContext* context, std::size_t p, std::uint64_t start, std::uint64_t count,
                  const LeafType& t, ColumnValues& out, std::string& error) {
     Arr a;
-    if (!decode_page(path, column, column.pages[p], start, count, a, error)) {
+    if (!decode_page(io, column, column.pages[p], start, count, a, error)) {
         error = "column '" + field.name + "' page " + std::to_string(p) + ": " + error;
         return false;
     }
     if (t.variable && is_blob_column(column)) {
-        return append_blob_descriptions(path, a, out, field.name, error);
+        return append_blob_descriptions(io, a, out, field.name, error);
     }
     return select_packed_child(a, context, t, field.name, error) && append_page(out, t, a, field.name, error);
 }
@@ -1408,7 +1407,7 @@ bool column_is_list_encoded(const pb::ColumnMetadata& column) {
     return false;
 }
 
-bool decode_column(const std::filesystem::path& path, const pb::Field& field, const pb::ColumnMetadata& column,
+bool decode_column(const EncodingsIo& io, const pb::Field& field, const pb::ColumnMetadata& column,
                    const LeafContext* context, ColumnValues& out, std::string& error) {
     error.clear();
     if (context != nullptr && context->binary_items != nullptr) {
@@ -1416,9 +1415,9 @@ bool decode_column(const std::filesystem::path& path, const pb::Field& field, co
             error = "column '" + field.name + "': a list of strings stored as lists of bytes is not read";
             return false;
         }
-        return decode_binary_as_list(path, field, column, *context->binary_items, out, error);
+        return decode_binary_as_list(io, field, column, *context->binary_items, out, error);
     }
-    if (!decode_pages(path, field, column, context, 0, column.pages.size(), out, error)) {
+    if (!decode_pages(io, field, column, context, 0, column.pages.size(), out, error)) {
         return false;
     }
     if (context == nullptr || !context->has_lists()) {
@@ -1434,7 +1433,7 @@ bool decode_column(const std::filesystem::path& path, const pb::Field& field, co
                 error = "list '" + a.name + "' has no offsets column";
                 return false;
             }
-            if (!decode_list_layer(path, a, layers[k], error)) {
+            if (!decode_list_layer(io, a, layers[k], error)) {
                 return false;
             }
         } else {
@@ -1470,12 +1469,12 @@ bool decode_column(const std::filesystem::path& path, const pb::Field& field, co
     return true;
 }
 
-bool decode_column_range(const std::filesystem::path& path, const pb::Field& field, const pb::ColumnMetadata& column,
+bool decode_column_range(const EncodingsIo& io, const pb::Field& field, const pb::ColumnMetadata& column,
                          const LeafContext* context, std::uint64_t first, std::uint64_t count,
                          std::size_t value_bytes, ColumnValues& out, std::string& error) {
     error.clear();
     if (needs_whole_column(context)) {
-        if (!decode_column(path, field, column, context, out, error)) {
+        if (!decode_column(io, field, column, context, out, error)) {
             return false;
         }
         const auto total = out.layers.empty() ? out.rows : out.layers.front().length;
@@ -1499,14 +1498,14 @@ bool decode_column_range(const std::filesystem::path& path, const pb::Field& fie
         if (lo >= hi) {
             continue;
         }
-        if (!append_rows(path, field, column, context, p, lo - starts[p], hi - lo, t, out, error)) {
+        if (!append_rows(io, field, column, context, p, lo - starts[p], hi - lo, t, out, error)) {
             return false;
         }
     }
     return true;
 }
 
-bool decode_column_rows(const std::filesystem::path& path, const pb::Field& field, const pb::ColumnMetadata& column,
+bool decode_column_rows(const EncodingsIo& io, const pb::Field& field, const pb::ColumnMetadata& column,
                         const LeafContext* context, const std::vector<std::uint64_t>& rows,
                         std::size_t value_bytes, ColumnValues& out, std::string& error) {
     error.clear();
@@ -1517,7 +1516,7 @@ bool decode_column_rows(const std::filesystem::path& path, const pb::Field& fiel
         }
     }
     if (needs_whole_column(context)) {
-        if (!decode_column(path, field, column, context, out, error)) {
+        if (!decode_column(io, field, column, context, out, error)) {
             return false;
         }
         const auto total = out.layers.empty() ? out.rows : out.layers.front().length;
@@ -1552,7 +1551,7 @@ bool decode_column_rows(const std::filesystem::path& path, const pb::Field& fiel
         while (j < rows.size() && rows[j] == rows[j - 1U] + 1U && rows[j] < starts[p + 1U]) {
             ++j;
         }
-        if (!append_rows(path, field, column, context, p, rows[i] - starts[p], static_cast<std::uint64_t>(j - i), t, out,
+        if (!append_rows(io, field, column, context, p, rows[i] - starts[p], static_cast<std::uint64_t>(j - i), t, out,
                          error)) {
             return false;
         }

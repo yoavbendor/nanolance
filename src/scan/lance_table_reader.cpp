@@ -2207,7 +2207,8 @@ bool load_fragment_overlays(const std::filesystem::path& dataset_path, const Pla
             layer.version = overlay.committed_version;
             layer.order = k;
             layer.offsets = &overlay.offsets_for(i);
-            if (!decode_lance_physical_column(*jailed, *on_disk, metadatas[static_cast<std::size_t>(column_index)],
+            const DataFileIo io(*jailed);
+            if (!decode_lance_physical_column(io, *on_disk, metadatas[static_cast<std::size_t>(column_index)],
                                               layer.values, error)) {
                 return false;
             }
@@ -2492,17 +2493,18 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
     parallel::for_each(decoded.size(), [&](std::size_t t) {
         const auto& morsel = morsels[t / n_columns];
         const auto& c = columns[t % n_columns];
+        const DataFileIo io(c.path);
         if (c.v20 != nullptr) {
             if (whole) {
-                v20::decode_column(c.path, *c.on_disk, *c.metadata, c.v20.get(), decoded[t], errors[t]);
+                v20::decode_column(io, *c.on_disk, *c.metadata, c.v20.get(), decoded[t], errors[t]);
             } else {
-                v20::decode_column_range(c.path, *c.on_disk, *c.metadata, c.v20.get(), morsel.first,
+                v20::decode_column_range(io, *c.on_disk, *c.metadata, c.v20.get(), morsel.first,
                                          morsel.second - morsel.first, c.value_bytes, decoded[t], errors[t]);
             }
         } else if (whole) {
-            decode_lance_physical_column(c.path, *c.on_disk, *c.metadata, decoded[t], errors[t]);
+            decode_lance_physical_column(io, *c.on_disk, *c.metadata, decoded[t], errors[t]);
         } else {
-            decode_lance_physical_column_range(c.path, *c.on_disk, *c.metadata, morsel.first,
+            decode_lance_physical_column_range(io, *c.on_disk, *c.metadata, morsel.first,
                                                morsel.second - morsel.first, c.value_bytes, decoded[t], errors[t]);
         }
     });
@@ -2798,11 +2800,12 @@ bool decode_data_file_rows(const std::filesystem::path& dataset_path, const Plan
     std::vector<std::string> errors(columns.size());
     parallel::for_each(columns.size(), [&](std::size_t c) {
         const auto& source = columns[c];
+        const DataFileIo io(source.path);
         if (source.v20 != nullptr) {
-            v20::decode_column_rows(source.path, *source.on_disk, *source.metadata, source.v20.get(), physical,
+            v20::decode_column_rows(io, *source.on_disk, *source.metadata, source.v20.get(), physical,
                                     source.value_bytes, decoded[c], errors[c]);
         } else {
-            decode_lance_physical_column_rows(source.path, *source.on_disk, *source.metadata, physical,
+            decode_lance_physical_column_rows(io, *source.on_disk, *source.metadata, physical,
                                               source.value_bytes, decoded[c], errors[c]);
         }
     });
