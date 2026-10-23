@@ -52,6 +52,7 @@
 #include <vector>
 
 #include "nanolance/dataset.hpp"
+#include "nanolance/index_search.hpp"
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/work_stats.hpp"
@@ -494,6 +495,7 @@ nb::object ds_scan(const std::filesystem::path& path, std::optional<std::uint64_
     request.include_deleted_rows = include_deleted_rows;
     request.blob_handling = static_cast<nano_lance::BlobHandling>(blob_handling);
     request.filter = filter ? &*filter : nullptr;
+    request.index_candidates = nano_lance::index_candidates;
     request.range.offset = offset;
     request.range.length = length < 0 ? nano_lance::LanceRowRange::kAllRows : static_cast<std::uint64_t>(length);
     std::string error;

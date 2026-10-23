@@ -7,7 +7,7 @@ for AI users", Wave 1, item 4. Two sessions: **R1** (read pylance's FRI), **R2**
 ## 0. Context budget (read this first)
 
 Budget about 200k tokens; aim for 120k. Never read a large file whole: `grep -n`, then `sed -n 'A,Bp'`
-windows of at most ~120 lines. Big ones: `src/dataset/index_search.cpp`, `src/dataset/dataset_ops.cpp`,
+windows of at most ~120 lines. Big ones: `src/index/index_search.cpp`, `src/dataset/dataset_ops.cpp`,
 `src/dataset/index_optimize.cpp`, `src/index/vector/vector_search.cpp`, `src/index/fts/fts_search.cpp`,
 `bindings/python/nanolance/lance/dataset.py` (3.5k+). Lance's Rust: read only the files named here.
 Cut output: `| tail -15` for pytest (add `-o addopts=`), `| tail -5` for `tools/pylance_suite.py`.
@@ -18,7 +18,7 @@ Cut output: `| tail -15` for pytest (add `-o addopts=`), `| tail -5` for `tools/
 True})`) compacts without rewriting the indexes: it adds a system index `__lance_frag_reuse` that maps
 the old row addresses to the new ones, and the indexes keep their old row addresses while their
 fragment coverage moves to the new fragments. Searches translate through it. nanolance today, on such
-a dataset, ignores every scalar index (`index_candidates` in `src/dataset/index_search.cpp` about line 1307
+a dataset, ignores every scalar index (`index_candidates` in `src/index/index_search.cpp` about line 1307
 returns early: correct, but a full scan), hides the system index from `list_indices` /
 `describe_indices`, and cannot write one. Targets in `.deps/pylance-tests/v12.0.0/tests/test_optimize.py`
 (lines 500-590): `test_defer_index_remap`, `test_defer_index_remap_via_commit_options[True|False]`,
@@ -57,7 +57,7 @@ has the dataset `f.lance`): 6,000 rows in 6 fragments of 1,000; BTREE on `i`; `d
 
 ## 3. Where things are in nanolance
 
-- `src/dataset/index_search.cpp` (the early return about line 1307), `src/index/vector/vector_search.cpp` and
+- `src/index/index_search.cpp` (the early return about line 1307), `src/index/vector/vector_search.cpp` and
   `src/index/fts/fts_search.cpp` (how each maps an index's row addresses to fragments), `src/table/index_maintenance.cpp`
   (`kFragReuseIndex`, kept as a system index), `src/dataset/index_segments.cpp` (system indexes are not user
   indexes).

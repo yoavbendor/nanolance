@@ -18,6 +18,7 @@
 #include "nanolance/expr.hpp"
 #include "nanolance/fts_tokenizer.hpp"
 #include "nanolance/lance_table_reader.hpp"
+#include "nanolance/index_search.hpp"
 #include "nanolance/manifest_reader.hpp"
 
 #include "lance_minimal.pb.hpp"
@@ -1339,6 +1340,7 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
     scan.with_row_address = true;
     const std::string* filter = request->filter && request->prefilter ? &*request->filter : nullptr;
     scan.filter = filter;
+    scan.index_candidates = nano_lance::index_candidates;
     ArrowSchema schema{};
     std::vector<ArrowArray> batches;
     if (!lance_dataset_scan(path, scan, schema, batches, error)) {
@@ -2467,6 +2469,7 @@ bool row_addresses(const std::filesystem::path& path, const FtsSearchRequest& q,
     request.fragment_ids = &fragments;
     request.with_row_address = true;
     request.filter = filter;
+    request.index_candidates = nano_lance::index_candidates;
     ArrowSchema schema{};
     std::vector<ArrowArray> batches;
     if (!lance_dataset_scan(path, request, schema, batches, error)) {

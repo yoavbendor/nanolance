@@ -15,7 +15,34 @@
 
 namespace nano_lance::pb {
 struct Field;
+struct Manifest;
 }  // namespace nano_lance::pb
+
+namespace nano_lance::expr {
+class Expression;
+}  // namespace nano_lance::expr
+
+namespace nano_lance {
+
+/// The rows a filter may pass, as an index layer answers it (index_search.hpp): the scan reads only those
+/// rows of the fragments answered for and still applies the whole filter to them.
+struct IndexCandidates {
+    /// The fragments the indices answered for, each with its rows (physical offsets, deleted rows
+    /// counted, ascending) that may pass. Every other fragment is read in full.
+    std::map<std::uint64_t, std::vector<std::uint32_t>> rows;
+    /// What answered: "ScalarIndexQuery: query=[<predicate>]@<index>(<type>)", one per predicate an
+    /// index answered, as Lance's plans name it.
+    std::vector<std::string> used;
+    /// True when `rows` is exactly the set of rows that pass the filter in the covered fragments (every
+    /// predicate answered by a BTREE or BITMAP, combined so no side is left to a scan).
+    bool exact = false;
+};
+
+/// Answers a bound filter from a version's indices. False only when an index that applies cannot be read.
+using IndexCandidatesFn = bool (*)(const std::filesystem::path& dataset_path, const pb::Manifest& manifest,
+                                   const expr::Expression& filter, IndexCandidates& out, std::string& error);
+
+}  // namespace nano_lance
 
 namespace nano_lance {
 
@@ -109,8 +136,11 @@ struct LanceScanRequest {
     /// How Blob v2 columns come back (see BlobHandling).
     BlobHandling blob_handling = BlobHandling::Ingest;
     /// With a filter: read only the rows the dataset's scalar indices say may pass (BTree, Bitmap,
-    /// LabelList; index_search.hpp). The rows returned are the same either way.
+    /// LabelList), as `index_candidates` answers them. The rows returned are the same either way.
     bool use_scalar_index = true;
+    /// How the filter is answered from indices: the index layer's index_candidates (index_search.hpp),
+    /// set by the caller that plans the read. Null: no index is consulted (the scan does not know them).
+    IndexCandidatesFn index_candidates = nullptr;
     /// Row-address masks: only the rows the mask allows are read, before the filter, the range and any
     /// ranking. With a mask, `range` counts the rows that pass it (as with a filter). Null: no mask.
     const RowAddrMask* row_mask = nullptr;

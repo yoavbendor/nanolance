@@ -331,7 +331,7 @@ add_library(nanolance STATIC
     src/file/lance_file_writer.cpp
     src/index/scalar/scalar_index.cpp
     src/index/scalar/bloom_filter.cpp
-    src/dataset/index_search.cpp
+    src/index/index_search.cpp
     src/index/index_files.cpp
     src/base/uuid.cpp
     src/arrow/arrow_owned.cpp

@@ -64,7 +64,7 @@ columns, packed structs, deletions, ranges and takes.
 Lance's scalar indexes in Lance's file layout (`src/index/scalar/scalar_index.cpp`), committed in the manifest as
 pylance commits one; `drop_index`, `list_indices`, `describe_indices` and `has_index` work as in
 pylance. Filtered reads use any BTree, Bitmap or LabelList index the dataset has, whoever built it
-(`src/dataset/index_search.cpp`):
+(`src/index/index_search.cpp`):
 
 | index | files | answers |
 |---|---|---|

@@ -6,7 +6,6 @@
 #include "nanolance/row_ids.hpp"
 #include "nanolance/roaring_bitmap.hpp"
 
-#include "nanolance/index_search.hpp"
 
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/column_slice.hpp"
@@ -3177,9 +3176,10 @@ bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb:
 
     // A filter a scalar index answers: per fragment it covers, the only rows that may pass.
     IndexCandidates candidates;
-    if (plan.filter && request.use_scalar_index && !request.include_deleted_rows && !manifest.indices.empty()) {
+    if (plan.filter && request.use_scalar_index && request.index_candidates != nullptr &&
+        !request.include_deleted_rows && !manifest.indices.empty()) {
         std::string why;
-        if (!index_candidates(dataset_path, manifest, *plan.filter, candidates, why)) {
+        if (!request.index_candidates(dataset_path, manifest, *plan.filter, candidates, why)) {
             candidates.rows.clear();  // an index that cannot be read is not used: the read scans
         }
     }

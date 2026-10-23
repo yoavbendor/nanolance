@@ -16,6 +16,7 @@
 #include "nanolance/expr.hpp"
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/lance_table_reader.hpp"
+#include "nanolance/index_search.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/manifest_writer.hpp"
 #include "nanolance/schema_mapper.hpp"
@@ -124,6 +125,7 @@ bool matching_rows(const std::filesystem::path& path, std::uint64_t version, con
     request.columns = &none;
     request.with_row_address = true;
     request.filter = predicate;
+    request.index_candidates = nano_lance::index_candidates;
     OwnedSchema schema;
     OwnedBatches batches;
     if (!scan(path, request, schema, batches, error)) {
@@ -836,6 +838,7 @@ bool update_once(const std::filesystem::path& dataset_path, const std::string* p
     request.with_row_address = true;
     request.with_row_id = stable;  // after the data columns: _rowid, then _rowaddr
     request.filter = predicate != nullptr && !predicate->empty() ? predicate : nullptr;
+    request.index_candidates = nano_lance::index_candidates;
     request.row_mask = row_mask;
     OwnedSchema schema;
     OwnedBatches batches;
@@ -2459,6 +2462,7 @@ bool fragment_delete_rows(const std::filesystem::path& dataset_path, std::uint64
         request.columns = &none;
         request.with_row_address = true;
         request.filter = predicate;
+        request.index_candidates = nano_lance::index_candidates;
         const std::vector<std::uint64_t> only{fragment_id};
         request.fragment_ids = &only;
         OwnedSchema schema;

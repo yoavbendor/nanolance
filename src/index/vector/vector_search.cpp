@@ -28,6 +28,7 @@
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/expr.hpp"
 #include "nanolance/lance_table_reader.hpp"
+#include "nanolance/index_search.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/parallel.hpp"
 
@@ -1352,6 +1353,7 @@ bool row_addresses(const std::filesystem::path& path, const NearestQuery& q, con
     request.fragment_ids = &fragments;
     request.with_row_address = true;
     request.filter = filter;
+    request.index_candidates = nano_lance::index_candidates;
     ArrowSchema schema{};
     std::vector<ArrowArray> batches;
     if (!lance_dataset_scan(path, request, schema, batches, error)) {

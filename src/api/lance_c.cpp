@@ -28,6 +28,7 @@
 #include "nanolance/index_optimize.hpp"
 #include "nanolance/index_segments.hpp"
 #include "nanolance/lance_table_reader.hpp"
+#include "nanolance/index_search.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/object_store.hpp"
 #include "nanolance/nano_lance_writer.h"
@@ -972,6 +973,7 @@ bool open_scan(const LanceScanner& scanner, ArrowArrayStream& out) {
     request.with_row_id = row_id;
     request.with_row_address = row_address;
     request.filter = scanner.filter.empty() ? nullptr : &scanner.filter;
+    request.index_candidates = nano_lance::index_candidates;
     request.use_scalar_index = use_scalar_index;
     request.include_deleted_rows = scanner.search.include_deleted_rows;
     // lance-c returns a blob column as its description unless asked for the bytes.
