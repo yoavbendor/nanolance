@@ -868,6 +868,56 @@ add_executable(nano_lance_external_blob_test tests/test_nano_lance_external_blob
 target_compile_features(nano_lance_external_blob_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_external_blob_test PRIVATE nanolance_reader)
 
+add_executable(nano_lance_shared_cache_test tests/test_shared_cache.cpp)
+target_compile_features(nano_lance_shared_cache_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_shared_cache_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_shared_cache_test PRIVATE nanolance)
+
+add_executable(nano_lance_uuid_test tests/test_uuid.cpp)
+target_compile_features(nano_lance_uuid_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_uuid_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_uuid_test PRIVATE nanolance)
+
+add_executable(nano_lance_bytes_test tests/test_bytes.cpp)
+target_compile_features(nano_lance_bytes_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_bytes_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_bytes_test PRIVATE nanolance)
+
+add_executable(nano_lance_parallel_test tests/test_parallel.cpp)
+target_compile_features(nano_lance_parallel_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_parallel_test PRIVATE nanolance)
+
+add_executable(nano_lance_buffer_pool_test tests/test_buffer_pool.cpp)
+target_compile_features(nano_lance_buffer_pool_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_buffer_pool_test PRIVATE nanolance)
+
+add_executable(nano_lance_work_stats_test tests/test_work_stats.cpp)
+target_compile_features(nano_lance_work_stats_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_work_stats_test PRIVATE nanolance)
+
+add_executable(nano_lance_byte_sink_test tests/test_byte_sink.cpp)
+target_compile_features(nano_lance_byte_sink_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_byte_sink_test PRIVATE nanolance nanolance_reader)
+
+add_executable(nano_lance_external_blob_io_test tests/test_external_blob_io.cpp)
+target_compile_features(nano_lance_external_blob_io_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_external_blob_io_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_external_blob_io_test PRIVATE nanolance_reader)
+
+add_executable(nano_lance_arrow_owned_test tests/test_arrow_owned.cpp)
+target_compile_features(nano_lance_arrow_owned_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_arrow_owned_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_arrow_owned_test PRIVATE nanolance)
+
+add_executable(nano_lance_arrow_slice_test tests/test_arrow_slice.cpp)
+target_compile_features(nano_lance_arrow_slice_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_arrow_slice_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_arrow_slice_test PRIVATE nanolance)
+
+add_executable(nano_lance_jsonb_test tests/test_jsonb.cpp)
+target_compile_features(nano_lance_jsonb_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_jsonb_test PRIVATE nanolance)
+
 # Live S3 integration test (only with the nanos3reader provider): range GETs against a real S3-compatible
 # endpoint; skips unless NANOLANCE_S3_TEST_URI (+ AWS_* env) is set. tests/s3_minio_integration.sh wires
 # this up against a throwaway MinIO. The SigV4 signer vectors now live in the nanos3reader repo's own tests.
@@ -1028,6 +1078,29 @@ add_test(NAME nano_lance_byte_source_remote COMMAND $<TARGET_FILE:nano_lance_byt
 set_tests_properties(nano_lance_byte_source_remote PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_external_blob COMMAND $<TARGET_FILE:nano_lance_external_blob_test>)
 set_tests_properties(nano_lance_external_blob PROPERTIES LABELS "smoke")
+
+add_test(NAME nano_lance_shared_cache COMMAND $<TARGET_FILE:nano_lance_shared_cache_test>)
+set_tests_properties(nano_lance_shared_cache PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_uuid COMMAND $<TARGET_FILE:nano_lance_uuid_test>)
+set_tests_properties(nano_lance_uuid PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_bytes COMMAND $<TARGET_FILE:nano_lance_bytes_test>)
+set_tests_properties(nano_lance_bytes PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_parallel COMMAND $<TARGET_FILE:nano_lance_parallel_test>)
+set_tests_properties(nano_lance_parallel PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_buffer_pool COMMAND $<TARGET_FILE:nano_lance_buffer_pool_test>)
+set_tests_properties(nano_lance_buffer_pool PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_work_stats COMMAND $<TARGET_FILE:nano_lance_work_stats_test>)
+set_tests_properties(nano_lance_work_stats PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_byte_sink COMMAND $<TARGET_FILE:nano_lance_byte_sink_test>)
+set_tests_properties(nano_lance_byte_sink PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_external_blob_io COMMAND $<TARGET_FILE:nano_lance_external_blob_io_test>)
+set_tests_properties(nano_lance_external_blob_io PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_arrow_owned COMMAND $<TARGET_FILE:nano_lance_arrow_owned_test>)
+set_tests_properties(nano_lance_arrow_owned PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_arrow_slice COMMAND $<TARGET_FILE:nano_lance_arrow_slice_test>)
+set_tests_properties(nano_lance_arrow_slice PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_jsonb COMMAND $<TARGET_FILE:nano_lance_jsonb_test>)
+set_tests_properties(nano_lance_jsonb PROPERTIES LABELS "smoke")
 
 if(NANOLANCE_S3_NANOS3READER_ACTIVE)
     # Live S3 integration: skips (CTest code 77) unless NANOLANCE_S3_TEST_URI + AWS_* env are set. Not in
