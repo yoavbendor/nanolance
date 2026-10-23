@@ -446,6 +446,7 @@ tests/test_dataset.py::test_schema_project_drop_column
 tests/test_dataset.py::test_schema_project_rename_column
 tests/test_dataset.py::test_schema_project_swap_column
 tests/test_dataset.py::test_scoring_columns
+tests/test_dataset.py::test_select_none
 tests/test_dataset.py::test_shallow_clone
 tests/test_dataset.py::test_sharded_iterator_batches
 tests/test_dataset.py::test_sharded_iterator_fragments
@@ -935,7 +936,10 @@ tests/test_optimize.py::test_defer_index_remap
 tests/test_optimize.py::test_defer_index_remap_via_commit_options[False]
 tests/test_optimize.py::test_defer_index_remap_via_commit_options[True]
 tests/test_optimize.py::test_describe_indices_matches_list_indices_for_frag_reuse
+tests/test_optimize.py::test_index_remapping
+tests/test_optimize.py::test_index_remapping_multiple_rewrite_tasks
 tests/test_optimize.py::test_optimize_indices_second_call_is_noop
+tests/test_optimize.py::test_remap_row_addrs
 tests/test_order_by.py::test_all_order_by_support_functions
 tests/test_order_by.py::test_one_column_order_by
 tests/test_order_by.py::test_two_column_order_by
@@ -1141,6 +1145,7 @@ tests/test_scalar_index.py::test_zonemap_deletion_handling
 tests/test_scalar_index.py::test_zonemap_fragment_ids_parameter_validation
 tests/test_scalar_index.py::test_zonemap_fsl_column
 tests/test_scalar_index.py::test_zonemap_index
+tests/test_scalar_index.py::test_zonemap_index_remapping
 tests/test_scalar_index.py::test_zonemap_segment_merge_and_commit_from_python
 tests/test_scalar_index.py::test_zonemap_with_stable_row_ids_after_compaction
 tests/test_scalar_index.py::test_zonemap_zone_size
