@@ -579,7 +579,11 @@ read-speed check; the cleanup test ignores `.nfs*` meanwhile.
 `test_file.py::test_batch_sizes`): 0.57 s a read warm, 3 s cold, against pylance's 0.09 s (6x); the test
 takes 55 s against 20 s, most of it system time (large buffers allocated and faulted in per read). On a
 192-core machine running 192 test workers it hit the suite's 300 s timeout. Profile the decode path of
-large binary pages (copies between page buffer, decode and Arrow builder).
+large binary pages (copies between page buffer, decode and Arrow builder). Likely mechanism: each read
+allocates fresh buffers of ~300 MB, which glibc maps and unmaps per call, so every read page-faults them in
+and every free is an munmap; on a 192-core machine both cost far more (page-table work, TLB shootdowns to
+every core running the process). Still over 300 s there with 32 test workers (2026-10-23); 55 s on 4 cores.
+Candidates: decode into the output buffer directly (one copy fewer), reuse or keep large buffers mapped.
 
 ### When the Lance pin moves past 12.0
 
