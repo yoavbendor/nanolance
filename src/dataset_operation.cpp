@@ -282,6 +282,17 @@ bool decode_operation(std::uint32_t kind, const Bytes& message, Operation& op, s
                 if (f.number == 2 && !fragment_into(op.updated_fragments)) return false;
                 if (f.number == 3 && !fragment_into(op.fragments)) return false;
                 if (f.number == 4) append_varints(f, op.fields_modified);
+                if (f.number == 7) op.rewrite_columns = f.value == 1U;
+                if (f.number == 10) {
+                    std::pair<std::uint64_t, OpBytes> entry;
+                    WireReader er(f);
+                    WireField e;
+                    while (er.next(e)) {
+                        if (e.number == 1) entry.first = e.value;
+                        if (e.number == 2) entry.second = e.bytes();
+                    }
+                    op.updated_fragment_offsets.push_back(std::move(entry));
+                }
                 break;
             case kRewrite: {
                 if (f.number == 1 || f.number == 2) {  // the deprecated single group

@@ -8,6 +8,7 @@
 
 #include "nanolance/base_paths.hpp"
 #include "nanolance/dataset_commit.hpp"
+#include "nanolance/deletion_vector.hpp"
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/mem_wal.hpp"
 #include "nanolance/manifest_reader.hpp"
@@ -418,6 +419,46 @@ bool stamp_missing_row_meta(std::vector<pb::DataFragment>& fragments, std::uint6
     return true;
 }
 
+/// Stable row ids, an Update in RewriteColumns mode: the rows its updated_fragment_offsets name were last
+/// updated at `version` (Lance's refresh of the row version metadata for the matched rows only).
+bool stamp_updated_rows(std::vector<pb::DataFragment>& fragments, const Operation& op, std::uint64_t version,
+                        std::string& error) {
+    for (const auto& [fragment_id, bitmap] : op.updated_fragment_offsets) {
+        auto fragment = std::find_if(fragments.begin(), fragments.end(),
+                                     [&](const pb::DataFragment& f) { return f.id == fragment_id; });
+        if (fragment == fragments.end()) {
+            continue;
+        }
+        std::vector<std::uint32_t> offsets;
+        FragmentRowMeta meta;
+        if (!parse_roaring_bitmap(bitmap, offsets, error, fragment->physical_rows) ||
+            !read_fragment_row_meta(*fragment, meta, error)) {
+            return false;
+        }
+        if (meta.external || offsets.empty()) {
+            continue;
+        }
+        std::vector<std::uint64_t> versions(fragment->physical_rows, 1U);
+        if (meta.has_last_updated) {
+            RowVersionSequence seq;
+            if (!RowVersionSequence::decode(meta.last_updated.data(), meta.last_updated.size(), seq, error)) {
+                return false;
+            }
+            versions = seq.to_vector();
+            versions.resize(fragment->physical_rows, 1U);
+        }
+        for (const auto offset : offsets) {
+            if (offset < versions.size()) {
+                versions[offset] = version;
+            }
+        }
+        meta.has_last_updated = true;
+        meta.last_updated = RowVersionSequence::from_values(versions).encode();
+        write_fragment_row_meta(*fragment, meta);
+    }
+    return true;
+}
+
 bool apply_operation(const pb::Manifest* base, const Operation& op, pb::Manifest& next, std::string& error,
                      bool enable_stable_row_ids = false, std::uint64_t new_version = 0) {
     if (base == nullptr && op.kind != kOverwrite) {
@@ -502,6 +543,9 @@ bool apply_operation(const pb::Manifest* base, const Operation& op, pb::Manifest
                 kept.push_back(it != updated.end() ? *it->second : f);
             }
             next.fragments = std::move(kept);
+            if (stable && op.rewrite_columns && !stamp_updated_rows(next.fragments, op, new_version, error)) {
+                return false;
+            }
             prune_updated_fields(next.indices, updated_ids, op.fields_modified);
             auto added = op.fragments;
             assign_ids(added, next_id);

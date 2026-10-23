@@ -401,6 +401,7 @@ tests/test_dataset.py::test_merge_insert_permissive_nullability
 tests/test_dataset.py::test_merge_insert_raises_without_pk_and_on_omitted
 tests/test_dataset.py::test_merge_insert_source_is_dataset
 tests/test_dataset.py::test_merge_insert_subcols
+tests/test_dataset.py::test_merge_insert_subcols_in_place
 tests/test_dataset.py::test_merge_insert_subcols_with_json_column
 tests/test_dataset.py::test_merge_insert_vector_column
 tests/test_dataset.py::test_merge_insert_when_matched_delete
@@ -589,6 +590,7 @@ tests/test_fragment.py::test_fragment_update_columns_partial_update
 tests/test_fragment.py::test_fragment_update_columns_with_custom_join_key
 tests/test_fragment.py::test_fragment_update_columns_with_json_column
 tests/test_fragment.py::test_fragment_update_columns_with_nulls
+tests/test_fragment.py::test_fragment_update_columns_with_offsets_rewrite_columns
 tests/test_fragment.py::test_fragment_validate
 tests/test_fragment.py::test_fragment_validate_across_data_files
 tests/test_fragment.py::test_fragment_validate_after_delete

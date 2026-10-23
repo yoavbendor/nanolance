@@ -3362,8 +3362,9 @@ class MergeInsertBuilder:
         return self
 
     def write_mode(self, mode: str) -> "MergeInsertBuilder":
-        """How the merged rows are written. nanolance gives every mode the same results, written as
-        whole rows ('rewrite_rows'); 'rewrite_columns' is checked as Lance checks it."""
+        """How the merged rows are written: 'auto' and 'rewrite_rows' write whole rows to new fragments;
+        'rewrite_columns' patches the source's columns into the fragments that hold the matched rows
+        (an update_all merge without a condition; one with a condition is written as whole rows)."""
         if mode not in ("auto", "rewrite_rows", "rewrite_columns"):
             raise ValueError(f"Invalid write_mode: {mode}. Expected one of 'auto', 'rewrite_rows', 'rewrite_columns'")
         self._write_mode = mode
@@ -3468,6 +3469,8 @@ class MergeInsertBuilder:
                        else "")
                     + "Use MergeInsertWriteMode::Auto or RewriteRows instead."
                 )
+            if self._update_all and not self._delete_by_source and not self._update_condition:
+                return self._rewrite_columns(reader.read_all())
         if len(reader.schema.names) < len(target.names):
             reader = self._fill_missing_columns(reader, target)
         blob_columns = [i for i, f in enumerate(target) if _is_blob_v2(f)]
@@ -3490,6 +3493,49 @@ class MergeInsertBuilder:
 
     _uncommitted = False
     _transaction = None
+    _columns_transaction = None
+
+    def _rewrite_columns(self, source: pa.Table) -> Dict[str, int]:
+        """write_mode("rewrite_columns"): the source's columns patched into the fragments holding the
+        matched rows (LanceFragment.update_columns, joined on each row's address), committed as one
+        Update with update_mode rewrite_columns. No fragment is added or renumbered, and the columns
+        the source lacks are neither read nor written."""
+        for k in self._on:
+            if k not in source.column_names:
+                raise ValueError(f"the source has no key column '{k}'")
+        names = [f"k{i}" for i in range(len(self._on))]
+        keys = self._ds.to_table(columns=self._on, with_row_address=True)
+        left = pa.table({**{n: source.column(k) for n, k in zip(names, self._on)},
+                         "__source": pa.array(range(source.num_rows), pa.int64())})
+        right = pa.table({**{n: keys.column(k) for n, k in zip(names, self._on)},
+                          "__addr": keys.column("_rowaddr")})
+        joined = left.join(right, keys=names, join_type="inner")
+        if len(set(joined.column("__source").to_pylist())) != joined.num_rows:
+            raise ValueError("merge insert: a source row matches more than one row of the dataset")
+        if len(set(joined.column("__addr").to_pylist())) != joined.num_rows:
+            raise ValueError("merge insert: a dataset row matches more than one source row")
+        values = source.drop_columns(self._on)
+        patch = values.take(joined.column("__source")).append_column("_rowaddr", joined.column("__addr"))
+        by_fragment: Dict[int, List[int]] = {}
+        for i, addr in enumerate(patch.column("_rowaddr").to_pylist()):
+            by_fragment.setdefault(addr >> 32, []).append(i)
+        updated, offsets, fields = [], {}, []
+        for fragment_id, rows in sorted(by_fragment.items()):
+            fragment = self._ds.get_fragment(fragment_id)
+            metadata, fields, matched = fragment.update_columns(
+                patch.take(pa.array(rows, pa.int64())), left_on="_rowaddr", with_offsets=True)
+            updated.append(metadata)
+            offsets[metadata.id] = matched
+        operation = LanceOperation.Update(updated_fragments=updated, fields_modified=fields,
+                                          update_mode="rewrite_columns", updated_fragment_offsets=offsets or None)
+        stats = {"num_inserted_rows": 0, "num_updated_rows": joined.num_rows, "num_deleted_rows": 0}
+        if self._uncommitted:
+            self._columns_transaction = Transaction(self._ds.version, operation)
+            return stats
+        if updated:
+            LanceDataset.commit(self._ds.uri, operation, read_version=self._ds.version)
+            self._ds._refresh_latest("Update")
+        return stats
 
     def _targets(self) -> Tuple[List[str], List[int]]:
         """Where the new data files go, as the native merge takes them: directories and base ids."""
@@ -3505,10 +3551,13 @@ class MergeInsertBuilder:
         from nanolance.lance._transactions import _operation
 
         self._uncommitted = True
+        self._columns_transaction = None
         try:
             stats = self.execute(data_obj, schema=schema)
         finally:
             self._uncommitted = False
+        if self._columns_transaction is not None:
+            return self._columns_transaction, stats
         read_version, field, message = self._transaction
         operation = _operation(int(field), bytes(message))
         for fragment in getattr(operation, "new_fragments", None) or getattr(operation, "fragments", None) or []:

@@ -78,6 +78,9 @@ struct Operation {
     std::map<std::string, std::string> config_upserts;  // Overwrite
     std::vector<OpBytes> initial_bases;               // Overwrite: each a lance.table.BasePath
     std::vector<std::uint64_t> fields_modified;       // Update
+    bool rewrite_columns = false;                     // Update: update_mode RewriteColumns
+    /// Update: per updated fragment, the offsets of the rows it changed (a portable Roaring bitmap).
+    std::vector<std::pair<std::uint64_t, OpBytes>> updated_fragment_offsets;
     std::vector<RewriteGroup> groups;                 // Rewrite
     std::vector<RewrittenIndex> rewritten_indices;    // Rewrite
     std::uint64_t restore_version = 0;                // Restore
