@@ -563,6 +563,16 @@ write.
 | T5 | ~~**Small spec leftovers**~~ (done 2026-10-20, `docs/tasks/WAVE3_SMALL.md` phase S): `_versions/latest_version_hint.json`, the inline transaction (12.0's `transaction_section`, field 21), `version_aux_data`, migration to stable row ids, plus `manifest_needs_migration` and `migrate_manifest_paths_v2` | 3 | decided, measured on pylance 12: (1) field 21 is **read** when the manifest names no transaction file or the file is gone (`read_transaction`, and the conflict classifier, which had called such a version retryable); **not written**, nanolance still writes the `.txn` file. (2) `latest_version_hint.json`: **not written** (pylance opens without it; revisit with object-store writes, item 8). (3) `version_aux_data`: **not needed** (always 0 or absent in pylance 12). (4) migration to stable row ids: **not needed** (pylance 12 has no API for it). V1 to V2 manifest names: renamed as Lance does. Left: the reader does not keep `physical_rows` / `num_deleted_rows` presence, so a manifest that lacks them is not reported as needing migration | measure what pylance 12 writes and reads for each; drop those that change nothing | 1 session | correctness does not depend on them; listed so they are decided, not forgotten | each matches pylance 12, or is recorded as not needed |
 | T6 | **Overlay refinements** (verdict 2026-10-21: low value -- an index is already kept for every overlay that does not touch its fields (`fragments_stale_for_index` is per field), so "updating labels on an indexed embedding table" stays indexed today; per-row exclusion helps only overlays of the indexed column itself): per-row index exclusion with re-evaluation (the spec's exclusion set) in place of searching the fragment unindexed; sparse overlays written as such | 3 | the fallback is correct but whole-fragment | the speed verdict stays with Opus | 1-2 sessions | updating labels on an indexed embedding table keeps the index fast | same results as now; reviewer's before/after shows faster searches on overlaid fragments |
 
+### Known issue: open handles to deleted data files (found 2026-10-23)
+
+`src/data_file_reader.cpp` keeps up to 4 data files open per thread (a thread-local LRU, to skip
+reopening). Files that `cleanup_old_versions` (or any delete) removes stay open there until each thread
+reads other files: on a 192-core machine up to ~770 handles. On local disks this is invisible; on NFS
+the deleted files linger as `.nfs*` entries and their space is not freed until the handles close. Fix:
+a deletion generation the threads check, or a shared, lock-protected handle cache that a delete can
+purge (it must not close a handle another thread is reading through). Needs its own change and a
+read-speed check; the cleanup test ignores `.nfs*` meanwhile.
+
 ### When the Lance pin moves past 12.0
 
 Not scheduled; T1 refuses each one until then. Roughly by size:

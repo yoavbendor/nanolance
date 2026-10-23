@@ -91,7 +91,7 @@ def _pylance_answers(path, cases):
     out = []
     while len(out) < len(cases):
         p = subprocess.run([sys.executable, "-c", PYLANCE_CHILD, path, json.dumps(cases), str(len(out))],
-                           capture_output=True, text=True, timeout=600, env=dict(os.environ))
+                           capture_output=True, text=True, timeout=1800, env=dict(os.environ))
         out += [json.loads(line) for line in p.stdout.splitlines() if line.startswith("[")]
         if p.returncode != 0:
             assert "memory allocation" in p.stderr, p.stderr[-500:]  # only that pylance abort is expected

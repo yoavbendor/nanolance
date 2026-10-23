@@ -42,6 +42,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -117,6 +118,7 @@ def environment(python: str) -> dict:
         "curl-config": tool_version(["curl-config", "--version"]),
         "git_commit": tool_version(["git", "-C", str(ROOT), "rev-parse", "HEAD"]),
         "git_branch": tool_version(["git", "-C", str(ROOT), "rev-parse", "--abbrev-ref", "HEAD"]),
+        "test_tmp": tempfile.gettempdir(),
         "env_CC_CXX_CMAKE": {k: os.environ[k] for k in ("CC", "CXX", "CMAKE_GENERATOR", "CMAKE_ARGS",
                                                           "CFLAGS", "CXXFLAGS", "LDFLAGS") if k in os.environ},
     }
@@ -211,6 +213,8 @@ def main(argv=None) -> int:
     ap.add_argument("--skip", default="", help="steps to skip, comma-separated (cpp,stress,pylance,lance_c,...)")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--max-kb", type=int, default=190, help="cap on report.txt (default 190 KB)")
+    ap.add_argument("--tmp", help="where the tests write their datasets (default: the system temp directory, "
+                                   "a local disk; a checkout on NFS makes the suite several times slower)")
     args = ap.parse_args(argv)
     if args.s3 and not re.match(r"^s3://[^/]+(/|$)", args.s3):
         ap.error(f"--s3 must look like s3://bucket/prefix (got {args.s3!r})")
@@ -220,6 +224,7 @@ def main(argv=None) -> int:
 
     out = ROOT / ".validate" / dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True)
+    scratch = Path(tempfile.mkdtemp(prefix="nanolance-validate-", dir=args.tmp))
     run = Run(out)
     print(f"logs and report: {out}", flush=True)
 
@@ -317,7 +322,7 @@ def main(argv=None) -> int:
                 e.pop("AWS_SESSION_TOKEN", None)
                 e.pop("AWS_PROFILE", None)
             # Its own temporary directory, removed afterwards: a run leaves gigabytes of test datasets.
-            basetemp = out / f"tmp-{name}"
+            basetemp = scratch / f"tmp-{name}"
             code, secs = run.sh(name, [py, "-m", "pytest", "-m", "not bench", "-q", "-rs", "-o", "addopts=", "-p",
                                        "no:cacheprovider", "--timeout", "1800", f"--basetemp={basetemp}",
                                        f"--junitxml={junit}", "tests"],
@@ -334,11 +339,11 @@ def main(argv=None) -> int:
 
     if "pylance" not in skip:
         # TMPDIR, not --basetemp: any extra pytest argument turns off the suite's expected-pass verdict.
-        (out / "tmp-pylance").mkdir()
+        (scratch / "tmp-pylance").mkdir()
         code, secs = run.sh("pylance", [py, str(ROOT / "tools" / "pylance_suite.py"), "--report",
                                         str(out / "pylance-suite.json")], "pylance.log",
-                            env=dict(base_env, TMPDIR=str(out / "tmp-pylance")), timeout=4 * 3600)
-        shutil.rmtree(out / "tmp-pylance", ignore_errors=True)
+                            env=dict(base_env, TMPDIR=str(scratch / "tmp-pylance")), timeout=4 * 3600)
+        shutil.rmtree(scratch / "tmp-pylance", ignore_errors=True)
         last = [l for l in (out / "pylance.log").read_text(errors="replace").splitlines() if "test suite against" in l]
         run.record("pylance", "ok" if code == 0 else "FAIL", secs, "pylance.log", last[-1].strip() if last else "")
 
@@ -363,6 +368,7 @@ def main(argv=None) -> int:
     elif "s3" not in skip:
         run.record("s3", "skip", 0, "", "no --s3 prefix given")
 
+    shutil.rmtree(scratch, ignore_errors=True)
     return finish(run, env_info, args)
 
 
