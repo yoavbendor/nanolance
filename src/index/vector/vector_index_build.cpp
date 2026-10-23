@@ -16,8 +16,9 @@
 // values left out, as Lance's filter_nan leaves them), and the index is committed in the
 // manifest's index section as Lance commits one.
 
-#include "index/index_build.hpp"
+#include "index/segment.hpp"
 #include "index/vector/rabitq_build.hpp"
+#include "index/vector/vector_segment.hpp"
 #include "nanolance/vector_search.hpp"
 
 #include "base/float16.hpp"
@@ -1409,9 +1410,10 @@ bool write_rq_auxiliary(const Rows& data, const std::vector<float>& centroids, c
 
 bool create_vector_index(const std::filesystem::path& dataset_path, const std::string& column,
                          const VectorIndexOptions& given, const index_build::SegmentTarget* target,
-                         std::uint64_t& new_version, std::string& error) {
+                         const index_build::VectorSegmentInputs& inputs, std::uint64_t& new_version,
+                         std::string& error) {
     error.clear();
-    const index_build::VectorModel* model = target != nullptr ? target->model : nullptr;
+    const index_build::VectorModel* model = inputs.model;
     VectorIndexOptions options = given;
     if (model != nullptr) {
         // An existing segment's model: its type, metric and PQ settings, its partitions.
@@ -1470,8 +1472,8 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     } else if (!load_read_version(dataset_path, options.read_version, manifest, version, error)) {
         return false;
     }
-    // Training alone (target->trained) commits nothing either.
-    const bool commit = target == nullptr || (target->out == nullptr && target->trained == nullptr);
+    // Training alone (inputs.trained) commits nothing either.
+    const bool commit = target == nullptr || (target->out == nullptr && inputs.trained == nullptr);
     AddressToRowId to_row_id;  // stable row ids go into the index, row addresses otherwise
     if (!AddressToRowId::build(manifest, to_row_id, error)) {
         return false;
@@ -1536,7 +1538,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     // Training alone (IndicesBuilder) takes float16 and float64 vectors too, as Lance's does; the
     // index files nanolance writes hold float32. A multivector index over float16 vectors stores
     // float16, as pylance's does (auxiliary.idx "flat" is halffloat).
-    const bool trains_only = target != nullptr && target->trained != nullptr;
+    const bool trains_only = inputs.trained != nullptr;
     const bool half_storage = multi && item == "e";
     if (binary && item != "C") {
         error = "Distance type hamming does not support Float32 vectors, use l2, cosine or dot";
@@ -1774,7 +1776,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     // IVF: train on a sample, then every vector to its nearest centroid.
     const bool dot_metric = options.metric == VectorMetric::Dot;
     const index_build::Progress* progress = target != nullptr ? target->progress : nullptr;
-    index_build::VectorModel* trained = target != nullptr ? target->trained : nullptr;
+    index_build::VectorModel* trained = inputs.trained;
     double loss = 0;
     std::vector<float> centroids;
     std::vector<std::uint8_t> binary_centroids;  // Hamming: [partitions][dim] bytes; `centroids` stays empty
@@ -1830,7 +1832,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         }
     }
     // A Hamming index keeps its partitions as they are: Lance's split and join are float k-means.
-    const bool shuffle_first = model != nullptr && target->rebalance_target != 0U && !binary;
+    const bool shuffle_first = model != nullptr && inputs.rebalance_target != 0U && !binary;
     std::vector<std::uint32_t> label;
     bool labelled = false;  // the codebook's sample covered every row: the labels are complete already
     const auto shuffle = [&] {
@@ -1842,8 +1844,8 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
                     assign(data, centroids, partitions, dot_metric, label, nullptr);
                 }
             }
-            if (model != nullptr && target->rebalance_target != 0U && !binary) {
-                adjust_partitions(data, centroids, partitions, label, target->rebalance_target, dot_metric,
+            if (model != nullptr && inputs.rebalance_target != 0U && !binary) {
+                adjust_partitions(data, centroids, partitions, label, inputs.rebalance_target, dot_metric,
                                   options.max_iters);
             }
             if (progress != nullptr) {  // every row is labelled
@@ -2385,8 +2387,8 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
-    if (target != nullptr && target->details != nullptr) {
-        details = *target->details;
+    if (inputs.details != nullptr) {
+        details = *inputs.details;
     }
     if (progress != nullptr) {
         if (!hnsw) {  // the files hold every partition: each is reported once they are written
@@ -2432,7 +2434,7 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
             [&](ReadVersion from) {
                 VectorIndexOptions o = options;
                 o.read_version = from;
-                return create_vector_index(dataset_path, column, o, nullptr, new_version, error);
+                return create_vector_index(dataset_path, column, o, nullptr, {}, new_version, error);
             },
             error);
     }
@@ -2441,6 +2443,7 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
     index_build::VectorModel model;
     index_build::Progress progress = options.progress;
     index_build::SegmentTarget target;
+    index_build::VectorSegmentInputs inputs;
     if (!options.ivf_centroids.empty()) {
         if (options.num_partitions.value_or(0U) == 0U ||
             options.ivf_centroids.size() % options.num_partitions.value_or(1U) != 0U) {
@@ -2460,23 +2463,23 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
         model.hnsw_m = options.hnsw_m;
         model.hnsw_ef_construction = options.hnsw_ef_construction;
         model.hnsw_max_level = options.hnsw_max_level;
-        target.model = &model;
+        inputs.model = &model;
     }
     if (options.progress) {
         target.progress = &progress;
     }
-    return create_vector_index(dataset_path, column, options, &target, new_version, error);
+    return create_vector_index(dataset_path, column, options, &target, inputs, new_version, error);
 }
 
 bool index_build::build_vector_segment(const std::filesystem::path& dataset_path, const std::string& column,
                                        const VectorIndexOptions& options, const SegmentTarget& target,
-                                       std::string& error) {
-    if (options.metric == VectorMetric::Hamming && target.model != nullptr && target.model->binary_centroids.empty()) {
+                                       const VectorSegmentInputs& inputs, std::string& error) {
+    if (options.metric == VectorMetric::Hamming && inputs.model != nullptr && inputs.model->binary_centroids.empty()) {
         error = "vector index: a Hamming index's model must hold byte centroids (not float ones)";
         return false;
     }
     std::uint64_t unused = 0;
-    return create_vector_index(dataset_path, column, options, &target, unused, error);
+    return create_vector_index(dataset_path, column, options, &target, inputs, unused, error);
 }
 
 }  // namespace nano_lance

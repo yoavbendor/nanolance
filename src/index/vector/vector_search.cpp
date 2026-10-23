@@ -20,7 +20,7 @@
 #include "nanolance/overlays.hpp"
 #include "nanolance/row_ids.hpp"
 
-#include "index/index_build.hpp"
+#include "index/vector/vector_segment.hpp"
 #include "base/fts_json.hpp"
 #include "index/index_files.hpp"
 #include "base/shared_cache.hpp"

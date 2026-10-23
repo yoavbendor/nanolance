@@ -8,7 +8,10 @@
 #include "nanolance/byte_sink.hpp"
 #include "nanolance/byte_source.hpp"
 
-#include "index/index_build.hpp"
+#include "index/fts/inverted_segment.hpp"
+#include "index/scalar/scalar_segment.hpp"
+#include "index/segment.hpp"
+#include "index/vector/vector_segment.hpp"
 #include "table/index_location.hpp"
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/manifest_reader.hpp"
@@ -597,23 +600,24 @@ bool build_segment(const std::filesystem::path& dataset_path, const std::string&
     target.fragments = fragments;
     target.out = &entry;
     target.uuid = uuid;
-    target.model = model;
-    target.details = details;
     if (type == "INVERTED") {
         InvertedIndexOptions o = inverted;
         o.name = name;
-        return index_build::build_inverted_segment(dataset_path, column, o, target, error);
+        return index_build::build_inverted_segment(dataset_path, column, o, target, {}, error);
     }
     ScalarIndexType scalar{};
     if (parse_scalar_index_type(type, scalar)) {
         ScalarIndexOptions o;
         o.name = name;
-        return index_build::build_scalar_segment(dataset_path, column, scalar, o, target, error);
+        return index_build::build_scalar_segment(dataset_path, column, scalar, o, target, {}, error);
     }
     VectorIndexOptions o = vector;
     o.type = type;
     o.name = name;
-    return index_build::build_vector_segment(dataset_path, column, o, target, error);
+    index_build::VectorSegmentInputs inputs;
+    inputs.model = model;
+    inputs.details = details;
+    return index_build::build_vector_segment(dataset_path, column, o, target, inputs, error);
 }
 
 }  // namespace
@@ -961,9 +965,10 @@ bool dataset_train_vector_model(const std::filesystem::path& dataset_path, std::
     target.manifest = &manifest;
     target.version = at;
     target.fragments = fragments;
-    target.model = model ? &*model : nullptr;
-    target.trained = &trained;
-    if (!index_build::build_vector_segment(dataset_path, column, options, target, error)) {
+    index_build::VectorSegmentInputs inputs;
+    inputs.model = model ? &*model : nullptr;
+    inputs.trained = &trained;
+    if (!index_build::build_vector_segment(dataset_path, column, options, target, inputs, error)) {
         return false;
     }
     out.dim = trained.dim;

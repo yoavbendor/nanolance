@@ -37,7 +37,10 @@
 #include "nanolance/vector_search.hpp"
 #include "nanolance/work_stats.hpp"
 
-#include "index/index_build.hpp"
+#include "index/fts/inverted_segment.hpp"
+#include "index/scalar/scalar_segment.hpp"
+#include "index/segment.hpp"
+#include "index/vector/vector_segment.hpp"
 #include "base/uuid.hpp"
 #include "table/index_location.hpp"
 
@@ -2586,10 +2589,11 @@ bool train(const Trainer& t, const nano_lance::VectorIndexOptions& o, const nano
     target.manifest = &t.manifest;
     target.version = t.version;
     target.fragments = t.fragments ? &*t.fragments : nullptr;
-    target.model = model;
-    target.trained = &trained;
+    nano_lance::index_build::VectorSegmentInputs inputs;
+    inputs.model = model;
+    inputs.trained = &trained;
     std::string error;
-    if (!nano_lance::index_build::build_vector_segment(t.path, t.column, o, target, error)) {
+    if (!nano_lance::index_build::build_vector_segment(t.path, t.column, o, target, inputs, error)) {
         fail(error);
         return false;
     }
@@ -2680,18 +2684,19 @@ bool execute(LanceIndexSegmentBuilder& b, std::vector<uint8_t>& bytes) {
     bool ok = false;
     if (b.is_vector) {
         b.vector.name = b.name;
-        target.model = b.model ? &*b.model : nullptr;
-        ok = nano_lance::index_build::build_vector_segment(b.path, b.column, b.vector, target, error);
+        nano_lance::index_build::VectorSegmentInputs inputs;
+        inputs.model = b.model ? &*b.model : nullptr;
+        ok = nano_lance::index_build::build_vector_segment(b.path, b.column, b.vector, target, inputs, error);
     } else if (b.scalar_type == LANCE_SCALAR_INVERTED) {
         b.inverted.name = b.name;
-        ok = nano_lance::index_build::build_inverted_segment(b.path, b.column, b.inverted, target, error);
+        ok = nano_lance::index_build::build_inverted_segment(b.path, b.column, b.inverted, target, {}, error);
     } else {
         nano_lance::ScalarIndexOptions o;
         o.name = b.name;
         const auto type = b.scalar_type == LANCE_SCALAR_BTREE    ? nano_lance::ScalarIndexType::BTree
                           : b.scalar_type == LANCE_SCALAR_BITMAP ? nano_lance::ScalarIndexType::Bitmap
                                                                  : nano_lance::ScalarIndexType::LabelList;
-        ok = nano_lance::index_build::build_scalar_segment(b.path, b.column, type, o, target, error);
+        ok = nano_lance::index_build::build_scalar_segment(b.path, b.column, type, o, target, {}, error);
     }
     if (!ok) {
         fail(error);

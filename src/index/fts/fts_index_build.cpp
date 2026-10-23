@@ -6,7 +6,8 @@
 // appearance, and the four files and manifest entry written as Lance's InvertedIndexBuilder writes
 // them, one partition holding every document.
 
-#include "index/index_build.hpp"
+#include "index/fts/inverted_segment.hpp"
+#include "index/segment.hpp"
 #include "nanolance/fts_search.hpp"
 
 #include "index/fts/fts_document_text.hpp"
@@ -759,7 +760,8 @@ namespace {
 
 bool create_inverted_index(const std::filesystem::path& dataset_path, const std::string& column,
                            const InvertedIndexOptions& options, const index_build::SegmentTarget* target,
-                           std::uint64_t& new_version, std::string& error) {
+                           const index_build::InvertedSegmentInputs& inputs, std::uint64_t& new_version,
+                           std::string& error) {
     error.clear();
     fts::AnalyzerParams params = options.params;
 
@@ -855,7 +857,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
             (*progress)(event, name, total, unit, completed);
         }
     };
-    const bool old_rows = target != nullptr && target->rows != nullptr && !target->rows->empty();
+    const bool old_rows = inputs.rows != nullptr && !inputs.rows->empty();
     const bool scan = request.fragment_ids == nullptr || !request.fragment_ids->empty();
     OwnedSchema taken;
     arrow_owned::OwnedBatches rows;
@@ -866,7 +868,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
         // An old segment's documents first, deleted or not.
         LanceScanRequest by_address = request;
         by_address.fragment_ids = nullptr;
-        std::vector<std::uint64_t> addresses = *target->rows;
+        std::vector<std::uint64_t> addresses = *inputs.rows;
         if (to_row_id.stable()) {  // the old segment's rows are ids
             RowIdToAddress resolver;
             if (!RowIdToAddress::build(dataset_path, manifest, resolver, error)) {
@@ -986,16 +988,16 @@ bool dataset_create_inverted_index(const std::filesystem::path& dataset_path, co
         [&](ReadVersion from) {
             InvertedIndexOptions o = options;
             o.read_version = from;
-            return create_inverted_index(dataset_path, column, o, nullptr, new_version, error);
+            return create_inverted_index(dataset_path, column, o, nullptr, {}, new_version, error);
         },
         error);
 }
 
 bool index_build::build_inverted_segment(const std::filesystem::path& dataset_path, const std::string& column,
                                          const InvertedIndexOptions& options, const SegmentTarget& target,
-                                         std::string& error) {
+                                         const InvertedSegmentInputs& inputs, std::string& error) {
     std::uint64_t unused = 0;
-    return create_inverted_index(dataset_path, column, options, &target, unused, error);
+    return create_inverted_index(dataset_path, column, options, &target, inputs, unused, error);
 }
 
 std::vector<std::uint8_t> index_build::inverted_details(const fts::AnalyzerParams& params, DocGranularity granularity) {

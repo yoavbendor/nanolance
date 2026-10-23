@@ -10,7 +10,10 @@
 #include "nanolance/frag_reuse.hpp"
 #include "nanolance/index_optimize.hpp"
 
-#include "index/index_build.hpp"
+#include "index/fts/inverted_segment.hpp"
+#include "index/scalar/scalar_segment.hpp"
+#include "index/segment.hpp"
+#include "index/vector/vector_segment.hpp"
 #include "index/index_files.hpp"
 #include "table/index_location.hpp"
 #include "nanolance/byte_source.hpp"
@@ -282,6 +285,7 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
         ScalarIndexOptions o;
         o.name = last.name;
         index_build::NGramPostings base;
+        index_build::ScalarSegmentInputs scalar_in;
         if ((manifest.reader_feature_flags & pb::kFlagStableRowIds) == 0U) {
             for (const auto* s : replaced) {
                 index_build::NGramPostings part;
@@ -300,11 +304,12 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
             for (auto it = base.begin(); it != base.end();) {
                 it = it->second.empty() ? base.erase(it) : std::next(it);
             }
-            where.postings = &base;
+            scalar_in.postings = &base;
             where.fragments = &unindexed;
             where.coverage = &fragments;
         }
-        if (!index_build::build_scalar_segment(dataset_path, column, ScalarIndexType::NGram, o, where, error)) {
+        if (!index_build::build_scalar_segment(dataset_path, column, ScalarIndexType::NGram, o, where, scalar_in,
+                                               error)) {
             return false;
         }
         break;
@@ -347,7 +352,7 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
                 return false;
             }
         }
-        if (!index_build::build_scalar_segment(dataset_path, column, type, o, where, error)) {
+        if (!index_build::build_scalar_segment(dataset_path, column, type, o, where, {}, error)) {
             return false;
         }
         break;
@@ -356,6 +361,7 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
         InvertedIndexOptions o;
         o.name = last.name;
         o.granularity = inverted_details_granularity(last.details_value);  // a rebuild keeps the granularity
+        index_build::InvertedSegmentInputs inverted_in;
         // As Lance merges new rows into a segment: its documents stay (deleted rows too -- they count
         // in its statistics until a rebuild), the uncovered fragments' live rows are added. Under stable
         // row ids a row id is not an address (its high bits do not name a fragment), so the segment is
@@ -375,12 +381,12 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
             }
             std::sort(old_rows.begin(), old_rows.end());
             old_rows.erase(std::unique(old_rows.begin(), old_rows.end()), old_rows.end());
-            where.rows = &old_rows;
+            inverted_in.rows = &old_rows;
             where.fragments = &unindexed;
             where.coverage = &fragments;
         }
         if (!index_build::load_inverted_params(segment_dir(dataset_path, reference), o.params, error) ||
-            !index_build::build_inverted_segment(dataset_path, column, o, where, error)) {
+            !index_build::build_inverted_segment(dataset_path, column, o, where, inverted_in, error)) {
             error = "index '" + last.name + "': " + error;
             return false;
         }
@@ -401,12 +407,13 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
         o.hnsw_m = model.hnsw_m;
         o.hnsw_ef_construction = model.hnsw_ef_construction;
         o.hnsw_max_level = model.hnsw_max_level;
+        index_build::VectorSegmentInputs vector_in;
         if (!retrain) {
-            where.model = &model;
-            where.rebalance_target = target_size;
+            vector_in.model = &model;
+            vector_in.rebalance_target = target_size;
         }
-        where.details = &reference.details_value;
-        if (!index_build::build_vector_segment(dataset_path, column, o, where, error)) {
+        vector_in.details = &reference.details_value;
+        if (!index_build::build_vector_segment(dataset_path, column, o, where, vector_in, error)) {
             error = "index '" + last.name + "': " + error;
             return false;
         }

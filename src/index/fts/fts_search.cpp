@@ -11,7 +11,7 @@
 #include "index/fts/fts_fst.hpp"
 #include "base/fts_json.hpp"
 #include "index/fts/fts_posting.hpp"
-#include "index/index_build.hpp"
+#include "index/fts/inverted_segment.hpp"
 #include "index/index_files.hpp"
 #include "base/shared_cache.hpp"
 #include "table/index_location.hpp"

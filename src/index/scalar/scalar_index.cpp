@@ -7,7 +7,8 @@
 // Lance's index files; the index is committed in the manifest's index section as Lance commits one.
 
 #include "base/float_text.hpp"
-#include "index/index_build.hpp"
+#include "index/scalar/scalar_segment.hpp"
+#include "index/segment.hpp"
 #include "nanolance/base_paths.hpp"
 #include "nanolance/frag_reuse.hpp"
 #include "nanolance/scalar_index.hpp"
@@ -1536,7 +1537,8 @@ bool extract_json_values(const std::vector<ArrowArray>& batches, const std::vect
 
 bool create_scalar_index(const std::filesystem::path& dataset_path, const std::string& column, ScalarIndexType type,
                          const ScalarIndexOptions& options, const index_build::SegmentTarget* target,
-                         std::uint64_t& new_version, std::string& error) {
+                         const index_build::ScalarSegmentInputs& inputs, std::uint64_t& new_version,
+                         std::string& error) {
     error.clear();
     pb::Manifest manifest;
     std::uint64_t version = 0;
@@ -1829,7 +1831,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         details = "/lance.table.ZoneMapIndexDetails";
         break;
     case ScalarIndexType::NGram:
-        written = write_ngram(dir, items, target != nullptr ? target->postings : nullptr, files, error);
+        written = write_ngram(dir, items, inputs.postings, files, error);
         details = "/lance.table.NGramIndexDetails";
         break;
     case ScalarIndexType::BloomFilter:
@@ -1896,16 +1898,17 @@ bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, cons
         [&](ReadVersion from) {
             ScalarIndexOptions o = options;
             o.read_version = from;
-            return create_scalar_index(dataset_path, column, type, o, nullptr, new_version, error);
+            return create_scalar_index(dataset_path, column, type, o, nullptr, {}, new_version, error);
         },
         error);
 }
 
 bool index_build::build_scalar_segment(const std::filesystem::path& dataset_path, const std::string& column,
                                        ScalarIndexType type, const ScalarIndexOptions& options,
-                                       const SegmentTarget& target, std::string& error) {
+                                       const SegmentTarget& target, const ScalarSegmentInputs& inputs,
+                                       std::string& error) {
     std::uint64_t unused = 0;
-    return create_scalar_index(dataset_path, column, type, options, &target, unused, error);
+    return create_scalar_index(dataset_path, column, type, options, &target, inputs, unused, error);
 }
 
 bool index_build::load_ngram_postings(const std::filesystem::path& dir, NGramPostings& out, std::string& error) {

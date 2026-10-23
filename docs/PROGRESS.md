@@ -2787,7 +2787,7 @@ include_deleted_rows).
     seeded k-means, keeping only centroids that win rows; join those under a quarter of it into the
     nearest of their 64 nearest survivors with room; also with nothing new to fold in.
   - The builders were split into "write a segment over these fragments" and a commit
-    (`src/index/index_build.hpp`), so creating and optimizing share one path.
+    (`src/index/segment.hpp`, with each kind's inputs in its own header), so creating and optimizing share one path.
 - **Compaction** folds its rewritten fragments back into the indexes that covered them (a second
   version; `CompactionOptions::reindex`, Python `compact_files(reindex=False)`).
 - **lance-c** (`src/api/lance_c.cpp`): vector index creation and `nearest` with every setter; INVERTED
@@ -2847,7 +2847,7 @@ Asked: continue lance-c compatibility, function before speed, without degrading 
     and its name and UUID rules;
   - IVF and PQ model training exported as Arrow with lance-c's provenance metadata, and models
     injected into builds (AUTO / LOCAL_TRAIN / PRECOMPUTED); the core's builders gained a fixed
-    UUID, progress stages, a train-only mode and partial models (`src/index/index_build.hpp`);
+    UUID, progress stages, a train-only mode and partial models (`src/index/segment.hpp`);
   - segment metadata parsing and accessors; commit as Lance's `commit_existing_index_segments`
     (validation, stale-coverage pruning, coverage-driven replacement, vector compatibility);
     listing;

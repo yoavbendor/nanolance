@@ -4,7 +4,7 @@
 #pragma once
 
 // Index segments: the physical pieces of a logical index. An index can be built one segment at a
-// time -- on other machines, over disjoint fragments (index_build.hpp builds one without committing
+// time -- on other machines, over disjoint fragments (index/segment.hpp builds one without committing
 // it) -- and the segments committed together, as Lance's commit_existing_index_segments does.
 
 #include "nanolance/fts_search.hpp"
