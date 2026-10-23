@@ -7,7 +7,7 @@ Status: **delegated** (implementer: Claude Haiku 5.5, reviewer: Claude Opus 5.5)
 You have about 100k tokens for the whole session. Spend them on code, not output:
 
 - **Never read a large file whole.** `grep -n` first, then `sed -n 'A,Bp'` windows of at most ~120
-  lines. `src/lance_table_reader.cpp` is 3k+ lines, `bindings/python/nanolance/lance/dataset.py` 3.5k+.
+  lines. `src/scan/lance_table_reader.cpp` is 3k+ lines, `bindings/python/nanolance/lance/dataset.py` 3.5k+.
 - **Always cut output**: `2>&1 | tail -15` (pytest), `| tail -5` (`tools/pylance_suite.py`),
   `ninja 2>&1 | grep -E "error|warning:|FAILED" | head -20`. pytest's config already passes `-q`, so
   for a summary line add `-o addopts=` (e.g. `python3 -m pytest -o addopts= -q tests/x.py | tail -2`).
@@ -60,8 +60,8 @@ Protos: `.deps/rust-suite/lance-12.0.0/protos/table.proto`.
 
 ### Phase A -- read (C++ + a little Python). Ends when nanolance reads pylance's multi-base datasets.
 
-1. New header/source `include/nanolance/base_paths.hpp` + `src/base_paths.cpp` (add to the
-   `nanolance` library in `CMakeLists.txt` next to `src/row_ids.cpp`): `struct BasePath { id, name,
+1. New header/source `include/nanolance/base_paths.hpp` + `src/table/base_paths.cpp` (add to the
+   `nanolance` library in `CMakeLists.txt` next to `src/table/row_ids.cpp`): `struct BasePath { id, name,
    has_name, is_dataset_root, path }`; `read_base_paths(const pb::Manifest&, std::vector<BasePath>&, error)`;
    `write_base_paths(pb::Manifest&, const std::vector<BasePath>&)` (phase B needs it);
    `data_file_base_id(const pb::DataFile&, std::optional<uint32_t>&)` and a setter;
@@ -69,10 +69,10 @@ Protos: `.deps/rust-suite/lance-12.0.0/protos/table.proto`.
    `std::filesystem::path data_file_dir(dataset_path, manifest, data_file)` /
    `deletion_file_dir(...)` returning the directory per section 2 (an unknown base_id is an error).
 2. Use the resolver at every read site. Find them with
-   `grep -rn '/ "data"\|"_deletions"' src/*.cpp`: `src/lance_table_reader.cpp` (the `PlannedFile`
+   `grep -rn '/ "data"\|"_deletions"' src/*.cpp`: `src/scan/lance_table_reader.cpp` (the `PlannedFile`
    has a `data_dir` field already -- empty means `<dataset>/data`; set it from the resolver where
-   PlannedFiles are built from manifest fragments), `src/dataset.cpp:~490`, `src/lance_c.cpp:~1373`,
-   `src/deletion_vector.cpp` (read side, ~673). Also Python: `bindings/python/nanolance/lance/dataset.py:~1348`
+   PlannedFiles are built from manifest fragments), `src/dataset/dataset.cpp:~490`, `src/api/lance_c.cpp:~1373`,
+   `src/table/deletion_vector.cpp` (read side, ~673). Also Python: `bindings/python/nanolance/lance/dataset.py:~1348`
    and `fragment.py:~408` join `data/` by hand -- give them the base directory too (expose a small
    binding or compute it from the manifest's base paths in Python, your choice; keep it to one helper).
 3. `DatasetBasePath` class in Python (new small module or in `dataset.py`), exported from
@@ -99,7 +99,7 @@ Read each failing test's body (`sed -n`), measure pylance, implement:
   accepted and ignored for local paths.
 - The C++ writer must place each new fragment's file in its target directory and set `base_id`;
   the manifest writer must carry `base_paths`. Find where the writer names data files
-  (`grep -n '"data"' src/writer.cpp src/manifest_writer.cpp`) and add a per-fragment target
+  (`grep -n '"data"' src/dataset/writer.cpp src/table/manifest_writer.cpp`) and add a per-fragment target
   directory + base id; plumb the bases list through `CommitExtras` (`include/nanolance/manifest_writer.hpp`)
   the way `stable_row_ids` was plumbed.
 - `ds.add_bases([...], transaction_properties=?)`: a new version with the bases appended (Lance's
@@ -114,9 +114,9 @@ Read each failing test's body (`sed -n`), measure pylance, implement:
 `test_blob_extension_write_fragments_external_registered_base`, `test_blob_extension_take_blobs_multi_base`.
 `write_fragments(target_bases=, initial_bases=)`, `DataFile.create(..., base_id=)` (today refused in
 `fragment.py:~80`), Overwrite transactions with `initial_bases` (refused in `_transactions.py:~769` and
-`src/dataset_transaction.cpp` `apply_operation`: `op.has_initial_bases`), `merge_insert` `target_bases`.
+`src/table/dataset_transaction.cpp` `apply_operation`: `op.has_initial_bases`), `merge_insert` `target_bases`.
 **Reviewer note for phase C:** phase A plans one directory per fragment (`fragment_data_dir` in
-`src/lance_table_reader.cpp` refuses a fragment whose files span bases). `TestDataReplacementWithBases`
+`src/scan/lance_table_reader.cpp` refuses a fragment whose files span bases). `TestDataReplacementWithBases`
 adds a new column's file in a base to a fragment whose other files are in the primary: make the
 reader resolve the directory **per data file** (`PlannedFile` / the per-file open path) instead of
 per fragment -- that is the one planner change allowed here.

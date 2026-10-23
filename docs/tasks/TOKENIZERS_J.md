@@ -7,8 +7,8 @@ only. ICU (phase I) and Lindera (phase L) are not part of it: keep refusing them
 ## 0. Context budget (read this first)
 
 Budget about 200k tokens; aim for 120k. Never read a large file whole: `grep -n`, then `sed -n 'A,Bp'` windows of
-at most ~120 lines. Big ones: `bindings/python/nanolance/lance/dataset.py` (5k+), `src/fts_index_build.cpp`,
-`src/fts_search.cpp`, jieba-rs `src/lib.rs` (68 KB). Cut output: `| tail -15` for pytest (add `-o addopts=`).
+at most ~120 lines. Big ones: `bindings/python/nanolance/lance/dataset.py` (5k+), `src/index/fts/fts_index_build.cpp`,
+`src/index/fts/fts_search.cpp`, jieba-rs `src/lib.rs` (68 KB). Cut output: `| tail -15` for pytest (add `-o addopts=`).
 
 ## 1. Targets
 
@@ -53,7 +53,7 @@ Probes in `/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratch
 
 ## 4. Implementation
 
-- C++ (`src/fts_tokenizer.cpp` and a new `src/fts_jieba.cpp`): the dictionary (a trie or hash of prefixes: jieba-rs
+- C++ (`src/index/fts/fts_tokenizer.cpp` and a new `src/index/fts/fts_jieba.cpp`): the dictionary (a trie or hash of prefixes: jieba-rs
   uses a double-array trie; any structure giving the same DAG is fine), the DAG, the route, the HMM Viterbi, search
   mode, the block regexes written as character-class code (no `<regex>`). Every float operation in the order
   jieba-rs does it (`f64`).
@@ -98,7 +98,7 @@ nanolance.lance._pytest_plugin <target ids> | tail -5`); `python3 tools/pylance_
 targets to `tests/pylance_suite/expected_pass.txt` by hand); last, once, the full bindings suite. Report under 40
 lines: questions first, then files, per-target status, tails, sizes, decisions.
 
-**J outcome (2026-10-22): done.** `src/fts_jieba.cpp` ports jieba-rs 0.10 (dictionary loading, the DAG and
+**J outcome (2026-10-22): done.** `src/index/fts/fts_jieba.cpp` ports jieba-rs 0.10 (dictionary loading, the DAG and
 route, cut_dag_hmm, the HMM Viterbi with jieba-macros's built-in model, cut_internal, cut_for_search) with its
 comparisons and float order; `base_tokenizer="jieba"` / `"jieba/<model>"` loads `<LANCE_LANGUAGE_MODEL_HOME or the
 local data dir>/lance/language_models/jieba/<model>` (dict.txt, or config.json's main and users), cached by

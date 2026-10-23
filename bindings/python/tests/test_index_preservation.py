@@ -3,7 +3,7 @@
 nanolance writes to datasets pylance indexed with any kind: append, delete, update,
 merge_insert, column changes, compaction. Each commit used to drop the manifest's index section, so
 pylance saw no indices afterwards and every indexed query became a full scan. nanolance now carries
-them on by Lance's own rules (src/index_maintenance.cpp): an index keeps the fragments it covers, a
+them on by Lance's own rules (src/table/index_maintenance.cpp): an index keeps the fragments it covers, a
 fragment whose rows it no longer describes leaves its coverage (compaction then gives the rewritten
 rows back to the indexes nanolance can rebuild), and an index on a dropped column goes.
 

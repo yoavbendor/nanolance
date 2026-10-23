@@ -87,7 +87,7 @@ The manifest entry's `index_details` is a `/lance.table.VectorIndexDetails` (`me
 
 ## Building (nanolance)
 
-`create_index(column, "IVF_FLAT" | "IVF_PQ", ...)` (`src/vector_index_build.cpp`) writes the files
+`create_index(column, "IVF_FLAT" | "IVF_PQ", ...)` (`src/index/vector/vector_index_build.cpp`) writes the files
 and manifest entry above with Lance 12's defaults:
 
 1. **Vectors.** The column (a fixed-size list of float32) is scanned with row addresses; null

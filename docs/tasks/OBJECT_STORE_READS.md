@@ -90,7 +90,7 @@ a few lines; otherwise leave Python alone.
   configure the main build with `-DNANOLANCE_ENABLE_S3=ON` (libcurl headers are installed here). Wheels
   (cibuildwheel, `bindings/python/pyproject.toml` `[tool.cibuildwheel.linux]`, manylinux_2_28) get
   libcurl in O3.
-- `src/s3_byte_source.cpp` (built when `NANOLANCE_S3_NANOS3READER_ACTIVE`): an `io::ByteSource` over
+- `src/io/s3_byte_source.cpp` (built when `NANOLANCE_S3_NANOS3READER_ACTIVE`): an `io::ByteSource` over
   `S3Client` (size from `head` at open; `read_at` = `read_range`; `small_read_block` 1 MiB and
   `footer_read_size` 64 KiB, so small reads become one request) and a lister over `list`, registered for
   `s3`. One `S3Client` per distinct `ClientOptions`.
@@ -143,7 +143,7 @@ tails, decisions.
 integration tests against moto, since `minio/minio` can no longer be pulled from Docker Hub.
 
 **O2 outcome (2026-10-19):** done in one Haiku session; reviewed. `s3://` datasets open through an
-`io::ByteSource` / lister over `S3Client` (`src/s3_byte_source.cpp`); storage_options from Python per
+`io::ByteSource` / lister over `S3Client` (`src/io/s3_byte_source.cpp`); storage_options from Python per
 bucket; whole table, projection, filters, take, count, BTREE, IVF_FLAT and INVERTED searches,
 deletions and versions match pylance on the same dataset (moto). The binding builds with S3 when
 libcurl is found. Review fix: writes to a URI were refused only in `nanolance.lance`; the low-level

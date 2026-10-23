@@ -8,7 +8,7 @@ indexes; partition info and clustering), **H2** (build them: k-modes training, `
 ## 0. Context budget (read this first)
 
 Budget about 200k tokens; aim for 120k. Never read a large file whole: `grep -n`, then `sed -n 'A,Bp'`
-windows of at most ~120 lines. Big ones: `src/vector_search.cpp` (3k+), `src/vector_index_build.cpp`,
+windows of at most ~120 lines. Big ones: `src/index/vector/vector_search.cpp` (3k+), `src/index/vector/vector_index_build.cpp`,
 `src/vector_index.cpp` (or wherever IVF files are decoded: `grep -ln "lance:ivf" src/*.cpp`),
 `bindings/python/nanolance/lance/dataset.py` (5k+). Lance's Rust: only the files named here. Cut output:
 `| tail -15` for pytest (add `-o addopts=`), `| tail -5` for `tools/pylance_suite.py`.
@@ -17,7 +17,7 @@ windows of at most ~120 lines. Big ones: `src/vector_search.cpp` (3k+), `src/vec
 
 pylance builds IVF_FLAT on `fixed_size_list<uint8>` columns with `metric="hamming"` (binary embeddings,
 perceptual hashes). nanolance searches such columns exactly (flat Hamming search is done: `binary_key`
-in `src/vector_search.cpp` ~2606 and ~3065) but refuses the index: "metric 'hamming' is not supported
+in `src/index/vector/vector_search.cpp` ~2606 and ~3065) but refuses the index: "metric 'hamming' is not supported
 (l2, cosine, dot)" / "does not support the hamming distance". After this task nanolance reads, searches,
 builds and maintains Hamming IVF_FLAT indexes as pylance does, and each engine uses the other's.
 
@@ -77,11 +77,11 @@ search results), not centroids.
 
 ## 3. Where things are in nanolance
 
-- Flat Hamming search: `src/vector_search.cpp` (`hamming` ~503, `binary_key`, the uint8 branch ~3065).
+- Flat Hamming search: `src/index/vector/vector_search.cpp` (`hamming` ~503, `binary_key`, the uint8 branch ~3065).
 - IVF read / search / build: `grep -n "IVF_FLAT\|lance:flat\|storage_metadata" src/*.cpp`; the float
   IVF_FLAT path is the model to follow. `NearestQuery` (`include/nanolance/vector_search.hpp` ~34)
   carries the key as `std::vector<float>`; the uint8 flat path already passes bytes beside it.
-- The refusals to lift: `grep -rn "hamming" bindings/python/nanolance/lance/*.py src/lance_c.cpp`.
+- The refusals to lift: `grep -rn "hamming" bindings/python/nanolance/lance/*.py src/api/lance_c.cpp`.
 - `IndicesBuilder` / `IvfModel`: `bindings/python/nanolance/lance/indices/builder.py`.
 - `optimize_indices` delta segments: `include/nanolance/index_optimize.hpp`.
 

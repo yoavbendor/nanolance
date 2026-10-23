@@ -11,8 +11,8 @@ add / drop / alter columns -- and compaction). Do only the phase you are given. 
 ## 0. Context budget (read this first)
 
 Budget about 200k tokens; aim for 120k. Never read a large file whole: `grep -n`, then `sed -n 'A,Bp'`
-windows of at most ~120 lines. Big ones: `src/dataset_ops.cpp`, `bindings/python/nanolance/lance/dataset.py`
-(5k+), `src/dataset_refs.cpp`, `src/deletion_vector.cpp`. Cut output: `| tail -15` for pytest (add
+windows of at most ~120 lines. Big ones: `src/dataset/dataset_ops.cpp`, `bindings/python/nanolance/lance/dataset.py`
+(5k+), `src/table/dataset_refs.cpp`, `src/table/deletion_vector.cpp`. Cut output: `| tail -15` for pytest (add
 `-o addopts=`).
 
 ## 1. Goal
@@ -32,15 +32,15 @@ still use `std::filesystem` / `std::ofstream` / `fopen` for what they write or r
 - Every write goes through `io::open_output(path_or_uri)` -> `OutputFile` (an `std::ostream`;
   `commit(error)` makes the object exist) or `io::put_if_absent` (create-only); removals through
   `io::remove_output`. On an object store there are no directories: guard `create_directories` and
-  `std::filesystem::exists` with `io::is_object_store_output(path)` (see W1's `src/writer.cpp`).
+  `std::filesystem::exists` with `io::is_object_store_output(path)` (see W1's `src/dataset/writer.cpp`).
 - Reads go through `io::open_source` / `io::read_all` / `io::list_dir` (`include/nanolance/byte_source.hpp`),
   which already work on `s3://`. A write path that reads an existing file with `std::ifstream` /
   `fopen` / `std::filesystem` must switch to these.
 - Remaining filesystem calls on write paths (from `grep -n "std::filesystem::\(create_directories\|remove\|
   rename\|exists\|directory_iterator\|file_size\|copy\)\|std::ofstream\|std::ifstream\|fopen(" src/*.cpp`):
-  `src/deletion_vector.cpp` (3: the deletion-file writer -- W2a), `src/dataset_refs.cpp` (1: refs JSON --
-  tags, W2a), `src/dataset_stitcher.cpp` (5: column stitching -- W2b), `src/nano_lance_external_blob.cpp`
-  (2), `src/dataset.cpp` (1), `src/data_file_reader.cpp` (1), `src/manifest_reader.cpp` (1); index
+  `src/table/deletion_vector.cpp` (3: the deletion-file writer -- W2a), `src/table/dataset_refs.cpp` (1: refs JSON --
+  tags, W2a), `src/dataset/dataset_stitcher.cpp` (5: column stitching -- W2b), `src/api/nano_lance_external_blob.cpp`
+  (2), `src/dataset/dataset.cpp` (1), `src/file/data_file_reader.cpp` (1), `src/table/manifest_reader.cpp` (1); index
   builders (`fts_index_build.cpp`, `vector_index_build.cpp`, `scalar_index.cpp`, `index_optimize.cpp`:
   W3, not now). Check each one you touch: is it on the path of an operation of your phase?
 - Tags on S3: pylance writes `_refs/tags/<name>.json` with a plain PUT and deletes it with a DELETE

@@ -36,10 +36,10 @@ endpoints from pylance's `storage_options`.
 ### 3.1 Write side: `io::ByteSink`
 
 All bytes nanolance writes go through six places (`std::ofstream` / `fopen`): the Lance file writer
-(`src/data_file_writer.cpp`, also used by every index file via `src/index_files.cpp`), deletion files
-(`src/deletion_vector.cpp`), manifests (`src/manifest_writer.cpp`), transaction files
-(`src/transaction_file.cpp`), Blob v2 sidecars (`src/blob_v2_external.cpp`), and refs JSON
-(`src/dataset_refs.cpp`). Add the write-side twin of `io::ByteSource`:
+(`src/file/data_file_writer.cpp`, also used by every index file via `src/index/index_files.cpp`), deletion files
+(`src/table/deletion_vector.cpp`), manifests (`src/table/manifest_writer.cpp`), transaction files
+(`src/table/transaction_file.cpp`), Blob v2 sidecars (`src/file/blob_v2_external.cpp`), and refs JSON
+(`src/table/dataset_refs.cpp`). Add the write-side twin of `io::ByteSource`:
 
 ```cpp
 namespace nano_lance::io {

@@ -15,7 +15,7 @@ LAYERS = [
                        "index metadata"),
     ("expr", "expr", "what a filter means (no storage)"),
     ("scan", "scan", "reading rows of fragments, given a row selection"),
-    ("index", "index", "each index kind: build, look up, describe (scalar/, fts/, vector/)"),
+    ("index", "index", "each index kind: build, look up, describe"),
     ("dataset", "dataset", "user operations: write sessions, updates, merge_insert, compaction, index "
                            "lifecycle, query planning"),
     ("api", "api", "the C APIs and lance-c"),

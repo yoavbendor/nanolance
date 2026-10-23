@@ -8,8 +8,8 @@ the reviewer's).
 
 About 100k tokens for the whole session:
 - Never read a large file whole: `grep -n`, then `sed -n 'A,Bp'` windows of at most ~120 lines.
-  `bindings/python/nanolance/lance/dataset.py` is 3.5k+ lines, `src/vector_search.cpp` 2k+,
-  `src/vector_index_build.cpp` 1.4k+.
+  `bindings/python/nanolance/lance/dataset.py` is 3.5k+ lines, `src/index/vector/vector_search.cpp` 2k+,
+  `src/index/vector/vector_index_build.cpp` 1.4k+.
 - Always cut output: `| tail -15` (pytest; add `-o addopts=` for a summary line, the config passes
   `-q`), `| tail -5` for `tools/pylance_suite.py`, `ninja 2>&1 | grep -E "error|warning:" | head`.
 - The oracle tests ARE the spec: read each one only (`grep -n "def test_x" -A50
@@ -45,9 +45,9 @@ Tests (all in `tests/test_vector_index.py`):
 is phase V2), `test_describe_vector_index`, `test_describe_index_runtime_hints_stored`,
 `test_vector_index_with_nprobes` (explain-plan text: look at how `explain_plan` builds its lines
 today, `grep -n "minimum_nprobes\|def explain_plan" bindings/python/nanolance/lance/dataset.py
-src/vector_search.cpp`), `test_index_cache_size`, `test_index_cache_size_bytes`,
+src/index/vector/vector_search.cpp`), `test_index_cache_size`, `test_index_cache_size_bytes`,
 `test_index_cache_size_deprecation` (pylance's `index_cache_hit_rate`, `index_cache_entry_count` etc.;
-nanolance has a process-wide index cache in C++ -- grep `load_ivf` / `cache` in `src/vector_search.cpp`;
+nanolance has a process-wide index cache in C++ -- grep `load_ivf` / `cache` in `src/index/vector/vector_search.cpp`;
 counting hits there is fine), `test_target_partition_size_to_num_partitions_clamps`,
 `test_validate_vector_index` (`lance.util` functions -- see what `bindings/python/nanolance/lance/util.py`
 has; placeholders come from `_stubs.py`), `test_use_index`, `test_nested_field_vector_index`.
@@ -77,7 +77,7 @@ and approx_mode are validated in Python only.
 Facts: the option refusals are in `bindings/python/nanolance/lance/dataset.py`
 (`grep -n "create_index option" bindings/python/nanolance/lance/dataset.py`). The C++ build already
 takes a pretrained model for distributed builds -- `include/nanolance/vector_index*.hpp`, grep
-`VectorIndexModel\|trained\|model` in `src/vector_index_build.cpp`, and how
+`VectorIndexModel\|trained\|model` in `src/index/vector/vector_index_build.cpp`, and how
 `create_index_uncommitted` / `IndicesBuilder` pass `ivf_centroids` / `pq_codebook` in Python
 (`grep -n "ivf_centroids\|pq_codebook" bindings/python/nanolance/lance/*.py`). Reuse that path for
 `create_index(ivf_centroids=, pq_codebook=)`. Progress callbacks: scalar / FTS builds already report

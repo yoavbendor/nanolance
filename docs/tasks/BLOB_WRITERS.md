@@ -8,7 +8,7 @@ Status: **delegated** (implementer: Claude Haiku 5.5, reviewer: Claude Opus 5.5)
 You have about 100k tokens of context for the whole job. Spend them on code, not on output:
 
 - **Never read a large file whole.** Find the place with `grep -n`, then read a window of at most
-  ~120 lines with `sed -n 'A,Bp' file`. Files here are 1-3k lines (`src/blob_v2_external.cpp`,
+  ~120 lines with `sed -n 'A,Bp' file`. Files here are 1-3k lines (`src/file/blob_v2_external.cpp`,
   `bindings/python/nanolance/lance/file.py`, `dataset.py` is 3k+).
 - **Always cut command output**: `... 2>&1 | tail -15` for pytest, `| tail -5` for
   `tools/pylance_suite.py` (it prints thousands of lines otherwise), `ninja 2>&1 | grep -E
@@ -155,7 +155,7 @@ rejects it today:
 
     OSError: Invalid user input: Blob v2 field 'blob' must be struct<data: large_binary, uri: utf8> or struct<data, uri, position: uint64, size: uint64>
 
-That comes from `append_blob_v2_batch_column_values` in `src/blob_v2_external.cpp` (~line 720).
+That comes from `append_blob_v2_batch_column_values` in `src/file/blob_v2_external.cpp` (~line 720).
 Teach it a third accepted input shape: children `kind, data, uri, blob_id, blob_size, position`
 (exactly STRUCT above). For each row emit the descriptor as given (kinds 1 packed / 2 dedicated /
 3 external: copy blob_id, blob_size -> size, position, uri; kind 0 inline: the bytes in `data` are
@@ -167,7 +167,7 @@ plus the same scenario read back by **real pylance** (section 6).
 
 **Phase B design notes (from the reviewer, read before coding):**
 
-- In `append_blob_v2_batch_column_values` (`src/blob_v2_external.cpp`, ~line 720) the input shape is
+- In `append_blob_v2_batch_column_values` (`src/file/blob_v2_external.cpp`, ~line 720) the input shape is
   chosen from the children found with `find_child(mapping, blob_field.id, name)`. Add the
   descriptor shape (all six names present) as a third branch; the existing loop (~lines 780-860) shows
   how a row is read (`large_binary_value`, `utf8_value`, `uint64_value`), how a null row is recorded

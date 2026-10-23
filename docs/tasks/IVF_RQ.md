@@ -100,7 +100,7 @@ last, once: the full pytest. Report under 40 lines: questions first, then files,
 decisions.
 
 **R1a, first session (2026-10-20):** stopped at a stop-and-ask point; its code is in the tree, not
-committed (src/vector_search.cpp: `Storage::Rq`, `load_rq_metadata` (refuses everything but 5 bits / fast
+committed (src/index/vector/vector_search.cpp: `Storage::Rq`, `load_rq_metadata` (refuses everything but 5 bits / fast
 rotation / raw_query / packed / L2, naming each), `load_rq_partition`, `rq_rotate` (fast rotation, with
 the non-power-of-two path), `rq_prepare`, `rq_row_codes` / `rq_binary_ip` (packed layout), `rq_distance`
 (4-bit blocked extended codes), the hook in `search_segment`). Measured:

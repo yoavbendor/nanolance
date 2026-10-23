@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 //
-// libFuzzer harness over the repetition/definition unraveler (src/repdef.cpp). Levels come straight
+// libFuzzer harness over the repetition/definition unraveler (src/encoding/repdef.cpp). Levels come straight
 // from untrusted pages, and the unraveler's output sizes every list array built from them, so beyond
 // "no crash" it asserts the structure any Arrow list needs on every input it ACCEPTS:
 //

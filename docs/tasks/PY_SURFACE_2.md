@@ -7,7 +7,7 @@ fresh session unless one finishes early with context to spare: **Q1** tokenize, 
 ## 0. Context budget
 
 About 100k tokens per session. `grep -n` then `sed -n` windows of at most ~120 lines; never read
-`bindings/python/nanolance/lance/dataset.py` (3.5k+), `src/vector_search.cpp` (2.4k) or
+`bindings/python/nanolance/lance/dataset.py` (3.5k+), `src/index/vector/vector_search.cpp` (2.4k) or
 `bindings/python/src/nanolance_bindings.cpp` whole. Cut all output (`| tail -15`; pytest
 `-o addopts=` for a summary line; `tools/pylance_suite.py ... | tail -5`). Real pylance 12.0.0 is
 `import lance` in plain `python3`: measure every behaviour there first. Write nanolance's own code.
@@ -21,7 +21,7 @@ min_ngram_length=None, max_ngram_length=None, prefix_only=None, split_identifier
 split_on_numerics=None, preserve_original=None, index_operators=None)` -> list of `FtsToken`
 (`.text`, `.position`, repr `FtsToken(text="cat", position=0)`). Same option resolution as
 `create_scalar_index(index_type="INVERTED")` (nanolance: `_inverted_params` / `_inverted_analyzer`
-in dataset.py; the C++ `fts::Analyzer` in src/fts_tokenizer.cpp does the work). `None` = the
+in dataset.py; the C++ `fts::Analyzer` in src/index/fts/fts_tokenizer.cpp does the work). `None` = the
 analyzer profile's default, except `max_token_length=None` disables the limit (omitted -> 40).
 Positions are relative to the first kept token, gaps from filters kept (`"the Cats and Dogs"` ->
 `[('cat', 0), ('dog', 2)]`). Errors as create_scalar_index's (`code analyzer flags require
@@ -35,8 +35,8 @@ metadata_cache_backend=None, store_registry=None)`; methods `size_bytes()`,
 metadata_cache_size_bytes=0)` (measure what the numbers mean). `ds.session()` returns the dataset's
 session; `lance.dataset(uri, session=s)`, `write_fragments(..., session=)`,
 `lance.dataset(uri, metadata_cache_size_bytes=0)`. Sizes must grow when a scan / index search fills
-nanolance's caches (nanolance has caches in C++: grep `index_cache()` in src/index_files.cpp /
-src/fts_search.cpp / src/vector_search.cpp, and whatever caches manifests / file metadata) and be
+nanolance's caches (nanolance has caches in C++: grep `index_cache()` in src/index/index_files.cpp /
+src/index/fts/fts_search.cpp / src/index/vector/vector_search.cpp, and whatever caches manifests / file metadata) and be
 smaller with a zero metadata cache. A session object that owns cache budgets and reports sizes
 from the C++ caches is the design; if the C++ caches are process-global, report their sizes and
 keep per-session budgets as far as the tests need -- decide, and stop and ask if a real per-session

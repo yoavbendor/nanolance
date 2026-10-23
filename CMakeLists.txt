@@ -251,18 +251,21 @@ endif()
 add_library(nanolance_nanom INTERFACE)
 target_include_directories(nanolance_nanom SYSTEM INTERFACE "${nanom_SOURCE_DIR}/include")
 
-add_library(nanolance_proto STATIC generated/lance_minimal.pb.cpp src/roaring_bitmap.cpp src/page_layout.cpp)
+add_library(nanolance_proto STATIC generated/lance_minimal.pb.cpp src/base/roaring_bitmap.cpp src/encoding/page_layout.cpp)
 target_compile_features(nanolance_proto PUBLIC cxx_std_20 PRIVATE cxx_std_23)
 target_include_directories(nanolance_proto PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/generated")
 target_include_directories(nanolance_proto PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+# Private headers are included by their path below src/ ("index/fts/fts_fst.hpp"), the layer they belong to.
+set(NANOLANCE_PRIVATE_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(nanolance_proto PRIVATE "${NANOLANCE_PRIVATE_INCLUDE}")
 target_link_libraries(nanolance_proto PRIVATE nanolance_nanom)
 
 add_library(nanolance_reader STATIC
-    src/byte_source.cpp
-    src/byte_sink.cpp
-    src/manifest_reader.cpp
-    src/nano_lance_reader.cpp
-    src/nano_lance_external_blob.cpp
+    src/io/byte_source.cpp
+    src/io/byte_sink.cpp
+    src/table/manifest_reader.cpp
+    src/api/nano_lance_reader.cpp
+    src/api/nano_lance_external_blob.cpp
 )
 target_compile_features(nanolance_reader PUBLIC cxx_std_20)
 target_include_directories(nanolance_reader PUBLIC
@@ -270,6 +273,7 @@ target_include_directories(nanolance_reader PUBLIC
     "${_NANOLANCE_GEN_INCLUDE}"
 )
 target_link_libraries(nanolance_reader PUBLIC nanolance_proto)
+target_include_directories(nanolance_reader PRIVATE "${NANOLANCE_PRIVATE_INCLUDE}")
 
 set(NANOLANCE_S3_CRYPTO "openssl" CACHE STRING
     "SigV4 crypto backend, forwarded to nanos3reader: openssl (default) | bundled")
@@ -300,7 +304,7 @@ elseif(NANOLANCE_ENABLE_S3)
     target_link_libraries(nanolance_reader PRIVATE nanos3reader::nanos3reader)
     target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_READER_HAS_S3=1)
     # s3:// datasets: the byte source and lister over S3Client (registered for "s3" by byte_source.cpp).
-    target_sources(nanolance_reader PRIVATE src/s3_byte_source.cpp src/s3_byte_sink.cpp)
+    target_sources(nanolance_reader PRIVATE src/io/s3_byte_source.cpp src/io/s3_byte_sink.cpp)
     target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_HAS_S3_BYTE_SOURCE=1)
     set(NANOLANCE_S3_NANOS3READER_ACTIVE ON)
 endif()
@@ -315,62 +319,62 @@ endif()
 option(NANOLANCE_WITH_JIEBA "Build the jieba tokenizer (embeds its HMM model)" ${_nanolance_jieba_default})
 
 add_library(nanolance STATIC
-    src/version.cpp
-    src/array_accessor.cpp
-    src/blob_builder.cpp
-    src/blob_v2_external.cpp
-    src/buffer_pool.cpp
-    src/column_slice.cpp
-    src/frag_reuse.cpp
-    src/index_maintenance.cpp
-    src/lance_file_writer.cpp
-    src/scalar_index.cpp
-    src/bloom_filter.cpp
-    src/index_search.cpp
-    src/index_files.cpp
-    src/vector_search.cpp
-    src/vector_index_build.cpp
-    src/hnsw_build.cpp
-    src/index_segments.cpp
-    src/fts_tokenizer.cpp
-    src/fts_jieba.cpp
-    src/fts_lindera.cpp
-    src/fts_fst.cpp
-    src/fts_posting.cpp
-    src/fts_search.cpp
-    src/fts_index_build.cpp
-    src/index_optimize.cpp
-    src/data_file_reader.cpp
-    src/deletion_vector.cpp
-    src/base_paths.cpp
-    src/overlays.cpp
-    src/proto_wire.hpp
-    src/row_ids.cpp
-    src/data_file_writer.cpp
-    src/fsst.cpp
-    src/lz4_block.cpp
-    src/lance_column_decoder.cpp
-    src/lance_v20_decoder.cpp
-    src/lance_table_reader.cpp
-    src/parallel.cpp
-    src/repdef.cpp
-    src/nano_lance_table_reader_c.cpp
-    src/manifest_writer.cpp
-    src/dataset.cpp
-    src/dataset_refs.cpp
-    src/transaction_file.cpp
-    src/jsonb.cpp
-    src/expr.cpp
-    src/arrow_slice.cpp
-    src/dataset_ops.cpp
-    src/dataset_transaction.cpp
-    src/dataset_operation.cpp
-    src/commit_conflicts.cpp
-    src/mem_wal.cpp
-    src/dataset_stitcher.cpp
-    src/schema_mapper.cpp
-    src/writer.cpp
-    src/writer_cxx.cpp
+    src/base/version.cpp
+    src/arrow/array_accessor.cpp
+    src/arrow/blob_builder.cpp
+    src/file/blob_v2_external.cpp
+    src/base/buffer_pool.cpp
+    src/encoding/column_slice.cpp
+    src/table/frag_reuse.cpp
+    src/table/index_maintenance.cpp
+    src/file/lance_file_writer.cpp
+    src/index/scalar/scalar_index.cpp
+    src/index/scalar/bloom_filter.cpp
+    src/dataset/index_search.cpp
+    src/index/index_files.cpp
+    src/index/vector/vector_search.cpp
+    src/index/vector/vector_index_build.cpp
+    src/index/vector/hnsw_build.cpp
+    src/dataset/index_segments.cpp
+    src/index/fts/fts_tokenizer.cpp
+    src/index/fts/fts_jieba.cpp
+    src/index/fts/fts_lindera.cpp
+    src/index/fts/fts_fst.cpp
+    src/index/fts/fts_posting.cpp
+    src/index/fts/fts_search.cpp
+    src/index/fts/fts_index_build.cpp
+    src/dataset/index_optimize.cpp
+    src/file/data_file_reader.cpp
+    src/table/deletion_vector.cpp
+    src/table/base_paths.cpp
+    src/table/overlays.cpp
+    src/base/proto_wire.hpp
+    src/table/row_ids.cpp
+    src/file/data_file_writer.cpp
+    src/encoding/fsst.cpp
+    src/encoding/lz4_block.cpp
+    src/encoding/lance_column_decoder.cpp
+    src/encoding/lance_v20_decoder.cpp
+    src/scan/lance_table_reader.cpp
+    src/base/parallel.cpp
+    src/encoding/repdef.cpp
+    src/api/nano_lance_table_reader_c.cpp
+    src/table/manifest_writer.cpp
+    src/dataset/dataset.cpp
+    src/table/dataset_refs.cpp
+    src/table/transaction_file.cpp
+    src/arrow/jsonb.cpp
+    src/expr/expr.cpp
+    src/arrow/arrow_slice.cpp
+    src/dataset/dataset_ops.cpp
+    src/table/dataset_transaction.cpp
+    src/table/dataset_operation.cpp
+    src/table/commit_conflicts.cpp
+    src/table/mem_wal.cpp
+    src/dataset/dataset_stitcher.cpp
+    src/arrow/schema_mapper.cpp
+    src/dataset/writer.cpp
+    src/dataset/writer_cxx.cpp
 )
 # The library's own sources compile as C++23 (nanom, which reads and writes Lance's protobuf, needs
 # it; nanolance_proto already does). Its public headers and API stay C++20.
@@ -390,6 +394,7 @@ target_link_libraries(nanolance PUBLIC
     "${NANOLANCE_ZSTD_TARGET}"
 )
 target_link_libraries(nanolance PRIVATE nanolance_nanom)
+target_include_directories(nanolance PRIVATE "${NANOLANCE_PRIVATE_INCLUDE}")
 if(NANOLANCE_WITH_JIEBA)
     target_compile_definitions(nanolance PRIVATE NANOLANCE_WITH_JIEBA=1)
 endif()
@@ -401,7 +406,7 @@ add_library(nanolance::nanolance ALIAS nanolance)
 # (LanceC::lance_c) as lance-c's; see docs/LANCE_C_COMPAT.md.
 option(NANOLANCE_BUILD_LANCE_C "Build liblance_c, lance-c's C API over nanolance" ON)
 if(NANOLANCE_BUILD_LANCE_C)
-    add_library(lance_c STATIC src/lance_c.cpp)
+    add_library(lance_c STATIC src/api/lance_c.cpp)
     target_compile_features(lance_c PUBLIC cxx_std_20)
     target_include_directories(lance_c PUBLIC
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/compat/lance-c/include>")
@@ -451,7 +456,7 @@ if(NANOLANCE_WARNING_FLAGS)
     # GCC 13's libstdc++ std::regex raises a false -Wmaybe-uninitialized, inlined into expr.cpp's regex
     # construction under -O2 with sanitizers. Downgrade that one warning for this file on GCC only.
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        set_source_files_properties(src/expr.cpp PROPERTIES COMPILE_OPTIONS "-Wno-error=maybe-uninitialized")
+        set_source_files_properties(src/expr/expr.cpp PROPERTIES COMPILE_OPTIONS "-Wno-error=maybe-uninitialized")
     endif()
 endif()
 
@@ -645,13 +650,13 @@ target_link_libraries(nano_lance_writer_lifecycle_test PRIVATE nanolance)
 
 add_executable(test_commit_conflicts tests/test_commit_conflicts.cpp)
 target_compile_features(test_commit_conflicts PRIVATE cxx_std_23)
-target_include_directories(test_commit_conflicts PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(test_commit_conflicts PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
 target_link_libraries(test_commit_conflicts PRIVATE nanolance)
 add_test(NAME commit_conflicts COMMAND $<TARGET_FILE:test_commit_conflicts>)
 
 add_executable(nano_lance_int128_test tests/test_int128.cpp)
 target_compile_features(nano_lance_int128_test PRIVATE cxx_std_20)
-target_include_directories(nano_lance_int128_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(nano_lance_int128_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
 target_link_libraries(nano_lance_int128_test PRIVATE nanolance)
 
 add_executable(nano_lance_row_ids_test tests/test_row_ids.cpp)

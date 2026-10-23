@@ -61,10 +61,10 @@ columns, packed structs, deletions, ranges and takes.
 ### Scalar indexes: built and used
 
 `create_scalar_index(column, "BTREE" | "BITMAP" | "LABEL_LIST", name=None, replace=True)` builds
-Lance's scalar indexes in Lance's file layout (`src/scalar_index.cpp`), committed in the manifest as
+Lance's scalar indexes in Lance's file layout (`src/index/scalar/scalar_index.cpp`), committed in the manifest as
 pylance commits one; `drop_index`, `list_indices`, `describe_indices` and `has_index` work as in
 pylance. Filtered reads use any BTree, Bitmap or LabelList index the dataset has, whoever built it
-(`src/index_search.cpp`):
+(`src/dataset/index_search.cpp`):
 
 | index | files | answers |
 |---|---|---|
@@ -101,7 +101,7 @@ column -- a fixed-size list of floats -- as pylance does, and `create_index(colu
 "IVF_PQ" | "IVF_HNSW_SQ", metric=..., num_partitions=..., num_sub_vectors=..., num_bits=..., m=...,
 ef_construction=..., max_level=...)` builds Lance's index for it. The format and the search, step for step, are in `docs/VECTOR_INDEX.md`.
 
-- **Searching** (`src/vector_search.cpp`) an IVF_FLAT or IVF_PQ index -- built by pylance or by
+- **Searching** (`src/index/vector/vector_search.cpp`) an IVF_FLAT or IVF_PQ index -- built by pylance or by
   nanolance -- gives pylance's answer: the same rows, in the same order, with the same `_distance`,
   under L2, cosine and dot, for Lance's default (adaptive) probing, `nprobes` / `minimum_nprobes` /
   `maximum_nprobes`, `refine_factor` and `distance_range`. With 4-bit PQ, which ranks by quantized
@@ -110,7 +110,7 @@ ef_construction=..., max_level=...)` builds Lance's index for it. The format and
   re-scored), deleted rows and null vectors never come back, `prefilter=True` filters before the
   search and otherwise the k nearest are filtered, `fast_search` searches only what is indexed, and
   a `metric` other than the index's (or `use_index=False`, or no index) searches exactly.
-- **Building** (`src/vector_index_build.cpp`) follows Lance's defaults: k-means as Lance trains it
+- **Building** (`src/index/vector/vector_index_build.cpp`) follows Lance's defaults: k-means as Lance trains it
   (random initial centroids, at most 50 iterations, 256 training vectors a partition, hierarchical
   past 256 partitions), partitions from rows / 4096 (IVF_FLAT) or / 8192 (IVF_PQ), PQ codebooks
   trained and codes chosen by L2 on residuals, files and manifest entry as Lance writes them. pylance
@@ -182,7 +182,7 @@ with LanceDB's default analyzer or the settings given. `lance.query` has pylance
 `MatchQuery`, `MultiMatchQuery`, `BoostQuery`, `BooleanQuery` (and `&` / `|`), `PhraseQuery`.
 `docs/FTS_INDEX.md` has the format and the search, step for step.
 
-- **Searching** (`src/fts_search.cpp`) an INVERTED index, built by pylance or by nanolance, gives
+- **Searching** (`src/index/fts/fts_search.cpp`) an INVERTED index, built by pylance or by nanolance, gives
   pylance's answer: the same rows with the same `_score`, bit for bit. Lance's order among equal
   scores is arbitrary; nanolance's is by row id. Around the index it does what pylance does:
   - rows in fragments the index does not cover are tokenized on the fly and scored with the
@@ -194,7 +194,7 @@ with LanceDB's default analyzer or the settings given. `lance.query` has pylance
     the documents' own statistics.
 
   `_score` comes after the columns asked for, or where `columns` names it.
-- **Building** (`src/fts_index_build.cpp`) supports the simple, whitespace and raw tokenizers with
+- **Building** (`src/index/fts/fts_index_build.cpp`) supports the simple, whitespace and raw tokenizers with
   English stemming and stop words (or custom ones), lower-casing, ASCII folding and
   `max_token_length`. For the same data, the files hold what pylance's and LanceDB's builds hold,
   byte for byte: vocabulary (an `fst` map, ported), posting blocks, block scores and impact data.
@@ -245,7 +245,7 @@ same machinery to give its rewritten rows back to the indexes.
 
 Every commit nanolance makes
 -- append, delete, update, `merge_insert`, column changes, compaction, restore -- writes the
-version's indices into the new manifest by Lance's own rules (`src/index_maintenance.cpp`, after
+version's indices into the new manifest by Lance's own rules (`src/table/index_maintenance.cpp`, after
 lance-table's `index_maintenance.rs`), so pylance goes on using them:
 
 | nanolance commit | what happens to an index |

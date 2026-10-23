@@ -24,7 +24,7 @@ keeps the whole text as one token. A query is tokenized the same way. So `"quick
 `quick`, and `résumé` is stemmed and then folded to `resume`, which the query `resume` (stemmed to
 `resum`) does not find.
 
-nanolance's analyzer (`src/fts_tokenizer.cpp`) produces Lance's tokens byte for byte. Its Unicode
+nanolance's analyzer (`src/index/fts/fts_tokenizer.cpp`) produces Lance's tokens byte for byte. Its Unicode
 tables and stemmer are generated from the Rust crates (`tools/fts_tables`,
 `tools/fts_stem_translate.py`). `tests/golden/fts_tokenizer` holds 3,000 lines tokenized by Lance.
 It supports `simple`, `whitespace` and `raw` with English. Other settings are refused: `icu`,
@@ -166,7 +166,7 @@ blocks are) and the tail as varints; `varint_doc_delta_v2` is varints only. nano
 and writes `packed_delta_v1`, as Lance 12 does. Other layouts (older per-document positions) are
 refused for phrases only; plain matches still work.
 
-### How nanolance searches (`src/fts_search.cpp`)
+### How nanolance searches (`src/index/fts/fts_search.cpp`)
 
 - An index's token map, document lengths and decoded posting lists are cached. The cache is keyed
   by the files' size and modification time.
@@ -181,12 +181,12 @@ refused for phrases only; plain matches still work.
 ## Building (nanolance)
 
 `create_scalar_index(column, "INVERTED" | "FTS", name=None, replace=True, **params)`
-(`src/fts_index_build.cpp`):
+(`src/index/fts/fts_index_build.cpp`):
 1. Scan the column's live rows with their addresses, fragment by fragment.
 2. Tokenize them in parallel.
 3. Give token ids in order of first appearance.
 4. Write one partition, `part_0`, with the files above. The block scores, `_max_score` and impacts
-   are Lance's. The FST is built by a port of the `fst` crate's builder (`src/fts_fst.cpp`),
+   are Lance's. The FST is built by a port of the `fst` crate's builder (`src/index/fts/fts_fst.cpp`),
    checked byte for byte against the crate (`tests/golden/fts_fst`).
 5. Commit the manifest entry: an `InvertedIndexDetails` (base tokenizer; the language as a JSON
    string, `"English"`; the analyzer flags; `block_size` 128; `posting_format_version` 2), with

@@ -6,7 +6,7 @@ fresh session: **S1** projection expressions, **S2** `ds.sql(...)`. ~15 of pylan
 ## 0. Context budget
 
 About 100k tokens per session. `grep -n` then `sed -n` windows of at most ~120 lines; never read
-`bindings/python/nanolance/lance/dataset.py` (3.5k+), `src/expr.cpp` (3k+), `src/dataset_ops.cpp`
+`bindings/python/nanolance/lance/dataset.py` (3.5k+), `src/expr/expr.cpp` (3k+), `src/dataset/dataset_ops.cpp`
 or `bindings/python/src/nanolance_bindings.cpp` whole. Cut all output. Real pylance 12.0.0 is
 `import lance` in plain `python3`: measure every behaviour there first. Write nanolance's own code.
 
@@ -16,8 +16,8 @@ nanolance already has a SQL expression engine in C++ (`include/nanolance/expr.hp
 `Expression::parse`, `bind(schema)`, `filter(batch)`, **`evaluate(batch, type, out)`** and
 **`result_type(name, out)`** (int64 for integer arithmetic, float64 with a float, utf8 for string
 functions, bool for predicates), with `lower`, `upper`, `length`, `abs`, `coalesce`, `json_get_*`,
-`json_array_length`, `arrow_cast`, ... (grep the function table near src/expr.cpp:1170).
-`add_columns` with SQL expressions uses them (src/dataset_ops.cpp ~1409): the model for evaluating
+`json_array_length`, `arrow_cast`, ... (grep the function table near src/expr/expr.cpp:1170).
+`add_columns` with SQL expressions uses them (src/dataset/dataset_ops.cpp ~1409): the model for evaluating
 expressions over scanned batches.
 
 **S1 -- projection expressions** (`test_dataset.py::test_take_with_projection`,

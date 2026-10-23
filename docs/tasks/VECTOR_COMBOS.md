@@ -4,8 +4,8 @@ Status: **delegated** (implementer: Claude Haiku 5.5, reviewer: Claude Opus 5.5)
 
 ## 0. Context budget
 
-About 100k tokens per session. `grep -n` then `sed -n` windows of at most ~120 lines; `src/vector_search.cpp`
-(2k+) and `src/vector_index_build.cpp` (1.4k+) must never be read whole. Cut all output (`| tail -15`,
+About 100k tokens per session. `grep -n` then `sed -n` windows of at most ~120 lines; `src/index/vector/vector_search.cpp`
+(2k+) and `src/index/vector/vector_index_build.cpp` (1.4k+) must never be read whole. Cut all output (`| tail -15`,
 pytest with `-o addopts=` for a summary line; `tools/pylance_suite.py ... | tail -5`;
 `ninja 2>&1 | grep -E "error|warning:" | head`). Only your phase.
 
@@ -42,7 +42,7 @@ in layout to IVF_HNSW_SQ's; its `index.idx` 592 bytes, 0 rows, 2 global buffers.
 
 So the work is to **decouple storage from sub-index** where the code assumes the three known pairs:
 find them with `grep -n "IVF_HNSW_SQ\|IVF_PQ\|IVF_FLAT\|hnsw\|__sq_code\|__pq_code\|__flat_marker"
-src/vector_search.cpp src/vector_index_build.cpp include/nanolance/vector*.hpp`, and the Python names
+src/index/vector/vector_search.cpp src/index/vector/vector_index_build.cpp include/nanolance/vector*.hpp`, and the Python names
 that refuse these kinds (`grep -n "IVF_SQ\|HNSW_PQ\|HNSW_FLAT\|does not support .* indexes" 
 bindings/python/nanolance/lance/*.py`). Reuse the SQ / PQ / FLAT distance code and the HNSW graph
 build / search that exist -- do not write new ones. Build parameters (`num_bits`, `m`,
@@ -92,7 +92,7 @@ Files changed, per-test status, decisions, questions.
 - pylance's files match section 1 (probe scripts: `/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchpad/c1/`
   -- `build_pylance.py` builds all kinds, `meta.py` dumps them).
 - Today a pylance IVF_SQ / IVF_HNSW_PQ / IVF_HNSW_FLAT index is **silently not used**: `load_ivf`
-  (src/vector_search.cpp ~750) refuses the type, `dataset_nearest` falls back to an exact search and
+  (src/index/vector/vector_search.cpp ~750) refuses the type, `dataset_nearest` falls back to an exact search and
   the plan says why (results exact, so they differ from pylance's approximate ones). Keep that
   fallback for kinds still unsupported (reviewer's call).
 - Coupling points to decouple (vector_search.cpp): type whitelist ~750 and `pq` / `hnsw` flags from

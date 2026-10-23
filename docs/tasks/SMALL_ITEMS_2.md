@@ -8,8 +8,8 @@ you could not finish rather than stretching the session.
 ## 0. Context budget
 
 About 100k tokens per session. `grep -n` then `sed -n` windows of at most ~120 lines; never read
-`bindings/python/nanolance/lance/dataset.py` (3.6k+), `src/expr.cpp`, `src/lance_table_reader.cpp`,
-`src/index_search.cpp` or `bindings/python/src/nanolance_bindings.cpp` whole. Cut all output. For each
+`bindings/python/nanolance/lance/dataset.py` (3.6k+), `src/expr/expr.cpp`, `src/scan/lance_table_reader.cpp`,
+`src/dataset/index_search.cpp` or `bindings/python/src/nanolance_bindings.cpp` whole. Cut all output. For each
 item: read the named pylance tests (`.deps/pylance-tests/v12.0.0/tests/...`), measure the behaviour
 on real pylance 12.0.0 (`import lance` in plain `python3`), then implement. Write nanolance's own code.
 
@@ -23,8 +23,8 @@ on real pylance 12.0.0 (`import lance` in plain `python3`), then implement. Writ
 2. Decimal and duration columns in filters and scalar indexes (`tests/test_scalar_index.py::
    test_scalar_index_types[btree-decimal128|decimal256|duration]` and the bitmap / zonemap variants,
    grep `test_scalar_index_types`): `arrow_cast(x, 'Decimal128(p, s)')` / `'Duration(Millisecond)'`
-   in filters (src/expr.cpp ~885-908 refuses them), and BTREE (and whatever other kinds the test
-   parametrizes) on decimal128 / decimal256 / duration columns (src/scalar_index.cpp refuses:
+   in filters (src/expr/expr.cpp ~885-908 refuses them), and BTREE (and whatever other kinds the test
+   parametrizes) on decimal128 / decimal256 / duration columns (src/index/scalar/scalar_index.cpp refuses:
    "a scalar index on a column of type decimal..."). Index files must equal pylance's (compare
    page_data / page_lookup rows as earlier index tasks did).
 
@@ -35,7 +35,7 @@ on real pylance 12.0.0 (`import lance` in plain `python3`), then implement. Writ
    `analyze_plan()` output for.
 5. `test_scalar_index.py::test_btree_index_cache_hit_miss_stats` (4): index cache hit / miss
    counters in `analyze_plan` or stats -- measure where pylance reports them; nanolance's caches are
-   in src/index_files.hpp (`IndexCache`).
+   in src/index/index_files.hpp (`IndexCache`).
 6. Late-materialization plan text (`test_dataset.py::test_late_materialization_param` 3,
    `test_fragment.py::test_fragment_scanner_late_materialization[*]` 3): the projection lines the tests
    assert (`projection=[values], source=stream`, `projection=[filter, values]`), and the

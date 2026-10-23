@@ -14,7 +14,7 @@ tokens into Lance tokens: the text is the token's surface, the position is Linde
 index, whitespace tokens skipped and not counted). Lance's usual filters (lower case, length, stop words, stem,
 ascii folding) apply afterwards.
 
-Lindera 3.0.7 (lindera, lindera-dictionary), as ported in `src/fts_lindera.cpp`:
+Lindera 3.0.7 (lindera, lindera-dictionary), as ported in `src/index/fts/fts_lindera.cpp`:
 - config: a YAML mapping (serde_yaml_ng, then JSON). `segmenter.dictionary` (a path, relative to the working
   directory, or `file://`; `embedded://` fails: Lance builds Lindera without embedded dictionaries),
   `segmenter.user_dictionary` (`.csv` or `.bin`), `segmenter.mode` (`normal`, `decompose`, or

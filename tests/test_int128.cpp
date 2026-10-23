@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 //
-// The portable 128-bit class (src/int128.hpp) against the compiler's __int128 on edge and random values.
+// The portable 128-bit class (src/base/int128.hpp) against the compiler's __int128 on edge and random values.
 // Known-value checks run everywhere; the comparison runs only where __int128 exists.
 
-#include "int128.hpp"
+#include "base/int128.hpp"
 
 #include <cstdint>
 #include <cstdio>

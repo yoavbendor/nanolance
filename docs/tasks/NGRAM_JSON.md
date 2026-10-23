@@ -7,14 +7,14 @@ Status: **delegated** (implementer: Claude Haiku 5.5, reviewer: Claude Opus 5.5)
 ## 0. Context budget
 
 About 100k tokens per session. `grep -n` then `sed -n` windows of at most ~120 lines; never read
-`dataset.py` (3.5k+), `src/index_search.cpp`, `src/scalar_index.cpp` or Lance's `ngram.rs` (2.7k) /
+`dataset.py` (3.5k+), `src/dataset/index_search.cpp`, `src/index/scalar/scalar_index.cpp` or Lance's `ngram.rs` (2.7k) /
 `json.rs` (1.7k) whole. Cut all output (`| tail -15`; pytest `-o addopts=` for a summary line;
 `tools/pylance_suite.py ... | tail -5`; `ninja 2>&1 | grep -E "error|warning:" | head`). Only your
 phase. Lance's source: `.deps/rust-suite/lance-index-12.0.0/src/scalar/{ngram.rs,json.rs}`,
 `.deps/rust-suite/lance-tokenizer-12.0.0/src/{ngram_tokenizer.rs,alphanum_only.rs}`. The model for
 adding an index kind is the ZONEMAP / BLOOMFILTER work (`docs/tasks/ZONED_INDEXES.md`): grep
-`ZONEMAP\|ZoneMap\|zonemap` in `src/scalar_index.cpp src/index_search.cpp src/index_segments.cpp
-src/index_files.cpp src/index_optimize.cpp include/nanolance/scalar_index.hpp
+`ZONEMAP\|ZoneMap\|zonemap` in `src/index/scalar/scalar_index.cpp src/dataset/index_search.cpp src/dataset/index_segments.cpp
+src/index/index_files.cpp src/dataset/index_optimize.cpp include/nanolance/scalar_index.hpp
 bindings/python/nanolance/lance/dataset.py bindings/python/nanolance/lance/indices/builder.py` and
 follow the same path. Real pylance is `import lance` in plain `python3`; a probe that dumps both
 indexes: `/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchpad/ngram/probe.py`
@@ -33,7 +33,7 @@ indexes: `/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchp
   (one token = the whole value lowered and folded), then `NgramTokenizer::all_ngrams(3, 3)` over
   characters, then `AlphaNumOnlyFilter` (keep a trigram only if every char `is_ascii_alphanumeric`).
   Token id: `ngram_to_token` (base 37; '0'-'9' -> 1-10, 'a'-'z' -> 11-36; first char * 37^2 ...).
-  nanolance already has lower-case and ASCII-folding code in `src/fts_tokenizer.cpp`: reuse it.
+  nanolance already has lower-case and ASCII-folding code in `src/index/fts/fts_tokenizer.cpp`: reuse it.
 - Manifest: `type_url` `/lance.table.NGramIndexDetails` (empty message), `index_version` 0,
   `describe_indices()[i].index_type == "NGram"`; `stats.index_stats(name)`: `index_type "NGram"`,
   `indices` / `segments` = `[{"num_ngrams": N}]`.
@@ -45,7 +45,7 @@ indexes: `/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchp
   `ngram/ngram_regex.rs` -- out of scope (treat as recheck all) unless a target test needs it.
   Results always equal a scan without the index; the plan shows
   `ScalarIndexQuery: query=[contains(w, Utf8("apple"))]@w_idx(NGram)` (nanolance builds this line in
-  `src/index_search.cpp` ~1012).
+  `src/dataset/index_search.cpp` ~1012).
 - Maintenance like the other scalar kinds: `optimize_indices` deltas, compaction re-cover,
   `create_index_uncommitted(index_type="NGRAM", fragment_ids=...)`, `merge_existing_index_segments`,
   `commit_existing_index_segments`, drop, empty dataset.
@@ -68,11 +68,11 @@ indexes: `/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchp
   json_get_string(col, '<path>') <op> literal` where the function's type equals the index's `<T>` and
   the path string equals the index path; plan line
   `ScalarIndexQuery: query=[Json(j = 11->x)]@j_idx(BTree)`. `json_extract` is never routed.
-  nanolance evaluates these functions already (`src/expr.cpp` ~1650).
+  nanolance evaluates these functions already (`src/expr/expr.cpp` ~1650).
 
 **ngram tokenizer for INVERTED** (N3): `base_tokenizer="ngram"`, `min_ngram_length` (default 3),
 `max_ngram_length` (default 3), `prefix_only`; `stem` / `remove_stop_words` default false for it.
-Port `ngram_tokenizer.rs` (221 lines, read whole) into `src/fts_tokenizer.cpp`'s chain. Oracle
+Port `ngram_tokenizer.rs` (221 lines, read whole) into `src/index/fts/fts_tokenizer.cpp`'s chain. Oracle
 `test_fts_ngram_tokenizer` (read it).
 
 ## 2. Phases and oracles
@@ -122,17 +122,17 @@ Files changed, per-test status, decisions, questions.
   deltas, compaction re-cover, `create_index_uncommitted` / merge / commit segments,
   `test_optimize_indices_second_call_is_noop`.
 - **Approved:** a new `expr::Predicate::Test::Contains` (include/nanolance/expr.hpp ~58), recognized
-  only from `contains(<string column>, '<literal>')` in the Condition walk (src/expr.cpp ~2980-3050,
+  only from `contains(<string column>, '<literal>')` in the Condition walk (src/expr/expr.cpp ~2980-3050,
   `HasAny` / `Has` are the precedent), with `filter()`, `to_string()` (~3189), `predicate_node`
-  (~3080) and the switch arms in src/index_search.cpp (~407, ~443, ~626, ~790). Row-evaluation
+  (~3080) and the switch arms in src/dataset/index_search.cpp (~407, ~443, ~626, ~790). Row-evaluation
   semantics unchanged.
 - `LIKE '%x%'` and `regexp_like` are **not** routed in N1: Lance sends them through
   `TextQuery::Regex` and `ngram/ngram_regex.rs` (`visit_like`, lance-index `scalar/expression.rs`
   ~970). A later item.
-- Known pieces: `write_file` / `struct_schema` (src/index_files.cpp 183-197) drop child field metadata,
+- Known pieces: `write_file` / `struct_schema` (src/index/index_files.cpp 183-197) drop child field metadata,
   so `posting_list` needs a schema carrying `lance-encoding:compression = none`; the inner bitmaps can
   use `roaring::encode` (roaring_bitmap.hpp:20); export a lower-case + ASCII-fold helper from
-  `Analyzer::emit` (src/fts_tokenizer.cpp 395-424) and include non-ASCII cases in the byte test (its
+  `Analyzer::emit` (src/index/fts/fts_tokenizer.cpp 395-424) and include non-ASCII cases in the byte test (its
   `kLower` table may differ from Rust's `to_lowercase` on rare characters: report any difference).
 
 **N1a outcome (2026-10-15):** done. NGRAM build / search / `contains` routing / plan line / describe /
@@ -162,7 +162,7 @@ cannot build" refusal is now tested with a pylance IVF_RQ index. +4 pylance test
   (supported: btree)`; label_list / json / unknown names get pylance's own errors. The other targets
   are a later item.
 - IndexConfig is the only form (no kwargs `index_type="JSON"`). The plan line and stats name the
-  target (`@j_idx(BTree)`, `index_type "BTree"`) -- special-case it in src/index_search.cpp ~1190.
+  target (`@j_idx(BTree)`, `index_type "BTree"`) -- special-case it in src/dataset/index_search.cpp ~1190.
 
 **N2 code map (2026-10-15, second investigation session; no code changed).** N2 is split:
 **N2a** = steps 1-3 + their tests, **N2b** = steps 4-6.
@@ -171,7 +171,7 @@ cannot build" refusal is now tested with a pylance IVF_RQ index. +4 pylance test
    `path`, the agreed refusals). Native: `_ds_create_scalar_index`
    (bindings/python/src/nanolance_bindings.cpp:1637) needs a path argument; `ScalarIndexOptions`
    (include/nanolance/scalar_index.hpp:34) a `json_path` field.
-2. C++: in `create_scalar_index` (src/scalar_index.cpp ~1118-1415) the json branch must come before
+2. C++: in `create_scalar_index` (src/index/scalar/scalar_index.cpp ~1118-1415) the json branch must come before
    the `key_kind_of` check (it rejects extension types). JSONPath subset: optional leading `$`,
    dot-separated member names (`$['x']` -> pylance's "Invalid JSONPath"). Extract per batch into typed
    nanoarrow arrays, type inference with Lance's error text, then the existing `write_btree` /
@@ -179,10 +179,10 @@ cannot build" refusal is now tested with a pylance IVF_RQ index. +4 pylance test
 3. describe (`index_type "Json"` from the URL) / stats (as BTree): check both against pylance.
    `test_describe_indices`' json column is all-null at path "x" -> inferred type Utf8.
 4. Routing: `json_get_int/float/bool/string(col, 'k') <op> literal` for identifier-like paths only,
-   a new predicate kind as N1's `Test::Contains`; src/index_search.cpp ~1137-1190, plan line
+   a new predicate kind as N1's `Test::Contains`; src/dataset/index_search.cpp ~1137-1190, plan line
    `@j_idx(BTree)` (special-case the type name).
-5. Optimize / merge / compaction re-cover / drop as BTree (src/index_optimize.cpp Kind mapping,
-   src/index_segments.cpp type maps).
+5. Optimize / merge / compaction re-cover / drop as BTree (src/dataset/index_optimize.cpp Kind mapping,
+   src/dataset/index_segments.cpp type maps).
 6. Tests on tmp_path in test_ngram_json_index.py, including the `a.b` divergence test.
 
 **N2a outcome (2026-10-15):** done. JSON index build (IndexConfig, btree target; JSONPath subset

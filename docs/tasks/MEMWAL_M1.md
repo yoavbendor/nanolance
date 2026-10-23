@@ -9,8 +9,8 @@ name.
 ## 0. Context budget (read this first)
 
 Budget about 200k tokens; aim for 120k. Never read a large file whole: `grep -n`, then `sed -n 'A,Bp'` windows
-of at most ~120 lines. Big ones: `bindings/python/nanolance/lance/dataset.py` (5k+), `src/dataset.cpp`,
-`src/dataset_ops.cpp`, the Lance sources below. Cut output: `| tail -15` for pytest (add `-o addopts=`).
+of at most ~120 lines. Big ones: `bindings/python/nanolance/lance/dataset.py` (5k+), `src/dataset/dataset.cpp`,
+`src/dataset/dataset_ops.cpp`, the Lance sources below. Cut output: `| tail -15` for pytest (add `-o addopts=`).
 
 ## 1. Targets
 
@@ -96,7 +96,7 @@ questions first, then files, per-target status, tails, decisions.
 **M1 outcome (2026-10-22): done.** Implemented by Haiku up to its usage limit, then finished and reviewed by
 Opus on the high-risk branch. `initialize_mem_wal` (every form: manual, unsharded, bucket, identity, maintained
 indexes, writer-config defaults, the refusals) commits Lance's `__lance_mem_wal` index entry as a CreateIndex
-(`src/mem_wal.cpp`: no fields, no fragment bitmap, no files, index_version 0, the details in an Any);
+(`src/table/mem_wal.cpp`: no fields, no fragment bitmap, no files, index_version 0, the details in an Any);
 `mem_wal_index_details` decodes it (`nanolance/lance/mem_wal.py`); `evaluate_sharding_spec` ports Lance's bucket
 hash (its Murmur3 variant) in Python, equal to pylance's over every type sharding.rs handles. The entry is listed
 and described as pylance lists it, survives append / delete / update / merge_insert / compaction /

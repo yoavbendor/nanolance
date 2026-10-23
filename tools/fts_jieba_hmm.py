@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Yoav Bendor
-"""Generate src/fts_jieba_hmm_data.inc: jieba-rs 0.10's built-in HMM model, zstd-compressed.
+"""Generate src/index/fts/fts_jieba_hmm_data.inc: jieba-rs 0.10's built-in HMM model, zstd-compressed.
 
 usage: fts_jieba_hmm.py <jieba-macros-0.10.0/src/hmm.model> <out.inc>
 
