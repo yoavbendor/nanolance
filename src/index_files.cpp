@@ -267,6 +267,7 @@ void remove_index_dir(const std::filesystem::path& dir) {
     }
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
+    close_data_files_under(dir.string());
 }
 
 bool write_file(const std::filesystem::path& dir, const std::string& name, const ArrowSchema& schema,

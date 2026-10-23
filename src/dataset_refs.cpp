@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/data_file_reader.hpp"
 #include "nanolance/work_stats.hpp"
 #include <nanolance/dataset_refs.hpp>
 #include "nanolance/byte_source.hpp"
@@ -131,6 +132,7 @@ bool remove_tree(const fs::path& dir, std::string& error) {
     if (!on_object_store(dir)) {
         std::error_code ec;
         fs::remove_all(dir, ec);
+        close_data_files_under(dir.string());
         if (ec) {
             error = ec.message();
             return false;
@@ -156,6 +158,7 @@ bool remove_file_at(const fs::path& path, std::string& error) {
     }
     std::error_code ec;
     fs::remove(path, ec);
+    close_data_files_under(path.string());
     if (ec) {
         error = ec.message();
         return false;
@@ -1409,6 +1412,7 @@ std::string pairs_text(const std::vector<std::pair<std::string, std::uint64_t>>&
 void remove_branch_dirs(const fs::path& dir, const fs::path& stop) {
     std::error_code ec;
     fs::remove_all(dir, ec);
+    close_data_files_under(dir.string());
     for (auto up = dir.parent_path(); up.generic_string().size() > stop.generic_string().size(); up = up.parent_path()) {
         if (!fs::is_directory(up, ec) || !fs::is_empty(up, ec) || ec) {
             break;
@@ -1876,6 +1880,7 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
         }
         std::error_code remove_ec;
         fs::remove(dataset_path / file.path, remove_ec);
+        close_data_files_under((dataset_path / file.path).string());
         if (remove_ec) {
             error = "failed to remove " + (dataset_path / file.path).string() + ": " + remove_ec.message();
             return false;
@@ -2106,6 +2111,7 @@ bool drop_dataset(const fs::path& dataset_path, bool ignore_not_found, std::stri
         return false;
     }
     fs::remove_all(dataset_path, ec);
+    close_data_files_under(dataset_path.string());
     if (ec) {
         error = "failed to drop " + dataset_path.string() + ": " + ec.message();
         return false;

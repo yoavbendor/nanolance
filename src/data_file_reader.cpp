@@ -14,6 +14,7 @@
 #include <fstream>
 #include <limits>
 #include <list>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -80,7 +81,42 @@ struct OpenDataFile {
     std::uint64_t block_start = std::numeric_limits<std::uint64_t>::max();
 };
 constexpr std::size_t kMaxOpenDataFiles = 4;
-thread_local std::list<std::pair<std::filesystem::path, OpenDataFile>> g_open_data_files;
+
+/// One thread's open files. Its lock is held by its own thread for the length of each public read
+/// below (uncontended: a few nanoseconds next to a pread), and by close_data_files_under() from the
+/// thread that deleted files, which so never closes a handle another thread is reading through. Every
+/// thread's cache is registered so that a delete can reach threads that are idle: a deleted file held
+/// open stays on disk (on NFS as a .nfsXXXX file) until the handle closes.
+struct ThreadOpenFiles {
+    std::recursive_mutex mutex;
+    std::list<std::pair<std::filesystem::path, OpenDataFile>> files;
+    ThreadOpenFiles();
+    ~ThreadOpenFiles();
+};
+
+std::mutex& registry_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::vector<ThreadOpenFiles*>& registry() {
+    static std::vector<ThreadOpenFiles*> r;
+    return r;
+}
+
+ThreadOpenFiles::ThreadOpenFiles() {
+    const std::lock_guard<std::mutex> lock(registry_mutex());
+    registry().push_back(this);
+}
+
+ThreadOpenFiles::~ThreadOpenFiles() {
+    const std::lock_guard<std::mutex> lock(registry_mutex());
+    auto& r = registry();
+    r.erase(std::remove(r.begin(), r.end(), this), r.end());
+}
+
+thread_local ThreadOpenFiles g_thread_files;
+thread_local std::list<std::pair<std::filesystem::path, OpenDataFile>>& g_open_data_files = g_thread_files.files;
 thread_local std::uint64_t g_read_epoch = 0;
 thread_local std::uint64_t g_next_read_epoch = 1;
 
@@ -99,7 +135,9 @@ OpenDataFile* find_or_open_data_file(const std::filesystem::path& path, std::str
     std::int64_t version = 0;
     const bool local = !io::is_remote(path.string());
     if (local && !io::stat_local(path.string(), file_size, version)) {
-        error = "failed to stat data file";
+        std::error_code ec;
+        error = std::filesystem::exists(path, ec) ? "failed to stat data file " + path.string()
+                                                  : "data file not found: " + path.string();
         return nullptr;
     }
 
@@ -157,6 +195,7 @@ bool read_le64(const unsigned char* p, std::uint64_t& v) {
 }  // namespace
 
 bool data_file_identity(const std::filesystem::path& path, std::uint64_t& size, std::int64_t& version) {
+    const std::lock_guard<std::recursive_mutex> lock(g_thread_files.mutex);
     std::string error;
     auto* file = find_or_open_data_file(path, error);
     if (file == nullptr) {
@@ -165,6 +204,17 @@ bool data_file_identity(const std::filesystem::path& path, std::uint64_t& size, 
     size = file->file_size;
     version = file->source->version_token();
     return true;
+}
+
+void close_data_files_under(const std::string& path_or_prefix) {
+    const std::lock_guard<std::mutex> registry_lock(registry_mutex());
+    for (ThreadOpenFiles* cache : registry()) {
+        const std::lock_guard<std::recursive_mutex> lock(cache->mutex);
+        cache->files.remove_if([&](const auto& entry) {
+            const std::string p = entry.first.string();
+            return p.size() >= path_or_prefix.size() && p.compare(0, path_or_prefix.size(), path_or_prefix) == 0;
+        });
+    }
 }
 
 DataFileReadScope::DataFileReadScope() : saved_(g_read_epoch) { g_read_epoch = g_next_read_epoch++; }
@@ -177,6 +227,7 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
     descriptor = pb::FileDescriptor{};
     layout = LanceDataFileFooterLayout{};
     error.clear();
+    const std::lock_guard<std::recursive_mutex> lock(g_thread_files.mutex);
 
     auto* file = find_or_open_data_file(path, error);
     if (file == nullptr) {
@@ -338,6 +389,7 @@ bool read_lance_data_file_bytes(const std::filesystem::path& path, const std::ui
         error = "read size overflow";
         return false;
     }
+    const std::lock_guard<std::recursive_mutex> lock(g_thread_files.mutex);
     auto* file = find_or_open_data_file(path, error);
     if (file == nullptr) {
         return false;

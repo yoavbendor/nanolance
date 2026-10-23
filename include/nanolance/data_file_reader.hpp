@@ -59,6 +59,12 @@ bool read_lance_data_file_column_metadatas(const std::filesystem::path& path, co
 /// Caches keyed on a file's identity use this instead of stat'ing the path on every lookup.
 bool data_file_identity(const std::filesystem::path& path, std::uint64_t& size, std::int64_t& version);
 
+/// Closes every thread's cached handle on a data file whose path starts with `path_or_prefix` (one file,
+/// or everything under a directory). Called after files are deleted: a deleted file held open keeps its
+/// space, and on NFS lingers as a .nfsXXXX file, until the handle closes. Waits for a thread that is
+/// reading through such a handle to finish that read.
+void close_data_files_under(const std::string& path_or_prefix);
+
 class DataFileReadScope {
   public:
     DataFileReadScope();

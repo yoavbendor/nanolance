@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/byte_sink.hpp"
+#include "nanolance/data_file_reader.hpp"
 
 #include <atomic>
 #include <filesystem>
@@ -166,6 +167,7 @@ bool remove_output(const std::string& path_or_uri, std::string& error) {
     }
     std::error_code ec;
     std::filesystem::remove(path_or_uri, ec);
+    close_data_files_under(path_or_uri);
     if (ec) {
         error = "failed to remove " + path_or_uri + ": " + ec.message();
         return false;
