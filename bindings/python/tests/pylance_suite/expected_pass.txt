@@ -495,6 +495,7 @@ tests/test_delta.py::test_delta_validation_errors
 tests/test_delta.py::test_delta_with_explicit_version_range
 tests/test_file.py::test_aborted_write
 tests/test_file.py::test_batch_sizes
+tests/test_file.py::test_compression
 tests/test_file.py::test_dictionary
 tests/test_file.py::test_different_types
 tests/test_file.py::test_empty_structs

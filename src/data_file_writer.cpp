@@ -2231,6 +2231,12 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                                    std::vector<pb::ColumnMetadata>& columns, std::string& error) -> bool {
         const auto& field = *physical_fields[field_index];
         const auto& values = *column_source[field_index];
+        // `lance-encoding:compression=zstd` on one column (pylance's per-column option) zstd-compresses that
+        // column alone, as the writer-wide `compress` flag does for every string column. Such a column
+        // skips FSST, which would otherwise be chosen where it pays.
+        const auto zstd_option = field.metadata.find("lance-encoding:compression");
+        const bool zstd_requested = zstd_option != field.metadata.end() && zstd_option->second == "zstd";
+        const bool compress_column = compress || zstd_requested;
 
         // Nulls are encodable only on the paths that have been taught the definition-level layer.
         // Everything else must refuse rather than drop them: ingest no longer rejects a null batch,
@@ -2988,7 +2994,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         fsst::Encoder fsst_encoder;
         if (packing_it != field.metadata.end() && packing_it->second == "fsst" &&
             train_column_fsst(field, values, fsst_encoder) &&
-            (!compress || fsst_pays_on_first_page(fsst_encoder, values, rows))) {
+            !zstd_requested && (!compress || fsst_pays_on_first_page(fsst_encoder, values, rows))) {
             pb::ColumnMetadata column;
             if (!write_nested_column(out, field, values, rows, column, error, &fsst_encoder)) {
                 return false;
@@ -3013,7 +3019,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                     variable_offset(values, i + 1U) - variable_offset(values, i) > kMaxVariableMiniblockBytes / 2U;
             }
         }
-        if (!compress || value_too_big_for_a_chunk) {
+        if (!compress_column || value_too_big_for_a_chunk) {
             pb::ColumnMetadata column;
             // Large values get FullZip pages (row-addressable, as Lance writes them); the rest
             // MiniBlock chunks.
@@ -3046,7 +3052,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             }
         }
 
-        const bool zstd_variable = compress;
+        const bool zstd_variable = compress_column;
         pb::ColumnMetadata column;
         column.encoding = column_encoding_bytes();
         // Hoisted out of the loop (not freshly declared per chunk): zstd_frame_buffer's resize() only

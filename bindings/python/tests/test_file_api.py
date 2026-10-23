@@ -8,6 +8,7 @@ column. The pylance-written side of each comparison is read by nanolance and the
 from __future__ import annotations
 
 import importlib
+import os
 
 import pyarrow as pa
 import pytest
@@ -87,3 +88,37 @@ def test_global_buffer_and_schema_metadata_match_pylance(tmp_path, lance):
     assert bytes(ours_read.read_global_buffer(py_index)) == payload
     assert ours_read.metadata().schema.metadata.get(b"foo") == b"bar"
     assert ours_read.metadata().global_buffers[py_index].size == len(payload)
+
+
+# ── LanceFileWriter: lance-encoding:compression on one column ──────────────────────────────────────
+
+
+def _zstd_schema():
+    return pa.schema([pa.field("c", pa.string(), metadata={"lance-encoding:compression": "zstd"})])
+
+
+@pytest.mark.parametrize("values, smaller", [
+    ([f"compress_me_please-{i}" for i in range(10 * 1024)], True),
+    # Values past one zstd chunk take the plain-page fallback: no smaller, but it must read back.
+    ([("x" * 40_000) + str(i) for i in range(300)], False),
+])
+def test_zstd_column_option_matches_pylance(tmp_path, lance, values, smaller):
+    table = pa.table({"c": values}, schema=_zstd_schema())
+
+    # nanolance writes the column zstd-compressed, as pylance does for the same option.
+    zstd_path = tmp_path / "zstd.lance"
+    with nl_file.LanceFileWriter(str(zstd_path), _zstd_schema()) as writer:
+        writer.write_batch(table)
+    plain_path = tmp_path / "plain.lance"
+    with nl_file.LanceFileWriter(str(plain_path), pa.schema([pa.field("c", pa.string())])) as writer:
+        writer.write_batch(pa.table({"c": values}))
+    if smaller:
+        assert os.path.getsize(zstd_path) < os.path.getsize(plain_path)
+    assert lance.file.LanceFileReader(str(zstd_path)).read_all().to_table() == table
+    assert nl_file.LanceFileReader(str(zstd_path)).read_all().to_table() == table
+
+    # pylance writes the same option; nanolance reads it.
+    pylance_path = tmp_path / "pylance.lance"
+    with lance.file.LanceFileWriter(str(pylance_path), _zstd_schema()) as writer:
+        writer.write_batch(table)
+    assert nl_file.LanceFileReader(str(pylance_path)).read_all().to_table() == table
