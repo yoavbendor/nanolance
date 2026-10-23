@@ -54,8 +54,7 @@ FILES = {
 
 # The public headers in include/nanolance/, by layer (they stay where they are; the check reads this).
 HEADERS = {
-    "base": ["work_stats", "read_safety", "path_safety", "parallel", "buffer_pool", "roaring_bitmap", "version",
-             "bloom_filter_hash"],
+    "base": ["work_stats", "read_safety", "path_safety", "parallel", "buffer_pool", "roaring_bitmap", "version"],
     "io": ["byte_source", "byte_sink", "object_store"],
     "arrow": ["schema_mapper", "array_accessor", "column_values", "arrow_slice", "blob_builder", "jsonb",
               "typed_writer"],
