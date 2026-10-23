@@ -12,6 +12,7 @@
 #include "nanolance/bool_bitpack.hpp"
 #include "encoding/values/bitpack.hpp"
 #include "encoding/values/general.hpp"
+#include "encoding/values/byte_stream_split.hpp"
 #include "nanolance/column_slice.hpp"
 #include <nanom/fastlanes.hpp>
 #include "nanolance/fsst.hpp"
@@ -3061,8 +3062,8 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
                 }
                 const auto base = out.fixed.size();
                 out.fixed.resize(base + raw.size());
-                (void)nanom::columnar::byte_stream_split(
-                    std::as_bytes(std::span(raw)), bytes_per_value, chunk_values,
+                (void)byte_stream_split::decode(
+                    std::as_bytes(std::span(raw)), bytes_per_value,
                     std::as_writable_bytes(std::span(out.fixed.data() + base, raw.size())));
                 remaining -= chunk_values;
             }

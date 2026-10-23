@@ -6,6 +6,7 @@
 
 #include "encoding/values/bitpack.hpp"
 #include "encoding/values/general.hpp"
+#include "encoding/values/byte_stream_split.hpp"
 #include "nanolance/parallel.hpp"
 #include "nanolance/work_stats.hpp"
 
@@ -2864,10 +2865,10 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                     // Byte-transpose (mantissa/exponent bytes grouped) so the zstd frame compresses
                     // meaningfully, then frame it: bytes become [u64 raw size][zstd].
                     scratch.resize(fixed_bytes_per_value * count);
-                    (void)nanom::columnar::byte_stream_split_encode(
+                    (void)byte_stream_split::encode(
                         std::as_bytes(std::span(values.fixed_data() + off * fixed_bytes_per_value,
                                                 fixed_bytes_per_value * count)),
-                        fixed_bytes_per_value, count, std::as_writable_bytes(std::span(scratch)));
+                        fixed_bytes_per_value, std::as_writable_bytes(std::span(scratch)));
                     if (!general::zstd_frame(scratch, compression_level, framed, error)) {
                         return false;
                     }
