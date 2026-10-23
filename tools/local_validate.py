@@ -312,10 +312,12 @@ def main(argv=None) -> int:
     # C++ build and ctest
     if "cpp" not in skip:
         build = out / "build-cpp"
-        code, secs = run.sh("cpp", ["cmake", "-S", str(ROOT), "-B", str(build), "-DCMAKE_BUILD_TYPE=Release"],
-                            "cpp.log", env=base_env)
+        # --fast builds the S3 reader in this tree too (S3 on), saving a second compile of the library.
+        s3_on = ["-DNANOLANCE_ENABLE_S3=ON"] if args.fast and "pytest" not in skip else []
+        code, secs = run.sh("cpp", ["cmake", "-S", str(ROOT), "-B", str(build), "-DCMAKE_BUILD_TYPE=Release",
+                                    *s3_on], "cpp.log", env=base_env)
         if code == 0:
-            only = ["--target", *smoke_targets(build)] if args.fast else []
+            only = ["--target", *smoke_targets(build), *(["lance_c_s3_read"] if s3_on else [])] if args.fast else []
             c2, s2 = run.sh("cpp", ["cmake", "--build", str(build), "-j", str(args.jobs), *only], "cpp.log",
                             env=base_env)
             code, secs = c2, secs + s2
@@ -331,7 +333,11 @@ def main(argv=None) -> int:
 
     # lance-c's reader of s3:// datasets, built with S3 as CI builds it; the object-store tests use it.
     s3_reader = None
-    if "cpp" not in skip and "pytest" not in skip:
+    if args.fast and "cpp" not in skip and "pytest" not in skip:
+        exe = out / "build-cpp" / "lance_c_s3_read"
+        s3_reader = str(exe) if exe.exists() else None
+        run.record("s3build", "ok" if s3_reader else "FAIL", 0, "cpp.log", "lance_c_s3_read, in the C++ tree")
+    elif "cpp" not in skip and "pytest" not in skip:
         build_s3 = out / "build-s3"
         code, secs = run.sh("s3build", ["cmake", "-S", str(ROOT), "-B", str(build_s3), "-DCMAKE_BUILD_TYPE=Release",
                                         "-DNANOLANCE_ENABLE_S3=ON"], "s3build.log", env=base_env)
@@ -389,7 +395,9 @@ def main(argv=None) -> int:
                 e.pop("AWS_PROFILE", None)
             # Its own temporary directory, removed afterwards: a run leaves gigabytes of test datasets.
             basetemp = scratch / f"tmp-{name}"
-            code, secs = run.sh(name, [py, "-m", "pytest", "-m", "not bench", "-q", "-rs", "-o", "addopts=", "-p",
+            # --fast runs its subset on several workers (loadgroup: the lindera tests share one worker).
+            workers = ["-n", str(min(os.cpu_count() or 4, 16)), "--dist", "loadgroup"] if fast else []
+            code, secs = run.sh(name, [py, "-m", "pytest", *workers, "-m", "not bench", "-q", "-rs", "-o", "addopts=", "-p",
                                        "no:cacheprovider", "--timeout", "1800", f"--basetemp={basetemp}",
                                        f"--junitxml={junit}", *(fast["pytest"] if fast else ["tests"])],
                                 f"{name}.log", cwd=pydir, env=e, timeout=4 * 3600)
