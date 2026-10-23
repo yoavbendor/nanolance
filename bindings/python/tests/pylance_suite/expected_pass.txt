@@ -1114,6 +1114,7 @@ tests/test_scalar_index.py::test_validate_distributed_fts_empty_results
 tests/test_scalar_index.py::test_validate_distributed_fts_large_dataset
 tests/test_scalar_index.py::test_validate_distributed_fts_score_consistency
 tests/test_scalar_index.py::test_vector_and_zonemap_on_fsl_column
+tests/test_scalar_index.py::test_vector_filter_fts_search
 tests/test_scalar_index.py::test_zonemap_deletion_handling
 tests/test_scalar_index.py::test_zonemap_fragment_ids_parameter_validation
 tests/test_scalar_index.py::test_zonemap_fsl_column
@@ -1222,6 +1223,7 @@ tests/test_vector_index.py::test_flat_1d_query_length_multiple_of_dim_is_rejecte
 tests/test_vector_index.py::test_fragment_scan_allowed_on_ann_with_file_scan_prefilter
 tests/test_vector_index.py::test_fragment_scan_disallowed_on_ann
 tests/test_vector_index.py::test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter
+tests/test_vector_index.py::test_fts_filter_vector_search
 tests/test_vector_index.py::test_has_index
 tests/test_vector_index.py::test_index_cache_size
 tests/test_vector_index.py::test_index_cache_size_bytes

@@ -3209,6 +3209,18 @@ def _nearest_query(ds, nearest, limit=None) -> dict:
     return dict(shared, q=rows[0].tolist(), vectors=1)
 
 
+def _search_filter_parts(filter):
+    """(the filter, a full-text query filter): `filter=MatchQuery(...)` is a query filter alone; a dict
+    is `{"expr_filter": ..., "search_filter": ...}`."""
+    from nanolance.lance.query import FullTextQuery
+
+    if isinstance(filter, dict) and ("search_filter" in filter or "expr_filter" in filter):
+        return filter.get("expr_filter"), filter.get("search_filter")
+    if isinstance(filter, FullTextQuery):
+        return None, filter
+    return filter, None
+
+
 def _filter_sql(filter) -> Optional[str]:
     """A filter as SQL: a string as given, a pyarrow compute expression translated."""
     if filter is None:
@@ -3946,6 +3958,23 @@ class LanceScanner(pa.dataset.Scanner):
         if include_deleted_rows and (nearest is not None or full_text_query is not None):
             raise ValueError("Cannot include deleted rows in a vector or full-text search")
         self._include_deleted = bool(include_deleted_rows)
+        # A full-text query as the filter (Lance's query filter: `filter=MatchQuery(...)`, or a dict of
+        # `search_filter` and `expr_filter`). With a vector search and prefilter, the search runs over the
+        # rows it matches; without prefilter, the k nearest are kept where they match. Errors are Lance's,
+        # raised when the scan runs.
+        filter, self._search_filter = _search_filter_parts(filter)
+        self._search_filter_error = None
+        if self._search_filter is not None:
+            from nanolance.lance.query import MatchQuery
+
+            if self._nearest is None and self._fts is None:
+                self._search_filter_error = ValueError(
+                    "Invalid user input: Query filter can only be used with full text search or vector search")
+            elif self._nearest is None:
+                raise unsupported("a full-text query filter with a full-text search")
+            elif not self._prefilter and not isinstance(self._search_filter, MatchQuery):
+                self._search_filter_error = ValueError(
+                    "Not supported: Only Match queries are supported currently when using FTS as a post-filter")
         self._filter = _filter_sql(filter)
         # A filter on _rowid / _rowaddr is evaluated here, over the rows the scan returns with their
         # addresses, before limit and offset (the scan cannot push it down).
@@ -4012,7 +4041,8 @@ class LanceScanner(pa.dataset.Scanner):
         self._batch_size = batch_size
         self._fragment_ids = None if fragments is None else [int(getattr(f, "fragment_id", f)) for f in fragments]
         self._with_row_id = bool(with_row_id)
-        self._with_row_address = bool(with_row_address)
+        # A full-text post-filter matches the k nearest by row address.
+        self._with_row_address = bool(with_row_address) or (self._search_filter is not None and not self._prefilter)
         self._use_scalar_index = use_scalar_index is not False
         # Row-address masks (serialize_row_addrs bytes): the native scan decodes them and applies them
         # before the filter, the range and any ranking; offset and limit then count the rows they allow.
@@ -4240,6 +4270,8 @@ class LanceScanner(pa.dataset.Scanner):
         return frame
 
     def _to_table(self) -> pa.Table:
+        if self._search_filter_error is not None:
+            raise self._search_filter_error
         if self._order_by:
             return self._sorted_table()
         if self._nearest is not None:
@@ -4330,7 +4362,24 @@ class LanceScanner(pa.dataset.Scanner):
         """The k nearest rows. A batch (``self._nearest`` a list) runs each query in turn, its rows in query
         order with a leading ``query_index``; offset and limit then apply to the whole result."""
         batch = isinstance(self._nearest, list)
+        matching = None
+        if self._search_filter is not None:
+            matching = self._search_filter_rows()
+            if self._prefilter:
+                if self._mask["row_addr_allowlist"] is not None:
+                    raise unsupported("a full-text query filter with a row-address allowlist")
+                self._mask["row_addr_allowlist"] = serialize_row_addrs(matching.tolist())
+                self._masked = True
+                matching = None
         tables = [self._nearest_one(n) for n in (self._nearest if batch else [self._nearest])]
+        if matching is not None:  # the k nearest, kept where the query matches
+            import pyarrow.compute as pc
+
+            kept = []
+            for t in tables:
+                t = t.filter(pc.is_in(t["_rowaddr"], value_set=pa.array(matching, pa.uint64())))
+                kept.append(t if self._asked_row_address else t.drop_columns(["_rowaddr"]))
+            tables = kept
         out = tables[0] if len(tables) == 1 else pa.concat_tables(tables)
         if batch:
             index = np.repeat(np.arange(len(tables), dtype=np.int32), [t.num_rows for t in tables])
@@ -4358,6 +4407,13 @@ class LanceScanner(pa.dataset.Scanner):
         if meta and out.schema.metadata != meta:
             out = out.replace_schema_metadata(meta)
         return out
+
+    def _search_filter_rows(self) -> np.ndarray:
+        """The row addresses the full-text query filter matches (every match, unranked)."""
+        found = self._ds.scanner(full_text_query=self._search_filter, columns=[], with_row_address=True,
+                                 fragments=None if self._fragment_ids is None else
+                                 [self._ds.get_fragment(i) for i in self._fragment_ids]).to_table()
+        return found["_rowaddr"].to_numpy().astype(np.uint64)
 
     def _fts_search(self):
         limit = None if self._limit is None else self._offset + self._limit
