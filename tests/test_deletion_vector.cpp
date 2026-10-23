@@ -71,26 +71,16 @@ int main() {
         require(offsets == expected, "offsets come back sorted");
     }
 
-    // An empty deletion list: the writer accepts it and the file counts zero rows.
-    // KNOWN: the reader does not read that file back. A zero-row record batch leaves its length field
-    // out (a flatbuffer default), and parse_arrow_ipc_uint32_column refuses the omitted field as
-    // "malformed Arrow IPC record batch length". The library's own callers never write an empty
-    // deletion file (an emptied fragment is removed instead), so this is reported rather than failed.
+    // An empty deletion list: the writer accepts it, the file counts zero rows, and it reads back empty (a
+    // zero-row record batch omits its length field, the flatbuffer default; the reader once refused that).
     {
         pb::DeletionFile written;
         std::string error;
         require(nano_lance::write_deletion_file(root, 5, 1, {}, written, error), "write empty: ", error);
         require(written.num_deleted_rows == 0, "an empty file counts zero");
         std::vector<std::uint32_t> offsets = {42};
-        if (nano_lance::read_deletion_vector(deletions, 5, written, offsets, error)) {
-            require(offsets.empty(), "an empty deletion file deletes nothing");
-        } else {
-            require(error == "malformed Arrow IPC record batch length",
-                    "the empty file is refused for the known reason: " + error);
-            require(offsets.empty(), "a refused read returns no offsets");
-            std::cout << "KNOWN: an empty deletion file (0 rows, Arrow IPC) written by write_deletion_file is "
-                         "refused by read_deletion_vector: \"" << error << "\"\n";
-        }
+        require(nano_lance::read_deletion_vector(deletions, 5, written, offsets, error), "read empty: ", error);
+        require(offsets.empty(), "an empty deletion file deletes nothing");
     }
 
     // A fragment with no deletion file: nothing deleted, and no file is opened.

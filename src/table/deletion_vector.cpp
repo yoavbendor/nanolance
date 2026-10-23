@@ -339,8 +339,9 @@ bool parse_arrow_ipc_uint32_column(const std::vector<std::uint8_t>& bytes,
             // RecordBatch: length(0), nodes(1), buffers(2), compression(3).
             std::size_t length_at = 0;
             std::int64_t rows = 0;
-            if (!flatbuffer_field(bytes, record_batch, 0U, length_at) || length_at == 0U ||
-                !read_i64(bytes, length_at, rows) || rows < 0) {
+            // An absent length is the flatbuffer default, 0: how a zero-row batch is written.
+            if (!flatbuffer_field(bytes, record_batch, 0U, length_at) ||
+                (length_at != 0U && !read_i64(bytes, length_at, rows)) || rows < 0) {
                 error = "malformed Arrow IPC record batch length";
                 return false;
             }

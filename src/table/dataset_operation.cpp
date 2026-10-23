@@ -222,6 +222,17 @@ bool uuid_of(const WireField& f, std::array<std::uint8_t, 16>& out) {
 
 bool decode_operation(std::uint32_t kind, const Bytes& message, Operation& op, std::string& error) {
     op.kind = kind;
+    // A kind this decoder does not read is refused whether or not its message has fields (an empty Clone
+    // was taken as decoded, since the refusal below only ran inside the field loop).
+    switch (kind) {
+        case kAppend: case kDelete: case kOverwrite: case kMerge: case kProject: case kCreateIndex:
+        case kRestore: case kReserveFragments: case kUpdate: case kRewrite: case kUpdateBases:
+        case kUpdateConfig: case kDataReplacement: case kDataOverlay:
+            break;
+        default:
+            error = std::string("LanceDataset.commit of ") + operation_name(kind) + " is not supported";
+            return false;
+    }
     WireReader r(message);
     WireField f;
     std::vector<WireField> schema;

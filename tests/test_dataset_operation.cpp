@@ -162,21 +162,13 @@ int main() {
         require(error.find("is not supported") != std::string::npos, "the refusal says so: ", error);
     }
 
-    // KNOWN: decode_operation's header says it refuses an operation it does not read. It refuses one with
-    // content, but the check sits inside the field loop, so an empty message of an unread kind (Clone, 113)
-    // is accepted and decodes as an empty operation of that kind. Reported rather than failed.
+    // An empty message of a kind this decoder does not read is refused too (it once decoded as an empty
+    // operation, the refusal only running inside the field loop).
     {
         nano_lance::Operation op;
         std::string error;
-        if (nano_lance::decode_operation(nano_lance::kCloneField, {}, op, error)) {
-            require(op.kind == nano_lance::kCloneField && op.fragments.empty() && op.removed_ids.empty() &&
-                        !op.has_schema,
-                    "the empty clone decodes to nothing else");
-            std::cout << "KNOWN: decode_operation(113 Clone, empty message) returns true with an empty operation "
-                         "of kind 113; the header says an operation this decoder does not read is refused\n";
-        } else {
-            require(false, "an empty clone message was refused (the known behaviour changed): ", error);
-        }
+        require(!nano_lance::decode_operation(nano_lance::kCloneField, {}, op, error), "an empty clone is refused");
+        require(error.find("is not supported") != std::string::npos, "the refusal says so: ", error);
     }
 
     // operation_name: Lance's names; an unknown field number is "an operation".
