@@ -2980,7 +2980,21 @@ bool append_value(ArrowArray& out, const ArrowSchemaView& type, const Value& v, 
         case NANOARROW_TYPE_INT8:
         case NANOARROW_TYPE_INT16:
         case NANOARROW_TYPE_INT32:
-        case NANOARROW_TYPE_INT64:
+        case NANOARROW_TYPE_INT64: {
+            const Value i = cast_value(v, "bigint", ctx);
+            if (ctx.failed) {
+                return false;
+            }
+            if (ArrowArrayAppendInt(&out, i.i) != NANOARROW_OK) {  // outside the column's range: Arrow's cast error
+                const char* name = type.type == NANOARROW_TYPE_INT8    ? "Int8"
+                                   : type.type == NANOARROW_TYPE_INT16 ? "Int16"
+                                   : type.type == NANOARROW_TYPE_INT32 ? "Int32"
+                                                                       : "Int64";
+                ctx.fail("Cast error: Can't cast value " + format_value(v) + " to type " + name);
+                return false;
+            }
+            return true;
+        }
         case NANOARROW_TYPE_TIME32:
         case NANOARROW_TYPE_TIME64: {
             const Value i = cast_value(v, "bigint", ctx);

@@ -1594,7 +1594,7 @@ bool dataset_add_columns_stream(const std::filesystem::path& dataset_path, Arrow
         int64_t at = 0;
         while (at < shared->array.length) {
             if (fragment >= manifest.fragments.size()) {
-                error = "the stream has more rows than the dataset";
+                error = "Stream produced more values than expected for dataset";
                 return false;
             }
             const auto want = manifest.fragments[fragment].physical_rows - in_fragment;
@@ -1617,7 +1617,7 @@ bool dataset_add_columns_stream(const std::filesystem::path& dataset_path, Arrow
         }
     }
     if (fragment != manifest.fragments.size()) {
-        error = "the stream has fewer rows than the dataset";
+        error = "Stream ended before producing values for all rows in dataset";
         return false;
     }
     if (!attach_columns(manifest, ids, staged, error)) {

@@ -74,6 +74,8 @@ def translate(message: str) -> Exception:
         return OSError(text)
     if "already exists" in lower:
         return OSError(text)
+    if text.startswith(("Stream ended before producing values", "Stream produced more values")):
+        return OSError(text)
     if text.startswith("Invalid user input: CompactionOptions::"):
         return OSError(text)
     if "append" in lower and "schema" in lower:

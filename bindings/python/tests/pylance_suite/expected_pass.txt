@@ -1156,10 +1156,12 @@ tests/test_schema_evolution.py::test_add_columns_callable[True]
 tests/test_schema_evolution.py::test_add_columns_exprs[False]
 tests/test_schema_evolution.py::test_add_columns_exprs[True]
 tests/test_schema_evolution.py::test_add_columns_from_file
+tests/test_schema_evolution.py::test_add_columns_from_rbr
 tests/test_schema_evolution.py::test_add_columns_udf[False]
 tests/test_schema_evolution.py::test_add_columns_udf[True]
 tests/test_schema_evolution.py::test_add_columns_udf_caching
 tests/test_schema_evolution.py::test_add_many_columns
+tests/test_schema_evolution.py::test_alter_columns
 tests/test_schema_evolution.py::test_drop_columns
 tests/test_schema_evolution.py::test_merge_batch_size
 tests/test_schema_evolution.py::test_merge_columns

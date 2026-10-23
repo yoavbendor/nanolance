@@ -1327,11 +1327,20 @@ class LanceDataset(pa.dataset.Dataset):
         for a in alterations:
             if not isinstance(a, dict) or "path" not in a:
                 raise ValueError("each alteration must be a dict with a 'path'")
-            unknown = set(a) - {"path", "name", "nullable", "data_type"}
+            unknown = [k for k in a if k not in ("path", "name", "nullable", "data_type")]
             if unknown:
-                raise ValueError(f"unknown alteration keys: {sorted(unknown)}")
+                raise ValueError(f"Unknown key: {unknown[0]}")
+            if not ({"name", "nullable", "data_type"} & set(a)):
+                raise ValueError("At least one of name, nullable, or data_type must be specified")
             item = dict(a)
+            if _resolve_path(self._data_schema, a["path"]) is None:
+                raise OSError(f'Invalid user input: Column "{a["path"]}" does not exist in the dataset')
             if item.get("data_type") is not None:
+                # pylance casts a column only within its family: integers, floats, or strings.
+                old = {f.name: f.type for f in self._data_schema}.get(a["path"])
+                if old is not None and _cast_family(old) != _cast_family(item["data_type"]):
+                    raise OSError(f'Invalid user input: Cannot cast column "{a["path"]}" from {_arrow_display(old)} '
+                                  f'to {_arrow_display(item["data_type"])}')
                 item["data_type"] = pa.field("x", item["data_type"])
             items.append(item)
         with native():
@@ -4915,6 +4924,18 @@ _ARROW_DISPLAY = {"int8": "Int8", "int16": "Int16", "int32": "Int32", "int64": "
 def _arrow_display(tp: pa.DataType) -> str:
     """An Arrow type as pylance's errors name it (Int64, Float32, Utf8, ...)."""
     return _ARROW_DISPLAY.get(str(tp), str(tp))
+
+
+def _cast_family(tp: pa.DataType) -> str:
+    """The types a column may be cast between (pylance's alter_columns): within integers, within
+    floats, within strings. Anything else is cast only to its own type."""
+    if pa.types.is_integer(tp):
+        return "integer"
+    if pa.types.is_floating(tp):
+        return "floating"
+    if pa.types.is_string(tp) or pa.types.is_large_string(tp):
+        return "string"
+    return str(tp)
 
 
 _DICT_I32 = pa.dictionary(pa.int32(), pa.utf8())
