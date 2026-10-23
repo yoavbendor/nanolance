@@ -57,10 +57,4 @@ bool lance_column_dictionary_entries(const EncodingsIo& io, const pb::Field& on_
                                      const pb::ColumnMetadata& column_metadata, std::vector<std::string>& out,
                                      std::string& error);
 
-/// A buffer compressed by Lance's general buffer compressor (`Compression.scheme`: "zstd", "lz4" or
-/// "none"/empty), decompressed into `out`. Bounded: never more than zstd/lz4 can produce from the
-/// bytes given, nor the decoded-size limit.
-bool decompress_general_buffer(const std::string& scheme, const std::uint8_t* data, std::size_t size,
-                               std::vector<std::uint8_t>& out, std::string& error);
-
 }  // namespace nano_lance

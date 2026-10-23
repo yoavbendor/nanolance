@@ -5,6 +5,7 @@
 #include "nanolance/data_file_writer.hpp"
 
 #include "encoding/values/bitpack.hpp"
+#include "encoding/values/general.hpp"
 #include "nanolance/parallel.hpp"
 #include "nanolance/work_stats.hpp"
 
@@ -806,37 +807,6 @@ std::vector<std::uint8_t> page_layout_bytes_inline_bitpacking(std::uint8_t uncom
     return descriptor::page_encoding(m);
 }
 
-
-// Frame a raw buffer as Lance's general-compression payload: [u64 LE uncompressed size][zstd frame].
-bool zstd_frame_buffer(const std::vector<std::uint8_t>& raw, int level, std::vector<std::uint8_t>& out,
-                       std::string& error) {
-    const auto bound = ZSTD_compressBound(raw.size());
-    // resize() (not assign(n, 0)): the 8-byte header is filled byte-by-byte below and ZSTD_compress
-    // unconditionally overwrites the rest, so this only needs to zero a growing size delta (or nothing,
-    // if the caller reuses `out` across calls of similar or shrinking size) rather than always
-    // re-touching all n bytes the way assign(n, val) is specified to.
-    out.resize(8U + bound);
-    const std::uint64_t uncompressed = raw.size();
-    for (int i = 0; i < 8; ++i) {
-        out[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>((uncompressed >> (8 * i)) & 0xFFU);
-    }
-    // Reused per-thread compression context: one-shot ZSTD_compress() allocates AND ZEROES a fresh
-    // multi-hundred-KB context (hash/chain tables, window) on every call, which callgrind showed as
-    // ~40% of a compressed float column's write instructions across its ~150 per-chunk calls -- far
-    // more than the actual compression work. ZSTD_compressCCtx on a reused context skips that setup
-    // cost and produces byte-identical output (same algorithm, same level).
-    thread_local std::unique_ptr<ZSTD_CCtx, std::size_t (*)(ZSTD_CCtx*)> cctx(ZSTD_createCCtx(),
-                                                                              &ZSTD_freeCCtx);
-    const auto csize = cctx != nullptr
-                           ? ZSTD_compressCCtx(cctx.get(), out.data() + 8U, bound, raw.data(), raw.size(), level)
-                           : ZSTD_compress(out.data() + 8U, bound, raw.data(), raw.size(), level);
-    if (ZSTD_isError(csize) != 0U) {
-        error = std::string("zstd compress failed: ") + ZSTD_getErrorName(csize);
-        return false;
-    }
-    out.resize(8U + csize);
-    return true;
-}
 
 std::size_t padded_size(std::size_t size, std::size_t alignment) {
     return (size + alignment - 1U) & ~(alignment - 1U);
@@ -2638,7 +2608,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             chunk.bytes = chunk_bytes;
             const auto control = control_buffer_for({chunk});
             std::vector<std::uint8_t> dict_frame;
-            if (!zstd_frame_buffer(build_dict_variable_block(distinct, values.variable.large), compression_level,
+            if (!general::zstd_frame(build_dict_variable_block(distinct, values.variable.large), compression_level,
                                    dict_frame, error)) {
                 return false;
             }
@@ -2898,7 +2868,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                         std::as_bytes(std::span(values.fixed_data() + off * fixed_bytes_per_value,
                                                 fixed_bytes_per_value * count)),
                         fixed_bytes_per_value, count, std::as_writable_bytes(std::span(scratch)));
-                    if (!zstd_frame_buffer(scratch, compression_level, framed, error)) {
+                    if (!general::zstd_frame(scratch, compression_level, framed, error)) {
                         return false;
                     }
                 }
@@ -3002,13 +2972,13 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         const bool zstd_variable = compress_column;
         pb::ColumnMetadata column;
         column.encoding = column_encoding_bytes();
-        // Hoisted out of the loop (not freshly declared per chunk): zstd_frame_buffer's resize() only
+        // Hoisted out of the loop (not freshly declared per chunk): general::zstd_frame's resize() only
         // avoids re-zeroing already-there bytes when the buffer is reused across calls of similar size,
         // which requires swap (not move) below so `framed`'s capacity survives being handed off.
         std::vector<std::uint8_t> framed;
         for (auto& chunk : chunks) {
             if (zstd_variable) {
-                if (!zstd_frame_buffer(chunk.bytes, compression_level, framed, error)) {
+                if (!general::zstd_frame(chunk.bytes, compression_level, framed, error)) {
                     return false;
                 }
                 std::swap(chunk.bytes, framed);  // value_count unchanged; bytes are now [u64][zstd]

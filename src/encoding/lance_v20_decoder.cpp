@@ -11,6 +11,7 @@
 #include <nanom/fastlanes.hpp>
 #include "nanolance/fsst.hpp"
 #include "nanolance/lance_column_decoder.hpp"
+#include "encoding/values/general.hpp"
 #include "nanolance/read_safety.hpp"
 #include "nanolance/schema_mapper.hpp"
 
@@ -377,7 +378,7 @@ struct PageReader {
         auto& slot = whole[key];
         if (compression.empty() || compression == "none") {
             slot = std::move(raw);
-        } else if (!decompress_general_buffer(compression, raw.data(), raw.size(), slot, error)) {
+        } else if (!general::decompress(compression, raw.data(), raw.size(), slot, error)) {
             whole.erase(key);
             return false;
         }

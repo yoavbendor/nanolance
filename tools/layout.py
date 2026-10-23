@@ -33,7 +33,7 @@ FILES = {
     "encoding": ["fsst.cpp", "lz4_block.cpp", "repdef.cpp", "page_layout.cpp", "column_slice.cpp",
                  "lance_descriptors.hpp", "lance_column_decoder.cpp", "lance_v20_decoder.cpp",
                  "encoding_choice.cpp", "encoding_choice.hpp", "blob_v2_layout.cpp",
-                 "values/bitpack.cpp", "values/bitpack.hpp"],
+                 "values/bitpack.cpp", "values/bitpack.hpp", "values/general.cpp", "values/general.hpp"],
     "file": ["data_file_reader.cpp", "data_file_writer.cpp", "lance_file_writer.cpp", "blob_v2_external.cpp"],
     "table": ["manifest_reader.cpp", "manifest_writer.cpp", "deletion_vector.cpp", "row_ids.cpp",
               "base_paths.cpp", "overlays.cpp", "transaction_file.cpp", "transaction_file.hpp",
