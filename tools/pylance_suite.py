@@ -5,6 +5,8 @@
     python tools/pylance_suite.py --update        # ... and rewrite the list of tests expected to pass
     python tools/pylance_suite.py --real-pylance  # the same tests against pylance itself (baseline)
     python tools/pylance_suite.py -k test_take    # extra arguments go to pytest
+    python tools/pylance_suite.py --files test_lance.py test_filter.py
+                                                  # only those files; the verdict covers those files' expected tests
 
 The tests come from the Lance repository at the tag of the pylance release nanolance.lance tracks
 (PYLANCE_API_VERSION), fetched with a sparse git checkout into .deps/pylance-tests/ -- they are not
@@ -95,18 +97,31 @@ def main(argv=None) -> int:
     ap.add_argument("--report", type=Path, default=None, help="write a JSON summary here")
     ap.add_argument("--workers", default="auto", help="pytest-xdist workers (0 for none)")
     ap.add_argument("--timeout", type=int, default=300)
+    ap.add_argument("--files", nargs="+", metavar="FILE",
+                    help="run only these test files (e.g. test_lance.py, from pylance's tests/); the verdict then "
+                         "checks only the expected-pass tests of those files. Not with --update.")
     args, extra = ap.parse_known_args(argv)
+    if args.files and args.update:
+        ap.error("--files and --update do not go together: --update rewrites the whole list")
 
     version = api_version()
     tests = fetch(version, args.cache)
     work = tests.parent
+    wanted = None
+    if args.files:
+        # Accept "test_lance.py" or "tests/test_lance.py"; the node ids in the list all start with "tests/".
+        wanted = {f[len("tests/"):] if f.startswith("tests/") else f for f in args.files}
+        missing = sorted(f for f in wanted if not (tests / f).is_file())
+        if missing:
+            ap.error(f"not in pylance {version}'s tests/: {', '.join(missing)}")
     # Lance runs its suite from its python/ directory: the lindera model configs name their dictionaries
     # "./python/tests/models/...". A link makes that path resolve from here too.
     link = work / "python"
     if not link.exists():
         link.symlink_to(".", target_is_directory=True)
     junit = work / ("real.xml" if args.real_pylance else "nanolance.xml")
-    cmd = [sys.executable, "-m", "pytest", "tests", "-q", "-p", "no:cacheprovider", f"--junitxml={junit}",
+    targets = ["tests"] if wanted is None else [f"tests/{f}" for f in sorted(wanted)]
+    cmd = [sys.executable, "-m", "pytest", *targets, "-q", "-p", "no:cacheprovider", f"--junitxml={junit}",
            "-o", "junit_family=xunit1"]
     if not args.real_pylance:
         cmd += ["-p", "nanolance.lance._pytest_plugin"]
@@ -154,6 +169,10 @@ def main(argv=None) -> int:
     expected = set()
     if EXPECTED.exists():
         expected = {line.strip() for line in EXPECTED.read_text().splitlines() if line.strip() and not line.startswith("#")}
+    if wanted is not None:
+        # Only the files that ran: the other files' expected tests were not run, so they are not lost.
+        expected = {n for n in expected if n.split("::")[0][len("tests/"):] in wanted}
+        passed = [n for n in passed if n.split("::")[0][len("tests/"):] in wanted]
     lost = sorted(n for n in expected if got.get(n) != "passed")
     new = sorted(set(passed) - expected)
     if new:
