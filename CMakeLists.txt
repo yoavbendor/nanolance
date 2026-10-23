@@ -265,6 +265,7 @@ add_library(nanolance_reader STATIC
     src/io/byte_sink.cpp
     src/table/manifest_reader.cpp
     src/api/nano_lance_reader.cpp
+    src/io/external_blob.cpp
     src/api/nano_lance_external_blob.cpp
 )
 target_compile_features(nanolance_reader PUBLIC cxx_std_20)

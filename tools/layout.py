@@ -25,7 +25,7 @@ LAYERS = [
 FILES = {
     "base": ["buffer_pool.cpp", "parallel.cpp", "version.cpp", "roaring_bitmap.cpp", "float16.hpp",
              "float_text.hpp", "int128.hpp", "proto_wire.hpp", "fts_json.hpp"],
-    "io": ["byte_source.cpp", "byte_sink.cpp", "s3_byte_source.cpp", "s3_byte_source.hpp", "s3_byte_sink.cpp",
+    "io": ["byte_source.cpp", "byte_sink.cpp", "external_blob.cpp", "external_blob.hpp", "s3_byte_source.cpp", "s3_byte_source.hpp", "s3_byte_sink.cpp",
            "s3_byte_sink.hpp"],
     "arrow": ["schema_mapper.cpp", "array_accessor.cpp", "arrow_slice.cpp", "blob_builder.cpp", "jsonb.cpp"],
     "encoding": ["fsst.cpp", "lz4_block.cpp", "repdef.cpp", "page_layout.cpp", "column_slice.cpp",
@@ -54,11 +54,11 @@ FILES = {
 
 # The public headers in include/nanolance/, by layer (they stay where they are; the check reads this).
 HEADERS = {
-    "base": ["work_stats", "read_safety", "path_safety", "parallel", "buffer_pool", "roaring_bitmap", "version"],
-    "io": ["byte_source", "byte_sink", "object_store"],
+    "base": ["work_stats", "read_safety", "bool_bitpack", "parallel", "buffer_pool", "roaring_bitmap", "version"],
+    "io": ["byte_source", "byte_sink", "object_store", "path_safety"],
     "arrow": ["schema_mapper", "array_accessor", "column_values", "arrow_slice", "blob_builder", "jsonb",
               "typed_writer"],
-    "encoding": ["fsst", "lz4_block", "repdef", "page_layout", "column_slice", "bool_bitpack",
+    "encoding": ["fsst", "lz4_block", "repdef", "page_layout", "column_slice",
                  "lance_column_decoder", "lance_v20_decoder"],
     "file": ["data_file_reader", "data_file_writer", "lance_file_writer", "blob_v2_external"],
     "table": ["manifest_reader", "manifest_writer", "deletion_vector", "row_ids", "base_paths", "overlays",

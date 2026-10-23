@@ -3,6 +3,7 @@
 
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/byte_sink.hpp"
+#include "nanolance/parallel.hpp"
 #include "nanolance/byte_source.hpp"
 #include "nanolance/work_stats.hpp"
 
@@ -13,6 +14,7 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <list>
 #include <mutex>
@@ -221,6 +223,14 @@ void close_data_files_under(const std::string& path_or_prefix) {
 namespace {
 // remove_output (in the library below this one) closes the handles of what it removes through this hook.
 [[maybe_unused]] const bool g_output_removed_hook_set = (io::set_output_removed_hook(&close_data_files_under), true);
+
+// Pool threads run their share of a parallel read inside a read scope of their own (parallel.hpp is below
+// this layer, so it is registered rather than called).
+void run_in_read_scope(const std::function<void()>& work) {
+    const DataFileReadScope scope;
+    work();
+}
+[[maybe_unused]] const bool g_worker_scope_set = (parallel::set_worker_scope(&run_in_read_scope), true);
 }  // namespace
 
 DataFileReadScope::DataFileReadScope() : saved_(g_read_epoch) { g_read_epoch = g_next_read_epoch++; }

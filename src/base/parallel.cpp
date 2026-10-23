@@ -3,7 +3,6 @@
 
 #include "nanolance/parallel.hpp"
 
-#include "nanolance/data_file_reader.hpp"
 #include "nanolance/read_safety.hpp"
 
 #include <algorithm>
@@ -25,6 +24,9 @@
 
 namespace nano_lance::parallel {
 namespace {
+
+/// set_worker_scope's: the scope pool threads run their work in (none until a layer above registers one).
+std::atomic<void (*)(const std::function<void()>&)> g_worker_scope{nullptr};
 
 /// One for_each call. Lives on its caller's stack: the caller removes it from the queue and waits for
 /// every helper to leave it before returning.
@@ -107,8 +109,11 @@ class Pool {
             }
             {
                 const ScopedReadLimits limits(job->limits);
-                const DataFileReadScope scope;
-                job->work();
+                if (const auto scope = g_worker_scope.load(std::memory_order_acquire)) {
+                    scope([job] { job->work(); });
+                } else {
+                    job->work();
+                }
             }
             {
                 // Under the job's lock, so the caller cannot see 0, return, and free the job between
@@ -186,6 +191,10 @@ std::size_t threads() {
 }
 
 void set_threads(std::size_t n) { g_threads.store(n == 0U ? default_threads() : n, std::memory_order_relaxed); }
+
+void set_worker_scope(void (*run)(const std::function<void()>& work)) {
+    g_worker_scope.store(run, std::memory_order_release);
+}
 
 void for_each(std::size_t n, const std::function<void(std::size_t)>& task) {
     const auto width = std::min(threads(), n);

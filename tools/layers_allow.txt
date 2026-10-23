@@ -1,8 +1,6 @@
 # Known layering violations: 'A -> B' means module A includes module B from a higher layer.
 # Maintained by tools/check_layers.py --write-allowlist. This list may only shrink.
 
-array_accessor -> bool_bitpack  # arrow -> encoding
-blob_v2_external -> nano_lance_reader  # file -> api
 frag_reuse -> index_files  # table -> index
 lance_column_decoder -> blob_v2_external  # encoding -> file
 lance_column_decoder -> data_file_reader  # encoding -> file
@@ -10,8 +8,6 @@ lance_table_reader -> index_search  # scan -> dataset
 lance_v20_decoder -> blob_v2_external  # encoding -> file
 lance_v20_decoder -> data_file_reader  # encoding -> file
 mem_wal -> index_files  # table -> index
-parallel -> data_file_reader  # base -> file
-path_safety -> byte_source  # base -> io
 scalar_index -> index_search  # index -> dataset
 typed_writer -> nano_lance_writer  # arrow -> api
 writer -> nano_lance_writer  # dataset -> api

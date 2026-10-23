@@ -7,7 +7,7 @@
 
 #include "nanolance/array_accessor.hpp"
 #include "nanolance/blob_builder.hpp"
-#include "nanolance/nano_lance_reader.h"
+#include "io/external_blob.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -1092,10 +1092,9 @@ bool blob_v2_locate(const BlobV2ExternalDescriptor& descriptor, const std::files
             if (descriptor.size == 0U && !descriptor.blob_uri.empty()) {
                 // Size 0: the blob is its object from `position` to the end, as Lance reads it.
                 std::uint64_t object_size = 0;
-                char message[512] = {0};
-                if (nano_lance_external_blob_size(descriptor.blob_uri.c_str(), &object_size, message,
-                                                  sizeof(message)) != NANO_LANCE_READER_OK) {
-                    error = std::string("cannot size external blob ") + descriptor.blob_uri + ": " + message;
+                std::string message;
+                if (io::external_blob_size(descriptor.blob_uri, object_size, message) != io::BlobStatus::Ok) {
+                    error = "cannot size external blob " + descriptor.blob_uri + ": " + message;
                     return false;
                 }
                 out.size = object_size >= descriptor.position ? object_size - descriptor.position : 0U;
@@ -1129,11 +1128,11 @@ bool blob_v2_read(const BlobV2Location& location, const std::uint64_t offset, co
     out.resize(static_cast<std::size_t>(length));
     if (location.external) {
         std::size_t got = 0;
-        char message[512] = {0};
-        if (nano_lance_fetch_external_blob(location.file.c_str(), at, length, out.data(), out.size(), &got, message,
-                                           sizeof(message)) != NANO_LANCE_READER_OK ||
+        std::string message;
+        if (io::fetch_external_blob(location.file, at, length, out.data(), out.size(), got, message) !=
+                io::BlobStatus::Ok ||
             got != out.size()) {
-            error = std::string("cannot read external blob ") + location.file + ": " + message;
+            error = "cannot read external blob " + location.file + ": " + message;
             out.clear();
             return false;
         }
