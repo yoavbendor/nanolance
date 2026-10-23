@@ -1194,7 +1194,9 @@ def _history(uri: str, storage) -> None:
 
 
 def _local_files(path) -> list:
-    return sorted(str(p.relative_to(path)) for p in path.rglob("*") if p.is_file())
+    # On NFS a deleted file that is still open is renamed to .nfsXXXX until it is closed (nanolance keeps a
+    # few data files open per thread): not a file of the dataset.
+    return sorted(str(p.relative_to(path)) for p in path.rglob("*") if p.is_file() and not p.name.startswith(".nfs"))
 
 
 def _relative_keys(uri: str) -> list:

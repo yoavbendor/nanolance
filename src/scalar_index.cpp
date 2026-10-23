@@ -1981,8 +1981,8 @@ bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_ve
         return path;
     };
     for (const auto& index : manifest.indices) {
-        // The fragment-reuse index is listed as Lance lists it; the other system indexes are not.
-        if (is_system_index(index) && index.name != "__lance_frag_reuse") {
+        // The fragment-reuse and MemWAL indexes are listed as Lance lists them; other system indexes are not.
+        if (is_system_index(index) && index.name != "__lance_frag_reuse" && index.name != "__lance_mem_wal") {
             continue;
         }
         IndexInfo info;

@@ -63,6 +63,9 @@ def outcomes(junit: Path) -> dict:
     for case in ET.parse(junit).iter("testcase"):
         classname = case.get("classname", "")
         name = case.get("name", "")
+        at = name.rfind("@")
+        if at > name.rfind("]"):  # --dist loadgroup names a grouped test "<name>@<group>"
+            name = name[:at]
         module = classname.split(".")
         # tests.test_x.TestClass -> tests/test_x.py::TestClass::name
         parts = [p for p in module if p]
@@ -97,6 +100,11 @@ def main(argv=None) -> int:
     version = api_version()
     tests = fetch(version, args.cache)
     work = tests.parent
+    # Lance runs its suite from its python/ directory: the lindera model configs name their dictionaries
+    # "./python/tests/models/...". A link makes that path resolve from here too.
+    link = work / "python"
+    if not link.exists():
+        link.symlink_to(".", target_is_directory=True)
     junit = work / ("real.xml" if args.real_pylance else "nanolance.xml")
     cmd = [sys.executable, "-m", "pytest", "tests", "-q", "-p", "no:cacheprovider", f"--junitxml={junit}",
            "-o", "junit_family=xunit1"]
@@ -106,7 +114,9 @@ def main(argv=None) -> int:
         import xdist  # noqa: F401
 
         if args.workers != "0":
-            cmd += ["-n", args.workers]
+            # loadgroup: Lance's conftest pins the lindera tests (one shared dictionary folder they unzip and
+            # delete) to one worker with xdist_group, which only takes effect with this mode.
+            cmd += ["-n", args.workers, "--dist", "loadgroup"]
     except ImportError:
         pass
     try:

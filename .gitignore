@@ -33,3 +33,4 @@ build2/
 docs/agents.md
 docs/bench-write-read.md
 docs/bench-trusted-parity.md
+.validate/

@@ -27,6 +27,7 @@ import pyarrow.dataset
 
 from nanolance import _nanolance
 from nanolance.lance import _native_log
+from nanolance.lance import mem_wal as _mem_wal
 from nanolance.lance._errors import NotSupportedError, index_build, native, refuse_object_store_write, unsupported
 from nanolance.lance._sql import SqlQueryBuilder
 from nanolance.lance.base_path import (_base_data_dir, _DatasetBases, _fragment_targets, _new_base_dicts)
@@ -1981,6 +1982,8 @@ class LanceDataset(pa.dataset.Dataset):
         return details
 
     def describe_indices(self) -> List["IndexDescription"]:
+        from datetime import timezone
+
         with native():
             indices = _nanolance._ds_list_indices(self._uri, self._version)
         by_name: Dict[str, List[dict]] = {}
@@ -1989,6 +1992,18 @@ class LanceDataset(pa.dataset.Dataset):
         out = []
         for name, segments in by_name.items():
             first = segments[0]
+            if name == _mem_wal.INDEX_NAME:
+                # The MemWAL index has no size and covers no fragments; its creation time is UTC, as pylance's is.
+                out.append(IndexDescription(
+                    name=name, type_url=first["type_url"], index_type=first["type"], fields=[], field_names=[],
+                    num_rows_indexed=0, total_size_bytes=None, details={},
+                    segments=[IndexSegmentDescription(
+                        uuid=s["uuid"], fragment_ids=set(), index_version=s["index_version"],
+                        dataset_version_at_last_update=s["dataset_version"], size_bytes=None,
+                        created_at=datetime.fromtimestamp(s["created_at"] / 1000, tz=timezone.utc)
+                        if s["created_at"] else None, base_id=None, covering_fields=[]) for s in segments],
+                ))
+                continue
             out.append(IndexDescription(
                 name=name, type_url=first["type_url"], index_type=first["type"] if first["type_url"] else "Unknown",
                 fields=list(first["field_ids"]), field_names=list(first["fields"]),
@@ -2002,6 +2017,89 @@ class LanceDataset(pa.dataset.Dataset):
                     base_id=None, covering_fields=list(first["field_ids"])) for s in segments],
             ))
         return out
+
+    def initialize_mem_wal(self, *, maintained_indexes: Optional[List[str]] = None,
+                           bucket_column: Optional[str] = None, num_buckets: Optional[int] = None,
+                           identity_column: Optional[str] = None, unsharded: bool = False,
+                           durable_write: Optional[bool] = None, max_wal_buffer_size: Optional[int] = None,
+                           max_wal_flush_interval_ms: Optional[int] = None,
+                           max_memtable_size: Optional[int] = None, max_memtable_rows: Optional[int] = None,
+                           max_memtable_batches: Optional[int] = None,
+                           max_unflushed_memtable_bytes: Optional[int] = None,
+                           manifest_scan_batch_size: Optional[int] = None,
+                           backpressure_log_interval_ms: Optional[int] = None,
+                           stats_log_interval_ms: Optional[int] = None,
+                           hnsw_params: Optional[Dict[str, Dict[str, int]]] = None) -> None:
+        """Initialize MemWAL on this dataset.
+
+        Must be called once before any calls to `mem_wal_writer`. Append-only
+        tables may omit primary-key metadata; primary keys are only required
+        for primary-key lookup and last-write-wins deduplication workflows.
+
+        At most one sharding mode may be selected: bucket sharding
+        (``bucket_column`` + ``num_buckets``), identity sharding
+        (``identity_column``), or ``unsharded``. With none selected, shards are
+        managed manually by passing shard IDs to `mem_wal_writer`.
+
+        Any writer-configuration keyword arguments (``durable_write``,
+        ``max_memtable_size``, ``max_wal_flush_interval_ms``, etc. -- the same
+        knobs accepted by `mem_wal_writer`) are recorded as the default
+        `~lance.mem_wal.ShardWriter` configuration in the MemWAL index, so
+        every writer starts from the same defaults.
+
+        Parameters
+        ----------
+        maintained_indexes : list of str, optional
+            Names of existing indexes to keep updated as data is written
+            through the MemWAL. Must reference indexes that already exist.
+        hnsw_params : dict, optional
+            Per-index HNSW build-parameter overrides recorded as writer-config
+            defaults, keyed by maintained vector index name. Each value is a dict
+            with any of ``num_edges`` (graph degree; level 0 keeps
+            ``2 * num_edges``, equivalent to FAISS's ``M``), ``ef_construction``,
+            and ``max_level``. Without an override an index uses the default
+            parameters. These are writer config -- they affect the MemTable a
+            writer builds and may be overridden per-writer in
+            :meth:`mem_wal_writer`.
+        bucket_column : str, optional
+            With ``num_buckets``, hash-bucket writes by this scalar column.
+        num_buckets : int, optional
+            Number of hash buckets (shards). Required with ``bucket_column``.
+        identity_column : str, optional
+            Shard by the raw value of this scalar column.
+        unsharded : bool, default False
+            Route every write to a single shard.
+
+        Raises
+        ------
+        IOError
+            - An entry in *maintained_indexes* does not exist on the dataset.
+            - MemWAL has already been initialized on this dataset.
+        ValueError
+            More than one sharding mode was selected, or bucket sharding was
+            given only one of ``bucket_column`` / ``num_buckets``.
+        """
+        _mem_wal.initialize(
+            self, maintained_indexes=maintained_indexes, bucket_column=bucket_column, num_buckets=num_buckets,
+            identity_column=identity_column, unsharded=unsharded, durable_write=durable_write,
+            max_wal_buffer_size=max_wal_buffer_size, max_wal_flush_interval_ms=max_wal_flush_interval_ms,
+            max_memtable_size=max_memtable_size, max_memtable_rows=max_memtable_rows,
+            max_memtable_batches=max_memtable_batches, max_unflushed_memtable_bytes=max_unflushed_memtable_bytes,
+            manifest_scan_batch_size=manifest_scan_batch_size,
+            backpressure_log_interval_ms=backpressure_log_interval_ms,
+            stats_log_interval_ms=stats_log_interval_ms, hnsw_params=hnsw_params)
+
+    def mem_wal_index_details(self) -> Optional[dict]:
+        """Return the MemWAL index details, or ``None`` if not initialized.
+
+        Returns
+        -------
+        dict or None
+            A dict with ``num_shards``, ``maintained_indexes``,
+            ``writer_config_defaults``, and ``sharding_specs``, or ``None`` when
+            MemWAL has not been initialized on this dataset.
+        """
+        return _mem_wal.index_details(self)
 
     @property
     def optimize(self) -> "DatasetOptimizer":
@@ -2313,7 +2411,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def __getattr__(self, name: str):
         known = {
-            "create_index",
+            "create_index", "mem_wal_writer", "prewarm_mem_wal", "list_mem_wal_latest_shard_ids",
             "create_branch", "sql",
             "join",
             "prewarm_index",

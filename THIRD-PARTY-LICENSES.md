@@ -9,6 +9,67 @@ following third-party software. All are permissive and Apache-2.0-compatible.
 |---|---|---|---|
 | **Lance** file format `.proto` schemas | nanolance's protobuf message types (manifest, data file, column/page metadata, encodings) are derived from Lance's `.proto` files, pinned at `v7.0.0-rc.1`. Generated into `generated/lance_minimal.pb.*`; see `third_party/lance_proto/`. nanolance does **not** link the Rust `lance` crate. | Apache-2.0 | https://github.com/lance-format/lance |
 
+## Ported code and embedded data (redistributed)
+
+| Component | How it's used | License | Project |
+|---|---|---|---|
+| **jieba-rs** 0.10.0 and **jieba-macros** 0.10.0 | `src/fts_jieba.cpp` ports jieba-rs's segmentation (dictionary, DAG and route, HMM Viterbi, search mode) to C++, and `src/fts_jieba_hmm_data.inc` embeds jieba-macros's built-in HMM model (`hmm.model`, zstd-compressed by `tools/fts_jieba_hmm.py`). Built unless `-DNANOLANCE_WITH_JIEBA=OFF` (off for wasm). Dictionaries are not embedded: a jieba model is read from the language model directory. | MIT | https://github.com/messense/jieba-rs (crates at commit 7818f91a) |
+| **Lindera** 3.0.7 (lindera, lindera-dictionary) | `src/fts_lindera.cpp` ports Lindera's tokenizer config, segmenter, lattice and Viterbi (normal and decompose modes), user-dictionary building and the mapping character filter to C++, and reads Lindera 3 dictionary files; `bindings/python/tests/lindera_dict.py` writes them for the tests. No dictionary is embedded: a lindera model is read from the language model directory. | MIT | https://github.com/lindera/lindera (tag v3.0.7) |
+| **daachorse** 2.1.0 (format) | `src/fts_lindera.cpp` walks the serialized double-array automaton Lindera's dict.da holds, and the test writer builds one, from the layout in daachorse's source. | MIT OR Apache-2.0 (used under Apache-2.0) | https://github.com/daac-tools/daachorse |
+
+jieba-rs's license (from its repository at the commit the 0.10.0 crates were published from):
+
+```
+MIT License
+
+Copyright (c) 2018 - 2019 messense
+Copyright (c) 2019 Paul Meng
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+Lindera's license (from its repository at tag v3.0.7; the crates carry no license file):
+
+```
+MIT License
+
+Copyright (c) 2019 by the project authors.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ## lance-c headers (vendored, unmodified)
 
 `compat/lance-c/include/lance/lance.h` and `lance.hpp`: from

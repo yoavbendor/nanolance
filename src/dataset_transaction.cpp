@@ -9,6 +9,7 @@
 #include "nanolance/base_paths.hpp"
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/index_maintenance.hpp"
+#include "nanolance/mem_wal.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/manifest_writer.hpp"
 #include "nanolance/overlays.hpp"
@@ -659,6 +660,12 @@ bool apply_operation(const pb::Manifest* base, const Operation& op, pb::Manifest
                 }
                 auto it = std::find_if(next.indices.begin(), next.indices.end(),
                                        [&](const pb::IndexMetadata& i) { return i.uuid == index.uuid; });
+                if (index.name == kMemWalIndexName && it == next.indices.end() &&
+                    std::any_of(next.indices.begin(), next.indices.end(),
+                                [](const pb::IndexMetadata& i) { return i.name == kMemWalIndexName; })) {
+                    error = "Invalid user input: MemWAL is already initialized on this dataset.";  // one per dataset
+                    return false;
+                }
                 if (it != next.indices.end()) {
                     *it = std::move(index);
                 } else {

@@ -6,6 +6,8 @@
 // AsciiFoldingFilter, chained as Lance 12's InvertedIndexParams::build chains them.
 
 #include "nanolance/fts_tokenizer.hpp"
+#include "nanolance/fts_jieba.hpp"
+#include "nanolance/fts_lindera.hpp"
 
 #include "fts_json.hpp"
 
@@ -367,8 +369,36 @@ std::string params_json(const AnalyzerParams& p) {
 
 bool Analyzer::init(const AnalyzerParams& params, std::string& error) {
     params_ = params;
-    if (params.base_tokenizer != "simple" && params.base_tokenizer != "whitespace" && params.base_tokenizer != "raw" &&
-        params.base_tokenizer != "code" && params.base_tokenizer != "ngram") {
+    jieba_.reset();
+    lindera_.reset();
+    const bool jieba = params.base_tokenizer == "jieba" || params.base_tokenizer.rfind("jieba/", 0) == 0;
+    const bool lindera = params.base_tokenizer.rfind("lindera/", 0) == 0;
+    if (lindera) {
+        // Lance's build_base_tokenizer: "lindera/<model>" is a directory under the model home.
+        const auto home = language_model_home();
+        if (home.empty()) {
+            error = "Invalid user input: unknown base tokenizer " + params.base_tokenizer;
+            return false;
+        }
+        lindera_ = Lindera::load(home / params.base_tokenizer, error);
+        if (lindera_ == nullptr) {
+            return false;
+        }
+    }
+    if (jieba) {
+        // Lance's build_base_tokenizer: "jieba" is "jieba/default", a directory under the model home.
+        const auto home = language_model_home();
+        if (home.empty()) {
+            error = "Invalid user input: unknown base tokenizer " + params.base_tokenizer;
+            return false;
+        }
+        jieba_ = Jieba::load(home / (params.base_tokenizer == "jieba" ? "jieba/default" : params.base_tokenizer), error);
+        if (jieba_ == nullptr) {
+            return false;
+        }
+    }
+    if (!jieba && !lindera && params.base_tokenizer != "simple" && params.base_tokenizer != "whitespace" &&
+        params.base_tokenizer != "raw" && params.base_tokenizer != "code" && params.base_tokenizer != "ngram") {
         // Lance's other base tokenizers (icu, jieba, lindera) exist, nanolance does not implement them.
         const std::string& base = params.base_tokenizer;
         const bool lance_tokenizer = base.rfind("icu", 0) == 0 || base.rfind("jieba", 0) == 0 ||
@@ -572,6 +602,24 @@ void Analyzer::tokenize(std::string_view text, std::vector<Token>& out) const {
                         emit(text.substr(from, to - from), 0, out);
                         return true;
                     });
+        return;
+    }
+    if (jieba_ != nullptr) {
+        // Lance's JiebaTokenizer: each token at its first character's offset.
+        std::vector<JiebaToken> tokens;
+        jieba_->tokenize_search(text, tokens);
+        for (const auto& t : tokens) {
+            emit(text.substr(t.byte_start, t.byte_end - t.byte_start), t.char_start, out);
+        }
+        return;
+    }
+    if (lindera_ != nullptr) {
+        // Lance's LinderaTokenizer: each token at Lindera's position.
+        std::vector<LinderaToken> tokens;
+        lindera_->tokenize(text, tokens);
+        for (const auto& t : tokens) {
+            emit(t.surface, t.position, out);
+        }
         return;
     }
     if (params_.base_tokenizer == "code") {
