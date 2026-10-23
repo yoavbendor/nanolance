@@ -77,6 +77,8 @@ struct WriterState {
     nano_lance::LanceSchemaMapping staged_schema;  // the on-disk schema the staged files were written with
     /// The Arrow schema metadata of the first batch, recorded in the manifest.
     std::map<std::string, std::vector<std::uint8_t>> schema_metadata;
+    /// Global buffers of the data file, after the schema's (nano_lance_writer_add_global_buffer).
+    std::vector<std::vector<std::uint8_t>> global_buffers;
     /// Table config recorded when the commit creates the dataset (nano_lance_writer_set_initial_config).
     std::map<std::string, std::string> initial_config;
     /// Create the dataset with stable row ids (nano_lance_writer_set_stable_row_ids).
@@ -1248,6 +1250,7 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     nano_lance::LanceFileExtras file_extras;
     file_extras.blob_pack_file_size = state->blob_pack_file_size;
     file_extras.schema_metadata = state->schema_metadata;  // Lance writes it into every data file
+    file_extras.global_buffers = state->global_buffers;
     std::optional<std::uint32_t> base_id;
     if (!state->fragment_targets.empty()) {
         const auto& target = state->fragment_targets[state->fragments_written % state->fragment_targets.size()];
@@ -1368,6 +1371,33 @@ int nano_lance_writer_set_initial_config(NanoLanceWriter* writer, const char* ke
         return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "config key and value are required");
     }
     state->initial_config[key] = value;
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_add_global_buffer(NanoLanceWriter* writer, const uint8_t* data, size_t size) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    if (data == nullptr && size != 0U) {
+        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "a global buffer needs its bytes");
+    }
+    state->global_buffers.emplace_back(data, data + size);
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_set_schema_metadata_entry(NanoLanceWriter* writer, const char* key, const uint8_t* value,
+                                                size_t size) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    if (key == nullptr || key[0] == '\0' || (value == nullptr && size != 0U)) {
+        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "schema metadata needs a key and a value");
+    }
+    state->schema_metadata[key] = std::vector<std::uint8_t>(value, value + size);
     clear_error(writer);
     return NANO_LANCE_OK;
 }

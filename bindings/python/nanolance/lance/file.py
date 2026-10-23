@@ -221,11 +221,18 @@ class LanceFileWriter:
         os.makedirs(parent, exist_ok=True)
         self._scratch = os.path.join(parent, f".{os.path.basename(self._path)}.{uuid.uuid4().hex}.nanolance")
         self._writer = None
+        # Added before the first batch opens the staged writer; replayed into it when it opens.
+        self._metadata: Dict[str, bytes] = {}
+        self._globals: List[bytes] = []
 
     def _open(self, schema: pa.Schema):
         if self._writer is None:
             with native():
                 self._writer = _nanolance._StagedWriter(self._scratch, _nanolance.WriteOptions(), False, 0, 0)
+                for key, value in self._metadata.items():
+                    self._writer.set_schema_metadata_entry(key, value)
+                for data in self._globals:
+                    self._writer.add_global_buffer(data)
             self._schema = schema
 
     def write_batch(self, batch: Union[pa.RecordBatch, pa.Table]) -> None:
@@ -270,10 +277,28 @@ class LanceFileWriter:
         shutil.rmtree(self._scratch, ignore_errors=True)
 
     def add_schema_metadata(self, key: str, value: str) -> None:
-        raise unsupported("LanceFileWriter.add_schema_metadata")
+        """Set one key of the file's schema metadata (replacing a key set before)."""
+        if self._closed:
+            raise ValueError("the writer is closed")
+        text_key = key if isinstance(key, str) else bytes(key).decode("utf-8")
+        raw_value = value.encode("utf-8") if isinstance(value, str) else bytes(value)
+        self._metadata[text_key] = raw_value
+        if self._writer is not None:
+            with native():
+                self._writer.set_schema_metadata_entry(text_key, raw_value)
 
     def add_global_buffer(self, data: bytes) -> int:
-        raise unsupported("LanceFileWriter.add_global_buffer")
+        """Store ``data`` in the file's global buffers and return its index in ``metadata().global_buffers``.
+
+        Global buffer 0 is the schema, so the first one added is 1."""
+        if self._closed:
+            raise ValueError("the writer is closed")
+        raw = bytes(data)
+        self._globals.append(raw)
+        if self._writer is not None:
+            with native():
+                self._writer.add_global_buffer(raw)
+        return len(self._globals)
 
     def __enter__(self) -> "LanceFileWriter":
         return self

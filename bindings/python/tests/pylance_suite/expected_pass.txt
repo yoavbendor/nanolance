@@ -524,6 +524,8 @@ tests/test_file.py::test_struct_null_regression
 tests/test_file.py::test_take
 tests/test_file.py::test_with_nulls
 tests/test_file.py::test_write_no_schema
+tests/test_file.py::test_write_read_additional_schema_metadata
+tests/test_file.py::test_write_read_global_buffer
 tests/test_file.py::test_write_read_with_session
 tests/test_filter.py::test_compound
 tests/test_filter.py::test_datatypes

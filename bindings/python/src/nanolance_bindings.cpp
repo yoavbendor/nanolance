@@ -824,6 +824,21 @@ public:
         }
     }
 
+    /// A file-API global buffer (the file's footer lists it); returns nothing, the index is call order.
+    void add_global_buffer(const nb::bytes& data) {
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(data.c_str());
+        if (nano_lance_writer_add_global_buffer(&writer_, bytes, data.size()) != NANO_LANCE_OK) {
+            throw std::runtime_error(writer_.last_error);
+        }
+    }
+    void set_schema_metadata_entry(const std::string& key, const nb::bytes& value) {
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(value.c_str());
+        if (nano_lance_writer_set_schema_metadata_entry(&writer_, key.c_str(), bytes, value.size()) !=
+            NANO_LANCE_OK) {
+            throw std::runtime_error(writer_.last_error);
+        }
+    }
+
     void set_initial_config(const std::string& key, const std::string& value) {
         if (nano_lance_writer_set_initial_config(&writer_, key.c_str(), value.c_str()) != 0) {
             throw std::runtime_error("failed to set the dataset config");
@@ -1550,6 +1565,9 @@ NB_MODULE(_nanolance, m) {
         .def("set_file_events", &StagedWriter::set_file_events)
         .def("project", &StagedWriter::project)
         .def("set_initial_config", &StagedWriter::set_initial_config)
+        .def("add_global_buffer", &StagedWriter::add_global_buffer, nb::arg("data"))
+        .def("set_schema_metadata_entry", &StagedWriter::set_schema_metadata_entry, nb::arg("key"),
+             nb::arg("value"))
         .def("set_initial_bases", &StagedWriter::set_initial_bases)
         .def("set_fragment_targets", &StagedWriter::set_fragment_targets)
         .def("set_stable_row_ids", &StagedWriter::set_stable_row_ids)
