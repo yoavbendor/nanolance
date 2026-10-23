@@ -32,7 +32,7 @@ still use `std::filesystem` / `std::ofstream` / `fopen` for what they write or r
 - Every write goes through `io::open_output(path_or_uri)` -> `OutputFile` (an `std::ostream`;
   `commit(error)` makes the object exist) or `io::put_if_absent` (create-only); removals through
   `io::remove_output`. On an object store there are no directories: guard `create_directories` and
-  `std::filesystem::exists` with `io::is_object_store_output(path)` (see W1's `src/dataset/writer.cpp`).
+  `std::filesystem::exists` with `io::is_object_store_output(path)` (see W1's `src/dataset/write_session.cpp`).
 - Reads go through `io::open_source` / `io::read_all` / `io::list_dir` (`include/nanolance/byte_source.hpp`),
   which already work on `s3://`. A write path that reads an existing file with `std::ifstream` /
   `fopen` / `std::filesystem` must switch to these.

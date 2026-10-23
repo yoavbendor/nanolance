@@ -99,7 +99,7 @@ Read each failing test's body (`sed -n`), measure pylance, implement:
   accepted and ignored for local paths.
 - The C++ writer must place each new fragment's file in its target directory and set `base_id`;
   the manifest writer must carry `base_paths`. Find where the writer names data files
-  (`grep -n '"data"' src/dataset/writer.cpp src/table/manifest_writer.cpp`) and add a per-fragment target
+  (`grep -n '"data"' src/dataset/write_session.cpp src/table/manifest_writer.cpp`) and add a per-fragment target
   directory + base id; plumb the bases list through `CommitExtras` (`include/nanolance/manifest_writer.hpp`)
   the way `stable_row_ids` was plumbed.
 - `ds.add_bases([...], transaction_properties=?)`: a new version with the bases appended (Lance's

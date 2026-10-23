@@ -31,7 +31,8 @@ FILES = {
     "arrow": ["schema_mapper.cpp", "array_accessor.cpp", "arrow_slice.cpp", "blob_builder.cpp", "jsonb.cpp",
               "arrow_owned.hpp", "arrow_owned.cpp"],
     "encoding": ["fsst.cpp", "lz4_block.cpp", "repdef.cpp", "page_layout.cpp", "column_slice.cpp",
-                 "lance_descriptors.hpp", "lance_column_decoder.cpp", "lance_v20_decoder.cpp"],
+                 "lance_descriptors.hpp", "lance_column_decoder.cpp", "lance_v20_decoder.cpp",
+                 "encoding_choice.cpp", "encoding_choice.hpp"],
     "file": ["data_file_reader.cpp", "data_file_writer.cpp", "lance_file_writer.cpp", "blob_v2_external.cpp"],
     "table": ["manifest_reader.cpp", "manifest_writer.cpp", "deletion_vector.cpp", "row_ids.cpp",
               "base_paths.cpp", "overlays.cpp", "transaction_file.cpp", "transaction_file.hpp",
@@ -50,8 +51,8 @@ FILES = {
               "vector/vector_search.cpp", "vector/vector_index_build.cpp", "vector/hnsw_build.cpp",
               "vector/hnsw_build.hpp", "vector/rabitq_build.hpp"],
     "dataset": ["dataset.cpp", "dataset_ops.cpp", "dataset_stitcher.cpp", "index_optimize.cpp",
-                "index_segments.cpp", "writer.cpp", "writer_cxx.cpp"],
-    "api": ["nano_lance_reader.cpp", "nano_lance_table_reader_c.cpp", "nano_lance_external_blob.cpp",
+                "index_segments.cpp", "write_session.cpp", "write_session.hpp"],
+    "api": ["nano_lance_writer.cpp", "writer_cxx.cpp", "nano_lance_reader.cpp", "nano_lance_table_reader_c.cpp", "nano_lance_external_blob.cpp",
             "lance_c.cpp"],
 }
 
@@ -59,8 +60,7 @@ FILES = {
 HEADERS = {
     "base": ["work_stats", "read_safety", "bool_bitpack", "parallel", "buffer_pool", "roaring_bitmap", "version"],
     "io": ["byte_source", "byte_sink", "object_store", "path_safety"],
-    "arrow": ["schema_mapper", "array_accessor", "column_values", "arrow_slice", "blob_builder", "jsonb",
-              "typed_writer"],
+    "arrow": ["schema_mapper", "array_accessor", "column_values", "arrow_slice", "blob_builder", "jsonb"],
     "encoding": ["fsst", "lz4_block", "repdef", "page_layout", "column_slice",
                  "lance_column_decoder", "lance_v20_decoder"],
     "file": ["data_file_reader", "data_file_writer", "lance_file_writer", "blob_v2_external"],
@@ -71,9 +71,8 @@ HEADERS = {
     "scan": ["lance_table_reader"],
     "index": ["index_search", "scalar_index", "bloom_filter", "fts_tokenizer", "fts_lindera", "fts_search", "fts_index_build",
               "vector_search", "vector_index_build"],
-    "dataset": ["dataset", "dataset_ops", "dataset_stitcher", "index_optimize", "index_segments", "writer",
-                "writer_internal"],
-    "api": ["nano_lance_reader", "nano_lance_writer", "nano_lance_external_blob",
+    "dataset": ["dataset", "dataset_ops", "dataset_stitcher", "index_optimize", "index_segments"],
+    "api": ["writer", "writer_internal", "typed_writer", "nano_lance_reader", "nano_lance_writer", "nano_lance_external_blob",
             "lance_c"],
 }
 

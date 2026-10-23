@@ -5,6 +5,3 @@ lance_column_decoder -> blob_v2_external  # encoding -> file
 lance_column_decoder -> data_file_reader  # encoding -> file
 lance_v20_decoder -> blob_v2_external  # encoding -> file
 lance_v20_decoder -> data_file_reader  # encoding -> file
-typed_writer -> nano_lance_writer  # arrow -> api
-writer -> nano_lance_writer  # dataset -> api
-writer_internal -> nano_lance_writer  # dataset -> api

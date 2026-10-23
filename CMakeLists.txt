@@ -377,8 +377,10 @@ add_library(nanolance STATIC
     src/table/mem_wal.cpp
     src/dataset/dataset_stitcher.cpp
     src/arrow/schema_mapper.cpp
-    src/dataset/writer.cpp
-    src/dataset/writer_cxx.cpp
+    src/encoding/encoding_choice.cpp
+    src/dataset/write_session.cpp
+    src/api/nano_lance_writer.cpp
+    src/api/writer_cxx.cpp
 )
 # The library's own sources compile as C++23 (nanom, which reads and writes Lance's protobuf, needs
 # it; nanolance_proto already does). Its public headers and API stay C++20.

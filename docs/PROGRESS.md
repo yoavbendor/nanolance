@@ -2892,7 +2892,7 @@ without degrading current function or speed.
 Asked: work through the Tier 1 list of `docs/ROADMAP.md` (what pylance users hit most), function
 first, without degrading function or speed.
 
-- **Append some of the columns** (`src/dataset/writer.cpp` `writer_project_append`): the new files hold the
+- **Append some of the columns** (`src/dataset/write_session.cpp` `writer_project_append`): the new files hold the
   given columns alone, with the dataset's field ids, as pylance writes them; leaving out a
   non-nullable column, or giving one the dataset lacks, is pylance's error, word for word.
 - **Reading columns a fragment lacks** (`src/scan/lance_table_reader.cpp`): a struct or list column

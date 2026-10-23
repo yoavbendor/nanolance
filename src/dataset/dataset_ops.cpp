@@ -20,7 +20,7 @@
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/manifest_writer.hpp"
 #include "nanolance/schema_mapper.hpp"
-#include "nanolance/writer_internal.hpp"
+#include "dataset/write_session.hpp"
 
 #include "lance_minimal.pb.hpp"
 #include "table/transaction_file.hpp"
@@ -198,12 +198,6 @@ void note_fragment_id(pb::Manifest& manifest, std::uint64_t id) {
 /// A staged writer: data files under the dataset, no manifest; the caller commits them.
 class StagedFiles {
 public:
-    ~StagedFiles() {
-        if (open_) {
-            nano_lance_writer_close(&writer_);
-        }
-    }
-
     /// `append`: rows of the dataset's own schema. Otherwise new columns, numbered from `field_id_base`.
     bool open(const std::filesystem::path& path, bool append, std::int32_t field_id_base, std::string& error) {
         if (append) {
@@ -216,16 +210,15 @@ public:
                 return false;
             }
         }
-        NanoLanceWriteOptions options{};
+        WriteOptions options;
         options.append = append;
         options.stage_fragments = true;
-        if (nano_lance_writer_open(&writer_, path.string().c_str(), &options) != NANO_LANCE_OK) {
-            error = writer_.last_error;
+        if (writer_.open(path.string(), options) != WriteStatus::Ok) {
+            error = writer_.error();
             return false;
         }
-        open_ = true;
-        nano_lance_writer_set_ignore_nullability(&writer_, true);
-        return append || writer_set_field_id_base(&writer_, field_id_base, error);
+        writer_.set_ignore_nullability(true);
+        return append || writer_.set_field_id_base(field_id_base, error);
     }
 
     bool set_fragment_targets(const std::vector<std::string>& dirs, const std::vector<std::uint32_t>& base_ids,
@@ -234,9 +227,8 @@ public:
         for (const auto& dir : dirs) {
             paths.push_back(dir.c_str());
         }
-        if (nano_lance_writer_set_fragment_targets(&writer_, paths.size(), paths.data(), base_ids.data()) !=
-            NANO_LANCE_OK) {
-            error = writer_.last_error;
+        if (writer_.set_fragment_targets(paths.size(), paths.data(), base_ids.data()) != WriteStatus::Ok) {
+            error = writer_.error();
             return false;
         }
         return true;
@@ -244,12 +236,12 @@ public:
 
     /// On an append writer: write only these top-level columns, with the dataset's field ids.
     bool project(const std::vector<std::string>& columns, std::string& error) {
-        return writer_project_append(&writer_, columns, error);
+        return writer_.project_append(columns, error);
     }
 
     bool write(ArrowArray& batch, ArrowSchema& schema, std::string& error) {
-        if (nano_lance_write_batch(&writer_, &batch, &schema) != NANO_LANCE_OK) {
-            error = writer_.last_error;
+        if (writer_.write_batch(&batch, &schema) != WriteStatus::Ok) {
+            error = writer_.error();
             return false;
         }
         rows_ += static_cast<std::uint64_t>(batch.length);
@@ -262,7 +254,7 @@ public:
             return true;
         }
         std::vector<NewFragment> files;
-        if (!writer_take_staged(&writer_, files, mapping_, error, keep_empty)) {
+        if (!writer_.take_staged(files, mapping_, error, keep_empty)) {
             return false;
         }
         for (auto& f : files) {
@@ -277,7 +269,7 @@ public:
     /// End a data file whenever the rows buffered reach `bytes` (0: never).
     void set_max_bytes(std::uint64_t bytes) {
         if (bytes > 0U) {
-            nano_lance_writer_set_max_pending_bytes(&writer_, bytes);
+            writer_.set_max_pending_bytes(bytes);
         }
     }
 
@@ -285,8 +277,7 @@ public:
     const LanceSchemaMapping& mapping() const { return mapping_; }
 
 private:
-    NanoLanceWriter writer_{};
-    bool open_ = false;
+    WriteSession writer_;
     std::uint64_t rows_ = 0;
     std::vector<NewFragment> files_;
     LanceSchemaMapping mapping_;
