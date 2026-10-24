@@ -10,6 +10,7 @@
 #include "encoding/values/dictionary.hpp"
 #include "encoding/values/rle.hpp"
 #include "encoding/values/scalar_value.hpp"
+#include "encoding/layout/miniblock.hpp"
 #include "nanolance/parallel.hpp"
 #include "nanolance/work_stats.hpp"
 
@@ -230,70 +231,6 @@ std::size_t max_values_per_uncompressed_chunk(std::size_t bytes_per_value) {
     return std::max<std::size_t>(1U, std::min(by_bytes, by_metadata));
 }
 
-// Chunk-meta (control) buffer for a multi-chunk miniblock page with one value buffer per chunk (the
-// structural-dictionary index chunks). Each word is
-// (wrapped_bytes/8 - 1) << 4 | log2(num_values), where wrapped_bytes is the chunk's full footprint in
-// the value buffer as written by miniblock_payload (8-byte chunk header + buffer, padded to 8). Lance
-// requires every non-final chunk to carry a nonzero log2 (num_values = 1 << log2, so full chunks must
-// be a power of two) and derives the final chunk's value count from the page's total item count.
-// The single-chunk control_buffer_for() below cannot serve here: it always writes log2=0, which is
-// correct only because the one chunk it describes is by definition the final one. A multi-chunk page
-// (a >1024-row dictionary column) needs this exact layout to be readable by stock Lance.
-//
-// The words are u32, matching has_large_chunk=1 in the page layout. They used to be u16 with
-// has_large_chunk=0, and stock Lance rejects that outright: v2_2's validate_page_layout refuses ANY
-// miniblock page without the u32 chunk grammar, before it looks at a single byte. Because that check
-// runs over the whole file's page table, one dictionary-encoded column made every OTHER column in the
-// same dataset unreadable by Lance too. The word's own layout is identical either way -- only the
-// width changes -- so nothing else about the page moved.
-std::vector<std::uint8_t> control_buffer_for_index_chunks(const std::vector<MiniblockChunk>& chunks) {
-    std::vector<std::uint8_t> out;
-    out.reserve(chunks.size() * 4U);
-    for (std::size_t i = 0; i < chunks.size(); ++i) {
-        const std::size_t wrapped = ((8U + chunks[i].bytes.size()) + 7U) / 8U * 8U;
-        const auto divided_minus_one = static_cast<std::uint32_t>(wrapped / 8U - 1U);
-        std::uint32_t log_num_values = 0U;
-        if (i + 1U < chunks.size()) {
-            for (std::size_t v = chunks[i].value_count; v > 1U; v >>= 1U) {
-                ++log_num_values;
-            }
-        }
-        append_le32(out, (divided_minus_one << 4U) | (log_num_values & 0x0FU));
-    }
-    return out;
-}
-
-// A chunk's 8-byte header is four little-endian u16 slots: the number of values the
-// repetition/definition layer covers (0 when there is none), then up to three buffer sizes, with
-// 0xFEFE marking an unused slot. Without levels the chunk holds values only; with them the level
-// buffer comes FIRST and the values follow it.
-void append_miniblock_chunk(std::vector<std::uint8_t>& out, const MiniblockChunk& chunk) {
-    if (chunk.repdef.empty()) {
-        append_le16(out, 0U);                                                  // no repdef layer
-        append_le16(out, static_cast<std::uint16_t>(chunk.bytes.size()));      // values
-        append_le16(out, 0U);
-        append_le16(out, 0xFEFEU);                                             // unused
-        out.insert(out.end(), chunk.bytes.begin(), chunk.bytes.end());
-    } else {
-        append_le16(out, static_cast<std::uint16_t>(chunk.value_count));       // values the levels cover
-        append_le16(out, static_cast<std::uint16_t>(chunk.repdef.size()));     // definition levels
-        append_le16(out, static_cast<std::uint16_t>(chunk.bytes.size()));      // values
-        append_le16(out, 0U);
-        out.insert(out.end(), chunk.repdef.begin(), chunk.repdef.end());
-        // Every buffer is padded to 8 bytes after it is written, the header recording the UNPADDED
-        // length. Invisible while a level buffer was always a 128-byte packed block; a short chunk's
-        // raw levels can be any even size, and stock Lance then read the values from the wrong offset
-        // ("Inline bitpacking width 67108864 exceeds 64-bit values").
-        while (out.size() % 8U != 0U) {
-            out.push_back(0U);
-        }
-        out.insert(out.end(), chunk.bytes.begin(), chunk.bytes.end());
-    }
-    while (out.size() % 8U != 0U) {
-        out.push_back(0U);
-    }
-}
-
 /// Pack `count` definition levels for the rows starting at `first_row` of `validity` into one
 /// FastLanes block at 1 bit per level.
 ///
@@ -347,113 +284,60 @@ std::vector<std::uint8_t> repdef_encoding_bytes() {
     return descriptor::out_of_line_bitpacking(16U, descriptor::flat(1U));
 }
 
-std::vector<std::uint8_t> miniblock_payload(const std::vector<MiniblockChunk>& chunks) {
+// The chunk framing and the metadata words are miniblock's (encoding/layout/miniblock.hpp); these adapt it to
+// MiniblockChunk. A page's chunks are padded to 8 bytes each, so consecutive chunks are contiguous.
+
+/// Bytes `chunk` occupies in a page: header, levels and values, each padded to 8.
+std::size_t chunk_footprint(const MiniblockChunk& chunk) {
+    const std::size_t sizes[1] = {chunk.bytes.size()};
+    return miniblock::chunk_bytes(chunk.repdef.size(), sizes);
+}
+
+std::vector<std::uint8_t> miniblock_payload(std::span<const MiniblockChunk> chunks) {
     std::vector<std::uint8_t> out;
     for (const auto& chunk : chunks) {
-        append_miniblock_chunk(out, chunk);
+        miniblock::append_chunk(out, chunk.value_count, chunk.repdef, chunk.bytes);
     }
     return out;
 }
 
-// Single-chunk fast paths: the variable-width paths emit one chunk per page, so the vector-based
-// miniblock_payload() above would otherwise force callers to wrap each chunk in a temporary
-// one-element vector (an extra heap allocation and copy of the whole chunk on every page). These
-// avoid that entirely. The chunk they describe is always the page's final one, which is why the
-// control word's log2 nibble is unconditionally 0 -- see miniblock_control_word.
-std::uint16_t miniblock_control_word(std::size_t repdef_bytes, std::size_t value_bytes);
-
-std::vector<std::uint8_t> control_buffer_for(const MiniblockChunk& chunk) {
-    std::vector<std::uint8_t> out;
-    append_le16(out, miniblock_control_word(chunk.repdef.size(), chunk.bytes.size()));
-    out.push_back(0U);
-    out.push_back(0U);
-    return out;
-}
-
-std::vector<std::uint8_t> miniblock_payload(const MiniblockChunk& chunk) {
-    std::vector<std::uint8_t> out;
-    out.reserve(chunk.bytes.size() + 16U);
-    append_miniblock_chunk(out, chunk);
-    return out;
-}
-
-// Stream one flat (uncompressed) miniblock chunk straight to `out`: the 8-byte miniblock chunk header,
-// then `chunk_bytes` value bytes copied directly from the column's value buffer, then 8-byte padding.
-// This is byte-identical to miniblock_payload() over a MiniblockChunk holding the same slice, but it
-// avoids materializing the slice into a MiniblockChunk and then again into a payload vector — for a
-// plain fixed-width column the chunk bytes are just a view into values.fixed. Returns bytes written.
-/// Same as stream_flat_miniblock_payload but for a chunk that carries definition levels: the header's
-/// four slots become [values covered][level bytes][value bytes][0], and the level buffer precedes the
-/// values.
-
-/// The per-chunk control word for a single-chunk page.
-///
-/// It encodes the chunk's FULL footprint -- its 8-byte header plus every buffer, padded to 8 -- as
-/// ((footprint / 8) - 1) << 4, with the low nibble holding log2(value count) for a non-final chunk
-/// and 0 for the last one. The pages built with it hold one chunk, so that chunk is always final and
-/// the nibble is always 0 (multi-chunk pages go through MiniblockPageWriter).
-///
-/// The previous form derived the word from the VALUE bytes alone, which agreed with this only
-/// because the 8-byte header and the -1 cancel when the values are a multiple of 8. Adding a
-/// definition-level buffer broke that coincidence and stock Lance panicked with "the offset + length
-/// of the sliced Buffer cannot exceed the existing length".
-std::uint16_t miniblock_control_word(std::size_t repdef_bytes, std::size_t value_bytes) {
-    // Each buffer is padded to 8 bytes in the chunk, so the level buffer's padding counts toward the
-    // footprint too -- see append_miniblock_chunk.
-    const auto padded_repdef = (repdef_bytes + 7U) & ~static_cast<std::size_t>(7U);
-    const auto footprint = ((8U + padded_repdef + value_bytes) + 7U) / 8U;
-    return static_cast<std::uint16_t>((footprint - 1U) << 4U);
-}
-
-std::uint64_t stream_miniblock_payload_with_repdef(std::ostream& out, const std::vector<std::uint8_t>& repdef,
-                                                   std::size_t value_count, const std::uint8_t* data,
-                                                   std::size_t chunk_bytes) {
-    std::vector<std::uint8_t> header;
-    append_le16(header, static_cast<std::uint16_t>(value_count));
-    append_le16(header, static_cast<std::uint16_t>(repdef.size()));
-    append_le16(header, static_cast<std::uint16_t>(chunk_bytes));
-    append_le16(header, 0U);
-    static constexpr std::array<char, 8> zeros{};
-    out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
-    out.write(reinterpret_cast<const char*>(repdef.data()), static_cast<std::streamsize>(repdef.size()));
-    // The level buffer is padded to 8 bytes before the values start (see append_miniblock_chunk).
-    const auto repdef_pad = (8U - (repdef.size() % 8U)) % 8U;
-    if (repdef_pad != 0U) {
-        out.write(zeros.data(), static_cast<std::streamsize>(repdef_pad));
+/// The metadata buffer for `chunks`: every chunk but the last must hold a power of two values (Lance
+/// derives the last one's count from the page's item count). The words are u32, matching has_large_chunk=1
+/// in the page layout: stock Lance's v2_2 validate_page_layout refuses any mini-block page without the u32
+/// chunk grammar, over the whole file's page table, so one u16 page made every column unreadable to it.
+std::vector<std::uint8_t> control_buffer_for(std::span<const MiniblockChunk> chunks) {
+    std::vector<miniblock::ChunkMeta> meta;
+    meta.reserve(chunks.size());
+    for (const auto& chunk : chunks) {
+        meta.push_back({chunk_footprint(chunk), chunk.value_count});
     }
-    out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(chunk_bytes));
-    std::uint64_t written = 8U + repdef.size() + repdef_pad + chunk_bytes;
-    const auto pad = (8U - (written % 8U)) % 8U;
-    if (pad != 0U) {
-        out.write(zeros.data(), static_cast<std::streamsize>(pad));
-    }
-    return written + pad;
+    return miniblock::control_buffer(meta);
 }
 
-/// A mini-block chunk as Lance serializes one in general: [levels][def size][each buffer's size, u32],
-/// padded to 8; the definition levels, padded; each buffer, padded. `def` empty: no levels.
+/// Stream one chunk straight to `out`: definition levels `def` (empty: none) covering `value_count` values,
+/// then each buffer, with the header and every buffer padded to 8. Byte-identical to
+/// miniblock::append_chunk, without first copying the value slices into a payload vector -- for a plain
+/// fixed-width column a chunk's bytes are just a view into values.fixed. Returns the bytes written.
 std::uint64_t stream_miniblock_chunk(std::ostream& out, std::size_t value_count, const std::vector<std::uint8_t>& def,
                                      const std::vector<std::pair<const std::uint8_t*, std::size_t>>& buffers) {
-    static constexpr std::array<char, 8> fill{static_cast<char>(0xFE), static_cast<char>(0xFE), static_cast<char>(0xFE),
-                                              static_cast<char>(0xFE), static_cast<char>(0xFE), static_cast<char>(0xFE),
-                                              static_cast<char>(0xFE), static_cast<char>(0xFE)};
-    std::vector<std::uint8_t> header;
-    append_le16(header, static_cast<std::uint16_t>(def.empty() ? 0U : value_count));
-    if (!def.empty()) {
-        append_le16(header, static_cast<std::uint16_t>(def.size()));
+    static constexpr std::array<char, 8> fill{static_cast<char>(miniblock::kFillByte), static_cast<char>(miniblock::kFillByte),
+                                              static_cast<char>(miniblock::kFillByte), static_cast<char>(miniblock::kFillByte),
+                                              static_cast<char>(miniblock::kFillByte), static_cast<char>(miniblock::kFillByte),
+                                              static_cast<char>(miniblock::kFillByte), static_cast<char>(miniblock::kFillByte)};
+    std::vector<std::size_t> sizes;
+    sizes.reserve(buffers.size());
+    for (const auto& b : buffers) {
+        sizes.push_back(b.second);
     }
-    for (const auto& b : buffers) {  // u32: the pages say has_large_chunk
-        append_le32(header, static_cast<std::uint32_t>(b.second));
-    }
-    std::uint64_t written = 0;
+    const auto header = miniblock::chunk_header(value_count, def.size(), sizes);
+    out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+    std::uint64_t written = header.size();
     const auto put = [&](const std::uint8_t* data, std::size_t size) {
         out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
-        written += size;
-        const auto pad = (8U - (written % 8U)) % 8U;
+        const auto pad = miniblock::pad_bytes(size);
         out.write(fill.data(), static_cast<std::streamsize>(pad));
-        written += pad;
+        written += size + pad;
     };
-    put(header.data(), header.size());
     if (!def.empty()) {
         put(def.data(), def.size());
     }
@@ -463,20 +347,10 @@ std::uint64_t stream_miniblock_chunk(std::ostream& out, std::size_t value_count,
     return written;
 }
 
-std::uint64_t stream_flat_miniblock_payload(std::ostream& out, const std::uint8_t* data,
-                                            std::size_t chunk_bytes) {
-    const std::array<char, 8> header{0, 0, static_cast<char>(chunk_bytes & 0xFFU),
-                                     static_cast<char>((chunk_bytes >> 8U) & 0xFFU), 0, 0,
-                                     static_cast<char>(0xFE), static_cast<char>(0xFE)};
-    out.write(header.data(), static_cast<std::streamsize>(header.size()));
-    out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(chunk_bytes));
-    std::uint64_t written = 8U + chunk_bytes;
-    const auto pad = (8U - (written % 8U)) % 8U;
-    static constexpr std::array<char, 8> zeros{};
-    if (pad != 0U) {
-        out.write(zeros.data(), static_cast<std::streamsize>(pad));
-    }
-    return written + pad;
+/// One chunk of one value buffer, `def` empty for a column without nulls.
+std::uint64_t stream_miniblock_chunk(std::ostream& out, std::size_t value_count, const std::vector<std::uint8_t>& def,
+                                     const std::uint8_t* data, std::size_t bytes) {
+    return stream_miniblock_chunk(out, value_count, def, {{data, bytes}});
 }
 
 /// Pages of a flat fixed-width column hold this much chunk payload before a new page starts.
@@ -510,11 +384,10 @@ std::size_t multichunk_values(std::size_t n) {
 
 /// A MiniBlock page of one or more chunks, streamed as the chunks are built.
 ///
-/// The caller streams each chunk (stream_flat_miniblock_payload / stream_miniblock_payload_with_repdef,
-/// which pad it to 8 bytes, so consecutive chunks are contiguous) and reports its footprint and value
-/// count here. finish() then writes the control buffer: one u32 word per chunk,
-/// (footprint/8 - 1) << 4 | log2(values), with the final chunk's nibble 0 -- Lance derives the last
-/// chunk's count from the page's item count, and every other chunk must hold a power of two.
+/// The caller streams each chunk (stream_miniblock_chunk) and reports its footprint and value count here.
+/// finish() then writes the control buffer: one u32 miniblock::control_word per chunk, the final chunk's
+/// log2 nibble 0 -- Lance derives the last chunk's count from the page's item count, and every other chunk
+/// must hold a power of two.
 class MiniblockPageWriter {
 public:
     explicit MiniblockPageWriter(std::ostream& out) : out_(out) {}
@@ -532,11 +405,7 @@ public:
     }
 
     void end_chunk(std::uint64_t footprint, std::size_t values) {
-        std::uint32_t log_values = 0U;
-        for (std::size_t v = values; v > 1U; v >>= 1U) {
-            ++log_values;
-        }
-        append_le32(control_, static_cast<std::uint32_t>((footprint / 8U - 1U) << 4U) | (log_values & 0x0FU));
+        append_le32(control_, miniblock::control_word(footprint, values, false));
         payload_size_ += footprint;
         rows_ += values;
         ++chunks_;
@@ -646,26 +515,6 @@ void append_le32(std::vector<std::uint8_t>& out, std::uint32_t value) {
     out.push_back(static_cast<std::uint8_t>((value >> 24U) & 0xFFU));
 }
 
-// Assemble one miniblock chunk holding multiple buffers (has_large_chunk => u32 sizes), matching
-// Lance's decode_miniblock_chunk: [u16 num_levels=0][u32 size_i...][pad8]([buf_i][pad8])*.
-std::vector<std::uint8_t> build_multibuffer_chunk(const std::vector<std::vector<std::uint8_t>>& buffers) {
-    std::vector<std::uint8_t> out;
-    append_le16(out, 0U);  // num_levels (no rep/def)
-    for (const auto& b : buffers) {
-        append_le32(out, static_cast<std::uint32_t>(b.size()));
-    }
-    while (out.size() % 8U != 0U) {
-        out.push_back(0U);
-    }
-    for (const auto& b : buffers) {
-        out.insert(out.end(), b.begin(), b.end());
-        while (out.size() % 8U != 0U) {
-            out.push_back(0U);
-        }
-    }
-    return out;
-}
-
 // MiniBlockLayout tail (f6 layers, f7 num_buffers, f9 num_items, f10 has_large_chunk).
 void miniblock_tail(descriptor::MiniBlock& m, std::uint64_t num_items, std::uint8_t num_buffers,
                     bool has_large_chunk = true) {
@@ -693,7 +542,7 @@ std::uint8_t offset_bits_token(bool large) {
 // PageLayout for structural dictionary with flat bitpacked u32 indices (matches stock Lance for
 // scattered low-cardinality strings): value_compression = InlineBitpacking(32), dictionary =
 // Variable+Flat(32) without general compression, num_buffers=1, has_large_chunk=true (the chunk-meta
-// words are u32 to match -- see control_buffer_for_index_chunks).
+// words are u32 to match -- see control_buffer_for).
 std::vector<std::uint8_t> page_layout_bytes_dict(std::uint32_t num_distinct, std::uint64_t num_items, bool large) {
     descriptor::MiniBlock m;
     m.value_compression = descriptor::inline_bitpacking(32U);
@@ -2436,11 +2285,11 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 }
             }
             const std::size_t length_bytes = 1U;
-            const auto chunk_bytes = build_multibuffer_chunk({run_values, run_lengths});
-            MiniblockChunk chunk;
-            chunk.bytes = chunk_bytes;
-            chunk.value_count = n;
-            const auto control = control_buffer_for({chunk});
+            std::vector<std::uint8_t> chunk_bytes;
+            const std::span<const std::uint8_t> run_buffers[2] = {run_values, run_lengths};
+            miniblock::append_chunk(chunk_bytes, 0U, {}, run_buffers);
+            const miniblock::ChunkMeta meta[1] = {{chunk_bytes.size(), n}};
+            const auto control = miniblock::control_buffer(meta);
 
             align64(out);
             const auto control_offset = pos(out);
@@ -2525,10 +2374,11 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                     r += run;
                 }
             }
-            const auto chunk_bytes = build_multibuffer_chunk({run_values, run_lengths});
-            MiniblockChunk chunk;
-            chunk.bytes = chunk_bytes;
-            const auto control = control_buffer_for({chunk});
+            std::vector<std::uint8_t> chunk_bytes;
+            const std::span<const std::uint8_t> run_buffers[2] = {run_values, run_lengths};
+            miniblock::append_chunk(chunk_bytes, 0U, {}, run_buffers);
+            const miniblock::ChunkMeta meta[1] = {{chunk_bytes.size(), rows}};
+            const auto control = miniblock::control_buffer(meta);
             std::vector<std::uint8_t> dict_frame;
             if (!general::zstd_frame(dictionary::encode_variable(distinct, values.variable.large), compression_level,
                                    dict_frame, error)) {
@@ -2621,7 +2471,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 index_chunks.push_back(std::move(chunk));
             }
             const auto payload = miniblock_payload(index_chunks);
-            const auto control = control_buffer_for_index_chunks(index_chunks);
+            const auto control = control_buffer_for(index_chunks);
             const auto dict_block = dictionary::encode_variable(distinct, values.variable.large);
 
             align64(out);
@@ -2710,12 +2560,8 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                                      : std::vector<std::uint8_t>{};
                 page_writer.begin_chunk();
                 const auto footprint =
-                    column_has_nulls
-                        ? stream_miniblock_payload_with_repdef(
-                              out, chunk_repdef, count,
-                              values.fixed_data() + off * fixed_bytes_per_value, chunk_bytes)
-                        : stream_flat_miniblock_payload(
-                              out, values.fixed_data() + off * fixed_bytes_per_value, chunk_bytes);
+                    stream_miniblock_chunk(out, count, chunk_repdef,
+                                           values.fixed_data() + off * fixed_bytes_per_value, chunk_bytes);
                 page_writer.end_chunk(footprint, count);
                 off += count;
                 if (off < total && multi != 0U && page_writer.payload_bytes() < kTargetMiniblockPageBytes) {
@@ -2800,11 +2646,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                                      : std::vector<std::uint8_t>{};
                 page_writer.begin_chunk();
                 const auto footprint =
-                    column_has_nulls ? stream_miniblock_payload_with_repdef(out, chunk_repdef, count,
-                                                                            chunk_bytes.data(),
-                                                                            chunk_bytes.size())
-                                     : stream_flat_miniblock_payload(out, chunk_bytes.data(),
-                                                                     chunk_bytes.size());
+                    stream_miniblock_chunk(out, count, chunk_repdef, chunk_bytes.data(), chunk_bytes.size());
                 page_writer.end_chunk(footprint, count);
                 off += count;
                 if (off < total && multi != 0U && page_writer.payload_bytes() < kTargetMiniblockPageBytes) {
@@ -2905,8 +2747,8 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 }
                 std::swap(chunk.bytes, framed);  // value_count unchanged; bytes are now [u64][zstd]
             }
-            const auto control = control_buffer_for(chunk);
-            const auto payload = miniblock_payload(chunk);
+            const auto control = control_buffer_for({&chunk, 1});
+            const auto payload = miniblock_payload({&chunk, 1});
 
             align64(out);
             const auto control_offset = pos(out);

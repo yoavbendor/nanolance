@@ -16,6 +16,7 @@
 #include "encoding/values/rle.hpp"
 #include "encoding/values/dictionary.hpp"
 #include "encoding/values/scalar_value.hpp"
+#include "encoding/layout/miniblock.hpp"
 #include "nanolance/column_slice.hpp"
 #include <nanom/fastlanes.hpp>
 #include "nanolance/fsst.hpp"
@@ -247,199 +248,6 @@ bool read_le16(const std::uint8_t* p, std::uint16_t& v) {
 bool read_le32(const std::uint8_t* p, std::uint32_t& v) {
     v = static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8U) |
         (static_cast<std::uint32_t>(p[2]) << 16U) | (static_cast<std::uint32_t>(p[3]) << 24U);
-    return true;
-}
-
-/// Every buffer inside a miniblock chunk is padded up to 8 bytes AFTER it is written, and the header
-/// records the unpadded length. The padding was invisible while the only level buffer nanolance
-/// produced or met was a full 128-byte packed block; a short chunk's raw level buffer (see
-/// append_definition_levels) can be any even size, and then the values start at the next multiple of
-/// 8, not immediately after the levels.
-constexpr std::size_t kMiniblockAlignment = 8U;
-
-constexpr std::size_t align_to_miniblock(std::size_t bytes) {
-    return (bytes + kMiniblockAlignment - 1U) & ~(kMiniblockAlignment - 1U);
-}
-
-/// How to read a chunk header, which is not a fixed shape: the slots that exist depend on the page's
-/// MiniBlockLayout descriptor.
-///
-/// Lance's own `decode_miniblock_chunk` (`rust/lance-encoding/src/encodings/logical/primitive.rs`)
-/// spells it out:
-///
-///     [u16 num_levels]
-///     [u16 rep_size]                       only when rep_compression is present
-///     [u16 def_size]                       only when def_compression is present
-///     [num_buffers x (u32 if has_large_chunk else u16)]
-///     pad to 8
-///     [rep] pad8  [def] pad8  [buffer_0] pad8  [buffer_1] pad8 ...
-///
-/// This used to be read as a fixed `[u16 num_levels][u16][u16][u16]`, which is the right 8 bytes for
-/// exactly one shape: no repetition layer, two value buffers, small chunks. That covers nanolance's
-/// own output and most of stock Lance's, and silently misreads the rest -- a `float64` column whose
-/// nulls come in runs sets `has_large_chunk`, so its buffer sizes are `u32` and the definition block
-/// starts 8 bytes later than the fixed parse expects.
-/// The defaults are the shape of a page with no descriptor at all, which is only ever an old
-/// nanolance file: no repetition, no definition levels (nullability postdates the writer emitting
-/// descriptors, so no such file has any), two u16 buffer sizes. That is exactly what the old fixed
-/// 8-byte parse assumed, so those files decode byte-for-byte as they did before.
-struct MiniBlockChunkShape {
-    bool has_repetition = false;
-    bool has_definition = false;
-    std::uint32_t num_buffers = 2;
-    bool large_buffer_sizes = false;
-
-    std::size_t buffer_size_bytes() const { return large_buffer_sizes ? 4U : 2U; }
-    /// Bytes before the padding, i.e. everything the header declares.
-    std::size_t declared_bytes() const {
-        return 2U + (has_repetition ? 2U : 0U) + (has_definition ? 2U : 0U) +
-               static_cast<std::size_t>(num_buffers) * buffer_size_bytes();
-    }
-};
-
-struct MiniBlockChunkHeader {
-    std::uint16_t num_levels = 0;
-    std::uint32_t rep_size = 0;
-    std::uint32_t def_size = 0;
-    std::vector<std::uint32_t> buffer_sizes;
-    /// Bytes the whole chunk occupies, padding included -- i.e. where the next chunk starts.
-    std::size_t chunk_bytes = 0;
-};
-
-bool read_miniblock_chunk_header(const std::vector<std::uint8_t>& payload, std::size_t offset,
-                                 const MiniBlockChunkShape& shape, MiniBlockChunkHeader& out,
-                                 std::string& error) {
-    out.buffer_sizes.clear();
-    // num_buffers comes from the untrusted descriptor; cap it so a hostile value cannot make the
-    // header arithmetic below run away before any of it is bounds-checked.
-    if (shape.num_buffers > 64U) {
-        error = "miniblock layout declares " + std::to_string(shape.num_buffers) + " buffers per chunk";
-        return false;
-    }
-    const auto declared = shape.declared_bytes();
-    if (offset > payload.size() || payload.size() - offset < declared) {
-        error = "truncated miniblock payload header";
-        return false;
-    }
-
-    std::size_t at = offset;
-    const auto take_u16 = [&payload, &at]() {
-        std::uint16_t v = 0;
-        read_le16(payload.data() + at, v);
-        at += 2U;
-        return static_cast<std::uint32_t>(v);
-    };
-    const auto take_u32 = [&payload, &at]() {
-        std::uint32_t v = 0;
-        read_le32(payload.data() + at, v);
-        at += 4U;
-        return v;
-    };
-
-    out.num_levels = static_cast<std::uint16_t>(take_u16());
-    out.rep_size = shape.has_repetition ? take_u16() : 0U;
-    out.def_size = shape.has_definition ? take_u16() : 0U;
-    out.buffer_sizes.reserve(shape.num_buffers);
-    for (std::uint32_t i = 0; i < shape.num_buffers; ++i) {
-        out.buffer_sizes.push_back(shape.large_buffer_sizes ? take_u32() : take_u16());
-    }
-
-    // Every section is padded to the miniblock alignment, so walk them in order and let each one's
-    // end define the next one's start. Sizes are untrusted: accumulate in 64 bits and compare against
-    // what is left of the payload at every step rather than summing first and checking once.
-    std::uint64_t cursor = align_to_miniblock(declared);
-    const auto advance = [&cursor](std::uint64_t size) {
-        cursor = (cursor + size + kMiniblockAlignment - 1U) & ~static_cast<std::uint64_t>(kMiniblockAlignment - 1U);
-    };
-    advance(out.rep_size);
-    advance(out.def_size);
-    for (const auto size : out.buffer_sizes) {
-        advance(size);
-    }
-    if (cursor > payload.size() - offset) {
-        error = "miniblock chunk exceeds payload";
-        return false;
-    }
-    out.chunk_bytes = static_cast<std::size_t>(cursor);
-    return true;
-}
-
-/// One decoded chunk: its value buffers, and its definition levels when it carries any.
-///
-/// `values` is the FIRST value buffer, which is the only one most encodings have; `extra_buffers`
-/// holds the rest (an RLE value block, for instance, is a values buffer plus a run-lengths buffer).
-struct MiniBlockChunkView {
-    std::vector<std::uint8_t> values;
-    std::vector<std::vector<std::uint8_t>> extra_buffers;
-    std::vector<std::uint8_t> repdef;
-    std::uint32_t repdef_values = 0;
-    /// List pages only: the repetition-level buffer, the header's level count, and the chunk's value
-    /// count from its metadata word. Levels outnumber values there (an empty or null list takes a
-    /// level and no value), so neither count can stand in for the other.
-    std::vector<std::uint8_t> rep;
-    std::uint32_t num_levels = 0;
-    std::uint64_t items = 0;
-};
-
-/// Split a page's payload into its chunks without concatenating them.
-///
-/// A page is NOT one chunk. nanolance's own writer happens to emit exactly one chunk per page, which
-/// is why treating the payload as a single chunk worked on its own files; stock Lance packs many
-/// (a 5000-row int64 page arrives as five 1024-value chunks), so the concatenated buffer failed the
-/// per-chunk size check with "bitpacked chunk size does not match bit width".
-bool split_miniblock_payload(const std::vector<std::uint8_t>& payload, const MiniBlockChunkShape& shape,
-                             std::vector<MiniBlockChunkView>& out, std::string& error) {
-    // `out`'s chunks are refilled in place, keeping their buffers' capacity: a page scan made a
-    // fresh vector per chunk, a whole second copy of the page allocated and given back on each read.
-    std::size_t used = 0;
-    std::size_t offset = 0;
-    while (offset < payload.size()) {
-        MiniBlockChunkHeader header;
-        if (!read_miniblock_chunk_header(payload, offset, shape, header, error)) {
-            out.resize(used);
-            return false;
-        }
-        if (header.chunk_bytes == 0U) {
-            error = "miniblock chunk declares no bytes";
-            out.resize(used);
-            return false;
-        }
-        if (used == out.size()) {
-            out.emplace_back();
-        }
-        MiniBlockChunkView& chunk = out[used++];
-        chunk.values.clear();
-        chunk.extra_buffers.clear();
-        chunk.repdef.clear();
-        chunk.repdef_values = 0;
-        chunk.rep.clear();
-        chunk.items = 0;
-        std::size_t at = offset + align_to_miniblock(shape.declared_bytes());
-        chunk.num_levels = header.num_levels;
-        if (shape.has_repetition && header.rep_size != 0U) {
-            chunk.rep.assign(payload.begin() + static_cast<std::ptrdiff_t>(at),
-                             payload.begin() + static_cast<std::ptrdiff_t>(at + header.rep_size));
-        }
-        at += align_to_miniblock(header.rep_size);
-        if (shape.has_definition && header.def_size != 0U) {
-            chunk.repdef_values = header.num_levels;
-            chunk.repdef.assign(payload.begin() + static_cast<std::ptrdiff_t>(at),
-                                payload.begin() + static_cast<std::ptrdiff_t>(at + header.def_size));
-        }
-        at += align_to_miniblock(header.def_size);
-        for (std::size_t i = 0; i < header.buffer_sizes.size(); ++i) {
-            const auto size = static_cast<std::size_t>(header.buffer_sizes[i]);
-            const auto first = payload.begin() + static_cast<std::ptrdiff_t>(at);
-            if (i == 0U) {
-                chunk.values.assign(first, first + static_cast<std::ptrdiff_t>(size));
-            } else {
-                chunk.extra_buffers.emplace_back(first, first + static_cast<std::ptrdiff_t>(size));
-            }
-            at += align_to_miniblock(size);
-        }
-        offset += header.chunk_bytes;
-    }
-    out.resize(used);
     return true;
 }
 
@@ -920,8 +728,8 @@ struct ColumnEncodingPlan {
     std::uint32_t variable_offset_bits = 0;
     /// Set when the descriptor named something this build does not model, so the error can say what.
     std::string unsupported_reason;
-    /// kMiniBlock: how to read each chunk's header. Not a constant -- see MiniBlockChunkShape.
-    MiniBlockChunkShape chunk_shape;
+    /// kMiniBlock: how to read each chunk's header. Not a constant -- see miniblock::ChunkShape.
+    miniblock::ChunkShape chunk_shape;
 };
 
 /// A dictionary block is stored raw, zstd-framed or LZ4-framed depending on who wrote the file:
@@ -1551,8 +1359,8 @@ ColumnEncodingPlan classify_column_encoding(const pb::Field& field, const pb::Co
 /// Bytes a pooled scratch object holds on to.
 std::size_t scratch_bytes(const std::vector<std::uint8_t>& v) { return v.capacity(); }
 std::size_t scratch_bytes(const std::vector<std::uint16_t>& v) { return v.capacity() * sizeof(std::uint16_t); }
-std::size_t scratch_bytes(const std::vector<MiniBlockChunkView>& chunks) {
-    std::size_t bytes = chunks.capacity() * sizeof(MiniBlockChunkView);
+std::size_t scratch_bytes(const std::vector<miniblock::ChunkView>& chunks) {
+    std::size_t bytes = chunks.capacity() * sizeof(miniblock::ChunkView);
     for (const auto& c : chunks) {
         bytes += c.values.capacity() + c.repdef.capacity() + c.rep.capacity();
         for (const auto& b : c.extra_buffers) {
@@ -1692,7 +1500,7 @@ const RawField* raw_find(const std::vector<RawField>& fields, std::uint32_t numb
 /// A legacy blob page's inner layout: a mini-block of 16-byte (position, size) rows -- Flat(128), or
 /// PackedStruct{[64, 64], Flat(128)} -- with no repetition or definition levels. Anything else is
 /// refused by name.
-bool legacy_blob_inner_shape(const std::vector<std::uint8_t>& encoding, MiniBlockChunkShape& shape, std::string& why) {
+bool legacy_blob_inner_shape(const std::vector<std::uint8_t>& encoding, miniblock::ChunkShape& shape, std::string& why) {
     std::vector<RawField> fields;
     // Any { type_url = 1, value = 2 } -> PageLayout { blob_layout = 4 } -> BlobLayout { inner_layout = 1 }
     // -> PageLayout { mini_block_layout = 1 }.
@@ -1732,7 +1540,7 @@ bool legacy_blob_inner_shape(const std::vector<std::uint8_t>& encoding, MiniBloc
     }
     const RawField* buffers = raw_find(mini, 7);
     const RawField* large = raw_find(mini, 10);
-    shape = MiniBlockChunkShape{};
+    shape = miniblock::ChunkShape{};
     shape.has_repetition = false;
     shape.has_definition = false;
     shape.num_buffers = buffers != nullptr ? static_cast<std::uint32_t>(buffers->varint) : 1U;
@@ -1753,20 +1561,20 @@ bool decode_legacy_blob_column(const EncodingsIo& io, const pb::Field& field,
     out.blob_v2.data_file = io.name();
     std::vector<std::uint8_t> control;
     std::vector<std::uint8_t> payload;
-    Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
+    Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
     auto& chunks = chunks_scratch.get();
     for (const auto& page : column.pages) {
         if (page.length == 0U) {
             continue;
         }
-        MiniBlockChunkShape shape;
+        miniblock::ChunkShape shape;
         std::string why;
         if (!legacy_blob_inner_shape(page.encoding, shape, why)) {
             error = "column '" + field.name + "': " + why;
             return false;
         }
         if (!read_page_buffers(io, page, false, control, payload, error) ||
-            !split_miniblock_payload(payload, shape, chunks, error)) {
+            !miniblock::split_payload(payload, shape, chunks, error)) {
             return false;
         }
         std::uint64_t rows = 0;
@@ -1795,7 +1603,7 @@ bool decode_legacy_blob_column(const EncodingsIo& io, const pb::Field& field,
 
 /// For a list column's item pass: give each chunk its value count from the metadata words, in place
 /// of the level count or byte-size inference the flat paths use. A no-op for any other column.
-[[nodiscard]] bool apply_item_view(const ColumnEncodingPlan& plan, std::vector<MiniBlockChunkView>& chunks,
+[[nodiscard]] bool apply_item_view(const ColumnEncodingPlan& plan, std::vector<miniblock::ChunkView>& chunks,
                                    std::string& error) {
     if (!plan.item_view) {
         return true;
@@ -1821,10 +1629,10 @@ bool decode_legacy_blob_column(const EncodingsIo& io, const pb::Field& field,
 /// them. Returns the chunks so the caller can decode their values.
 [[nodiscard]] bool read_page_chunks_with_validity(const std::vector<std::uint8_t>& payload,
                                                   const ColumnEncodingPlan& plan, std::uint64_t page_rows,
-                                                  std::vector<MiniBlockChunkView>& chunks,
+                                                  std::vector<miniblock::ChunkView>& chunks,
                                                   std::uint64_t& validity_rows, ColumnValues& out,
                                                   std::string& error) {
-    if (!split_miniblock_payload(payload, plan.chunk_shape, chunks, error) ||
+    if (!miniblock::split_payload(payload, plan.chunk_shape, chunks, error) ||
         !apply_item_view(plan, chunks, error)) {
         return false;
     }
@@ -2241,7 +2049,7 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
         PageScratch data_scratch;
         auto& control = control_scratch.get();
         auto& data = data_scratch.get();
-        Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
+        Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
         auto& chunks = chunks_scratch.get();
         std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
@@ -2287,7 +2095,7 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
         std::vector<std::uint8_t> payload;
         std::vector<std::uint8_t> dict_stored;
         DictionaryBlock dict;
-        Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
+        Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
         auto& chunks = chunks_scratch.get();
         std::vector<std::pair<std::uint32_t, std::uint8_t>> runs;  // (dictionary index, run length)
         std::uint64_t validity_rows = 0;
@@ -2426,7 +2234,7 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
         std::vector<std::uint8_t> dict_stored;
         DictionaryBlock dict;
         std::vector<std::uint8_t> indices_bytes;
-        std::vector<MiniBlockChunkView> index_chunks;
+        std::vector<miniblock::ChunkView> index_chunks;
         std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
             if (page.buffer_offsets.size() < 3U || page.buffer_sizes.size() < 3U) {
@@ -2819,7 +2627,7 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
         PageScratch payload_scratch;
         auto& control = control_scratch.get();
         auto& payload = payload_scratch.get();
-        Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
+        Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
         auto& chunks = chunks_scratch.get();
         std::vector<std::uint8_t> raw;
         std::uint64_t validity_rows = 0;
@@ -2868,7 +2676,7 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
         reserve_capped(out.fixed, declared_rows);
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> payload;
-        Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
+        Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
         auto& chunks = chunks_scratch.get();
         std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
@@ -2914,7 +2722,7 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
         PageScratch payload_scratch;
         auto& control = control_scratch.get();
         auto& payload = payload_scratch.get();
-        Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
+        Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
         auto& chunks = chunks_scratch.get();
         std::vector<std::uint8_t> raw;
         // Scratch for the FSST path only; hoisted so their capacity is reused across chunks.
@@ -3059,7 +2867,7 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
     }
     std::vector<std::uint8_t> control;
     std::vector<std::uint8_t> payload;
-    Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
+    Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
     auto& chunks = chunks_scratch.get();
     // Every page carries its own descriptor, and Rust Lance chooses per page: a float64 column
     // bit-packs its full pages and writes the short last one Flat, and a page with no nulls in it
@@ -3113,7 +2921,7 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
         if (!read_page_buffers(io, page, false, control, payload, error)) {
             return false;
         }
-        if (!split_miniblock_payload(payload, plan->chunk_shape, chunks, error) ||
+        if (!miniblock::split_payload(payload, plan->chunk_shape, chunks, error) ||
             !apply_item_view(*plan, chunks, error)) {
             return false;
         }
@@ -3216,41 +3024,6 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
     return true;
 }
 
-
-/// Value counts per chunk, from a MiniBlock page's metadata buffer: one word per chunk (u32 when
-/// `has_large_chunk`, else u16), `log_num_values` in its low 4 bits. Every chunk but the last holds
-/// `2^log` values; the last holds what is left of `num_items`.
-bool chunk_items_from_metadata(const std::vector<std::uint8_t>& control, bool large_words, std::uint64_t num_items,
-                               std::vector<std::uint64_t>& out, std::string& error) {
-    out.clear();
-    const std::size_t word = large_words ? 4U : 2U;
-    if (control.empty() || control.size() % word != 0U) {
-        error = "list page metadata is " + std::to_string(control.size()) + " bytes, not whole words";
-        return false;
-    }
-    const std::size_t chunks = control.size() / word;
-    std::uint64_t sum = 0;
-    for (std::size_t i = 0; i + 1U < chunks; ++i) {
-        const auto log = control[i * word] & 0x0FU;
-        if (log == 0U) {
-            error = "list page chunk " + std::to_string(i) + " is not the last but declares no values";
-            return false;
-        }
-        const std::uint64_t n = std::uint64_t{1} << log;
-        if (n > num_items - sum) {
-            error = "list page chunks declare more values than the page's " + std::to_string(num_items);
-            return false;
-        }
-        sum += n;
-        out.push_back(n);
-    }
-    if (num_items - sum == 0U && num_items != 0U) {
-        error = "list page's last chunk has no values";
-        return false;
-    }
-    out.push_back(num_items - sum);
-    return true;
-}
 
 /// Append `count` bits of `src` (empty = all valid) to `dst`, which already holds `at` bits.
 void append_validity_bits(std::vector<std::uint8_t>& dst, std::uint64_t& dst_nulls, std::uint64_t at,
@@ -3398,7 +3171,7 @@ bool decode_nested_column(const EncodingsIo& io, const pb::Field& on_disk_field,
     PageScratch payload_scratch;
     auto& control = control_scratch.get();
     auto& payload = payload_scratch.get();
-    Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
+    Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
     auto& chunks = chunks_scratch.get();
     Scratch<std::vector<std::uint16_t>> rep_scratch;
     Scratch<std::vector<std::uint16_t>> def_scratch;
@@ -3436,15 +3209,15 @@ bool decode_nested_column(const EncodingsIo& io, const pb::Field& on_disk_field,
                 error = where + "a page declares repetition levels but no encoding for them";
                 return false;
             }
-            MiniBlockChunkShape chunk_shape;
+            miniblock::ChunkShape chunk_shape;
             chunk_shape.has_repetition = has_rep;
             chunk_shape.has_definition = mb.repdef_compression != nullptr;
             chunk_shape.large_buffer_sizes = mb.has_large_chunk;
             chunk_shape.num_buffers = mb.num_buffers != 0U ? mb.num_buffers : 2U;
             if (!read_page_buffers(io, page, false, control, payload, error) ||
-                !split_miniblock_payload(payload, chunk_shape, chunks, error) ||
+                !miniblock::split_payload(payload, chunk_shape, chunks, error) ||
                 (window == nullptr &&
-                 !chunk_items_from_metadata(control, mb.has_large_chunk, mb.num_items, items, error))) {
+                 !miniblock::decode_chunk_items(control, mb.has_large_chunk, mb.num_items, items, error))) {
                 error = where + error;
                 return false;
             }
@@ -4176,7 +3949,7 @@ std::shared_ptr<const MiniBlockPageIndex> miniblock_page_index(const EncodingsIo
         return nullptr;
     }
     std::string why;  // metadata that does not add up: no index, the page is decoded whole
-    if (!chunk_items_from_metadata(control, mb.has_large_chunk, flat ? page.length : mb.num_items, index->items,
+    if (!miniblock::decode_chunk_items(control, mb.has_large_chunk, flat ? page.length : mb.num_items, index->items,
                                    why)) {
         return nullptr;
     }
@@ -4186,7 +3959,7 @@ std::shared_ptr<const MiniBlockPageIndex> miniblock_page_index(const EncodingsIo
     for (std::size_t c = 0; c < chunks; ++c) {
         std::uint32_t w = 0;
         std::memcpy(&w, control.data() + c * word, word);
-        index->byte_start[c + 1U] = index->byte_start[c] + ((static_cast<std::uint64_t>(w) >> 4U) + 1U) * 8U;
+        index->byte_start[c + 1U] = index->byte_start[c] + miniblock::decode_control_word(w).chunk_bytes;
         std::uint64_t finished = index->items[c];
         if (!flat) {
             std::memcpy(&finished, rep_index.data() + c * stride * 8U, 8U);

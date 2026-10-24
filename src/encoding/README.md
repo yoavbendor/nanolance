@@ -26,8 +26,17 @@ One module per encoding, `values/<name>.{hpp,cpp}` or `layout/<name>.{hpp,cpp}`,
   memory.
 - The header says the byte layout in a few lines, and names Lance's source it follows.
 
-`values/bitpack` is the first one and the example: `encode_block` / `decode_block` for an inline FastLanes
-block, `decode_series` for a buffer of blocks, `decode_out_of_line` for a descriptor-width buffer.
+The modules so far:
+
+| module | what it holds |
+|---|---|
+| `values/bitpack` | FastLanes bitpacking: `encode_block` / `decode_block` for an inline block, `decode_series` for a buffer of blocks, `decode_out_of_line` for a descriptor-width buffer |
+| `values/general` | zstd / LZ4 general compression and nanolance's `[u64 size][zstd]` frame |
+| `values/byte_stream_split` | byte-stream split of fixed-width values |
+| `values/rle` | run-length values and run-length definition levels |
+| `values/dictionary` | dictionary blocks of fixed and variable-width values, and their indices |
+| `values/scalar_value` | a constant page's one value |
+| `layout/miniblock` | mini-block chunk framing (header, levels, buffers, padding) and the metadata words that index the chunks |
 
 ## Its test
 
