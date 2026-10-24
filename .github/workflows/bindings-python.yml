@@ -71,7 +71,7 @@ jobs:
           curl -sf http://127.0.0.1:5055/ > /dev/null || { cat /tmp/moto.log; exit 1; }
           curl -sf -X PUT http://127.0.0.1:5055/nl-test
 
-      # lance-c's reader of s3:// datasets (tests/lance_c_s3_read.cpp), built with S3 and -Werror.
+      # lance-c's reader of s3:// datasets (tests/integration/lance_c_s3_read.cpp), built with S3 and -Werror.
       - name: Build lance-c's S3 reader
         run: |
           cmake -S . -B build-s3 -G Ninja -DCMAKE_BUILD_TYPE=Release -DNANOLANCE_ENABLE_S3=ON -DNANOLANCE_WERROR=ON

@@ -26,6 +26,8 @@ on:
       - "tests/**"
       - "tools/**"
       - "generated/**"
+      - "bindings/python/tests/**"
+      - "docs/**"
       - ".github/workflows/ci-platforms.yml"
   pull_request:
     paths:
@@ -36,6 +38,8 @@ on:
       - "tests/**"
       - "tools/**"
       - "generated/**"
+      - "bindings/python/tests/**"
+      - "docs/**"
       - ".github/workflows/ci-platforms.yml"
   workflow_dispatch:
 
@@ -46,7 +50,9 @@ concurrency:
 jobs:
   layers:
     # The layering of src/ (src/README.md): no file includes a higher layer's header beyond the violations
-    # tools/layers_allow.txt still lists, and that list only shrinks. Seconds; no build.
+    # tools/layers_allow.txt still lists, and that list only shrinks. And each layer's README: its spec
+    # coverage table names code and tests that exist, and every module has a test in tests/<layer>/
+    # (docs/LAYER_README_TEMPLATE.md). Seconds; no build.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -55,7 +61,9 @@ jobs:
       - name: Test the check
         run: |
           python3 -m pip install --quiet pytest
-          python3 -m pytest -q -p no:cacheprovider tools/test_check_layers.py
+          python3 -m pytest -q -p no:cacheprovider tools/test_check_layers.py tools/test_check_spec.py
+      - name: Check the spec coverage of the layer READMEs
+        run: python3 tools/check_spec.py
 
   macos:
     # macos-14 is deprecated; a retired runner label queues forever instead of failing.

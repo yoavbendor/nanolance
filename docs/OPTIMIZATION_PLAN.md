@@ -523,7 +523,7 @@ only the lifetime changes. `commit()` defaults `is_append` to whatever `open()` 
 to `true` after the first successful commit, so the one argument that was easy to get wrong now has a
 right answer by default.
 
-Both are guarded by `tests/test_writer_api.cpp`, which asserts **byte-identical data files** between
+Both are guarded by `tests/api/test_writer_api.cpp`, which asserts **byte-identical data files** between
 the old spelling and the new one — for the options struct, for a zeroed struct against plain `init`,
 for a NULL options pointer, and for the RAII type against the hand-rolled C sequence. A second way to
 write files would be worse than none; the test is there to keep it the same way.

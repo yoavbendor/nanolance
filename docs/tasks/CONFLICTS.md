@@ -128,7 +128,7 @@ UpdateBases).
 
 ## 5. Tests you write
 
-C++: `tests/test_commit_conflicts.cpp` (add to CMake like the other `tests/test_*.cpp`). A two-writer
+C++: `tests/table/test_commit_conflicts.cpp` (add to CMake like the other `tests/test_*.cpp`). A two-writer
 harness: open at v1, commit "theirs" through the public API, then commit "ours" from the stale v1
 manifest. One test per row of section 2 (outcome and row count), plus each compatible pair of C2 / C3
 asserting **rebased, not re-run** via the counter, plus: a version without a transaction file is
@@ -167,7 +167,7 @@ per-pair status, tails, decisions.
 **C1 outcome (2026-10-20, first session):** verdicts implemented (`src/commit_conflicts.{hpp,cpp}`, decoder
 moved to `src/dataset_operation.{hpp,cpp}`, `classify_concurrent` in `commit_next_version`, counters in
 `include/nanolance/dataset_commit.hpp`, `_errors.py` maps "Incompatible transaction:" to OSError,
-`tests/test_commit_conflicts.cpp` at verdict level). Reviewer found: **the probe of section 2 is unchanged
+`tests/table/test_commit_conflicts.cpp` at verdict level). Reviewer found: **the probe of section 2 is unchanged
 end to end**, because nanolance's Python mutations never race from a stale handle -- `delete_once`
 (`src/dataset/dataset_ops.cpp` ~791) and the other `*_once` functions `load_latest`, so a handle opened at v1
 deletes from v3. pylance commits from the handle's own version (`read_version`), then resolves.
@@ -205,7 +205,7 @@ Reviewer's answers to the session's questions:
 columns, compaction, update_config and table / schema metadata (the last two now retry too). The probe:
 "delete vs overwrite" and "update_config same key" raise pylance's OSError; the four "re-run: keep" rows
 succeed; all other rows unchanged. `bindings/python/tests/test_commit_conflicts.py` (20),
-`tests/test_commit_conflicts.cpp` two-writer tests. Reviewer: removed `load_latest` (unused; the wasm
+`tests/table/test_commit_conflicts.cpp` two-writer tests. Reviewer: removed `load_latest` (unused; the wasm
 build's clang `-Werror` failed on it). Decisions:
 - A reader-form `add_columns` (stream, not replayable) surfaces a retryable verdict as a commit conflict
   instead of re-running: accepted (pylance surfaces that pair too).

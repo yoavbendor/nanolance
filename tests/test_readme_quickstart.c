@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    /* ---- BEGIN documented snippet (keep in step with README.md "Quick start (C write)") ---- */
+    /* ---- BEGIN documented snippet (keep in step with README.md "Quick start", "C") ---- */
     {
         NanoLanceWriteOptions options = {0};         /* zeroed == the defaults */
         NanoLanceWriter w = {0};

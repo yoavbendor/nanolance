@@ -264,7 +264,7 @@ Sizes: **XS** < 1 h, **S** half a day, **M** 1–2 days, **L** most of a week �
 |---|---|---|---|
 | A1 | **Fix `nlance-pagelayout` labelling.** It names physical columns after the first N schema fields, skipping structs but not lists or maps, so a list column is labelled with the list's name and a map's `value` column is labelled `key`. Map physical columns to *leaf* fields. Also print `rep=` (only a flag is stored today), `layers=`, FullZip details, and decode CompressiveEncoding field 11 instead of `Unknown(field 11)`. | S | Sonnet |
 | A2 | **Pin every gap as a failing test by its message.** Add to `test_lance_read_matrix.py`: a *value-size* axis (strings of 64/255/256/1024 B, one-long-value-among-short), FSL at dims 8/64/768, the list shapes above, `halffloat`, `duration`. Use `KNOWN_GAPS` with the specific message, exactly as the four previous gaps were pinned, so each fails loudly when fixed. | S | Sonnet |
-| A3 | **proto3 defaulting hardening.** `Field.type` (ours 2, proto3's 0) and `Field.encoding` (ours 1, proto3's 0) are the same shape as the `parent_id` bug. Neither is load-bearing on the read path today; make the decoder honour proto3 and add hand-built wire-byte tests like the `parent_id` ones in `tests/test_lance_minimal_pb.cpp`. | XS | Sonnet |
+| A3 | **proto3 defaulting hardening.** `Field.type` (ours 2, proto3's 0) and `Field.encoding` (ours 1, proto3's 0) are the same shape as the `parent_id` bug. Neither is load-bearing on the read path today; make the decoder honour proto3 and add hand-built wire-byte tests like the `parent_id` ones in `tests/table/test_lance_minimal_pb.cpp`. | XS | Sonnet |
 | A4 | **`macos-14` → `macos-15`** in `wheels.yml` and `ci-platforms.yml` (deprecated; a retired label queues forever — see PROGRESS item 12). | XS | Sonnet |
 
 ### Phase B — FullZip and fixed-size lists (highest user impact)
@@ -647,7 +647,7 @@ still calls vector and full-text indexes out of scope; it should be updated alon
 
 1. ~~**Wire what the core already does**~~ -- **done (2026-10-08)**: vector index creation and
    search with every setter, INVERTED in `create_scalar_index`, `full_text_search` and prepared Match
-   contexts with both coverage modes (`tests/test_lance_c_search.cpp`).
+   contexts with both coverage modes (`tests/api/test_lance_c_search.cpp`).
 2. **Wait on core features from the index gaps list:**
    - ~~`lance_scanner_set_ef`: HNSW indexes~~ -- done with IVF_HNSW_SQ (and
      `set_query_parallelism`, which Lance's HNSW search uses).

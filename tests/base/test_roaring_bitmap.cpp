@@ -199,6 +199,32 @@ int main() {
         require(!nano_lance::pb::decode_index_section(broken, again, error), "a truncated index section");
     }
 
+    // The 64-bit RoaringTreemap (u64 LE key count, then per high key [u32 LE high][portable bitmap]): empty,
+    // one key, several keys with ids on both sides of 2^32, and the refusals of a short or implausible input.
+    {
+        for (const std::vector<std::uint64_t>& ids :
+             {std::vector<std::uint64_t>{}, std::vector<std::uint64_t>{0, 1, 70000},
+              std::vector<std::uint64_t>{5, 0xFFFFFFFFULL, 0x100000000ULL, 0x100000007ULL, 0x700000000ULL + 4097U}}) {
+            const auto bytes = nano_lance::roaring::encode_treemap(ids);
+            std::vector<std::uint64_t> back;
+            std::string error;
+            require(nano_lance::roaring::decode_treemap(bytes.data(), bytes.size(), back, error), error);
+            require(back == ids, "a treemap round-trips");
+        }
+        const auto empty = nano_lance::roaring::encode_treemap({});
+        require(empty == std::vector<std::uint8_t>(8, 0), "an empty treemap is a zero key count");
+        const auto two = nano_lance::roaring::encode_treemap({1, 0x200000001ULL});
+        require(two[0] == 2 && two[8] == 0 && two[9] == 0, "two keys, the first high key 0");
+        std::vector<std::uint64_t> back;
+        std::string error;
+        require(!nano_lance::roaring::decode_treemap(two.data(), 7, back, error), "no key count");
+        require(!nano_lance::roaring::decode_treemap(two.data(), two.size() - 2U, back, error), "a truncated bitmap");
+        std::vector<std::uint8_t> implausible(12, 0);
+        implausible[0] = 9;
+        require(!nano_lance::roaring::decode_treemap(implausible.data(), implausible.size(), back, error),
+                "more keys than the bytes can hold");
+    }
+
     std::cout << "roaring bitmap ok\n";
     return 0;
 }
