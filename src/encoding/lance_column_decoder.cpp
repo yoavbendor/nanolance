@@ -241,17 +241,6 @@ bool decompress_full_zip_value(page_layout::BufferScheme scheme, const std::uint
     return true;
 }
 
-bool read_le16(const std::uint8_t* p, std::uint16_t& v) {
-    v = static_cast<std::uint16_t>(static_cast<unsigned>(p[0]) | (static_cast<unsigned>(p[1]) << 8U));
-    return true;
-}
-
-bool read_le32(const std::uint8_t* p, std::uint32_t& v) {
-    v = static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8U) |
-        (static_cast<std::uint32_t>(p[2]) << 16U) | (static_cast<std::uint32_t>(p[3]) << 24U);
-    return true;
-}
-
 auto read_list_offset = [](const std::vector<std::uint8_t>& bytes, std::size_t index, bool large) -> std::int64_t {
     const auto offset_width = large ? 8U : 4U;
     const auto* src = bytes.data() + index * offset_width;
