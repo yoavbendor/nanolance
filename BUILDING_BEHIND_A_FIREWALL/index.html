@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -962,7 +962,7 @@ needed for a repeatable build:</p>
 </ul>
 <p>You need <code>uv</code> (get it from the mirror: <code>pip install uv</code>), a C++ toolchain and CMake as in section 3,
 and the mirror settings from section 2.</p>
-<div class="language-sh highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">UV_DEFAULT_INDEX</span><span class="o">=</span>https://mirror.example.com/api/pypi/simple<span class="w">   </span><span class="c1"># your PyPI mirror&#39;s simple index</span>
+<div class="language-sh highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">UV_DEFAULT_INDEX</span><span class="o">=</span>https://mirror.example.com/api/pypi/simple<span class="w">   </span><span class="c1"># your PyPI mirror's simple index</span>
 <a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">NANOLANCE_GIT_BASE</span><span class="o">=</span>https://gitlab.example.com/mirrors<span class="w">          </span><span class="c1"># as in section 2</span>
 <a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>tools/python_env_behind_firewall.sh<span class="w">                                  </span><span class="c1"># a few minutes (faster on re-runs)</span>
 <a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="nb">cd</span><span class="w"> </span>bindings/python
@@ -994,7 +994,7 @@ Python 3.10 and newer, 8.0.1 for 3.9).</p>
    commits yourself), then pull the new nanolance into your checkout.</li>
 <li>See whether a dependency pin moved:</li>
 </ol>
-<div class="language-sh highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>git<span class="w"> </span>diff<span class="w"> </span>&lt;old&gt;..&lt;new&gt;<span class="w"> </span>--<span class="w"> </span>CMakeLists.txt<span class="w"> </span>bindings/python/CMakeLists.txt<span class="w"> </span>cmake/<span class="w"> </span>tools/*_suite.py<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s2">&quot;GIT_TAG|GIT_REPOSITORY|^[-+]REPO|COMMIT&quot;</span>
+<div class="language-sh highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>git<span class="w"> </span>diff<span class="w"> </span>&lt;old&gt;..&lt;new&gt;<span class="w"> </span>--<span class="w"> </span>CMakeLists.txt<span class="w"> </span>bindings/python/CMakeLists.txt<span class="w"> </span>cmake/<span class="w"> </span>tools/*_suite.py<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s2">"GIT_TAG|GIT_REPOSITORY|^[-+]REPO|COMMIT"</span>
 </code></pre></div>
 <p>Nothing printed: the mirrors already have everything. A new commit or tag: make sure the mirror
    has it (<code>git ls-remote $NANOLANCE_GIT_BASE/apache/arrow-nanoarrow.git | grep &lt;sha or tag&gt;</code>; for a
@@ -1004,7 +1004,7 @@ Python 3.10 and newer, 8.0.1 for 3.9).</p>
 <h2 id="6-a-git-only-alternative">6. A git-only alternative<a class="headerlink" href="#6-a-git-only-alternative" title="Permanent link">&para;</a></h2>
 <p>Without touching the build, git can rewrite GitHub URLs for everything on the machine, submodules
 included, as long as the mirror keeps GitHub's <code>owner/repo</code> paths:</p>
-<div class="language-sh highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>git<span class="w"> </span>config<span class="w"> </span>--global<span class="w"> </span>url.<span class="s2">&quot;https://gitlab.example.com/mirrors/&quot;</span>.insteadOf<span class="w"> </span><span class="s2">&quot;https://github.com/&quot;</span>
+<div class="language-sh highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>git<span class="w"> </span>config<span class="w"> </span>--global<span class="w"> </span>url.<span class="s2">"https://gitlab.example.com/mirrors/"</span>.insteadOf<span class="w"> </span><span class="s2">"https://github.com/"</span>
 <a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>git<span class="w"> </span>submodule<span class="w"> </span>update<span class="w"> </span>--init<span class="w"> </span>--recursive<span class="w">    </span><span class="c1"># now from the mirror too</span>
 </code></pre></div>
 <p>This is the simplest way to also get the example submodules. <code>NANOLANCE_GIT_BASE</code> is the better
@@ -1087,10 +1087,10 @@ project on the machine, and can point single repositories elsewhere.</p>
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

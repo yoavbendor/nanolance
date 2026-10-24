@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -814,8 +814,8 @@
 <h1 id="task-ivf_sq-ivf_hnsw_pq-ivf_hnsw_flat-vector-indexes-recombinations-of-existing-pieces">Task: IVF_SQ, IVF_HNSW_PQ, IVF_HNSW_FLAT vector indexes (recombinations of existing pieces)<a class="headerlink" href="#task-ivf_sq-ivf_hnsw_pq-ivf_hnsw_flat-vector-indexes-recombinations-of-existing-pieces" title="Permanent link">&para;</a></h1>
 <p>Status: <strong>delegated</strong> (implementer: Claude Haiku 5.5, reviewer: Claude Opus 5.5). Roadmap order item 4.</p>
 <h2 id="0-context-budget">0. Context budget<a class="headerlink" href="#0-context-budget" title="Permanent link">&para;</a></h2>
-<p>About 100k tokens per session. <code>grep -n</code> then <code>sed -n</code> windows of at most ~120 lines; <code>src/vector_search.cpp</code>
-(2k+) and <code>src/vector_index_build.cpp</code> (1.4k+) must never be read whole. Cut all output (<code>| tail -15</code>,
+<p>About 100k tokens per session. <code>grep -n</code> then <code>sed -n</code> windows of at most ~120 lines; <code>src/index/vector/vector_search.cpp</code>
+(2k+) and <code>src/index/vector/vector_index_build.cpp</code> (1.4k+) must never be read whole. Cut all output (<code>| tail -15</code>,
 pytest with <code>-o addopts=</code> for a summary line; <code>tools/pylance_suite.py ... | tail -5</code>;
 <code>ninja 2&gt;&amp;1 | grep -E "error|warning:" | head</code>). Only your phase.</p>
 <h2 id="1-the-idea-measured-on-pylance-1200-here">1. The idea (measured on pylance 12.0.0 here)<a class="headerlink" href="#1-the-idea-measured-on-pylance-1200-here" title="Permanent link">&para;</a></h2>
@@ -886,7 +886,7 @@ in layout to IVF_HNSW_SQ's; its <code>index.idx</code> 592 bytes, 0 rows, 2 glob
 <code>auxiliary.idx</code> (as IVF_FLAT's storage) + HNSW <code>index.idx</code>.</p>
 <p>So the work is to <strong>decouple storage from sub-index</strong> where the code assumes the three known pairs:
 find them with <code>grep -n "IVF_HNSW_SQ\|IVF_PQ\|IVF_FLAT\|hnsw\|__sq_code\|__pq_code\|__flat_marker"
-src/vector_search.cpp src/vector_index_build.cpp include/nanolance/vector*.hpp</code>, and the Python names
+src/index/vector/vector_search.cpp src/index/vector/vector_index_build.cpp include/nanolance/vector*.hpp</code>, and the Python names
 that refuse these kinds (<code>grep -n "IVF_SQ\|HNSW_PQ\|HNSW_FLAT\|does not support .* indexes" 
 bindings/python/nanolance/lance/*.py</code>). Reuse the SQ / PQ / FLAT distance code and the HNSW graph
 build / search that exist -- do not write new ones. Build parameters (<code>num_bits</code>, <code>m</code>,
@@ -928,7 +928,7 @@ Files changed, per-test status, decisions, questions.</p>
 - pylance's files match section 1 (probe scripts: <code>/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchpad/c1/</code>
   -- <code>build_pylance.py</code> builds all kinds, <code>meta.py</code> dumps them).
 - Today a pylance IVF_SQ / IVF_HNSW_PQ / IVF_HNSW_FLAT index is <strong>silently not used</strong>: <code>load_ivf</code>
-  (src/vector_search.cpp ~750) refuses the type, <code>dataset_nearest</code> falls back to an exact search and
+  (src/index/vector/vector_search.cpp ~750) refuses the type, <code>dataset_nearest</code> falls back to an exact search and
   the plan says why (results exact, so they differ from pylance's approximate ones). Keep that
   fallback for kinds still unsupported (reviewer's call).
 - Coupling points to decouple (vector_search.cpp): type whitelist ~750 and <code>pq</code> / <code>hnsw</code> flags from
@@ -1036,10 +1036,10 @@ IVF_RQ (RaBitQ), the default partition size of the HNSW kinds vs pylance's (unch
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

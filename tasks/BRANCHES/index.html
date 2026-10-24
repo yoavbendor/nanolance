@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -852,7 +852,7 @@ you are given.</p>
 <h2 id="0-context-budget-read-this-first">0. Context budget (read this first)<a class="headerlink" href="#0-context-budget-read-this-first" title="Permanent link">&para;</a></h2>
 <p>Budget about 200k tokens; aim for 120k. Never read a large file whole: <code>grep -n</code>, then <code>sed -n 'A,Bp'</code>
 windows of at most ~120 lines. Big ones: <code>bindings/python/nanolance/lance/dataset.py</code> (5k+),
-<code>src/dataset.cpp</code>, <code>src/manifest_writer.cpp</code>, <code>src/dataset_ops.cpp</code>, <code>bindings/python/src/nanolance_bindings.cpp</code>.
+<code>src/dataset/dataset.cpp</code>, <code>src/table/manifest_writer.cpp</code>, <code>src/dataset/dataset_ops.cpp</code>, <code>bindings/python/src/nanolance_bindings.cpp</code>.
 Lance's Rust: read only the files named here. Cut output: <code>| tail -15</code> for pytest (add <code>-o addopts=</code>),
 <code>| tail -5</code> for <code>tools/pylance_suite.py</code>.</p>
 <h2 id="1-goal">1. Goal<a class="headerlink" href="#1-goal" title="Permanent link">&para;</a></h2>
@@ -873,8 +873,8 @@ v1 3 rows, v2 +1 row; branch <code>exp</code> from v1, then one append on <code>
 (and <code>_versions/latest_version_hint.json</code>, <code>{"version":N}</code>, which pylance writes on every commit, main
 included). Branch names can contain <code>/</code> (Lance's <code>branch_location.rs</code>). Its reference is
 <code>&lt;root&gt;/_refs/branches/B.json</code>:</p>
-<div class="language-json highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="p">{</span><span class="nt">&quot;parentBranch&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;identifier&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">&quot;version_mapping&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[[</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;1935c23a6df942abaf8023c96579f240&quot;</span><span class="p">]]},</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w"> </span><span class="nt">&quot;parentVersion&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;createAt&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1792482184</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;manifestSize&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">369</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;metadata&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{}}</span>
+<div class="language-json highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="p">{</span><span class="nt">"parentBranch"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span><span class="w"> </span><span class="nt">"identifier"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"version_mapping"</span><span class="p">:</span><span class="w"> </span><span class="p">[[</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="s2">"1935c23a6df942abaf8023c96579f240"</span><span class="p">]]},</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w"> </span><span class="nt">"parentVersion"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">"createAt"</span><span class="p">:</span><span class="w"> </span><span class="mi">1792482184</span><span class="p">,</span><span class="w"> </span><span class="nt">"manifestSize"</span><span class="p">:</span><span class="w"> </span><span class="mi">369</span><span class="p">,</span><span class="w"> </span><span class="nt">"metadata"</span><span class="p">:</span><span class="w"> </span><span class="p">{}}</span>
 </code></pre></div>
 <p><code>parentBranch</code> is null for main, else the parent's name. <code>identifier.version_mapping</code> is the chain of
 (parent_version, 32-hex random id) from the root: a branch of a branch has two entries (its parent's,
@@ -926,14 +926,14 @@ never touched by a branch write.</p>
 <code>base_paths</code>) and <code>transaction.proto</code> (the Clone operation).</p>
 <h2 id="3-where-things-are-in-nanolance">3. Where things are in nanolance<a class="headerlink" href="#3-where-things-are-in-nanolance" title="Permanent link">&para;</a></h2>
 <ul>
-<li>Base paths are read and written already: <code>include/nanolance/base_paths.hpp</code>, <code>src/base_paths.cpp</code>
+<li>Base paths are read and written already: <code>include/nanolance/base_paths.hpp</code>, <code>src/table/base_paths.cpp</code>
   (<code>read_base_paths</code>, <code>write_base_paths</code>, data-file resolution by <code>base_id</code>); multi-base datasets are done
   (<code>docs/tasks/MULTI_BASE.md</code>).</li>
-<li>Manifests: <code>src/dataset.cpp</code> (reading, line ~281 reads base paths), <code>src/manifest_writer.cpp</code>
+<li>Manifests: <code>src/dataset/dataset.cpp</code> (reading, line ~281 reads base paths), <code>src/table/manifest_writer.cpp</code>
   (feature flags, unknown-field preservation: check field 20 survives a commit).</li>
 <li>Transaction files: <code>grep -rn "Clone\|write_transaction" src/*.cpp | head</code>.</li>
 <li>Tags (Python): <code>dataset.py</code> near line 2460 (<code>Tags</code>); refs JSON reading in <code>_namespace_dir.py</code> near 1670.</li>
-<li>Commit retries / version numbering: <code>src/dataset.cpp</code> (<code>rebase</code>), <code>src/manifest_writer.cpp</code>.</li>
+<li>Commit retries / version numbering: <code>src/dataset/dataset.cpp</code> (<code>rebase</code>), <code>src/table/manifest_writer.cpp</code>.</li>
 </ul>
 <h2 id="4-phases">4. Phases<a class="headerlink" href="#4-phases" title="Permanent link">&para;</a></h2>
 <ul>
@@ -1109,10 +1109,10 @@ namespace branch tests pass (expected list 1234); <code>tests/test_branches.py</
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -851,14 +851,14 @@ indexes; partition info and clustering), <strong>H2</strong> (build them: k-mode
 <code>optimize_indices</code> delta segments, <code>IvfModel</code> save / load). Do only the phase you are given.</p>
 <h2 id="0-context-budget-read-this-first">0. Context budget (read this first)<a class="headerlink" href="#0-context-budget-read-this-first" title="Permanent link">&para;</a></h2>
 <p>Budget about 200k tokens; aim for 120k. Never read a large file whole: <code>grep -n</code>, then <code>sed -n 'A,Bp'</code>
-windows of at most ~120 lines. Big ones: <code>src/vector_search.cpp</code> (3k+), <code>src/vector_index_build.cpp</code>,
+windows of at most ~120 lines. Big ones: <code>src/index/vector/vector_search.cpp</code> (3k+), <code>src/index/vector/vector_index_build.cpp</code>,
 <code>src/vector_index.cpp</code> (or wherever IVF files are decoded: <code>grep -ln "lance:ivf" src/*.cpp</code>),
 <code>bindings/python/nanolance/lance/dataset.py</code> (5k+). Lance's Rust: only the files named here. Cut output:
 <code>| tail -15</code> for pytest (add <code>-o addopts=</code>), <code>| tail -5</code> for <code>tools/pylance_suite.py</code>.</p>
 <h2 id="1-goal">1. Goal<a class="headerlink" href="#1-goal" title="Permanent link">&para;</a></h2>
 <p>pylance builds IVF_FLAT on <code>fixed_size_list&lt;uint8&gt;</code> columns with <code>metric="hamming"</code> (binary embeddings,
 perceptual hashes). nanolance searches such columns exactly (flat Hamming search is done: <code>binary_key</code>
-in <code>src/vector_search.cpp</code> ~2606 and ~3065) but refuses the index: "metric 'hamming' is not supported
+in <code>src/index/vector/vector_search.cpp</code> ~2606 and ~3065) but refuses the index: "metric 'hamming' is not supported
 (l2, cosine, dot)" / "does not support the hamming distance". After this task nanolance reads, searches,
 builds and maintains Hamming IVF_FLAT indexes as pylance does, and each engine uses the other's.</p>
 <p>Targets (<code>.deps/pylance-tests/v12.0.0/tests/</code>):
@@ -910,11 +910,11 @@ tests compare behaviour (partition count = <code>round(sqrt(num_rows))</code> wh
 search results), not centroids.</p>
 <h2 id="3-where-things-are-in-nanolance">3. Where things are in nanolance<a class="headerlink" href="#3-where-things-are-in-nanolance" title="Permanent link">&para;</a></h2>
 <ul>
-<li>Flat Hamming search: <code>src/vector_search.cpp</code> (<code>hamming</code> ~503, <code>binary_key</code>, the uint8 branch ~3065).</li>
+<li>Flat Hamming search: <code>src/index/vector/vector_search.cpp</code> (<code>hamming</code> ~503, <code>binary_key</code>, the uint8 branch ~3065).</li>
 <li>IVF read / search / build: <code>grep -n "IVF_FLAT\|lance:flat\|storage_metadata" src/*.cpp</code>; the float
   IVF_FLAT path is the model to follow. <code>NearestQuery</code> (<code>include/nanolance/vector_search.hpp</code> ~34)
   carries the key as <code>std::vector&lt;float&gt;</code>; the uint8 flat path already passes bytes beside it.</li>
-<li>The refusals to lift: <code>grep -rn "hamming" bindings/python/nanolance/lance/*.py src/lance_c.cpp</code>.</li>
+<li>The refusals to lift: <code>grep -rn "hamming" bindings/python/nanolance/lance/*.py src/api/lance_c.cpp</code>.</li>
 <li><code>IndicesBuilder</code> / <code>IvfModel</code>: <code>bindings/python/nanolance/lance/indices/builder.py</code>.</li>
 <li><code>optimize_indices</code> delta segments: <code>include/nanolance/index_optimize.hpp</code>.</li>
 </ul>
@@ -1069,10 +1069,10 @@ large appends); k-modes trains flat above 256 partitions (Lance goes hierarchica
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

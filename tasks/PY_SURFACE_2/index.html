@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -817,7 +817,7 @@ fresh session unless one finishes early with context to spare: <strong>Q1</stron
 <strong>Q3</strong> batch queries. ~23 of pylance's tests.</p>
 <h2 id="0-context-budget">0. Context budget<a class="headerlink" href="#0-context-budget" title="Permanent link">&para;</a></h2>
 <p>About 100k tokens per session. <code>grep -n</code> then <code>sed -n</code> windows of at most ~120 lines; never read
-<code>bindings/python/nanolance/lance/dataset.py</code> (3.5k+), <code>src/vector_search.cpp</code> (2.4k) or
+<code>bindings/python/nanolance/lance/dataset.py</code> (3.5k+), <code>src/index/vector/vector_search.cpp</code> (2.4k) or
 <code>bindings/python/src/nanolance_bindings.cpp</code> whole. Cut all output (<code>| tail -15</code>; pytest
 <code>-o addopts=</code> for a summary line; <code>tools/pylance_suite.py ... | tail -5</code>). Real pylance 12.0.0 is
 <code>import lance</code> in plain <code>python3</code>: measure every behaviour there first. Write nanolance's own code.</p>
@@ -829,7 +829,7 @@ min_ngram_length=None, max_ngram_length=None, prefix_only=None, split_identifier
 split_on_numerics=None, preserve_original=None, index_operators=None)</code> -&gt; list of <code>FtsToken</code>
 (<code>.text</code>, <code>.position</code>, repr <code>FtsToken(text="cat", position=0)</code>). Same option resolution as
 <code>create_scalar_index(index_type="INVERTED")</code> (nanolance: <code>_inverted_params</code> / <code>_inverted_analyzer</code>
-in dataset.py; the C++ <code>fts::Analyzer</code> in src/fts_tokenizer.cpp does the work). <code>None</code> = the
+in dataset.py; the C++ <code>fts::Analyzer</code> in src/index/fts/fts_tokenizer.cpp does the work). <code>None</code> = the
 analyzer profile's default, except <code>max_token_length=None</code> disables the limit (omitted -&gt; 40).
 Positions are relative to the first kept token, gaps from filters kept (<code>"the Cats and Dogs"</code> -&gt;
 <code>[('cat', 0), ('dog', 2)]</code>). Errors as create_scalar_index's (<code>code analyzer flags require
@@ -842,8 +842,8 @@ metadata_cache_backend=None, store_registry=None)</code>; methods <code>size_byt
 metadata_cache_size_bytes=0)</code> (measure what the numbers mean). <code>ds.session()</code> returns the dataset's
 session; <code>lance.dataset(uri, session=s)</code>, <code>write_fragments(..., session=)</code>,
 <code>lance.dataset(uri, metadata_cache_size_bytes=0)</code>. Sizes must grow when a scan / index search fills
-nanolance's caches (nanolance has caches in C++: grep <code>index_cache()</code> in src/index_files.cpp /
-src/fts_search.cpp / src/vector_search.cpp, and whatever caches manifests / file metadata) and be
+nanolance's caches (nanolance has caches in C++: grep <code>index_cache()</code> in src/index/index_files.cpp /
+src/index/fts/fts_search.cpp / src/index/vector/vector_search.cpp, and whatever caches manifests / file metadata) and be
 smaller with a zero metadata cache. A session object that owns cache budgets and reports sizes
 from the C++ caches is the design; if the C++ caches are process-global, report their sizes and
 keep per-session budgets as far as the tests need -- decide, and stop and ask if a real per-session
@@ -990,10 +990,10 @@ pylance tests (1132). Task PY_SURFACE_2 done. Known single-query divergences (sm
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

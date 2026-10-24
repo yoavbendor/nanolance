@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -816,7 +816,7 @@
 (scalar / FTS breadth). Three phases, each a fresh session: <strong>F1</strong>, <strong>F2</strong>, <strong>F3</strong> (section 2).</p>
 <h2 id="0-context-budget">0. Context budget<a class="headerlink" href="#0-context-budget" title="Permanent link">&para;</a></h2>
 <p>About 100k tokens per session. <code>grep -n</code> then <code>sed -n</code> windows of at most ~120 lines; never read
-<code>src/fts_search.cpp</code> (2k lines), <code>src/fts_index_build.cpp</code>, <code>dataset.py</code> (3.5k+) or Lance's
+<code>src/index/fts/fts_search.cpp</code> (2k lines), <code>src/index/fts/fts_index_build.cpp</code>, <code>dataset.py</code> (3.5k+) or Lance's
 <code>tokenizer.rs</code> (1.8k) whole. Cut all output (<code>| tail -15</code>; pytest with <code>-o addopts=</code> for a summary
 line; <code>tools/pylance_suite.py ... | tail -5</code>; <code>ninja 2&gt;&amp;1 | grep -E "error|warning:" | head</code>). Only
 your phase. Lance's Rust source is the reference, unpacked here:
@@ -834,8 +834,8 @@ your own scratch dir; it writes <code>ds_*</code> next to itself).</p>
 refuses <code>format_version</code>, <code>block_size</code>, <code>analyzer</code>, <code>split_identifiers</code>, <code>split_on_numerics</code>,
 <code>preserve_original</code>, <code>index_operators</code> (<code>_INVERTED_OPTIONS</code> / <code>_inverted_params</code>,
 <code>bindings/python/nanolance/lance/dataset.py</code> ~1015); the native side refuses block size != 128
-(<code>src/fts_index_build.cpp</code> ~561); the reader refuses format != "2" and block != "128"
-(<code>load_inverted</code>, <code>src/fts_search.cpp</code> ~716).</p>
+(<code>src/index/fts/fts_index_build.cpp</code> ~561); the reader refuses format != "2" and block != "128"
+(<code>load_inverted</code>, <code>src/index/fts/fts_search.cpp</code> ~716).</p>
 <p>Lance's rules (<code>index/format.rs</code>, <code>tokenizer.rs</code>):
 - <code>format_version</code> accepts <code>1 | 2 | 3 | "1" | "v1" | "V1" | ...</code>; anything else -&gt; ValueError
   <code>unsupported FTS format version {v}, expected 1, 2, or 3</code>. <code>block_size</code> is 128 or 256, else a
@@ -852,7 +852,7 @@ refuses <code>format_version</code>, <code>block_size</code>, <code>analyzer</co
 - <strong>V3 with block 128 is byte-identical to V2</strong> except <code>format_version = "3"</code> (docs / tokens files
   equal, invert differs only in its metadata) -- verified.
 - <strong>V1</strong> = <code>posting_tail_codec = fixed32_v1</code> (tail block stores doc ids / frequencies as plain u32;
-  nanolance's decoder already has <code>TailCodec::Fixed32</code>, <code>src/fts_posting.cpp</code> ~111 -- but the reader
+  nanolance's decoder already has <code>TailCodec::Fixed32</code>, <code>src/index/fts/fts_posting.cpp</code> ~111 -- but the reader
   looks for the string <code>"fixed32"</code>, pylance writes <code>"fixed32_v1"</code>: fix it). With <code>with_position</code>, V1
   has <strong>no</strong> <code>positions_layout</code>: <code>invert.lance</code> has an extra column
   <code>_position: list&lt;list&lt;large_binary&gt;&gt;</code> -- per posting list, per document, a compressed position
@@ -860,14 +860,14 @@ refuses <code>format_version</code>, <code>block_size</code>, <code>analyzer</co
   <code>compress_positions\|POSITION_COL</code> there). nanolance currently reports that layout as unsupported
   (<code>positions_error</code>); F1 reads and writes it.
 - <strong>Block 256</strong> (<code>encoding.rs</code> 66-330): full blocks are <code>BitPacker8x</code> (8 lanes x 32, same scheme as
-  the 4x one in <code>src/fts_posting.cpp</code>, 8 interleaved lanes instead of 4): doc ids as a sorted block
+  the 4x one in <code>src/index/fts/fts_posting.cpp</code>, 8 interleaved lanes instead of 4): doc ids as a sorted block
   <code>[u32 first doc][u8 bits][packed deltas]</code>, then frequencies <strong>patched FOR</strong>
   <code>[u8 width][u8 exception count][packed body][exceptions: (u8 index, varint high bits)...]</code>
   (<code>compress_pfor_block_with</code> -- copy its width choice exactly so bytes match). <strong>No 4-byte block max
   score prefix</strong> on any 256 block, including the remainder (<code>posting_block_score_prefix_len</code>). The
   tail (remainder &lt; 256) uses the tail codec as today. Impact skip data (<code>_impacts</code>) uses the same
   entry encoding for every block size, one entry per posting block and one per 32 blocks
-  (<code>impact.rs</code> top; nanolance's <code>encode_impact_entry</code> in <code>src/fts_index_build.cpp</code> ~100-130).
+  (<code>impact.rs</code> top; nanolance's <code>encode_impact_entry</code> in <code>src/index/fts/fts_index_build.cpp</code> ~100-130).
 - Code analyzer (<code>analyzer="code"</code>, or <code>base_tokenizer="code"</code>): params JSON written into <code>params</code>:
   <code>"base_tokenizer":"code"</code>, <code>"stem":false</code>, <code>"remove_stop_words":false</code>, <code>"lower_case":true</code>,
   <code>"ascii_folding":true</code>, and four extra keys (nanolance already writes them, as false):
@@ -894,7 +894,7 @@ refuses <code>format_version</code>, <code>block_size</code>, <code>analyzer</co
   same data (one partition: compare <code>part_0_invert.lance</code> columns). Oracle:
   <code>test_create_scalar_index_fts_block_size</code>, <code>test_code_analyzer_does_not_split_identifiers_by_default[256]</code>
   passes only after F3.</li>
-<li><strong>F3 -- code analyzer.</strong> Tokenizer in <code>src/fts_tokenizer.cpp</code> (C++ port of the two Rust files;
+<li><strong>F3 -- code analyzer.</strong> Tokenizer in <code>src/index/fts/fts_tokenizer.cpp</code> (C++ port of the two Rust files;
   same token texts and positions), options, errors, params, details proto; query-side tokenization
   through the same analyzer. Oracle: all 8 <code>test_code_analyzer_*</code> (grep <code>def test_code_analyzer</code>
   in <code>.deps/pylance-tests/v12.0.0/tests/test_scalar_index.py</code>).</li>
@@ -917,7 +917,7 @@ _nanolance.cpython-311-x86_64-linux-gnu.so /usr/local/lib/python3.11/dist-packag
 Stop and ask (question first) if pylance's files differ from section 1, if V1's legacy position
 encoding needs more than ~150 lines, if 256-block bytes cannot be matched after comparing with
 pylance's, or if the code analyzer needs Unicode tables nanolance lacks (<code>is_alphanumeric</code> on
-non-ASCII: check what <code>src/fts_tokenizer.cpp</code> uses for the simple tokenizer first and reuse it).</p>
+non-ASCII: check what <code>src/index/fts/fts_tokenizer.cpp</code> uses for the simple tokenizer first and reuse it).</p>
 <h2 id="5-done-per-phase-report-under-40-lines-sent-once">5. Done per phase -- report (under 40 lines, sent once)<a class="headerlink" href="#5-done-per-phase-report-under-40-lines-sent-once" title="Permanent link">&para;</a></h2>
 <p>Tails of: <code>cd build &amp;&amp; ctest -j8 | tail -3</code>; the oracle <code>-k</code> run; your test file;
 <code>python3 tools/pylance_suite.py | tail -4</code> ("all N expected tests passed"); last, once, quiet:
@@ -942,7 +942,7 @@ unchanged. +1 pylance test (1037).</p>
 - Reviewer's answer on Unicode: <code>WordDelimiterFilter</code> uses <code>char::is_lowercase</code> / <code>is_uppercase</code>
   (~148-158). Generate exact <strong>Lowercase and Uppercase range tables</strong> from Rust std with
   <code>tools/fts_tables</code> (it builds offline in ~30 s against lance-tokenizer 12.0.0), the same way <code>kAlnum</code>
-  is generated, into <code>src/fts_tables.inc</code>. <code>is_alphanumeric</code> = existing <code>kAlnum</code> (<code>src/fts_tokenizer.cpp</code>
+  is generated, into <code>src/index/fts/fts_tables.inc</code>. <code>is_alphanumeric</code> = existing <code>kAlnum</code> (<code>src/index/fts/fts_tokenizer.cpp</code>
   ~58). The Rust oracle in <code>tools/fts_tables</code> can also emit golden token lists for the code analyzer.
 - Params JSON key order already matches pylance (<code>params_json</code>); write the four flags' real values for
   code indexes only, so text-analyzer params stay byte-identical.
@@ -957,7 +957,7 @@ unchanged. +1 pylance test (1037).</p>
 - No Python tokenize binding: token-list cases go to <code>tests/golden/fts_tokenizer/cases.txt</code>
   (<code>tests/test_fts_tokenizer.cpp</code>, ctest <code>nano_lance_fts_tokenizer</code>).</p>
 <p><strong>F3 outcome (2026-10-15):</strong> done. Code analyzer (<code>CodeLexTokenizer</code> + <code>WordDelimiterFilter</code> ported to
-<code>src/fts_tokenizer.cpp</code>, exact Unicode Lowercase / Uppercase tables generated from Rust std by
+<code>src/index/fts/fts_tokenizer.cpp</code>, exact Unicode Lowercase / Uppercase tables generated from Rust std by
 <code>tools/fts_tables</code>), its options, Lance's messages, default format 3, <code>code_config</code> in
 InvertedIndexDetails (bytes equal to pylance's), details decoded in <code>describe_indices</code>. 528 golden
 code-analyzer token cases from Lance's own crate; all 8 <code>test_code_analyzer_*</code> pass (+8, 1045).
@@ -1039,10 +1039,10 @@ Text-analyzer params unchanged. Left: <code>lance.tokenize</code> binding (<code
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

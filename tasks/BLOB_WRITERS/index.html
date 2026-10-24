@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -934,7 +934,7 @@
 <p>You have about 100k tokens of context for the whole job. Spend them on code, not on output:</p>
 <ul>
 <li><strong>Never read a large file whole.</strong> Find the place with <code>grep -n</code>, then read a window of at most
-  ~120 lines with <code>sed -n 'A,Bp' file</code>. Files here are 1-3k lines (<code>src/blob_v2_external.cpp</code>,
+  ~120 lines with <code>sed -n 'A,Bp' file</code>. Files here are 1-3k lines (<code>src/file/blob_v2_external.cpp</code>,
   <code>bindings/python/nanolance/lance/file.py</code>, <code>dataset.py</code> is 3k+).</li>
 <li><strong>Always cut command output</strong>: <code>... 2&gt;&amp;1 | tail -15</code> for pytest, <code>| tail -5</code> for
   <code>tools/pylance_suite.py</code> (it prints thousands of lines otherwise), <code>ninja 2&gt;&amp;1 | grep -E
@@ -1061,14 +1061,14 @@ is finished with no blobs: does the file exist? copy that). Use pyarrow's buffer
 (<code>arr.buffers()</code>, <code>arr.offset</code>, offsets dtype) to copy only valid slices; never <code>to_pylist()</code> the
 payload bytes of large arrays one by one if you can slice buffers instead (performance matters in
 this repo, but correctness first). Run the 8 phase-A pylance tests:</p>
-<div class="language-text highlight"><pre><span></span><code>cd /home/user/nanolance &amp;&amp; python3 tools/pylance_suite.py -k &quot;packed_blob_writer&quot;
+<div class="language-text highlight"><pre><span></span><code>cd /home/user/nanolance &amp;&amp; python3 tools/pylance_suite.py -k "packed_blob_writer"
 </code></pre></div>
 <p><strong>Phase B -- descriptor-form blob columns in the file writer (C++).</strong> The data-replacement test
 writes a data file whose <code>lance.blob.v2</code> column <em>is</em> the descriptor struct of 3.5. nanolance's writer
 rejects it today:</p>
-<div class="language-text highlight"><pre><span></span><code>OSError: Invalid user input: Blob v2 field &#39;blob&#39; must be struct&lt;data: large_binary, uri: utf8&gt; or struct&lt;data, uri, position: uint64, size: uint64&gt;
+<div class="language-text highlight"><pre><span></span><code>OSError: Invalid user input: Blob v2 field 'blob' must be struct&lt;data: large_binary, uri: utf8&gt; or struct&lt;data, uri, position: uint64, size: uint64&gt;
 </code></pre></div>
-<p>That comes from <code>append_blob_v2_batch_column_values</code> in <code>src/blob_v2_external.cpp</code> (~line 720).
+<p>That comes from <code>append_blob_v2_batch_column_values</code> in <code>src/file/blob_v2_external.cpp</code> (~line 720).
 Teach it a third accepted input shape: children <code>kind, data, uri, blob_id, blob_size, position</code>
 (exactly STRUCT above). For each row emit the descriptor as given (kinds 1 packed / 2 dedicated /
 3 external: copy blob_id, blob_size -&gt; size, position, uri; kind 0 inline: the bytes in <code>data</code> are
@@ -1079,7 +1079,7 @@ produces. Do not try to validate that the sidecar exists. Then make the data-rep
 plus the same scenario read back by <strong>real pylance</strong> (section 6).</p>
 <p><strong>Phase B design notes (from the reviewer, read before coding):</strong></p>
 <ul>
-<li>In <code>append_blob_v2_batch_column_values</code> (<code>src/blob_v2_external.cpp</code>, ~line 720) the input shape is
+<li>In <code>append_blob_v2_batch_column_values</code> (<code>src/file/blob_v2_external.cpp</code>, ~line 720) the input shape is
   chosen from the children found with <code>find_child(mapping, blob_field.id, name)</code>. Add the
   descriptor shape (all six names present) as a third branch; the existing loop (~lines 780-860) shows
   how a row is read (<code>large_binary_value</code>, <code>utf8_value</code>, <code>uint64_value</code>), how a null row is recorded
@@ -1230,10 +1230,10 @@ public API names not listed above, or deleting existing behaviour.</p>
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

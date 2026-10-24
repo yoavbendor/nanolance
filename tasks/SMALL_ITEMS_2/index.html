@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -818,8 +818,8 @@ fresh session: <strong>A</strong> types and validation, <strong>B</strong> plans
 you could not finish rather than stretching the session.</p>
 <h2 id="0-context-budget">0. Context budget<a class="headerlink" href="#0-context-budget" title="Permanent link">&para;</a></h2>
 <p>About 100k tokens per session. <code>grep -n</code> then <code>sed -n</code> windows of at most ~120 lines; never read
-<code>bindings/python/nanolance/lance/dataset.py</code> (3.6k+), <code>src/expr.cpp</code>, <code>src/lance_table_reader.cpp</code>,
-<code>src/index_search.cpp</code> or <code>bindings/python/src/nanolance_bindings.cpp</code> whole. Cut all output. For each
+<code>bindings/python/nanolance/lance/dataset.py</code> (3.6k+), <code>src/expr/expr.cpp</code>, <code>src/scan/lance_table_reader.cpp</code>,
+<code>src/dataset/index_search.cpp</code> or <code>bindings/python/src/nanolance_bindings.cpp</code> whole. Cut all output. For each
 item: read the named pylance tests (<code>.deps/pylance-tests/v12.0.0/tests/...</code>), measure the behaviour
 on real pylance 12.0.0 (<code>import lance</code> in plain <code>python3</code>), then implement. Write nanolance's own code.</p>
 <h2 id="1-items">1. Items<a class="headerlink" href="#1-items" title="Permanent link">&para;</a></h2>
@@ -831,8 +831,8 @@ on real pylance 12.0.0 (<code>import lance</code> in plain <code>python3</code>)
 2. Decimal and duration columns in filters and scalar indexes (<code>tests/test_scalar_index.py::
    test_scalar_index_types[btree-decimal128|decimal256|duration]</code> and the bitmap / zonemap variants,
    grep <code>test_scalar_index_types</code>): <code>arrow_cast(x, 'Decimal128(p, s)')</code> / <code>'Duration(Millisecond)'</code>
-   in filters (src/expr.cpp ~885-908 refuses them), and BTREE (and whatever other kinds the test
-   parametrizes) on decimal128 / decimal256 / duration columns (src/scalar_index.cpp refuses:
+   in filters (src/expr/expr.cpp ~885-908 refuses them), and BTREE (and whatever other kinds the test
+   parametrizes) on decimal128 / decimal256 / duration columns (src/index/scalar/scalar_index.cpp refuses:
    "a scalar index on a column of type decimal..."). Index files must equal pylance's (compare
    page_data / page_lookup rows as earlier index tasks did).</p>
 <p><strong>Phase B -- plans and stats</strong>
@@ -842,7 +842,7 @@ on real pylance 12.0.0 (<code>import lance</code> in plain <code>python3</code>)
    <code>analyze_plan()</code> output for.
 5. <code>test_scalar_index.py::test_btree_index_cache_hit_miss_stats</code> (4): index cache hit / miss
    counters in <code>analyze_plan</code> or stats -- measure where pylance reports them; nanolance's caches are
-   in src/index_files.hpp (<code>IndexCache</code>).
+   in src/index/index_files.hpp (<code>IndexCache</code>).
 6. Late-materialization plan text (<code>test_dataset.py::test_late_materialization_param</code> 3,
    <code>test_fragment.py::test_fragment_scanner_late_materialization[*]</code> 3): the projection lines the tests
    assert (<code>projection=[values], source=stream</code>, <code>projection=[filter, values]</code>), and the
@@ -1010,10 +1010,10 @@ expected list (1172 -&gt; 1171) on purpose: the plan must describe what runs.</p
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

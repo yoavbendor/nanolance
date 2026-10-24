@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -832,8 +832,8 @@ add / drop / alter columns -- and compaction). Do only the phase you are given. 
 (cleanup, drop, branches) come later: keep refusing those by name.</p>
 <h2 id="0-context-budget-read-this-first">0. Context budget (read this first)<a class="headerlink" href="#0-context-budget-read-this-first" title="Permanent link">&para;</a></h2>
 <p>Budget about 200k tokens; aim for 120k. Never read a large file whole: <code>grep -n</code>, then <code>sed -n 'A,Bp'</code>
-windows of at most ~120 lines. Big ones: <code>src/dataset_ops.cpp</code>, <code>bindings/python/nanolance/lance/dataset.py</code>
-(5k+), <code>src/dataset_refs.cpp</code>, <code>src/deletion_vector.cpp</code>. Cut output: <code>| tail -15</code> for pytest (add
+windows of at most ~120 lines. Big ones: <code>src/dataset/dataset_ops.cpp</code>, <code>bindings/python/nanolance/lance/dataset.py</code>
+(5k+), <code>src/table/dataset_refs.cpp</code>, <code>src/table/deletion_vector.cpp</code>. Cut output: <code>| tail -15</code> for pytest (add
 <code>-o addopts=</code>).</p>
 <h2 id="1-goal">1. Goal<a class="headerlink" href="#1-goal" title="Permanent link">&para;</a></h2>
 <p>Each operation below, on an <code>s3://</code> dataset opened with pylance's <code>storage_options</code>, does what it does on a
@@ -851,15 +851,15 @@ still use <code>std::filesystem</code> / <code>std::ofstream</code> / <code>fope
 <li>Every write goes through <code>io::open_output(path_or_uri)</code> -&gt; <code>OutputFile</code> (an <code>std::ostream</code>;
   <code>commit(error)</code> makes the object exist) or <code>io::put_if_absent</code> (create-only); removals through
   <code>io::remove_output</code>. On an object store there are no directories: guard <code>create_directories</code> and
-  <code>std::filesystem::exists</code> with <code>io::is_object_store_output(path)</code> (see W1's <code>src/writer.cpp</code>).</li>
+  <code>std::filesystem::exists</code> with <code>io::is_object_store_output(path)</code> (see W1's <code>src/dataset/write_session.cpp</code>).</li>
 <li>Reads go through <code>io::open_source</code> / <code>io::read_all</code> / <code>io::list_dir</code> (<code>include/nanolance/byte_source.hpp</code>),
   which already work on <code>s3://</code>. A write path that reads an existing file with <code>std::ifstream</code> /
   <code>fopen</code> / <code>std::filesystem</code> must switch to these.</li>
 <li>Remaining filesystem calls on write paths (from <code>grep -n "std::filesystem::\(create_directories\|remove\|
   rename\|exists\|directory_iterator\|file_size\|copy\)\|std::ofstream\|std::ifstream\|fopen(" src/*.cpp</code>):
-  <code>src/deletion_vector.cpp</code> (3: the deletion-file writer -- W2a), <code>src/dataset_refs.cpp</code> (1: refs JSON --
-  tags, W2a), <code>src/dataset_stitcher.cpp</code> (5: column stitching -- W2b), <code>src/nano_lance_external_blob.cpp</code>
-  (2), <code>src/dataset.cpp</code> (1), <code>src/data_file_reader.cpp</code> (1), <code>src/manifest_reader.cpp</code> (1); index
+  <code>src/table/deletion_vector.cpp</code> (3: the deletion-file writer -- W2a), <code>src/table/dataset_refs.cpp</code> (1: refs JSON --
+  tags, W2a), <code>src/dataset/dataset_stitcher.cpp</code> (5: column stitching -- W2b), <code>src/api/nano_lance_external_blob.cpp</code>
+  (2), <code>src/dataset/dataset.cpp</code> (1), <code>src/file/data_file_reader.cpp</code> (1), <code>src/table/manifest_reader.cpp</code> (1); index
   builders (<code>fts_index_build.cpp</code>, <code>vector_index_build.cpp</code>, <code>scalar_index.cpp</code>, <code>index_optimize.cpp</code>:
   W3, not now). Check each one you touch: is it on the path of an operation of your phase?</li>
 <li>Tags on S3: pylance writes <code>_refs/tags/&lt;name&gt;.json</code> with a plain PUT and deletes it with a DELETE
@@ -993,10 +993,10 @@ index builds: add_columns from a function and <code>merge</code> (fragment-level
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

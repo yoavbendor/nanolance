@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -734,6 +734,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Analyzer">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#text-in-many-scripts-nanolances-own-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Text in many scripts (nanolance's own settings)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -805,10 +822,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#how-nanolance-searches-srcfts_searchcpp" class="md-nav__link">
+  <a href="#how-nanolance-searches-srcindexftsfts_searchcpp" class="md-nav__link">
     <span class="md-ellipsis">
       
-        How nanolance searches (src/fts_search.cpp)
+        How nanolance searches (src/index/fts/fts_search.cpp)
       
     </span>
   </a>
@@ -872,11 +889,52 @@ against pylance:
 keeps the whole text as one token. A query is tokenized the same way. So <code>"quickly"</code> finds
 <code>quick</code>, and <code>résumé</code> is stemmed and then folded to <code>resume</code>, which the query <code>resume</code> (stemmed to
 <code>resum</code>) does not find.</p>
-<p>nanolance's analyzer (<code>src/fts_tokenizer.cpp</code>) produces Lance's tokens byte for byte. Its Unicode
+<p>nanolance's analyzer (<code>src/index/fts/fts_tokenizer.cpp</code>) produces Lance's tokens byte for byte. Its Unicode
 tables and stemmer are generated from the Rust crates (<code>tools/fts_tables</code>,
 <code>tools/fts_stem_translate.py</code>). <code>tests/golden/fts_tokenizer</code> holds 3,000 lines tokenized by Lance.
 It supports <code>simple</code>, <code>whitespace</code> and <code>raw</code> with English. Other settings are refused: <code>icu</code>,
-<code>ngram</code>, <code>code</code>, <code>jieba/*</code>, <code>lindera/*</code>, other languages, and JSON documents.</p>
+<code>ngram</code>, <code>code</code>, <code>jieba/*</code>, <code>lindera/*</code>, other languages, and JSON documents. See below for the
+settings nanolance adds for text in many scripts.</p>
+<h3 id="text-in-many-scripts-nanolances-own-settings">Text in many scripts (nanolance's own settings)<a class="headerlink" href="#text-in-many-scripts-nanolances-own-settings" title="Permanent link">&para;</a></h3>
+<p>Lance's analyzer treats every character as it comes: a pointed Hebrew word (שָׁלוֹם) is another token than
+the unpointed one (שלום), a decomposed é (e + combining accent) loses its accent as a word break, and
+<code>ascii_folding</code> keeps only the folded form, so a query with diacritics cannot rank its exact spelling
+first. nanolance adds four settings, all off by default:</p>
+<table>
+<thead>
+<tr>
+<th>setting</th>
+<th>what it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>unicode_normalize</code></td>
+<td>the text in NFC before it is split into words (a decomposed é is é), and Romanian's cedilla ş ţ as the comma ș ț</td>
+</tr>
+<tr>
+<td><code>remove_marks</code></td>
+<td>Hebrew niqqud and cantillation, Arabic harakat and tatweel (and Syriac and Thaana marks) removed: pointed and unpointed text make the same tokens; implies <code>unicode_normalize</code></td>
+</tr>
+<tr>
+<td><code>arabic_normalize</code></td>
+<td>أ إ آ ٱ as ا, ى as ي, ة as ه (these merge some distinct words, so they are a switch of their own); implies <code>unicode_normalize</code></td>
+</tr>
+<tr>
+<td><code>ascii_folding_keep_original</code></td>
+<td>with <code>ascii_folding</code>, a word whose folded form differs is indexed both ways at one position: a query without diacritics finds every spelling, one with them scores the exact spelling higher (it matches both tokens); a phrase matches on the folded forms</td>
+</tr>
+</tbody>
+</table>
+<div class="language-python highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="n">ds</span><span class="o">.</span><span class="n">create_scalar_index</span><span class="p">(</span><span class="s2">"text"</span><span class="p">,</span> <span class="s2">"INVERTED"</span><span class="p">,</span> <span class="n">remove_marks</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">unicode_normalize</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>                       <span class="n">ascii_folding_keep_original</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+<p>Queries go through the same analyzer, so they are normalized the same way. Each setting is written into
+the <code>params</code> JSON only when it is on, so an index without them is Lance's to the byte. An index with any
+of them names its tokenizer <code>nanolance/&lt;base&gt;</code> (in <code>params</code> and in the index details): pylance then refuses
+to search it ("unknown base tokenizer nanolance/simple") instead of searching it with different tokens,
+and reads the dataset and its other indexes as usual. Hebrew's attached prefixes (ה, ו, ב, ל, מ, ש, כ)
+are not split off, and stemming and stop words remain English only.</p>
 <h2 id="files">Files<a class="headerlink" href="#files" title="Permanent link">&para;</a></h2>
 <p>An index is a directory <code>_indices/&lt;uuid&gt;/</code> of Lance files (format 2.2). Each column below is
 non-nullable.</p>
@@ -967,7 +1025,7 @@ Lance does. It does not read them: it scores exhaustively, and stops early where
 <div class="language-text highlight"><pre><span></span><code>idf(n, N)       = ln((N - n + 0.5) / (n + 0.5) + 1)
 norm(dl)        = K1 * (1 - B + B * dl / avgdl)
 doc_weight(f)   = (K1 + 1) * f / (f + norm(dl))
-score           = sum over the query&#39;s tokens (repeats included) of idf * doc_weight
+score           = sum over the query's tokens (repeats included) of idf * doc_weight
 </code></pre></div>
 <p><code>N</code>, <code>n</code> and <code>avgdl</code> are summed over every partition (and segment) of the index.</p>
 <ul>
@@ -1048,7 +1106,7 @@ With <code>packed_delta_v1</code> they go in groups of 128 (<code>[bit width][Bi
 blocks are) and the tail as varints; <code>varint_doc_delta_v2</code> is varints only. nanolance reads both
 and writes <code>packed_delta_v1</code>, as Lance 12 does. Other layouts (older per-document positions) are
 refused for phrases only; plain matches still work.</p>
-<h3 id="how-nanolance-searches-srcfts_searchcpp">How nanolance searches (<code>src/fts_search.cpp</code>)<a class="headerlink" href="#how-nanolance-searches-srcfts_searchcpp" title="Permanent link">&para;</a></h3>
+<h3 id="how-nanolance-searches-srcindexftsfts_searchcpp">How nanolance searches (<code>src/index/fts/fts_search.cpp</code>)<a class="headerlink" href="#how-nanolance-searches-srcindexftsfts_searchcpp" title="Permanent link">&para;</a></h3>
 <ul>
 <li>An index's token map, document lengths and decoded posting lists are cached. The cache is keyed
   by the files' size and modification time.</li>
@@ -1062,12 +1120,12 @@ refused for phrases only; plain matches still work.</p>
 </ul>
 <h2 id="building-nanolance">Building (nanolance)<a class="headerlink" href="#building-nanolance" title="Permanent link">&para;</a></h2>
 <p><code>create_scalar_index(column, "INVERTED" | "FTS", name=None, replace=True, **params)</code>
-(<code>src/fts_index_build.cpp</code>):
+(<code>src/index/fts/fts_index_build.cpp</code>):
 1. Scan the column's live rows with their addresses, fragment by fragment.
 2. Tokenize them in parallel.
 3. Give token ids in order of first appearance.
 4. Write one partition, <code>part_0</code>, with the files above. The block scores, <code>_max_score</code> and impacts
-   are Lance's. The FST is built by a port of the <code>fst</code> crate's builder (<code>src/fts_fst.cpp</code>),
+   are Lance's. The FST is built by a port of the <code>fst</code> crate's builder (<code>src/index/fts/fts_fst.cpp</code>),
    checked byte for byte against the crate (<code>tests/golden/fts_fst</code>).
 5. Commit the manifest entry: an <code>InvertedIndexDetails</code> (base tokenizer; the language as a JSON
    string, <code>"English"</code>; the analyzer flags; <code>block_size</code> 128; <code>posting_format_version</code> 2), with
@@ -1157,10 +1215,10 @@ in their field metadata. pylance and LanceDB list and search the index as their 
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

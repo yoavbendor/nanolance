@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -919,8 +919,8 @@ scheme (<code>register_source_factory</code>, <code>register_list_factory</code>
 <a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="w">    </span><span class="c1">// Exactly n bytes at offset (one range GET; a short body is an error).</span>
 <a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">    </span><span class="kt">bool</span><span class="w"> </span><span class="nf">read_range</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&amp;</span><span class="w"> </span><span class="n">uri</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">n</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="kt">uint8_t</span><span class="o">*</span><span class="w"> </span><span class="n">dst</span><span class="p">,</span>
 <a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="w">                    </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&amp;</span><span class="w"> </span><span class="n">error</span><span class="p">);</span>
-<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="w">    </span><span class="c1">// ListObjectsV2 under prefix_uri (&quot;s3://bucket/prefix/&quot;), every page. With delimiter &quot;/&quot;, the</span>
-<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="w">    </span><span class="c1">// immediate children only, sub-&quot;directories&quot; in common_prefixes.</span>
+<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="w">    </span><span class="c1">// ListObjectsV2 under prefix_uri ("s3://bucket/prefix/"), every page. With delimiter "/", the</span>
+<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="w">    </span><span class="c1">// immediate children only, sub-"directories" in common_prefixes.</span>
 <a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="w">    </span><span class="kt">bool</span><span class="w"> </span><span class="nf">list</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&amp;</span><span class="w"> </span><span class="n">prefix_uri</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&amp;</span><span class="w"> </span><span class="n">delimiter</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">ObjectInfo</span><span class="o">&gt;&amp;</span><span class="w"> </span><span class="n">objects</span><span class="p">,</span>
 <a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="w">              </span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&gt;&amp;</span><span class="w"> </span><span class="n">common_prefixes</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&amp;</span><span class="w"> </span><span class="n">error</span><span class="p">);</span>
 <a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="p">};</span>
@@ -943,7 +943,7 @@ a few lines; otherwise leave Python alone.</p>
   configure the main build with <code>-DNANOLANCE_ENABLE_S3=ON</code> (libcurl headers are installed here). Wheels
   (cibuildwheel, <code>bindings/python/pyproject.toml</code> <code>[tool.cibuildwheel.linux]</code>, manylinux_2_28) get
   libcurl in O3.</li>
-<li><code>src/s3_byte_source.cpp</code> (built when <code>NANOLANCE_S3_NANOS3READER_ACTIVE</code>): an <code>io::ByteSource</code> over
+<li><code>src/io/s3_byte_source.cpp</code> (built when <code>NANOLANCE_S3_NANOS3READER_ACTIVE</code>): an <code>io::ByteSource</code> over
   <code>S3Client</code> (size from <code>head</code> at open; <code>read_at</code> = <code>read_range</code>; <code>small_read_block</code> 1 MiB and
   <code>footer_read_size</code> 64 KiB, so small reads become one request) and a lister over <code>list</code>, registered for
   <code>s3</code>. One <code>S3Client</code> per distinct <code>ClientOptions</code>.</li>
@@ -991,7 +991,7 @@ tails, decisions.</p>
 <p><strong>O1 outcome (2026-10-19):</strong> nanos3reader 0.4.0 (<code>S3Client</code>; commits 3e83de0, 7158595); its CI runs the
 integration tests against moto, since <code>minio/minio</code> can no longer be pulled from Docker Hub.</p>
 <p><strong>O2 outcome (2026-10-19):</strong> done in one Haiku session; reviewed. <code>s3://</code> datasets open through an
-<code>io::ByteSource</code> / lister over <code>S3Client</code> (<code>src/s3_byte_source.cpp</code>); storage_options from Python per
+<code>io::ByteSource</code> / lister over <code>S3Client</code> (<code>src/io/s3_byte_source.cpp</code>); storage_options from Python per
 bucket; whole table, projection, filters, take, count, BTREE, IVF_FLAT and INVERTED searches,
 deletions and versions match pylance on the same dataset (moto). The binding builds with S3 when
 libcurl is found. Review fix: writes to a URI were refused only in <code>nanolance.lance</code>; the low-level
@@ -1086,10 +1086,10 @@ a wheel refuses <code>s3://</code> by name.</p>
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

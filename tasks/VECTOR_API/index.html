@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -818,8 +818,8 @@ the reviewer's).</p>
 <h2 id="0-context-budget-read-this-first">0. Context budget (read this first)<a class="headerlink" href="#0-context-budget-read-this-first" title="Permanent link">&para;</a></h2>
 <p>About 100k tokens for the whole session:
 - Never read a large file whole: <code>grep -n</code>, then <code>sed -n 'A,Bp'</code> windows of at most ~120 lines.
-  <code>bindings/python/nanolance/lance/dataset.py</code> is 3.5k+ lines, <code>src/vector_search.cpp</code> 2k+,
-  <code>src/vector_index_build.cpp</code> 1.4k+.
+  <code>bindings/python/nanolance/lance/dataset.py</code> is 3.5k+ lines, <code>src/index/vector/vector_search.cpp</code> 2k+,
+  <code>src/index/vector/vector_index_build.cpp</code> 1.4k+.
 - Always cut output: <code>| tail -15</code> (pytest; add <code>-o addopts=</code> for a summary line, the config passes
   <code>-q</code>), <code>| tail -5</code> for <code>tools/pylance_suite.py</code>, <code>ninja 2&gt;&amp;1 | grep -E "error|warning:" | head</code>.
 - The oracle tests ARE the spec: read each one only (<code>grep -n "def test_x" -A50
@@ -853,9 +853,9 @@ the reviewer's).</p>
 is phase V2), <code>test_describe_vector_index</code>, <code>test_describe_index_runtime_hints_stored</code>,
 <code>test_vector_index_with_nprobes</code> (explain-plan text: look at how <code>explain_plan</code> builds its lines
 today, <code>grep -n "minimum_nprobes\|def explain_plan" bindings/python/nanolance/lance/dataset.py
-src/vector_search.cpp</code>), <code>test_index_cache_size</code>, <code>test_index_cache_size_bytes</code>,
+src/index/vector/vector_search.cpp</code>), <code>test_index_cache_size</code>, <code>test_index_cache_size_bytes</code>,
 <code>test_index_cache_size_deprecation</code> (pylance's <code>index_cache_hit_rate</code>, <code>index_cache_entry_count</code> etc.;
-nanolance has a process-wide index cache in C++ -- grep <code>load_ivf</code> / <code>cache</code> in <code>src/vector_search.cpp</code>;
+nanolance has a process-wide index cache in C++ -- grep <code>load_ivf</code> / <code>cache</code> in <code>src/index/vector/vector_search.cpp</code>;
 counting hits there is fine), <code>test_target_partition_size_to_num_partitions_clamps</code>,
 <code>test_validate_vector_index</code> (<code>lance.util</code> functions -- see what <code>bindings/python/nanolance/lance/util.py</code>
 has; placeholders come from <code>_stubs.py</code>), <code>test_use_index</code>, <code>test_nested_field_vector_index</code>.</p>
@@ -880,7 +880,7 @@ and approx_mode are validated in Python only.</p>
 <p>Facts: the option refusals are in <code>bindings/python/nanolance/lance/dataset.py</code>
 (<code>grep -n "create_index option" bindings/python/nanolance/lance/dataset.py</code>). The C++ build already
 takes a pretrained model for distributed builds -- <code>include/nanolance/vector_index*.hpp</code>, grep
-<code>VectorIndexModel\|trained\|model</code> in <code>src/vector_index_build.cpp</code>, and how
+<code>VectorIndexModel\|trained\|model</code> in <code>src/index/vector/vector_index_build.cpp</code>, and how
 <code>create_index_uncommitted</code> / <code>IndicesBuilder</code> pass <code>ivf_centroids</code> / <code>pq_codebook</code> in Python
 (<code>grep -n "ivf_centroids\|pq_codebook" bindings/python/nanolance/lance/*.py</code>). Reuse that path for
 <code>create_index(ivf_centroids=, pq_codebook=)</code>. Progress callbacks: scalar / FTS builds already report
@@ -980,10 +980,10 @@ Found: the HNSW <code>index.idx</code> differs between runs of the same build (p
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

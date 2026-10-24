@@ -1,0 +1,1027 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A standalone C++ Arrow <-> Lance v2.2 writer and reader — no Rust lance core. Rows keep large payloads external (uri + offset + size, never copied); the reader is hardened against untrusted files (bounds/overflow-checked decode, allocation budgets, ASan+UBSan+LSan CI, continuous fuzzing).">
+      
+      
+      
+        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/tasks/TOKENIZERS_J/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
+    
+    
+      
+        <title>Task: the jieba tokenizer for INVERTED indexes (ROADMAP item 11, phase J) - nanolance</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#task-the-jieba-tokenizer-for-inverted-indexes-roadmap-item-11-phase-j" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="nanolance" class="md-header__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            nanolance
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Task: the jieba tokenizer for INVERTED indexes (ROADMAP item 11, phase J)
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="nanolance" class="md-nav__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    nanolance
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../SAFETY/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory safety & Rust reviewers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../agents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AI agent integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarks
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Benchmarks
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench-write-read/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Write/read vs Parquet & Rust lance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench-trusted-parity/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety-parity (trusted vs default)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../OPTIMIZATION_PLAN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap & review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../PROGRESS/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation progress
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../s3_reader_notes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    S3 reader notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../disk-lru-block-cache/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Disk LRU block cache
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../lance_table_reader_plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Table reader design notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#0-context-budget-read-this-first" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        0. Context budget (read this first)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-targets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Targets
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-sources-read-only-copies-port-from-these-never-from-memory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Sources (read-only copies -- port from these, never from memory)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-measure-first-pylance-1200-is-the-oracle" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Measure first (pylance 12.0.0 is the oracle)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-implementation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Implementation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-tests-you-write" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Tests you write
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-rules" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Rules
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-stop-and-ask-question-first-in-the-report" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Stop and ask (question first in the report)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-done-and-report" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8. Done and report
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="task-the-jieba-tokenizer-for-inverted-indexes-roadmap-item-11-phase-j">Task: the jieba tokenizer for INVERTED indexes (ROADMAP item 11, phase J)<a class="headerlink" href="#task-the-jieba-tokenizer-for-inverted-indexes-roadmap-item-11-phase-j" title="Permanent link">&para;</a></h1>
+<p>Status: <strong>done</strong> (2026-10-22, Opus; a delegated start was stopped and replaced). High-risk branch
+<code>claude/nanolance-optimization-review-h3rxi7-highrisk</code>. Item 11 is icu / jieba / lindera; this phase is jieba
+only. ICU (phase I) and Lindera (phase L) are not part of it: keep refusing them by name.</p>
+<h2 id="0-context-budget-read-this-first">0. Context budget (read this first)<a class="headerlink" href="#0-context-budget-read-this-first" title="Permanent link">&para;</a></h2>
+<p>Budget about 200k tokens; aim for 120k. Never read a large file whole: <code>grep -n</code>, then <code>sed -n 'A,Bp'</code> windows of
+at most ~120 lines. Big ones: <code>bindings/python/nanolance/lance/dataset.py</code> (5k+), <code>src/index/fts/fts_index_build.cpp</code>,
+<code>src/index/fts/fts_search.cpp</code>, jieba-rs <code>src/lib.rs</code> (68 KB). Cut output: <code>| tail -15</code> for pytest (add <code>-o addopts=</code>).</p>
+<h2 id="1-targets">1. Targets<a class="headerlink" href="#1-targets" title="Permanent link">&para;</a></h2>
+<p><code>.deps/pylance-tests/v12.0.0/tests/test_scalar_index.py</code>: <code>test_jieba_tokenizer</code>,
+<code>test_jieba_invalid_user_dict_tokenizer</code>, <code>test_jieba_invalid_main_dict_tokenizer</code>, <code>test_jieba_user_dict_tokenizer</code>
+(and any other test there that uses <code>base_tokenizer="jieba..."</code>: grep). Their models are in
+<code>.deps/pylance-tests/v12.0.0/tests/models/jieba/</code> (<code>LANCE_LANGUAGE_MODEL_HOME</code> points there).</p>
+<h2 id="2-sources-read-only-copies-port-from-these-never-from-memory">2. Sources (read-only copies -- port from these, never from memory)<a class="headerlink" href="#2-sources-read-only-copies-port-from-these-never-from-memory" title="Permanent link">&para;</a></h2>
+<p><code>/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchpad/crates/</code> (re-download with
+<code>curl -sSfL https://static.crates.io/crates/&lt;name&gt;/&lt;name&gt;-&lt;version&gt;.crate | tar -xz</code> if gone):
+- <code>jieba-rs/jieba-rs-0.10.0/src/lib.rs</code>: <code>with_dict</code> / <code>load_dict</code> / <code>add_word</code> (dictionary parsing, the frequency
+  total, <code>log</code> of probabilities), <code>dag</code>, <code>calc</code> (the route: ties and the float arithmetic exactly), <code>cut_internal</code>
+  (the block regexes <code>RE_HAN_DEFAULT</code> / <code>RE_SKIP_DEFAULT</code> -- line ~125 -- and what happens to skipped text),
+  <code>cut_dag_hmm</code>, <code>cut_for_search</code> and <code>tokenize(.., TokenizeMode::Search, hmm = true)</code> (the 2- and 3-character
+  grams, token start / end in characters).
+- <code>jieba-rs/jieba-rs-0.10.0/src/hmm.rs</code>: Viterbi (<code>MIN_FLOAT</code>, <code>ALLOWED_PREV_STATUS</code>, the order states are tried
+  in, how ties are broken), <code>RE_SKIP</code>.
+- <code>jieba-macros/jieba-macros-0.10.0/src/hmm.model</code>: the built-in HMM (initial, transition, emission
+  probabilities) that jieba uses when no model is set (Lance sets none), and <code>src/lib.rs</code> (how it is parsed).
+- <code>lance-tokenizer/lance-tokenizer-12.0.0/src/jieba.rs</code>: how jieba's tokens become Lance tokens (offsets, <code>position =
+  token.start</code> in characters, <code>position_length</code>).
+- <code>lance-index/lance-index-12.0.0/src/scalar/inverted/tokenizer/jieba.rs</code>: <code>config.json</code> (<code>main</code>, <code>users</code>),
+  <code>dict.txt</code> by default, the errors; and <code>tokenizer.rs</code> / <code>document_tokenizer.rs</code> next to it: how
+  <code>base_tokenizer = "jieba/&lt;model&gt;"</code> resolves <code>&lt;model&gt;</code> under <code>LANCE_LANGUAGE_MODEL_HOME</code> (and its default when
+  unset), which filters (lower_case, stem, stop words, ascii folding, max_token_length) apply after jieba.
+- Licences: jieba-rs and jieba-macros are MIT (<code>Cargo.toml</code>). Copy their licence text and copyright lines from the
+  crates' files (if a crate ships no LICENSE file, from the <code>repository</code> its Cargo.toml names, at the tag of that
+  version) into <code>THIRD-PARTY-LICENSES.md</code>, never from memory.</p>
+<h2 id="3-measure-first-pylance-1200-is-the-oracle">3. Measure first (pylance 12.0.0 is the oracle)<a class="headerlink" href="#3-measure-first-pylance-1200-is-the-oracle" title="Permanent link">&para;</a></h2>
+<p>Probes in <code>/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchpad/j-work/</code>:
+1. With jieba-rs's own full dictionary (<code>jieba-rs-0.10.0/src/data/dict.txt</code>, 5 MB) as a model directory
+   (<code>&lt;dir&gt;/jieba/full/dict.txt</code>), pylance's index over a few thousand mixed Chinese / ASCII / punctuation / emoji /
+   number sentences: the token list of each document (pylance's <code>tokenize</code> helpers, or read its index's
+   <code>part_0_tokens.lance</code> and the posting lists), and full_text_query results with scores.
+2. The same with the tests' tiny dictionary (8 entries: the HMM decides most words).
+3. What pylance writes in the index metadata (params JSON) for <code>base_tokenizer="jieba/default"</code>, and where it looks
+   for the model at search time.</p>
+<h2 id="4-implementation">4. Implementation<a class="headerlink" href="#4-implementation" title="Permanent link">&para;</a></h2>
+<ul>
+<li>C++ (<code>src/index/fts/fts_tokenizer.cpp</code> and a new <code>src/index/fts/fts_jieba.cpp</code>): the dictionary (a trie or hash of prefixes: jieba-rs
+  uses a double-array trie; any structure giving the same DAG is fine), the DAG, the route, the HMM Viterbi, search
+  mode, the block regexes written as character-class code (no <code>&lt;regex&gt;</code>). Every float operation in the order
+  jieba-rs does it (<code>f64</code>).</li>
+<li>The built-in HMM model: embedded zstd-compressed (nanolance already links zstd), parsed on first use, behind a
+  CMake option <code>NANOLANCE_WITH_JIEBA</code> (default ON; the wasm build sets it OFF: there a jieba index is refused by
+  name). Report the size the embedded model adds to the Python extension.</li>
+<li>Models: <code>base_tokenizer="jieba/&lt;name&gt;"</code> loads <code>&lt;LANCE_LANGUAGE_MODEL_HOME&gt;/jieba/&lt;name&gt;/</code> (config.json or
+  dict.txt) when an index is built and when it is searched (as Lance does: measure 3.3); errors as pylance raises them
+  (the targets: OSError for a missing user or main dictionary).</li>
+<li>Both directions: nanolance searches a jieba index pylance built, pylance searches one nanolance built, results and
+  scores equal.</li>
+</ul>
+<h2 id="5-tests-you-write">5. Tests you write<a class="headerlink" href="#5-tests-you-write" title="Permanent link">&para;</a></h2>
+<p><code>bindings/python/tests/test_fts_jieba.py</code> (<code>require_pylance()</code>): 3.1 and 3.2 through both engines (token lists equal
+document by document; queries' rows and scores equal to 1e-6), each engine searching the other's index, user
+dictionaries, the error cases. Point <code>LANCE_LANGUAGE_MODEL_HOME</code> at a temporary directory you build in the test
+(copy the 5 MB dictionary in only if the test can find the crate copy; otherwise use a dictionary the test writes:
+no test may download).</p>
+<h2 id="6-rules">6. Rules<a class="headerlink" href="#6-rules" title="Permanent link">&para;</a></h2>
+<p><code>AGENTS.md</code> sections 5 and 7. No skipped or weakened tests; no <code>except Exception</code> around failures. The local native
+build has <code>-DNANOLANCE_WERROR=ON</code>: delete helpers you stop using. Check the wasm build still configures and builds
+with jieba OFF (<code>source /home/user/emsdk/emsdk_env.sh</code> if present; else say so in the report). Do not add fields to
+Python classes that mirror pylance's. Do not commit, push, change branches, or run <code>--update</code>. <strong>Every other
+tokenizer's output must stay byte-identical</strong> (the existing FTS tests must pass unchanged). Builds:
+<code>cd build &amp;&amp; ninja</code>, then <code>cd bindings/python &amp;&amp; python3 -m pip install -q -e .</code> (always <code>python3 -m pip</code>). Run each
+full suite once, at the end; the bindings suite with <code>| grep -E "^(FAILED|ERROR)|passed|failed" | tail -15</code>.</p>
+<h2 id="7-stop-and-ask-question-first-in-the-report">7. Stop and ask (question first in the report)<a class="headerlink" href="#7-stop-and-ask-question-first-in-the-report" title="Permanent link">&para;</a></h2>
+<ul>
+<li>a token list differs from pylance's and the jieba-rs source does not explain it;</li>
+<li>the embedded model would add more than 1 MB to the Python extension;</li>
+<li>a pylance test that passes today fails.</li>
+</ul>
+<h2 id="8-done-and-report">8. Done and report<a class="headerlink" href="#8-done-and-report" title="Permanent link">&para;</a></h2>
+<p>Tails of: <code>cd build &amp;&amp; ctest -j4 | tail -3</code>; your new tests; the targets through nanolance (<code>cd
+/home/user/nanolance/.deps/pylance-tests/v12.0.0 &amp;&amp; python3 -m pytest -o addopts= -q -p
+nanolance.lance._pytest_plugin &lt;target ids&gt; | tail -5</code>); <code>python3 tools/pylance_suite.py | tail -4</code> (add the passing
+targets to <code>tests/pylance_suite/expected_pass.txt</code> by hand); last, once, the full bindings suite. Report under 40
+lines: questions first, then files, per-target status, tails, sizes, decisions.</p>
+<p><strong>J outcome (2026-10-22): done.</strong> <code>src/index/fts/fts_jieba.cpp</code> ports jieba-rs 0.10 (dictionary loading, the DAG and
+route, cut_dag_hmm, the HMM Viterbi with jieba-macros's built-in model, cut_internal, cut_for_search) with its
+comparisons and float order; <code>base_tokenizer="jieba"</code> / <code>"jieba/&lt;model&gt;"</code> loads <code>&lt;LANCE_LANGUAGE_MODEL_HOME or the
+local data dir&gt;/lance/language_models/jieba/&lt;model&gt;</code> (dict.txt, or config.json's main and users), cached by
+file stamps; each token is emitted at its first character's offset, through Lance's filters. The HMM model is
+embedded zstd-compressed (170 KB; <code>tools/fts_jieba_hmm.py</code>, checked byte-equal to a fresh packing),
+<code>NANOLANCE_WITH_JIEBA</code> (ON; OFF for wasm). Measured against pylance: per-document token sets equal for 60
+documents x {jieba-rs's full 5 MB dictionary, the tests' 8-word one} x {filters on, off}; 1112 + 800 query
+answers (term and phrase, both engines, each searching the other's index) equal. The 4 pylance targets pass
+(expected list 1259). <strong>pylance 12 aborts the process</strong> (a 96 GiB allocation) on some jieba queries, on its own
+index and on nanolance's alike (4 of 200 random queries, e.g. 习以成风, 不食烟火: search-mode tokens step back
+in position); nanolance answers them. The tests take pylance's answers in a child process for that reason.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Apache-2.0
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/yoavbendor/nanolance" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
+      
+    
+  </body>
+</html>

@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -816,7 +816,7 @@
 fresh session: <strong>S1</strong> projection expressions, <strong>S2</strong> <code>ds.sql(...)</code>. ~15 of pylance's tests.</p>
 <h2 id="0-context-budget">0. Context budget<a class="headerlink" href="#0-context-budget" title="Permanent link">&para;</a></h2>
 <p>About 100k tokens per session. <code>grep -n</code> then <code>sed -n</code> windows of at most ~120 lines; never read
-<code>bindings/python/nanolance/lance/dataset.py</code> (3.5k+), <code>src/expr.cpp</code> (3k+), <code>src/dataset_ops.cpp</code>
+<code>bindings/python/nanolance/lance/dataset.py</code> (3.5k+), <code>src/expr/expr.cpp</code> (3k+), <code>src/dataset/dataset_ops.cpp</code>
 or <code>bindings/python/src/nanolance_bindings.cpp</code> whole. Cut all output. Real pylance 12.0.0 is
 <code>import lance</code> in plain <code>python3</code>: measure every behaviour there first. Write nanolance's own code.</p>
 <h2 id="1-facts">1. Facts<a class="headerlink" href="#1-facts" title="Permanent link">&para;</a></h2>
@@ -824,8 +824,8 @@ or <code>bindings/python/src/nanolance_bindings.cpp</code> whole. Cut all output
 <code>Expression::parse</code>, <code>bind(schema)</code>, <code>filter(batch)</code>, <strong><code>evaluate(batch, type, out)</code></strong> and
 <strong><code>result_type(name, out)</code></strong> (int64 for integer arithmetic, float64 with a float, utf8 for string
 functions, bool for predicates), with <code>lower</code>, <code>upper</code>, <code>length</code>, <code>abs</code>, <code>coalesce</code>, <code>json_get_*</code>,
-<code>json_array_length</code>, <code>arrow_cast</code>, ... (grep the function table near src/expr.cpp:1170).
-<code>add_columns</code> with SQL expressions uses them (src/dataset_ops.cpp ~1409): the model for evaluating
+<code>json_array_length</code>, <code>arrow_cast</code>, ... (grep the function table near src/expr/expr.cpp:1170).
+<code>add_columns</code> with SQL expressions uses them (src/dataset/dataset_ops.cpp ~1409): the model for evaluating
 expressions over scanned batches.</p>
 <p><strong>S1 -- projection expressions</strong> (<code>test_dataset.py::test_take_with_projection</code>,
 <code>test_nested_projection_list</code>, <code>test_dynamic_projection</code>, <code>test_schema_evolution.py::
@@ -973,10 +973,10 @@ dataset</code> (no columns) is an error here. Task SQL_SURFACE done.</p>
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

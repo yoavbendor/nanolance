@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -839,8 +839,8 @@ for AI users", Wave 0, item T1. One session.</p>
 <h2 id="0-context-budget-read-this-first">0. Context budget (read this first)<a class="headerlink" href="#0-context-budget-read-this-first" title="Permanent link">&para;</a></h2>
 <p>Budget about 200k tokens; aim for 100k:
 - Never read a large file whole: <code>grep -n</code>, then <code>sed -n 'A,Bp'</code> windows of at most ~120 lines.
-  Big ones: <code>src/dataset.cpp</code>, <code>src/dataset_ops.cpp</code>, <code>src/dataset_transaction.cpp</code>,
-  <code>src/manifest_writer.cpp</code>, <code>bindings/python/nanolance/lance/dataset.py</code> (3.5k+ lines).
+  Big ones: <code>src/dataset/dataset.cpp</code>, <code>src/dataset/dataset_ops.cpp</code>, <code>src/table/dataset_transaction.cpp</code>,
+  <code>src/table/manifest_writer.cpp</code>, <code>bindings/python/nanolance/lance/dataset.py</code> (3.5k+ lines).
 - Cut output: <code>| tail -15</code> for pytest (add <code>-o addopts=</code>), <code>| tail -5</code> for <code>tools/pylance_suite.py</code>,
   <code>ninja 2&gt;&amp;1 | grep -E "error|warning:" | head</code>.</p>
 <h2 id="1-goal">1. Goal<a class="headerlink" href="#1-goal" title="Permanent link">&para;</a></h2>
@@ -884,14 +884,14 @@ writer flags field 10 (tag <code>0x50</code>), each followed by the varint value
 (copy it into the test; do not import from the scratchpad).</p>
 <h2 id="3-where-things-are-in-nanolance">3. Where things are in nanolance<a class="headerlink" href="#3-where-things-are-in-nanolance" title="Permanent link">&para;</a></h2>
 <ul>
-<li>Every manifest is decoded in one place: <code>load_manifest_source</code> in <code>src/manifest_reader.cpp</code> (about
+<li>Every manifest is decoded in one place: <code>load_manifest_source</code> in <code>src/table/manifest_reader.cpp</code> (about
   line 194, <code>pb::decode_manifest</code>). The paired-bit check and the reader check go there or right after,
   so the C++ library, the Python binding and lance-c all refuse.</li>
 <li>Flag constants: <code>generated/lance_minimal.pb.hpp</code> (about line 173, <code>kFlag*</code>) and
   <code>include/nanolance/overlays.hpp</code> (<code>kFlagDataOverlays</code>). Add the supported mask there as one constant.</li>
 <li>Writes: find the one function every commit's manifest goes through (<code>grep -n "write_manifest\|commit_next_version" src/*.cpp</code>).
   Check the writer word of the manifest the write was made from, and of the latest version when a
-  commit rebases. <code>src/manifest_writer.cpp</code> (about line 433) copies the prior manifest's flags into
+  commit rebases. <code>src/table/manifest_writer.cpp</code> (about line 433) copies the prior manifest's flags into
   the new one: that is how an unknown bit is carried forward today.</li>
 <li>Python error types: see how the binding turns a C++ error into <code>ValueError</code> or <code>OSError</code>
   (<code>grep -n "OSError\|ValueError" bindings/python/nanolance/lance/dataset.py | head -40</code>). Match pylance's
@@ -1016,10 +1016,10 @@ with pylance: whether a refused overwrite leaves an unreferenced data file behin
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

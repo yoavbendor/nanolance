@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -1031,6 +1031,28 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#known-issue-open-handles-to-deleted-data-files-found-and-fixed-2026-10-23" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ~~Known issue: open handles to deleted data files~~ (found and fixed 2026-10-23)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#known-gap-reading-files-of-large-binary-values-found-and-fixed-2026-10-23" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ~~Known gap: reading files of large binary values~~ (found and fixed 2026-10-23)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#when-the-lance-pin-moves-past-120" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1265,7 +1287,7 @@ before it and against pylance 12.0.0 (<code>tools/bench_matrix.py</code>, <code>
   uint8-valued, apparently per-bit majority (k-modes; whether seeded is unverified). The float-only
   vector path (NearestQuery::key, IVF partitions, the builder) needs a uint8 element type -- several
   sessions.
-- ~~MSVC: <code>__int128</code> in src/row_ids.cpp and src/expr.cpp~~ Done 2026-10-17: <code>src/int128.hpp</code> (two 64-bit words without <code>__int128</code>; <code>-DNANOLANCE_PORTABLE_INT128</code> forces it, built and ctest-passed on Linux), and <code>__builtin_clz</code> in src/fts_index_build.cpp replaced by <code>std::bit_width</code>. Not yet built with MSVC itself (run the manual Windows job). <code>-DNANOLANCE_WERROR=ON</code> builds clean with this GCC again (2026-10-17).
+- ~~MSVC: <code>__int128</code> in src/table/row_ids.cpp and src/expr/expr.cpp~~ Done 2026-10-17: <code>src/base/int128.hpp</code> (two 64-bit words without <code>__int128</code>; <code>-DNANOLANCE_PORTABLE_INT128</code> forces it, built and ctest-passed on Linux), and <code>__builtin_clz</code> in src/index/fts/fts_index_build.cpp replaced by <code>std::bit_width</code>. Not yet built with MSVC itself (run the manual Windows job). <code>-DNANOLANCE_WERROR=ON</code> builds clean with this GCC again (2026-10-17).
 - ~~Count from an exact scalar-index mask without reading (<code>CountFromMask</code>)~~ Done 2026-10-17 (BTREE / BITMAP, deletions, updates, partial coverage; +3). <code>io_stats_incremental()</code> done 2026-10-17 (+1): read / write IOPs and bytes from process-wide counters, each dataset object reporting the change since its own last call -- reads by other dataset objects in between are included (pylance counts per object). Left: LABEL_LIST exactness, the ScalarIndexQuery metrics in the count plan. Scan statistics done 2026-10-17 (<code>scan_stats_callback</code>, <code>ScanStatistics</code>; the 4 cache hit / miss tests). Left there: nanolance's index caches are process-wide (keyed by file path), pylance's are per dataset session -- a fresh dataset object hits where pylance misses; making them per-session means threading a session through the index loaders. Hit / miss counts for FTS and phrase queries differ in number from pylance's (direction matches); <code>indices_loaded</code> and <code>index_comparisons</code> are 0.
 - ~~<code>lance._datagen</code>~~ Done 2026-10-17: answers as a pylance wheel built without datagen (pylance's own wheel), so test_datagen.py imports, 1 passes, 3 skip.
 - ~~Expression grammar: list / bracket indexing (<code>l[1]</code>, <code>s['x']</code>, <code>list_struct[1]['x']</code>) and a float16 list cast in projections and filters (SQL_SURFACE S1: <code>test_nested_projection_list</code>, <code>test_dynamic_projection_with_vectors_index</code>).~~ Done 2026-10-16 (<code>docs/tasks/EXPR_TYPES.md</code>, phases A-C; what is left is listed there).
@@ -1273,7 +1295,7 @@ before it and against pylance 12.0.0 (<code>tools/bench_matrix.py</code>, <code>
 - ~~KNN column placement: with <code>with_row_id=True</code> and <code>_rowid</code> in <code>columns</code>, pylance puts <code>_rowid</code> last; pylance adds <code>_rowid</code> to <code>fast_search</code> output (PY_SURFACE_2 Q3 notes).~~ Done 2026-10-17 (also <code>_rowaddr</code>; measured on flat and IVF_FLAT).
 - ~~Validate INVERTED / tokenize <code>language</code> names against Lance's list (pylance raises ValueError for unknown names; nanolance accepts them when stemming and stop words are off).~~ Done 2026-10-17 (pylance's 18 names, case-sensitive, any tokenizer). Left: stemming and stop words for languages other than English; ~~<code>language=None</code>~~ (TypeError as pylance, 2026-10-17).
 - Seen once under load (2026-10-17, two full runs at once): <code>test_hnsw.py::test_new_kinds_match_pylance[True-dot-IVF_SQ]</code> failed; passes alone and in its file.
-- Rare failures in <code>tests/test_index_optimize.py</code> (~1 run in 15-90): <code>test_optimize_after_append[nanolance]</code> (IVF_PQ <code>vec2</code> distances after pylance's vs nanolance's <code>optimize_indices</code> differ; captured 2026-10-16: pylance's copy returned consistently larger distances) and once <code>test_vector_model_kept_or_retrained</code> (captured in CI 2026-10-20 on dcc8622: <code>operands could not be broadcast together with shapes (3,16) (4,16)</code> -- the two engines' optimized models ended with 3 and 4 centroids, so a partition join / split decision differed on the unseeded model). Found so far: IVF k-means is unseeded in both engines (pylance's partition sizes vary run to run as much as nanolance's), so each run tests a different index; with the default target both engines join the 4 partitions into one and pick the same survivor (20 probe runs, identical centroids); pylance's optimized index keeps some deleted rows (3767-3781 rows vs nanolance's 3760 live). Next: a seeded build loop that saves the datasets of a mismatching run, then diff the two optimized indexes partition by partition (codes, row ids). Probe scripts: scratchpad flaky3/probe*.py (recreate from this note if gone).
+- (2026-10-21: <code>test_vector_model_kept_or_retrained</code> fixed -- seeded, its premise asserted; <code>test_optimize_after_append[nanolance]</code>'s mismatch did not recur in 60 repetitions of its vec2 check.) Rare failures in <code>tests/test_index_optimize.py</code> (~1 run in 15-90): <code>test_optimize_after_append[nanolance]</code> (IVF_PQ <code>vec2</code> distances after pylance's vs nanolance's <code>optimize_indices</code> differ; captured 2026-10-16: pylance's copy returned consistently larger distances) and once <code>test_vector_model_kept_or_retrained</code> (captured in CI 2026-10-20 on dcc8622: <code>operands could not be broadcast together with shapes (3,16) (4,16)</code> -- the two engines' optimized models ended with 3 and 4 centroids, so a partition join / split decision differed on the unseeded model). Found so far: IVF k-means is unseeded in both engines (pylance's partition sizes vary run to run as much as nanolance's), so each run tests a different index; with the default target both engines join the 4 partitions into one and pick the same survivor (20 probe runs, identical centroids); pylance's optimized index keeps some deleted rows (3767-3781 rows vs nanolance's 3760 live). Next: a seeded build loop that saves the datasets of a mismatching run, then diff the two optimized indexes partition by partition (codes, row ids). Probe scripts: scratchpad flaky3/probe*.py (recreate from this note if gone).
 - External blob URIs under a registered base path: the descriptor should carry the base id and a
   base-relative URI (pylance's <code>test_blob_extension_write_fragments_external_registered_base</code>).
   Found by the multi-base phase C session; touches the external-blob writer, so left to Opus.
@@ -1304,7 +1326,7 @@ plain append / update / scan comes before a whole subsystem.</p>
 <tbody>
 <tr>
 <td>1</td>
-<td>~~Writes with part of the schema~~ -- <strong>done (2026-10-08)</strong>: appends of some columns (files hold only those, as Lance's do), <code>merge_insert</code> with part of the columns, <code>when_matched_delete</code> / <code>fail</code>, the primary key as default <code>on</code>; 12 more of pylance's tests pass. Left: <code>write_mode("rewrite_columns")</code> writes whole rows (same results, other layout)</td>
+<td>~~Writes with part of the schema~~ -- <strong>done (2026-10-08)</strong>: appends of some columns (files hold only those, as Lance's do), <code>merge_insert</code> with part of the columns, <code>when_matched_delete</code> / <code>fail</code>, the primary key as default <code>on</code>; 12 more of pylance's tests pass. <code>write_mode("rewrite_columns")</code> patches the source columns into the matched rows' fragments and stamps their row versions (2026-10-23; one with an update condition is still written as whole rows)</td>
 <td>~10</td>
 </tr>
 <tr>
@@ -1339,7 +1361,7 @@ plain append / update / scan comes before a whole subsystem.</p>
 </tr>
 <tr>
 <td>1</td>
-<td>~~Compaction parity~~ -- <strong>mostly done (2026-10-08)</strong>: Lance's planner exactly (candidacy by physical rows, runs broken by exclusions and by index coverage, split_for_size, source budgets, zero refused), <code>max_bytes_per_file</code> / <code>batch_size</code>, and Lance's two commits (ReserveFragments, then Rewrite); a differential test plans 16 random datasets as pylance does. Left: remapping an index's row addresses in the Rewrite (nanolance re-covers the rewritten fragments with a delta in a third version, so an indexed compaction is one version more and indexes an appended fragment Lance leaves unindexed), <code>defer_index_remap</code>, <code>Compaction.plan</code> / distributed compaction</td>
+<td>~~Compaction parity~~ -- <strong>mostly done (2026-10-08)</strong>: Lance's planner exactly (candidacy by physical rows, runs broken by exclusions and by index coverage, split_for_size, source budgets, zero refused), <code>max_bytes_per_file</code> / <code>batch_size</code>, and Lance's two commits (ReserveFragments, then Rewrite); a differential test plans 16 random datasets as pylance does. Left: remapping an index's row addresses in the Rewrite (nanolance re-covers the rewritten fragments with a delta in a third version, so an indexed compaction is one version more; since 2026-10-23 that delta takes back only the fragments that replaced covered ones, as Lance's remap, a zone map is left to optimize_indices, and <code>remap_row_addrs</code> follows rows through the fragment-reuse index), <code>defer_index_remap</code>, <code>Compaction.plan</code> / distributed compaction</td>
 <td>~10</td>
 </tr>
 <tr>
@@ -1410,7 +1432,7 @@ still refuses.</p>
 (<code>docs/REAL_DATASETS.md</code>). None mismatched. Two gaps matter most for what people actually store:</p>
 <ul>
 <li><strong>Done (2026-10-01): Lance file format 2.0</strong> (footer <code>0.3</code>), all 6 refusals. LanceDB wrote 2.0 by
-  default, so most LanceDB tables on the Hub are 2.0 (281 of 621 tables). <code>src/lance_v20_decoder.cpp</code>
+  default, so most LanceDB tables on the Hub are 2.0 (281 of 621 tables). <code>src/encoding/lance_v20_decoder.cpp</code>
   reads the <code>ArrayEncoding</code> tree of <code>encodings_v2_0.proto</code> (Flat, Nullable, Binary, Dictionary,
   FixedSizeList, FixedSizeBinary, List, Struct, PackedStruct, Fsst, both bit-packings, blob
   columns) into the same <code>ColumnValues</code> as 2.1, decoding only the rows a range or take needs. 57
@@ -1727,7 +1749,7 @@ round-trips pylance → nanolance → pylance.</p>
 </tr>
 </tbody>
 </table>
-<p><strong>Status:</strong> C0 done — <a href="../NESTED_COLUMNS/">NESTED_COLUMNS.md</a>. C1 done — <code>src/repdef.cpp</code>, tested
+<p><strong>Status:</strong> C0 done — <a href="../NESTED_COLUMNS/">NESTED_COLUMNS.md</a>. C1 done — <code>src/encoding/repdef.cpp</code>, tested
 against Lance's own <code>repdef.rs</code> vectors and fuzzed (<code>fuzz_repdef</code>). <strong>C2, C3, C4 and C7 done</strong>, and
 the <code>list&lt;list&lt;…&gt;&gt;</code> part of C5: every flat leaf type, null/empty lists and null items, dictionary and
 constant pages inside lists, row ranges and deletions (<code>tests/test_lance_lists.py</code>, 66 cases against
@@ -1764,7 +1786,7 @@ map type — it is stored as a list of (key, value) structs, so it needed only t
 </tbody>
 </table>
 <p>The read side has to come first: it is the oracle for the write side, alongside pylance.</p>
-<p><strong>Status:</strong> D1 done — <code>repdef::serialize</code> in <code>src/repdef.cpp</code>. Property test: 20,000 random nested
+<p><strong>Status:</strong> D1 done — <code>repdef::serialize</code> in <code>src/encoding/repdef.cpp</code>. Property test: 20,000 random nested
 columns (lists and structs at depths 1–4, nulls and empties at every layer, garbage children under
 null lists) serialized over a random row range and unravelled back, compared row by row; two
 deliberate mutations fail it thousands of times. <strong>D2 done:</strong> lists, large lists, maps, lists of
@@ -2031,7 +2053,7 @@ write.</p>
 <tr>
 <td>T1</td>
 <td>~~<strong>Refuse manifests whose feature flags nanolance does not support</strong>, on open and on write~~ -- <strong>done 2026-10-19</strong> (<code>docs/tasks/FEATURE_FLAGS.md</code>)</td>
-<td>missing: <code>reader_feature_flags</code> is not checked when a dataset opens, and a write copies the prior manifest's flags (<code>src/manifest_writer.cpp</code>, about line 433)</td>
+<td>missing: <code>reader_feature_flags</code> is not checked when a dataset opens, and a write copies the prior manifest's flags (<code>src/table/manifest_writer.cpp</code>, about line 433)</td>
 <td>copy Lance 12's supported set and its paired-flag rules (<code>ensure_can_read_manifest</code>, <code>can_write_dataset</code>) into the brief; check that nanolance honours bit 5 (no transaction file) and bit 7 (covered index metadata)</td>
 <td>1 session</td>
 <td>a dataset from a newer Lance (fragment tree: <code>fragments</code> is empty) would read as an empty table, and a write could drop a feature it does not understand. pylance refuses both</td>
@@ -2149,7 +2171,7 @@ write.</p>
 <tbody>
 <tr>
 <td>8</td>
-<td><strong>Object-store writes</strong> with atomic commits (conditional put) (W1-W4 done 2026-10-21, <code>docs/OBJECT_STORE_WRITES.md</code>: every write on <code>s3://</code> but <code>cleanup_old_versions</code> (its C++ walks <code>_versions/</code> with <code>std::filesystem</code>: still refused) and <code>migrate_manifest_paths_v2</code> (local only by design); <code>tools/s3_real_check.py</code> exercises it all on a real bucket. Found by that script on 2026-10-21 and fixed: objects over 8 MiB uploaded as 0 bytes (the spill path), packed / dedicated blobs not readable from S3. Left: cleanup on S3, W5)</td>
+<td><strong>Object-store writes</strong> with atomic commits (conditional put) (W1-W4 done 2026-10-21, <code>docs/OBJECT_STORE_WRITES.md</code>: every write on <code>s3://</code> but <code>migrate_manifest_paths_v2</code> (local only by design); <code>cleanup_old_versions</code> on S3 since 2026-10-21 (Lance's rules on the store's LastModified, every option, branch forks kept; equal to a local copy and to pylance's own cleanup on moto; auto cleanup on commit too, since 2026-10-22); <code>tools/s3_real_check.py</code> exercises it all on a real bucket. Found by that script on 2026-10-21 and fixed: objects over 8 MiB uploaded as 0 bytes (the spill path), packed / dedicated blobs not readable from S3. Left: uploading while encoding (W5 speed))</td>
 <td>--</td>
 <td>Opus design, then sessions</td>
 <td>write training sets straight to object storage</td>
@@ -2157,10 +2179,10 @@ write.</p>
 </tr>
 <tr>
 <td>9</td>
-<td><strong>Multi-word top-k (WAND / MaxScore)</strong></td>
+<td>~~<strong>Multi-word top-k (WAND / MaxScore)</strong>~~ (done 2026-10-21: block-max MaxScore for OR queries with a limit, <code>Search::match_pruned</code> in <code>src/index/fts/fts_search.cpp</code>; on 500k Zipf documents a query with a common word took 6-9 ms, 0.2-0.5x pylance (the "about 2x" was measured on rare words), now 0.4-2.2 ms, 1.8-6x pylance (<code>bench/fts_or_queries.py</code>); rows and scores bit-identical to the exhaustive search (<code>tests/test_fts_pruning.py</code>, which a too-tight bound fails); AND, phrase and fuzzy queries still score exhaustively)</td>
 <td>0 (speed only)</td>
 <td>Opus: design and verdict; Haiku for mechanical parts</td>
-<td>multi-term queries (already about 2x pylance)</td>
+<td>multi-term queries</td>
 <td>same results and scores; reviewer's A/B faster</td>
 </tr>
 <tr>
@@ -2173,15 +2195,15 @@ write.</p>
 </tr>
 <tr>
 <td>11</td>
-<td><strong>icu / jieba / lindera tokenizers</strong></td>
+<td><strong>icu / jieba / lindera tokenizers</strong> (measured 2026-10-21 from the Lance 12 sources: jieba = jieba-rs 0.10 (MIT; dictionaries come from <code>LANCE_LANGUAGE_MODEL_HOME</code>, only its 0.5 MB HMM model would be embedded) -- phase J done 2026-10-22 on the high-risk branch (<code>docs/tasks/TOKENIZERS_J.md</code>, +4 pylance tests); icu = ICU4X <code>WordSegmenter::new_dictionary</code>: system ICU4C 74 gives the same tokens on 28 of 29 probe sentences across 15 scripts, one Japanese dictionary split differs (pylance はい</td>
+<td>い, ICU4C は</td>
+<td>いい), so an ICU4C backend would be close, not equal -- deferred; lindera = Lindera 3.0.7's lattice morphological analyser over Lindera 3 dictionaries -- phase L done 2026-10-22 on the high-risk branch (<code>docs/tasks/TOKENIZERS_L.md</code>, +7 pylance tests; token filters and the non-mapping character filters refused))</td>
 <td>20</td>
 <td>Opus: licences (copied from the source trees, never from memory) and dictionary packaging; then 2-3 sessions</td>
-<td>multilingual RAG</td>
-<td>the 20 pass</td>
 </tr>
 <tr>
 <td>12</td>
-<td><strong>MemWAL</strong></td>
+<td><strong>MemWAL</strong> (M1 done 2026-10-22 on the high-risk branch, <code>docs/tasks/MEMWAL_M1.md</code>: initialize_mem_wal, the <code>__lance_mem_wal</code> index, sharding specs; +13 pylance tests. Left: M2, the LSM write and read path, 7 tests)</td>
 <td>20</td>
 <td>Opus design (a subsystem)</td>
 <td>real-time agent memory</td>
@@ -2216,7 +2238,7 @@ write.</p>
 <td>T2</td>
 <td>~~<strong>Lance's conflict rules in the C++ commit path</strong>~~ (done 2026-10-20, <code>docs/tasks/CONFLICTS.md</code> C1-C3: Lance 12's check_txn in C++, incompatible pairs refused with Lance's message, compatible pairs rebased without re-running, concurrent deletes merged, mutations and index builds commit from the handle's version; left: key-existence filter for PK merge_insert, rebase on stable-row-id datasets)</td>
 <td>2</td>
-<td>partial: C++ rebases only when the other writers just added fragments (<code>src/dataset.cpp</code> <code>rebase</code>); anything else fails as "commit conflict" and the operation re-runs. The Python transaction API has the fuller matrix (<code>_transactions.py</code> <code>conflict_with</code>)</td>
+<td>partial: C++ rebases only when the other writers just added fragments (<code>src/dataset/dataset.cpp</code> <code>rebase</code>); anything else fails as "commit conflict" and the operation re-runs. The Python transaction API has the fuller matrix (<code>_transactions.py</code> <code>conflict_with</code>)</td>
 <td>the rebasable pairs from the transaction spec (Delete or Update deletion masks merged, CreateIndex pairs, ReserveFragments) and a two-writer test harness</td>
 <td>1-2 sessions</td>
 <td>ingestion, deduplicating deletes, compaction and index builds run at once; every needless conflict re-runs the work</td>
@@ -2234,9 +2256,9 @@ write.</p>
 </tr>
 <tr>
 <td>T4</td>
-<td><strong>Arrow dictionary columns on write</strong> (<code>dict:&lt;value&gt;:&lt;key&gt;:false</code>)</td>
+<td>~~<strong>Arrow dictionary columns on write</strong> (<code>dict:&lt;value&gt;:&lt;key&gt;:false</code>)~~ (done earlier; checked 2026-10-21: string / large_string / int64 values with int8 / int32 / uint16 indices and nulls, each engine reads the other's as dictionaries; <code>tests/test_type_support_matrix.py</code> "dictionary")</td>
 <td>1 (filler)</td>
-<td>refused at <code>write_batch</code>; users cast first</td>
+<td>was refused at <code>write_batch</code></td>
 <td>measure how pylance 12 stores a dictionary column and what type it reads back</td>
 <td>1 session</td>
 <td>pandas categoricals and label columns arrive as dictionaries</td>
@@ -2254,7 +2276,7 @@ write.</p>
 </tr>
 <tr>
 <td>T6</td>
-<td><strong>Overlay refinements</strong>: per-row index exclusion with re-evaluation (the spec's exclusion set) in place of searching the fragment unindexed; sparse overlays written as such</td>
+<td><strong>Overlay refinements</strong> (verdict 2026-10-21: low value -- an index is already kept for every overlay that does not touch its fields (<code>fragments_stale_for_index</code> is per field), so "updating labels on an indexed embedding table" stays indexed today; per-row exclusion helps only overlays of the indexed column itself): per-row index exclusion with re-evaluation (the spec's exclusion set) in place of searching the fragment unindexed; sparse overlays written as such</td>
 <td>3</td>
 <td>the fallback is correct but whole-fragment</td>
 <td>the speed verdict stays with Opus</td>
@@ -2264,6 +2286,21 @@ write.</p>
 </tr>
 </tbody>
 </table>
+<h3 id="known-issue-open-handles-to-deleted-data-files-found-and-fixed-2026-10-23">~~Known issue: open handles to deleted data files~~ (found and fixed 2026-10-23)<a class="headerlink" href="#known-issue-open-handles-to-deleted-data-files-found-and-fixed-2026-10-23" title="Permanent link">&para;</a></h3>
+<p><code>src/file/data_file_reader.cpp</code> keeps up to 4 data files open per thread. Files a cleanup deleted stayed open
+there until each thread read other files (on a 192-core machine up to ~770 handles; on NFS the deleted
+files lingered as <code>.nfs*</code> and kept their space). Each thread's cache now has its own lock, held by that
+thread during each read, and every cache is registered: <code>close_data_files_under()</code> (called after cleanup's
+removals, dropping a dataset, removing index directories, and <code>io::remove_output</code>) takes each cache's lock
+and closes the handles under the removed path, so it never closes a handle mid-read.</p>
+<h3 id="known-gap-reading-files-of-large-binary-values-found-and-fixed-2026-10-23">~~Known gap: reading files of large binary values~~ (found and fixed 2026-10-23)<a class="headerlink" href="#known-gap-reading-files-of-large-binary-values-found-and-fixed-2026-10-23" title="Permanent link">&para;</a></h3>
+<p>pylance stores a list<binary> of one value repeated (<code>test_file.py::test_batch_sizes</code>: 300 KB x 1,009 rows)
+as a constant page. nanolance expanded it by appending into an unreserved vector (153 MB, then a 306 MB
+reallocation and copy) and then copied the result into the output (302 MB) on every read: 0.65 s a read,
+2.24 M page faults per 10 reads, against pylance's 0.09 s. The expansion now reserves its size and the first
+page's buffers are taken instead of copied: 0.22 s a read, 0.75 M faults; the test takes 15 s (pylance 20 s,
+before 55 s). Left: one buffer of the full size per read is still faulted in fresh (glibc unmaps buffers this
+large when freed; pylance's pool keeps its pages).</p>
 <h3 id="when-the-lance-pin-moves-past-120">When the Lance pin moves past 12.0<a class="headerlink" href="#when-the-lance-pin-moves-past-120" title="Permanent link">&para;</a></h3>
 <p>Not scheduled; T1 refuses each one until then. Roughly by size:
 - non-reusable field ids: <code>max_allocated_field_id</code> (field 24) with writer flag bit 15, writer-only, small;
@@ -2318,7 +2355,7 @@ and phrase queries from (4) are done).</p>
 section was written 39 of them only returned <code>LANCE_ERR_NOT_SUPPORTED</code>; none does now (2026-10-08):
 the last 20, the index-segment API, are done, and lance-c's own suite passes 106 of 106. All 39 were
 vector search, full-text search or index segments. Much of what they need now exists in nanolance's
-core (Phases 2 and 3 above) and only has to be wired into <code>src/lance_c.cpp</code>. <code>docs/LANCE_C_COMPAT.md</code>
+core (Phases 2 and 3 above) and only has to be wired into <code>src/api/lance_c.cpp</code>. <code>docs/LANCE_C_COMPAT.md</code>
 still calls vector and full-text indexes out of scope; it should be updated along with this work.</p>
 <ol>
 <li>~~<strong>Wire what the core already does</strong>~~ -- <strong>done (2026-10-08)</strong>: vector index creation and
@@ -2451,10 +2488,10 @@ Task A1 makes the tool print all of this itself.</p>
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

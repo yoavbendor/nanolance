@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -873,7 +873,10 @@
 
 
 <h1 id="design-writes-to-object-stores-roadmap-wave-3-item-8">Design: writes to object stores (ROADMAP Wave 3, item 8)<a class="headerlink" href="#design-writes-to-object-stores-roadmap-wave-3-item-8" title="Permanent link">&para;</a></h1>
-<p>Status: W1 done (2026-10-20, Opus); W2-W4 delegated next, W5 by Opus.</p>
+<p>Status: W1-W4 done (2026-10-20/21); every write works on <code>s3://</code> except <code>migrate_manifest_paths_v2</code>
+(local only, 3.2). <code>cleanup_old_versions</code> dates objects by the listing's LastModified (nanos3reader
+<code>ObjectInfo::last_modified_ns</code>); an object the store does not date is treated as just written (kept).
+Auto cleanup on commit runs on object stores too (2026-10-22, as Lance's). W5: races and the S3 checker are in CI; uploading while encoding is left (section 7).</p>
 <h2 id="1-goal">1. Goal<a class="headerlink" href="#1-goal" title="Permanent link">&para;</a></h2>
 <p>Every write nanolance does on a local dataset -- create, append, overwrite, delete, update, merge_insert,
 schema changes, compaction, index builds, tags, branches, cleanup -- also works on <code>s3://</code> (and, through
@@ -900,10 +903,10 @@ endpoints from pylance's <code>storage_options</code>.</p>
 <h2 id="3-design">3. Design<a class="headerlink" href="#3-design" title="Permanent link">&para;</a></h2>
 <h3 id="31-write-side-iobytesink">3.1 Write side: <code>io::ByteSink</code><a class="headerlink" href="#31-write-side-iobytesink" title="Permanent link">&para;</a></h3>
 <p>All bytes nanolance writes go through six places (<code>std::ofstream</code> / <code>fopen</code>): the Lance file writer
-(<code>src/data_file_writer.cpp</code>, also used by every index file via <code>src/index_files.cpp</code>), deletion files
-(<code>src/deletion_vector.cpp</code>), manifests (<code>src/manifest_writer.cpp</code>), transaction files
-(<code>src/transaction_file.cpp</code>), Blob v2 sidecars (<code>src/blob_v2_external.cpp</code>), and refs JSON
-(<code>src/dataset_refs.cpp</code>). Add the write-side twin of <code>io::ByteSource</code>:</p>
+(<code>src/file/data_file_writer.cpp</code>, also used by every index file via <code>src/index/index_files.cpp</code>), deletion files
+(<code>src/table/deletion_vector.cpp</code>), manifests (<code>src/table/manifest_writer.cpp</code>), transaction files
+(<code>src/table/transaction_file.cpp</code>), Blob v2 sidecars (<code>src/file/blob_v2_external.cpp</code>), and refs JSON
+(<code>src/table/dataset_refs.cpp</code>). Add the write-side twin of <code>io::ByteSource</code>:</p>
 <div class="language-cpp highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">namespace</span><span class="w"> </span><span class="nn">nano_lance</span><span class="o">::</span><span class="nn">io</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="k">class</span><span class="w"> </span><span class="nc">ByteSink</span><span class="w"> </span><span class="p">{</span><span class="w">                       </span><span class="c1">// one object being written, streamed</span>
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="k">public</span><span class="o">:</span>
@@ -1018,7 +1021,10 @@ current code moved behind an interface). The wasm build has no sinks for object 
 No credentials in tests or logs beyond moto's <code>testing</code> keys.</p>
 <h2 id="7-later-not-now">7. Later, not now<a class="headerlink" href="#7-later-not-now" title="Permanent link">&para;</a></h2>
 <ul>
-<li>Streaming multipart uploads from memory (no temp file) for the Lance file writer.</li>
+<li>Streaming multipart uploads from memory (no temp file) for the Lance file writer, so parts go up while
+  the file is still being encoded. Measured 2026-10-21 on moto (<code>bench/s3_upload_speed.py</code>): 512 MiB in
+  4.6 s vs pylance's 4.3 s with 8 parts in flight (4.7 / 6.7 s before, with 4); 16 MiB in 0.19 s vs
+  0.12 s, the encode-then-upload gap this would close.</li>
 <li>Parallel uploads of a commit's files (index builds write many).</li>
 <li><code>gs://</code> and <code>az://</code> native clients (today S3-compatible endpoints only).</li>
 </ul>
@@ -1102,10 +1108,10 @@ section 3.3 detects instead. Revisit if a user needs it.</p>
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

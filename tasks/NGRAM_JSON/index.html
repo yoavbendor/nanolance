@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -817,14 +817,14 @@
 <strong>N3</strong> <code>base_tokenizer="ngram"</code> for INVERTED.</p>
 <h2 id="0-context-budget">0. Context budget<a class="headerlink" href="#0-context-budget" title="Permanent link">&para;</a></h2>
 <p>About 100k tokens per session. <code>grep -n</code> then <code>sed -n</code> windows of at most ~120 lines; never read
-<code>dataset.py</code> (3.5k+), <code>src/index_search.cpp</code>, <code>src/scalar_index.cpp</code> or Lance's <code>ngram.rs</code> (2.7k) /
+<code>dataset.py</code> (3.5k+), <code>src/dataset/index_search.cpp</code>, <code>src/index/scalar/scalar_index.cpp</code> or Lance's <code>ngram.rs</code> (2.7k) /
 <code>json.rs</code> (1.7k) whole. Cut all output (<code>| tail -15</code>; pytest <code>-o addopts=</code> for a summary line;
 <code>tools/pylance_suite.py ... | tail -5</code>; <code>ninja 2&gt;&amp;1 | grep -E "error|warning:" | head</code>). Only your
 phase. Lance's source: <code>.deps/rust-suite/lance-index-12.0.0/src/scalar/{ngram.rs,json.rs}</code>,
 <code>.deps/rust-suite/lance-tokenizer-12.0.0/src/{ngram_tokenizer.rs,alphanum_only.rs}</code>. The model for
 adding an index kind is the ZONEMAP / BLOOMFILTER work (<code>docs/tasks/ZONED_INDEXES.md</code>): grep
-<code>ZONEMAP\|ZoneMap\|zonemap</code> in <code>src/scalar_index.cpp src/index_search.cpp src/index_segments.cpp
-src/index_files.cpp src/index_optimize.cpp include/nanolance/scalar_index.hpp
+<code>ZONEMAP\|ZoneMap\|zonemap</code> in <code>src/index/scalar/scalar_index.cpp src/dataset/index_search.cpp src/dataset/index_segments.cpp
+src/index/index_files.cpp src/dataset/index_optimize.cpp include/nanolance/scalar_index.hpp
 bindings/python/nanolance/lance/dataset.py bindings/python/nanolance/lance/indices/builder.py</code> and
 follow the same path. Real pylance is <code>import lance</code> in plain <code>python3</code>; a probe that dumps both
 indexes: <code>/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchpad/ngram/probe.py</code>
@@ -841,7 +841,7 @@ indexes: <code>/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scr
   (one token = the whole value lowered and folded), then <code>NgramTokenizer::all_ngrams(3, 3)</code> over
   characters, then <code>AlphaNumOnlyFilter</code> (keep a trigram only if every char <code>is_ascii_alphanumeric</code>).
   Token id: <code>ngram_to_token</code> (base 37; '0'-'9' -&gt; 1-10, 'a'-'z' -&gt; 11-36; first char * 37^2 ...).
-  nanolance already has lower-case and ASCII-folding code in <code>src/fts_tokenizer.cpp</code>: reuse it.
+  nanolance already has lower-case and ASCII-folding code in <code>src/index/fts/fts_tokenizer.cpp</code>: reuse it.
 - Manifest: <code>type_url</code> <code>/lance.table.NGramIndexDetails</code> (empty message), <code>index_version</code> 0,
   <code>describe_indices()[i].index_type == "NGram"</code>; <code>stats.index_stats(name)</code>: <code>index_type "NGram"</code>,
   <code>indices</code> / <code>segments</code> = <code>[{"num_ngrams": N}]</code>.
@@ -853,7 +853,7 @@ indexes: <code>/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scr
   <code>ngram/ngram_regex.rs</code> -- out of scope (treat as recheck all) unless a target test needs it.
   Results always equal a scan without the index; the plan shows
   <code>ScalarIndexQuery: query=[contains(w, Utf8("apple"))]@w_idx(NGram)</code> (nanolance builds this line in
-  <code>src/index_search.cpp</code> ~1012).
+  <code>src/dataset/index_search.cpp</code> ~1012).
 - Maintenance like the other scalar kinds: <code>optimize_indices</code> deltas, compaction re-cover,
   <code>create_index_uncommitted(index_type="NGRAM", fragment_ids=...)</code>, <code>merge_existing_index_segments</code>,
   <code>commit_existing_index_segments</code>, drop, empty dataset.</p>
@@ -875,10 +875,10 @@ indexes: <code>/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scr
   json_get_string(col, '&lt;path&gt;') &lt;op&gt; literal</code> where the function's type equals the index's <code>&lt;T&gt;</code> and
   the path string equals the index path; plan line
   <code>ScalarIndexQuery: query=[Json(j = 11-&gt;x)]@j_idx(BTree)</code>. <code>json_extract</code> is never routed.
-  nanolance evaluates these functions already (<code>src/expr.cpp</code> ~1650).</p>
+  nanolance evaluates these functions already (<code>src/expr/expr.cpp</code> ~1650).</p>
 <p><strong>ngram tokenizer for INVERTED</strong> (N3): <code>base_tokenizer="ngram"</code>, <code>min_ngram_length</code> (default 3),
 <code>max_ngram_length</code> (default 3), <code>prefix_only</code>; <code>stem</code> / <code>remove_stop_words</code> default false for it.
-Port <code>ngram_tokenizer.rs</code> (221 lines, read whole) into <code>src/fts_tokenizer.cpp</code>'s chain. Oracle
+Port <code>ngram_tokenizer.rs</code> (221 lines, read whole) into <code>src/index/fts/fts_tokenizer.cpp</code>'s chain. Oracle
 <code>test_fts_ngram_tokenizer</code> (read it).</p>
 <h2 id="2-phases-and-oracles">2. Phases and oracles<a class="headerlink" href="#2-phases-and-oracles" title="Permanent link">&para;</a></h2>
 <p>Run pylance's tests through the runner (it loads nanolance as <code>lance</code>):
@@ -920,17 +920,17 @@ Files changed, per-test status, decisions, questions.</p>
   deltas, compaction re-cover, <code>create_index_uncommitted</code> / merge / commit segments,
   <code>test_optimize_indices_second_call_is_noop</code>.
 - <strong>Approved:</strong> a new <code>expr::Predicate::Test::Contains</code> (include/nanolance/expr.hpp ~58), recognized
-  only from <code>contains(&lt;string column&gt;, '&lt;literal&gt;')</code> in the Condition walk (src/expr.cpp ~2980-3050,
+  only from <code>contains(&lt;string column&gt;, '&lt;literal&gt;')</code> in the Condition walk (src/expr/expr.cpp ~2980-3050,
   <code>HasAny</code> / <code>Has</code> are the precedent), with <code>filter()</code>, <code>to_string()</code> (~3189), <code>predicate_node</code>
-  (~3080) and the switch arms in src/index_search.cpp (~407, ~443, ~626, ~790). Row-evaluation
+  (~3080) and the switch arms in src/dataset/index_search.cpp (~407, ~443, ~626, ~790). Row-evaluation
   semantics unchanged.
 - <code>LIKE '%x%'</code> and <code>regexp_like</code> are <strong>not</strong> routed in N1: Lance sends them through
   <code>TextQuery::Regex</code> and <code>ngram/ngram_regex.rs</code> (<code>visit_like</code>, lance-index <code>scalar/expression.rs</code>
   ~970). A later item.
-- Known pieces: <code>write_file</code> / <code>struct_schema</code> (src/index_files.cpp 183-197) drop child field metadata,
+- Known pieces: <code>write_file</code> / <code>struct_schema</code> (src/index/index_files.cpp 183-197) drop child field metadata,
   so <code>posting_list</code> needs a schema carrying <code>lance-encoding:compression = none</code>; the inner bitmaps can
   use <code>roaring::encode</code> (roaring_bitmap.hpp:20); export a lower-case + ASCII-fold helper from
-  <code>Analyzer::emit</code> (src/fts_tokenizer.cpp 395-424) and include non-ASCII cases in the byte test (its
+  <code>Analyzer::emit</code> (src/index/fts/fts_tokenizer.cpp 395-424) and include non-ASCII cases in the byte test (its
   <code>kLower</code> table may differ from Rust's <code>to_lowercase</code> on rare characters: report any difference).</p>
 <p><strong>N1a outcome (2026-10-15):</strong> done. NGRAM build / search / <code>contains</code> routing / plan line / describe /
 stats / drop / empty dataset; token rows and posting bytes equal pylance's (nulls, empty strings,
@@ -957,7 +957,7 @@ cannot build" refusal is now tested with a pylance IVF_RQ index. +4 pylance test
   (supported: btree)</code>; label_list / json / unknown names get pylance's own errors. The other targets
   are a later item.
 - IndexConfig is the only form (no kwargs <code>index_type="JSON"</code>). The plan line and stats name the
-  target (<code>@j_idx(BTree)</code>, <code>index_type "BTree"</code>) -- special-case it in src/index_search.cpp ~1190.</p>
+  target (<code>@j_idx(BTree)</code>, <code>index_type "BTree"</code>) -- special-case it in src/dataset/index_search.cpp ~1190.</p>
 <p><strong>N2 code map (2026-10-15, second investigation session; no code changed).</strong> N2 is split:
 <strong>N2a</strong> = steps 1-3 + their tests, <strong>N2b</strong> = steps 4-6.
 1. Python: <code>create_scalar_index</code> (dataset.py ~973-1017) drops IndexConfig parameters other than
@@ -965,7 +965,7 @@ cannot build" refusal is now tested with a pylance IVF_RQ index. +4 pylance test
    <code>path</code>, the agreed refusals). Native: <code>_ds_create_scalar_index</code>
    (bindings/python/src/nanolance_bindings.cpp:1637) needs a path argument; <code>ScalarIndexOptions</code>
    (include/nanolance/scalar_index.hpp:34) a <code>json_path</code> field.
-2. C++: in <code>create_scalar_index</code> (src/scalar_index.cpp ~1118-1415) the json branch must come before
+2. C++: in <code>create_scalar_index</code> (src/index/scalar/scalar_index.cpp ~1118-1415) the json branch must come before
    the <code>key_kind_of</code> check (it rejects extension types). JSONPath subset: optional leading <code>$</code>,
    dot-separated member names (<code>$['x']</code> -&gt; pylance's "Invalid JSONPath"). Extract per batch into typed
    nanoarrow arrays, type inference with Lance's error text, then the existing <code>write_btree</code> /
@@ -973,10 +973,10 @@ cannot build" refusal is now tested with a pylance IVF_RQ index. +4 pylance test
 3. describe (<code>index_type "Json"</code> from the URL) / stats (as BTree): check both against pylance.
    <code>test_describe_indices</code>' json column is all-null at path "x" -&gt; inferred type Utf8.
 4. Routing: <code>json_get_int/float/bool/string(col, 'k') &lt;op&gt; literal</code> for identifier-like paths only,
-   a new predicate kind as N1's <code>Test::Contains</code>; src/index_search.cpp ~1137-1190, plan line
+   a new predicate kind as N1's <code>Test::Contains</code>; src/dataset/index_search.cpp ~1137-1190, plan line
    <code>@j_idx(BTree)</code> (special-case the type name).
-5. Optimize / merge / compaction re-cover / drop as BTree (src/index_optimize.cpp Kind mapping,
-   src/index_segments.cpp type maps).
+5. Optimize / merge / compaction re-cover / drop as BTree (src/dataset/index_optimize.cpp Kind mapping,
+   src/dataset/index_segments.cpp type maps).
 6. Tests on tmp_path in test_ngram_json_index.py, including the <code>a.b</code> divergence test.</p>
 <p><strong>N2a outcome (2026-10-15):</strong> done. JSON index build (IndexConfig, btree target; JSONPath subset
 <code>$</code> + dotted names, others refused by name), Lance's type inference and messages, BTree pages equal
@@ -1082,10 +1082,10 @@ targets other than btree, pylance's NOT / AND plan text for JSON queries.</p>
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

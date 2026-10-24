@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -830,8 +830,8 @@
 you are given. W4 (cleanup, drop, branches, clones, migrate) comes later: keep refusing those by name.</p>
 <h2 id="0-context-budget">0. Context budget<a class="headerlink" href="#0-context-budget" title="Permanent link">&para;</a></h2>
 <p>Budget about 200k tokens; aim for 120k. Never read a large file whole: <code>grep -n</code>, then <code>sed -n 'A,Bp'</code>
-windows of at most ~120 lines. Big ones: <code>src/vector_index_build.cpp</code>, <code>src/fts_index_build.cpp</code>,
-<code>src/scalar_index.cpp</code>, <code>bindings/python/nanolance/lance/dataset.py</code> (5k+). Cut output: <code>| tail -15</code> for
+windows of at most ~120 lines. Big ones: <code>src/index/vector/vector_index_build.cpp</code>, <code>src/index/fts/fts_index_build.cpp</code>,
+<code>src/index/scalar/scalar_index.cpp</code>, <code>bindings/python/nanolance/lance/dataset.py</code> (5k+). Cut output: <code>| tail -15</code> for
 pytest (add <code>-o addopts=</code>).</p>
 <h2 id="1-goal">1. Goal<a class="headerlink" href="#1-goal" title="Permanent link">&para;</a></h2>
 <ul>
@@ -847,13 +847,13 @@ pytest (add <code>-o addopts=</code>).</p>
 </ul>
 <h2 id="2-facts">2. Facts<a class="headerlink" href="#2-facts" title="Permanent link">&para;</a></h2>
 <ul>
-<li>Remaining filesystem calls on index build paths: <code>src/fts_index_build.cpp</code> ~915-972,
-  <code>src/vector_index_build.cpp</code> ~2061-2372, <code>src/scalar_index.cpp</code> ~1788-1883 (an index directory
-  created, and <code>remove_all</code> of it on failure), <code>src/index_optimize.cpp</code> ~475 (<code>remove_all</code> of a merged
+<li>Remaining filesystem calls on index build paths: <code>src/index/fts/fts_index_build.cpp</code> ~915-972,
+  <code>src/index/vector/vector_index_build.cpp</code> ~2061-2372, <code>src/index/scalar/scalar_index.cpp</code> ~1788-1883 (an index directory
+  created, and <code>remove_all</code> of it on failure), <code>src/dataset/index_optimize.cpp</code> ~475 (<code>remove_all</code> of a merged
   segment's directory). On an object store there are no directories: skip creating them
   (<code>io::is_object_store_output</code>), and replace <code>remove_all</code> of a failed build by removing the objects it
   wrote (<code>io::list_dir</code> + <code>io::remove_output</code>, best effort: an unreferenced index directory is harmless,
-  cleanup removes it). Index files themselves go through <code>src/index_files.cpp</code> <code>write_file</code> (check: does
+  cleanup removes it). Index files themselves go through <code>src/index/index_files.cpp</code> <code>write_file</code> (check: does
   it reach <code>io::open_output</code>?).</li>
 <li>Python refusals to lift: <code>grep -n "refuse_object_store_write" bindings/python/nanolance/lance/dataset.py
   bindings/python/nanolance/lance/fragment.py</code> (the index ones for W3a; fragment / merge / UDF / commit for
@@ -990,10 +990,10 @@ Reviewer (W3b): fragment writes and commits register the bucket's storage_option
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

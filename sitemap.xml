@@ -2,230 +2,250 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
          <loc>https://yoavbendor.github.io/nanolance/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/BENCHMARKS/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/BUILDING_BEHIND_A_FIREWALL/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/DELEGATION/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/FTS_INDEX/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/LANCE_C_COMPAT/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
+    </url>
+    <url>
+         <loc>https://yoavbendor.github.io/nanolance/LOCAL_VALIDATION/</loc>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/NESTED_COLUMNS/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/NEXT_WEEK/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/OBJECT_STORE_WRITES/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/OPTIMIZATION_PLAN/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/PERFORMANCE_GATE/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/PROGRESS/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/PYLANCE_COMPAT/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/REAL_DATASETS/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/ROADMAP/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/RUST_SUITE/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/SAFETY/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/STATUS_2026-10-21/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
+    </url>
+    <url>
+         <loc>https://yoavbendor.github.io/nanolance/STATUS_2026-10-22/</loc>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/VECTOR_INDEX/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/agents/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/bench-trusted-parity/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/bench-write-read/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/bench/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/disk-lru-block-cache/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/getting-started/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/lance_table_reader_plan/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/s3_reader_notes/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/BINARY_IVF/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/BLOB_WRITERS/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/BRANCHES/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/CONFLICTS/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/EXPR_TYPES/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/FEATURE_FLAGS/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/FRAG_REUSE/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/FTS_FORMATS/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/FTS_LISTS/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/IVF_RQ/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
+    </url>
+    <url>
+         <loc>https://yoavbendor.github.io/nanolance/tasks/MEMWAL_M1/</loc>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/MULTIVECTOR/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/MULTI_BASE/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/NGRAM_JSON/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/OBJECT_STORE_READS/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/OBJECT_STORE_W2/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/OBJECT_STORE_W3/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/OBJECT_STORE_W4/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/PROGRESS/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/PY_SURFACE/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/PY_SURFACE_2/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/SMALL_ITEMS_1/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/SMALL_ITEMS_2/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/SQL_SURFACE/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
+    </url>
+    <url>
+         <loc>https://yoavbendor.github.io/nanolance/tasks/TOKENIZERS_J/</loc>
+         <lastmod>2026-10-24</lastmod>
+    </url>
+    <url>
+         <loc>https://yoavbendor.github.io/nanolance/tasks/TOKENIZERS_L/</loc>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/VECTOR_API/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/VECTOR_COMBOS/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/WAVE3_SMALL/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/WEBLANCE_DEBUG/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/WEBLANCE_EXPLORE/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/WEBLANCE_FASTER_MAP/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/tasks/ZONED_INDEXES/</loc>
-         <lastmod>2026-10-21</lastmod>
+         <lastmod>2026-10-24</lastmod>
     </url>
 </urlset>

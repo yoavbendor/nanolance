@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -805,7 +805,7 @@
 items; do them in order, one session may finish all three.</p>
 <h2 id="0-context-budget">0. Context budget<a class="headerlink" href="#0-context-budget" title="Permanent link">&para;</a></h2>
 <p>About 100k tokens. <code>grep -n</code> then <code>sed -n</code> windows of at most ~120 lines (<code>dataset.py</code> 3.5k+,
-<code>src/lance_table_reader.cpp</code> 3k+, <code>src/vector_search.cpp</code> 2k+). Cut all output (<code>| tail -15</code>; pytest
+<code>src/scan/lance_table_reader.cpp</code> 3k+, <code>src/index/vector/vector_search.cpp</code> 2k+). Cut all output (<code>| tail -15</code>; pytest
 with <code>-o addopts=</code> for a summary line; <code>tools/pylance_suite.py ... | tail -5</code>). The pylance tests are
 the spec: read only the named ones. When unclear, run the same calls on real pylance (<code>import lance</code>).</p>
 <h2 id="1-row-address-masks-row_addr_allowlist-row_addr_blocklist-lancedatasetserialize_row_addrs">1. Row-address masks: <code>row_addr_allowlist</code> / <code>row_addr_blocklist</code>, <code>lance.dataset.serialize_row_addrs</code><a class="headerlink" href="#1-row-address-masks-row_addr_allowlist-row_addr_blocklist-lancedatasetserialize_row_addrs" title="Permanent link">&para;</a></h2>
@@ -814,7 +814,7 @@ the spec: read only the named ones. When unclear, run the same calls on real pyl
 - <code>serialize_row_addrs([0, 2, 4, ...])</code> returns Lance's <strong>RowAddrTreeMap</strong> serialization: u32 count of
   fragments, then per fragment ascending <code>[u32 fragment id][u32 byte size][portable Roaring bitmap of
   the row offsets]</code>. nanolance already writes exactly this (<code>serialize_treemap</code> in
-  <code>src/scalar_index.cpp</code>) and reads it (<code>read_treemap</code> in <code>src/index_search.cpp</code>). For
+  <code>src/index/scalar/scalar_index.cpp</code>) and reads it (<code>read_treemap</code> in <code>src/dataset/index_search.cpp</code>). For
   <code>[1, 2, (1&lt;&lt;32)|5]</code> pylance returns 58 bytes starting <code>02 00 00 00 00 00 00 00 14 00 00 00 3a 30 ...</code>
   -- your Python output must be byte-identical (compare with pylance in your test). The Python roaring
   encoder exists: <code>_serialize_roaring</code> in <code>bindings/python/nanolance/lance/bitmap.py</code>.
@@ -824,11 +824,11 @@ the spec: read only the named ones. When unclear, run the same calls on real pyl
   its top-k over the surviving rows (<code>test_knn_topk_is_computed_over_masked_rows</code>). Malformed bytes:
   an error matching <code>(?i)row address mask|invalid</code>.
 - Implementation hint: masks are row sets per fragment, like the scalar-index candidates the scan
-  already takes (<code>PlannedFile::candidates</code> in <code>src/lance_table_reader.cpp</code>; how <code>index_candidates</code>
-  feeds them in). Vector search has a <code>RowMask</code> (<code>src/vector_search.cpp</code>), full-text search a <code>RowMask</code>
-  in <code>src/fts_search.cpp</code>: intersect the caller's mask there. Pass the mask from Python as bytes to the
+  already takes (<code>PlannedFile::candidates</code> in <code>src/scan/lance_table_reader.cpp</code>; how <code>index_candidates</code>
+  feeds them in). Vector search has a <code>RowMask</code> (<code>src/index/vector/vector_search.cpp</code>), full-text search a <code>RowMask</code>
+  in <code>src/index/fts/fts_search.cpp</code>: intersect the caller's mask there. Pass the mask from Python as bytes to the
   native call; decode it once in C++.
-- The two <code>test_overlay_stale_replay_*</code> tests need data overlays, which now work (<code>src/overlays.cpp</code>):
+- The two <code>test_overlay_stale_replay_*</code> tests need data overlays, which now work (<code>src/table/overlays.cpp</code>):
   they must pass once the mask is applied on every row source.</p>
 <h2 id="2-lancedatasetvectorindexreader">2. <code>lance.dataset.VectorIndexReader</code><a class="headerlink" href="#2-lancedatasetvectorindexreader" title="Permanent link">&para;</a></h2>
 <p>Oracle: <code>tests/test_vector_index.py::test_nested_field_vector_index</code> (and any other test using
@@ -838,13 +838,13 @@ with <code>with_vector=True</code> the storage column: <code>flat</code> (FixedS
 <code>__pq_code</code> (FixedSizeList<uint8>[m]) for IVF_PQ -- copy the exact schema and row order real pylance
 returns on the same index, for IVF_FLAT, IVF_PQ and IVF_HNSW_SQ (<code>__sq_code</code>). The partition data is
 in the index's <code>auxiliary.idx</code> (offsets/lengths per partition are in the IVF model nanolance already
-decodes: <code>load_ivf</code> / <code>IvfIndex</code> in <code>src/vector_search.cpp</code>). With stable row ids <code>_rowid</code> is the id.</p>
+decodes: <code>load_ivf</code> / <code>IvfIndex</code> in <code>src/index/vector/vector_search.cpp</code>). With stable row ids <code>_rowid</code> is the id.</p>
 <h2 id="3-_take_rows-of-a-deleted-rows-address">3. <code>_take_rows</code> of a deleted row's address<a class="headerlink" href="#3-_take_rows-of-a-deleted-rows-address" title="Permanent link">&para;</a></h2>
 <p><code>ds._take_rows([address_of_a_deleted_row, ...])</code> returns the deleted row in nanolance; pylance leaves it
 out (datasets without stable row ids). Reproduce: <code>write_dataset</code> 300 rows, <code>delete("id % 4 = 1")</code>,
 <code>_take_rows([(0 &lt;&lt; 32) | 5])</code> -&gt; pylance <code>[]</code>. Fix where <code>_take_rows</code> resolves addresses
 (<code>grep -n "def _take_rows" bindings/python/nanolance/lance/dataset.py</code>, and <code>resolve_row_ids</code> in
-<code>src/row_ids.cpp</code>, which skips deleted rows only for stable ids). Add the case to
+<code>src/table/row_ids.cpp</code>, which skips deleted rows only for stable ids). Add the case to
 <code>bindings/python/tests/test_take.py</code> against pylance.</p>
 <h2 id="4-rules-builds-stop-rules-done">4. Rules, builds, stop rules, done<a class="headerlink" href="#4-rules-builds-stop-rules-done" title="Permanent link">&para;</a></h2>
 <p><code>AGENTS.md</code> sections 5 and 7. No skipped / weakened tests. C++ without warnings. Do not commit, push,
@@ -864,7 +864,7 @@ Report under 40 lines: files, per-item status, tails, decisions, questions.</p>
 <p><strong>Session 1 (2026-10-15):</strong> <code>serialize_row_addrs</code> done (byte-identical to pylance;
 <code>tests/test_row_addr_masks.py</code>). Stopped at the stop rule on the scan mask. <strong>Reviewer's design for the
 rest of item 1:</strong>
-- In the reader (<code>src/lance_table_reader.cpp</code>), a row the mask excludes is dropped exactly like a
+- In the reader (<code>src/scan/lance_table_reader.cpp</code>), a row the mask excludes is dropped exactly like a
   deleted row: build the fragment's <code>keep</code> vector from its deletion file AND the mask (allowlist: only
   listed offsets; blocklist: listed offsets off), so slicing, compaction and row ids keep working.
   A fragment with no allowed rows is skipped at planning.
@@ -886,7 +886,7 @@ a mask with <code>include_deleted_rows</code> masks the table scan only (unteste
 either engine; <code>_take_rows</code> of a deleted row's address leaves it out (<code>resolve_row_ids(skip_deleted)</code>).
 Reviewer: a KNN on a nested vector (<code>data.embedding</code>) over unindexed fragments failed in the exhaustive
 scan (it projected the dotted path); it now reads the root struct and descends
-(<code>vector_sub_path</code>, src/vector_search.cpp). Left: <code>test_read_partition_nested_vector_quoted_field</code>
+(<code>vector_sub_path</code>, src/index/vector/vector_search.cpp). Left: <code>test_read_partition_nested_vector_quoted_field</code>
 needs a Hamming index (roadmap). +2 pylance tests (1035).</p>
 
 
@@ -965,10 +965,10 @@ needs a Hamming index (roadmap). +2 pylance tests (1035).</p>
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

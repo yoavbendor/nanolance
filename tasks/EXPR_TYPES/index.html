@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -829,26 +829,26 @@ float16 list casts, <strong>C</strong> DataFusion's result types. Do the items o
 you could not finish rather than stretching the session.</p>
 <h2 id="0-context-budget">0. Context budget<a class="headerlink" href="#0-context-budget" title="Permanent link">&para;</a></h2>
 <p>About 100k tokens per session. <code>grep -n</code> then <code>sed -n</code> windows of at most ~120 lines; never read
-<code>src/expr.cpp</code> (3.3k lines), <code>src/scalar_index.cpp</code>, <code>src/index_search.cpp</code>,
+<code>src/expr/expr.cpp</code> (3.3k lines), <code>src/index/scalar/scalar_index.cpp</code>, <code>src/dataset/index_search.cpp</code>,
 <code>bindings/python/nanolance/lance/dataset.py</code> or <code>bindings/python/src/nanolance_bindings.cpp</code> whole.
 Cut all output (<code>| tail</code>, <code>| head</code>, <code>cut -c1-200</code>). For each item: read the named pylance tests
 (<code>.deps/pylance-tests/v12.0.0/tests/...</code>), measure the behaviour on real pylance 12.0.0 (<code>import lance</code>
 in plain <code>python3</code>), then implement. Write nanolance's own code.</p>
 <h2 id="1-where-things-are">1. Where things are<a class="headerlink" href="#1-where-things-are" title="Permanent link">&para;</a></h2>
 <ul>
-<li>Filter / projection expressions: <code>src/expr.cpp</code>. <code>detail::Kind</code> (line ~32: Null, Bool, Int, UInt,
+<li>Filter / projection expressions: <code>src/expr/expr.cpp</code>. <code>detail::Kind</code> (line ~32: Null, Bool, Int, UInt,
   Double, String, Binary, Date, Timestamp, List) and <code>detail::Value</code> (~35) hold one value. Column
-  values are read from Arrow arrays into <code>Value</code>s (grep <code>NANOARROW_TYPE_</code> in src/expr.cpp); literals
+  values are read from Arrow arrays into <code>Value</code>s (grep <code>NANOARROW_TYPE_</code> in src/expr/expr.cpp); literals
   are parsed (grep <code>Tok::</code>); <code>arrow_cast</code> is rewritten to <code>Op::Cast</code> at ~885 with a table of type
   names, and refuses the rest at ~908 (<code>arrow_cast to '...' is not supported in nanolance filters</code>).
-  Comparison of two Values: grep <code>compare(</code> in src/expr.cpp. <code>Expression::result_type</code> gives a
+  Comparison of two Values: grep <code>compare(</code> in src/expr/expr.cpp. <code>Expression::result_type</code> gives a
   projection's Arrow type.</li>
-<li>Scalar index keys: <code>src/scalar_index.cpp</code>: <code>KeyKind</code> (grep <code>enum class KeyKind</code>), the type switch at
+<li>Scalar index keys: <code>src/index/scalar/scalar_index.cpp</code>: <code>KeyKind</code> (grep <code>enum class KeyKind</code>), the type switch at
   ~95-132 (DECIMAL128 -&gt; <code>KeyKind::Decimal128</code> exists; DECIMAL256 and DURATION refuse with "a scalar
   index on a column of type ... is not supported"), <code>Int128</code> at ~244. Index search with a predicate's
-  literal: <code>src/index_search.cpp</code> (grep <code>Decimal128</code>).</li>
+  literal: <code>src/dataset/index_search.cpp</code> (grep <code>Decimal128</code>).</li>
 <li>ZONEMAP / BITMAP builders reuse the same key kinds (grep <code>KeyKind</code> in src/zone*.cpp,
-  src/scalar_index.cpp).</li>
+  src/index/scalar/scalar_index.cpp).</li>
 </ul>
 <h2 id="2-items">2. Items<a class="headerlink" href="#2-items" title="Permanent link">&para;</a></h2>
 <p><strong>Phase A -- decimal and duration values (10 of pylance's tests)</strong></p>
@@ -898,10 +898,10 @@ are below, so do not re-measure them): <strong>A1</strong> = items 1 (decimal va
   <code>v / 2</code> -&gt; (16,6), <code>abs(v)</code> -&gt; (10,2); duration <code>arrow_cast(v, 'Duration(Second)')</code> -&gt; duration[s]
   truncating. <strong>Decision: phase A only compares decimals / durations and projects bare columns.</strong>
 - Index files: not yet measured -- the page_data / page_lookup files live under
-  <code>_indices/&lt;uuid&gt;/</code>; open them with nanolance's <code>index_files::read_table</code> (src/index_files.cpp) or
+  <code>_indices/&lt;uuid&gt;/</code>; open them with nanolance's <code>index_files::read_table</code> (src/index/index_files.cpp) or
   <code>lance.file.LanceFileReader(path)</code> on the exact <code>.lance</code> file path, and match their column types.</p>
 <p>Code map from A0 (grep-located):
-- src/expr.cpp: <code>enum class Kind</code> (32), <code>struct Value</code> (35): add <code>Decimal</code> (four 64-bit limbs,
+- src/expr/expr.cpp: <code>enum class Kind</code> (32), <code>struct Value</code> (35): add <code>Decimal</code> (four 64-bit limbs,
   two's complement, + scale) and <code>Duration</code> (count + unit; <code>unit_to_ns</code> ~1330). <code>read_scalar</code> (~1313):
   DECIMAL128 / 256 and unit-aware DURATION, the scale threaded from bind (ColumnRef). <code>bind_node</code>
   (~1080-1160): <code>scalar_type()</code> already admits DURATION; decimals are excluded. Literal coercion
@@ -911,10 +911,10 @@ are below, so do not re-measure them): <strong>A1</strong> = items 1 (decimal va
   their own name). <code>compare()</code> (~1376): exact cross-scale compare (rescale in 512 bits: 10^76 fits).
   <code>kind_name</code> (~1420). The vectorised literal compare (~2390) compares DURATION raw counts: it must
   fall back for Duration literals. Output append (~2130) appends DURATION through cast_value "bigint".
-- src/scalar_index.cpp: <code>KeyKind</code> (89), <code>key_kind_of</code> (91-131), <code>Int128</code> (246), <code>order_items&lt;Int128&gt;</code>
+- src/index/scalar/scalar_index.cpp: <code>KeyKind</code> (89), <code>key_kind_of</code> (91-131), <code>Int128</code> (246), <code>order_items&lt;Int128&gt;</code>
   (407), <code>zone_extrema&lt;Int128&gt;</code> (906); the uuid refusal at ~1563 (<code>extension_name</code> -&gt; "a scalar index on
   an extension type is not supported"): key the storage type, keep what page_data stores (measure).
-- src/index_search.cpp: grep <code>Decimal128</code> for the literal-to-key path.</p>
+- src/dataset/index_search.cpp: grep <code>Decimal128</code> for the literal-to-key path.</p>
 <p><strong>A1 outcome (2026-10-16):</strong> decimal128 / decimal256 in filters, exact (46 tests); rounding half away
 from zero, pylance's overflow and float-literal messages (pylance quotes the type: <code>'Decimal128(10,
 2)'</code>, and shows the literal as DataFusion types it, <code>Float64(2)</code> for <code>2.0</code>).
@@ -978,7 +978,7 @@ rules it shows:
   d32 - d32 -&gt; int64 days; d32 +/- dur -&gt; pylance's coercion error.</p>
 <p><strong>Reviewer's decisions:</strong> (1) filters keep their semantics (they return rows where pylance's
 literal coercion refuses <code>i16 &gt; 40000</code> / <code>i32 = 7.0</code>) -- a recorded divergence; the typed rules
-apply to projections only (a mode of evaluation inside src/expr.cpp, not a planning change).
+apply to projections only (a mode of evaluation inside src/expr/expr.cpp, not a planning change).
 (2) u64 with a signed int -&gt; decimal128(21,0) / (38,0), as pylance. (3) match ts - ts, ts +/- dur,
 d32 - d32; refuse mixed-unit duration arithmetic (pylance's month_day_nano interval) with a clear
 error. Phase C is split: <strong>C1</strong> integers and floats (a typed pass through <code>guess()</code> /
@@ -1110,10 +1110,10 @@ measured pylance behaviours, questions.</p>
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

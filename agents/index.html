@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -31,10 +31,10 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -1115,14 +1115,14 @@ readable by stock <code>lance</code> (verified against <code>pylance</code> 12.0
   and CMake target names changed.</li>
 </ul>
 <h2 id="2-minimal-write-flow-c-api">2. Minimal write flow (C API)<a class="headerlink" href="#2-minimal-write-flow-c-api" title="Permanent link">&para;</a></h2>
-<div class="language-c highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;nanolance/nano_lance_writer.h&quot;</span>
+<div class="language-c highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="cp">#include</span><span class="w"> </span><span class="cpf">"nanolance/nano_lance_writer.h"</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;nanoarrow/nanoarrow.h&gt;</span>
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>
 <a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">NanoLanceWriteOptions</span><span class="w"> </span><span class="n">options</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mi">0</span><span class="p">};</span><span class="w">                 </span><span class="c1">// zeroed == the defaults</span>
 <a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="n">NanoLanceWriter</span><span class="w"> </span><span class="n">w</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mi">0</span><span class="p">};</span>
 <a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="n">options</span><span class="p">.</span><span class="n">compression_level</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
 <a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="n">options</span><span class="p">.</span><span class="n">compression</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">true</span><span class="p">;</span><span class="w">                          </span><span class="c1">// Lance-compatible compression (see §3)</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="n">nano_lance_writer_open</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;out.lance&quot;</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">options</span><span class="p">);</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="n">nano_lance_writer_open</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="s">"out.lance"</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">options</span><span class="p">);</span>
 <a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="n">nano_lance_write_batch</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">arrow_array</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">arrow_schema</span><span class="p">);</span><span class="w">  </span><span class="c1">// call repeatedly; schema is fixed after #1</span>
 <a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="n">nano_lance_writer_commit</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="cm">/*is_append=*/</span><span class="nb">false</span><span class="p">);</span>
 <a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="n">nano_lance_writer_close</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">);</span>
@@ -1160,16 +1160,16 @@ destructor closes it.</p>
 <p>First-class Python bindings live in <a href="bindings/python/"><code>bindings/python/</code></a> (<code>pip install -e bindings/python</code>).
 They wrap the same C API via nanobind and the Arrow PyCapsule interface — zero-copy in/out of pyarrow,
 polars, etc. The module is <code>import nanolance</code> (not <code>lance</code>; that name is the official <code>pylance</code> SDK).</p>
-<div class="language-python highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">import</span> <span class="nn">pyarrow</span> <span class="k">as</span> <span class="nn">pa</span>
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="kn">import</span> <span class="nn">nanolance</span>
+<div class="language-python highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pa</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">nanolance</span>
 <a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
-<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="n">table</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">({</span><span class="s2">&quot;uri&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;s3://b/f.pcapng&quot;</span><span class="p">]</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">,</span> <span class="s2">&quot;position&quot;</span><span class="p">:</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1000</span><span class="p">),</span> <span class="s2">&quot;size&quot;</span><span class="p">:</span> <span class="p">[</span><span class="mi">1500</span><span class="p">]</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">})</span>
-<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="n">nanolance</span><span class="o">.</span><span class="n">write_table</span><span class="p">(</span><span class="n">table</span><span class="p">,</span> <span class="s2">&quot;out.lance&quot;</span><span class="p">,</span> <span class="n">compression</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="n">roundtrip</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">(</span><span class="n">nanolance</span><span class="o">.</span><span class="n">read_table</span><span class="p">(</span><span class="s2">&quot;out.lance&quot;</span><span class="p">))</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="n">table</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">({</span><span class="s2">"uri"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"s3://b/f.pcapng"</span><span class="p">]</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">,</span> <span class="s2">"position"</span><span class="p">:</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1000</span><span class="p">),</span> <span class="s2">"size"</span><span class="p">:</span> <span class="p">[</span><span class="mi">1500</span><span class="p">]</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">})</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="n">nanolance</span><span class="o">.</span><span class="n">write_table</span><span class="p">(</span><span class="n">table</span><span class="p">,</span> <span class="s2">"out.lance"</span><span class="p">,</span> <span class="n">compression</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="n">roundtrip</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">(</span><span class="n">nanolance</span><span class="o">.</span><span class="n">read_table</span><span class="p">(</span><span class="s2">"out.lance"</span><span class="p">))</span>
 <a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>
 <a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="c1"># Projection, and a fragment-at-a-time stream for datasets larger than memory:</span>
-<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="n">subset</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">(</span><span class="n">nanolance</span><span class="o">.</span><span class="n">read_table</span><span class="p">(</span><span class="s2">&quot;out.lance&quot;</span><span class="p">,</span> <span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;uri&quot;</span><span class="p">,</span> <span class="s2">&quot;size&quot;</span><span class="p">]))</span>
-<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">pa</span><span class="o">.</span><span class="n">RecordBatchReader</span><span class="o">.</span><span class="n">from_stream</span><span class="p">(</span><span class="n">nanolance</span><span class="o">.</span><span class="n">open_stream</span><span class="p">(</span><span class="s2">&quot;out.lance&quot;</span><span class="p">)):</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="n">subset</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">(</span><span class="n">nanolance</span><span class="o">.</span><span class="n">read_table</span><span class="p">(</span><span class="s2">"out.lance"</span><span class="p">,</span> <span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">"uri"</span><span class="p">,</span> <span class="s2">"size"</span><span class="p">]))</span>
+<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">pa</span><span class="o">.</span><span class="n">RecordBatchReader</span><span class="o">.</span><span class="n">from_stream</span><span class="p">(</span><span class="n">nanolance</span><span class="o">.</span><span class="n">open_stream</span><span class="p">(</span><span class="s2">"out.lance"</span><span class="p">)):</span>
 <a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a>    <span class="o">...</span>
 </code></pre></div>
 <p>Key options mirror the C writer: <code>compression=True</code>, <code>WriteOptions(append=True)</code>, etc. See
@@ -1308,9 +1308,9 @@ does not recycle memory across threads. A retaining allocator (jemalloc, mimallo
 <code>MALLOC_MMAP_THRESHOLD_</code>/<code>MALLOC_TRIM_THRESHOLD_</code>) can still gain a little on one thread.</p>
 <h2 id="5-verifying-lance-interop-do-this-after-changes">5. Verifying Lance interop (do this after changes)<a class="headerlink" href="#5-verifying-lance-interop-do-this-after-changes" title="Permanent link">&para;</a></h2>
 <p><div class="language-bash highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1"># build (see §6), then:</span>
-<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>python<span class="w"> </span>-<span class="w"> </span><span class="s">&lt;&lt;&#39;PY&#39;</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>python<span class="w"> </span>-<span class="w"> </span><span class="s">&lt;&lt;'PY'</span>
 <a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="s">import lance</span>
-<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="s">ds = lance.dataset(&quot;out.lance&quot;); t = ds.to_table()</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="s">ds = lance.dataset("out.lance"); t = ds.to_table()</span>
 <a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="s">print(t.num_rows, t.schema)   # values must match what you wrote</span>
 <a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="s">PY</span>
 </code></pre></div>
@@ -1338,7 +1338,7 @@ on-disk size shrank.</p>
   is what this flag does.</li>
 </ul>
 <h2 id="6a-threads-rules-for-code-on-the-read-and-write-paths">6a. Threads: rules for code on the read and write paths<a class="headerlink" href="#6a-threads-rules-for-code-on-the-read-and-write-paths" title="Permanent link">&para;</a></h2>
-<p>Reads, takes and writes run on several threads (<code>src/parallel.cpp</code>; README "Threads"). Keep it safe:</p>
+<p>Reads, takes and writes run on several threads (<code>src/base/parallel.cpp</code>; README "Threads"). Keep it safe:</p>
 <ul>
 <li><strong>No shared mutable state without a lock.</strong> Per-call scratch is <code>thread_local</code> (see the <code>packed</code>,
   <code>scratch</code> and zstd context buffers); process-wide caches take a mutex. A new <code>static</code> that is written
@@ -1383,8 +1383,8 @@ still passes when the rows come back right but slowly. Don't time it (CI machine
 <li>Find the authoritative format in the Lance Rust source (<code>protos/encodings_v2_1.proto</code> for the
    <code>PageLayout</code> / <code>CompressiveEncoding</code> field numbers; <code>rust/lance-encoding/src/encodings/...</code> for the
    byte layout). Don't guess from prose docs — verify against real <code>lance</code> output bytes.</li>
-<li>Writer: build the exact <code>PageLayout</code> protobuf + data buffer in <code>src/data_file_writer.cpp</code>.</li>
-<li>Reader: invert it in <code>src/lance_column_decoder.cpp</code>. The decoder dispatches on the on-disk field's
+<li>Writer: build the exact <code>PageLayout</code> protobuf + data buffer in <code>src/file/data_file_writer.cpp</code>.</li>
+<li>Reader: invert it in <code>src/encoding/lance_column_decoder.cpp</code>. The decoder dispatches on the on-disk field's
    <code>encoding</code> and <code>nanolance:*</code> metadata tags set by the writer (Lance ignores those tags and reads the
    real <code>PageLayout</code>).</li>
 <li>Validate both directions: nanolance write → nanolance read, <strong>and</strong> nanolance write → <code>lance</code> read.</li>
@@ -1532,10 +1532,10 @@ still passes when the rows come back right but slowly. Don't time it (CI machine
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

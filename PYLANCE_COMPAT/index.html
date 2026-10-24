@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -908,18 +908,18 @@
 <h1 id="pylance-compatibility-nanolancelance">pylance compatibility (<code>nanolance.lance</code>)<a class="headerlink" href="#pylance-compatibility-nanolancelance" title="Permanent link">&para;</a></h1>
 <p><code>nanolance.lance</code> is a pylance-compatible Python API over nanolance. Code written against pylance's
 <code>lance</code> module runs on nanolance by changing its import:</p>
-<div class="language-python highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">import</span> <span class="nn">nanolance.lance</span> <span class="k">as</span> <span class="nn">lance</span>
+<div class="language-python highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">nanolance.lance</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">lance</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">write_dataset</span><span class="p">(</span><span class="n">table</span><span class="p">,</span> <span class="s2">&quot;data.lance&quot;</span><span class="p">,</span> <span class="n">max_rows_per_file</span><span class="o">=</span><span class="mi">1_000_000</span><span class="p">)</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span><span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;image&quot;</span><span class="p">,</span> <span class="s2">&quot;label&quot;</span><span class="p">],</span> <span class="n">limit</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">with_row_id</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">write_dataset</span><span class="p">(</span><span class="n">table</span><span class="p">,</span> <span class="s2">"data.lance"</span><span class="p">,</span> <span class="n">max_rows_per_file</span><span class="o">=</span><span class="mi">1_000_000</span><span class="p">)</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span><span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">,</span> <span class="s2">"label"</span><span class="p">],</span> <span class="n">limit</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">with_row_id</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="n">ds</span><span class="o">.</span><span class="n">take</span><span class="p">([</span><span class="mi">4031</span><span class="p">,</span> <span class="mi">17</span><span class="p">,</span> <span class="mi">2980</span><span class="p">])</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">&quot;data.lance&quot;</span><span class="p">,</span> <span class="n">version</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span><span class="o">.</span><span class="n">count_rows</span><span class="p">()</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"data.lance"</span><span class="p">,</span> <span class="n">version</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span><span class="o">.</span><span class="n">count_rows</span><span class="p">()</span>
 </code></pre></div>
 <p>Or, leaving the code unchanged, by making <code>import lance</code> load nanolance for the process:</p>
-<div class="language-python highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">import</span> <span class="nn">nanolance.lance</span>
+<div class="language-python highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">nanolance.lance</span>
 <a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="n">nanolance</span><span class="o">.</span><span class="n">lance</span><span class="o">.</span><span class="n">install_as_lance</span><span class="p">()</span>   <span class="c1"># before anything imports lance</span>
 <a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
-<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="kn">import</span> <span class="nn">lance</span>                         <span class="c1"># nanolance&#39;s, for this process only</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>                         <span class="c1"># nanolance's, for this process only</span>
 </code></pre></div>
 <p><code>install_as_lance()</code> changes what <code>import lance</code> means in the current process. It does not touch a
 pylance install. <code>uninstall_as_lance()</code> undoes it. No package called <code>lance</code> is published: the real
@@ -971,7 +971,7 @@ compared, results are checked against pylance on the same files, in both directi
 </tr>
 <tr>
 <td>Filters</td>
-<td><code>filter=</code> on <code>to_table</code>, <code>to_batches</code>, <code>scanner</code>, <code>count_rows</code> and fragments: an SQL string or a pyarrow compute expression. Comparisons, <code>AND</code> / <code>OR</code> / <code>NOT</code> with SQL's three-valued logic, <code>IS [NOT] NULL</code>, <code>IN</code>, <code>BETWEEN</code>, <code>LIKE</code> / <code>ILIKE</code>, arithmetic, <code>CAST</code>, <code>DATE</code> / <code>TIMESTAMP</code> literals, struct fields (<code>s.a</code>), and the functions <code>lower</code>, <code>upper</code>, <code>length</code>, <code>abs</code>, <code>coalesce</code>, <code>starts_with</code>, <code>ends_with</code>, <code>contains</code>. With a filter, <code>offset</code> and <code>limit</code> count the rows that pass, as in pylance.</td>
+<td><code>filter=</code> on <code>to_table</code>, <code>to_batches</code>, <code>scanner</code>, <code>count_rows</code> and fragments: an SQL string or a pyarrow compute expression. Comparisons, <code>AND</code> / <code>OR</code> / <code>NOT</code> with SQL's three-valued logic, <code>IS [NOT] NULL</code>, <code>IN</code>, <code>BETWEEN</code>, <code>LIKE</code> / <code>ILIKE</code>, arithmetic, <code>CAST</code>, <code>DATE</code> / <code>TIMESTAMP</code> literals, struct fields (<code>s.a</code>), and the functions <code>lower</code>, <code>upper</code>, <code>length</code>, <code>abs</code>, <code>coalesce</code>, <code>starts_with</code>, <code>ends_with</code>, <code>contains</code>. Strings are compared by character in every script, as pylance does: <code>LIKE</code>'s <code>_</code> is one character, <code>ILIKE</code> and <code>regexp_like(..., 'i')</code> compare Unicode case folds, <code>lower</code> / <code>upper</code> change every script's case, and <code>regexp_like</code>'s <code>.</code>, ranges, <code>\w</code>, <code>\d</code> and <code>\s</code> are Unicode (its <code>[[:alpha:]]</code>-style classes stay ASCII, as DataFusion's are; tests/test_unicode_filters.py). An unknown keyword argument to <code>scanner</code>, <code>to_table</code> or <code>count_rows</code> is a <code>TypeError</code>, as in pylance. With a filter, <code>offset</code> and <code>limit</code> count the rows that pass, as in pylance.</td>
 </tr>
 <tr>
 <td>Changes</td>
@@ -1001,10 +1001,10 @@ columns, packed structs, deletions, ranges and takes.</p>
 <h2 id="indexes">Indexes<a class="headerlink" href="#indexes" title="Permanent link">&para;</a></h2>
 <h3 id="scalar-indexes-built-and-used">Scalar indexes: built and used<a class="headerlink" href="#scalar-indexes-built-and-used" title="Permanent link">&para;</a></h3>
 <p><code>create_scalar_index(column, "BTREE" | "BITMAP" | "LABEL_LIST", name=None, replace=True)</code> builds
-Lance's scalar indexes in Lance's file layout (<code>src/scalar_index.cpp</code>), committed in the manifest as
+Lance's scalar indexes in Lance's file layout (<code>src/index/scalar/scalar_index.cpp</code>), committed in the manifest as
 pylance commits one; <code>drop_index</code>, <code>list_indices</code>, <code>describe_indices</code> and <code>has_index</code> work as in
 pylance. Filtered reads use any BTree, Bitmap or LabelList index the dataset has, whoever built it
-(<code>src/index_search.cpp</code>):</p>
+(<code>src/index/index_search.cpp</code>):</p>
 <table>
 <thead>
 <tr>
@@ -1055,7 +1055,7 @@ column -- a fixed-size list of floats -- as pylance does, and <code>create_index
 "IVF_PQ" | "IVF_HNSW_SQ", metric=..., num_partitions=..., num_sub_vectors=..., num_bits=..., m=...,
 ef_construction=..., max_level=...)</code> builds Lance's index for it. The format and the search, step for step, are in <code>docs/VECTOR_INDEX.md</code>.</p>
 <ul>
-<li><strong>Searching</strong> (<code>src/vector_search.cpp</code>) an IVF_FLAT or IVF_PQ index -- built by pylance or by
+<li><strong>Searching</strong> (<code>src/index/vector/vector_search.cpp</code>) an IVF_FLAT or IVF_PQ index -- built by pylance or by
   nanolance -- gives pylance's answer: the same rows, in the same order, with the same <code>_distance</code>,
   under L2, cosine and dot, for Lance's default (adaptive) probing, <code>nprobes</code> / <code>minimum_nprobes</code> /
   <code>maximum_nprobes</code>, <code>refine_factor</code> and <code>distance_range</code>. With 4-bit PQ, which ranks by quantized
@@ -1064,7 +1064,7 @@ ef_construction=..., max_level=...)</code> builds Lance's index for it. The form
   re-scored), deleted rows and null vectors never come back, <code>prefilter=True</code> filters before the
   search and otherwise the k nearest are filtered, <code>fast_search</code> searches only what is indexed, and
   a <code>metric</code> other than the index's (or <code>use_index=False</code>, or no index) searches exactly.</li>
-<li><strong>Building</strong> (<code>src/vector_index_build.cpp</code>) follows Lance's defaults: k-means as Lance trains it
+<li><strong>Building</strong> (<code>src/index/vector/vector_index_build.cpp</code>) follows Lance's defaults: k-means as Lance trains it
   (random initial centroids, at most 50 iterations, 256 training vectors a partition, hierarchical
   past 256 partitions), partitions from rows / 4096 (IVF_FLAT) or / 8192 (IVF_PQ), PQ codebooks
   trained and codes chosen by L2 on residuals, files and manifest entry as Lance writes them. pylance
@@ -1130,7 +1130,7 @@ with LanceDB's default analyzer or the settings given. <code>lance.query</code> 
 <code>MatchQuery</code>, <code>MultiMatchQuery</code>, <code>BoostQuery</code>, <code>BooleanQuery</code> (and <code>&amp;</code> / <code>|</code>), <code>PhraseQuery</code>.
 <code>docs/FTS_INDEX.md</code> has the format and the search, step for step.</p>
 <ul>
-<li><strong>Searching</strong> (<code>src/fts_search.cpp</code>) an INVERTED index, built by pylance or by nanolance, gives
+<li><strong>Searching</strong> (<code>src/index/fts/fts_search.cpp</code>) an INVERTED index, built by pylance or by nanolance, gives
   pylance's answer: the same rows with the same <code>_score</code>, bit for bit. Lance's order among equal
   scores is arbitrary; nanolance's is by row id. Around the index it does what pylance does:</li>
 <li>rows in fragments the index does not cover are tokenized on the fly and scored with the
@@ -1142,7 +1142,7 @@ with LanceDB's default analyzer or the settings given. <code>lance.query</code> 
     the documents' own statistics.</li>
 </ul>
 <p><code>_score</code> comes after the columns asked for, or where <code>columns</code> names it.
-- <strong>Building</strong> (<code>src/fts_index_build.cpp</code>) supports the simple, whitespace and raw tokenizers with
+- <strong>Building</strong> (<code>src/index/fts/fts_index_build.cpp</code>) supports the simple, whitespace and raw tokenizers with
   English stemming and stop words (or custom ones), lower-casing, ASCII folding and
   <code>max_token_length</code>. For the same data, the files hold what pylance's and LanceDB's builds hold,
   byte for byte: vocabulary (an <code>fst</code> map, ported), posting blocks, block scores and impact data.
@@ -1187,7 +1187,7 @@ same machinery to give its rewritten rows back to the indexes.</p>
 <h3 id="indexes-nanolance-keeps">Indexes nanolance keeps<a class="headerlink" href="#indexes-nanolance-keeps" title="Permanent link">&para;</a></h3>
 <p>Every commit nanolance makes
 -- append, delete, update, <code>merge_insert</code>, column changes, compaction, restore -- writes the
-version's indices into the new manifest by Lance's own rules (<code>src/index_maintenance.cpp</code>, after
+version's indices into the new manifest by Lance's own rules (<code>src/table/index_maintenance.cpp</code>, after
 lance-table's <code>index_maintenance.rs</code>), so pylance goes on using them:</p>
 <table>
 <thead>
@@ -1227,12 +1227,12 @@ readable, but nanolance refuses to commit to it rather than drop its indices.</p
 <p>A <code>nanolance.lance</code> dataset is a <code>pyarrow.dataset.Dataset</code> (its scanner a <code>pyarrow.dataset.Scanner</code>,
 its fragments <code>pyarrow.dataset.Fragment</code>s), as pylance's is, so the engines that read pylance
 datasets read nanolance's the same way, with projections and filters pushed into the scan:</p>
-<div class="language-python highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">nanolance</span><span class="o">.</span><span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">&quot;data.lance&quot;</span><span class="p">)</span>
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="n">duckdb</span><span class="o">.</span><span class="n">sql</span><span class="p">(</span><span class="s2">&quot;SELECT s, count(*) FROM ds WHERE id &gt; 500 GROUP BY s&quot;</span><span class="p">)</span>   <span class="c1"># replacement scan</span>
+<div class="language-python highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">nanolance</span><span class="o">.</span><span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"data.lance"</span><span class="p">)</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="n">duckdb</span><span class="o">.</span><span class="n">sql</span><span class="p">(</span><span class="s2">"SELECT s, count(*) FROM ds WHERE id &gt; 500 GROUP BY s"</span><span class="p">)</span>   <span class="c1"># replacement scan</span>
 <a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="n">duckdb</span><span class="o">.</span><span class="n">from_arrow</span><span class="p">(</span><span class="n">ds</span><span class="p">)</span>                                               <span class="c1"># a relation</span>
-<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="n">ds</span><span class="o">.</span><span class="n">to_polars</span><span class="p">()</span>                         <span class="c1"># a Polars LazyFrame, as LanceDB&#39;s Table.to_polars()</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="n">ds</span><span class="o">.</span><span class="n">to_polars</span><span class="p">()</span>                         <span class="c1"># a Polars LazyFrame, as LanceDB's Table.to_polars()</span>
 <a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="n">polars</span><span class="o">.</span><span class="n">scan_pyarrow_dataset</span><span class="p">(</span><span class="n">ds</span><span class="p">)</span>        <span class="c1"># the same</span>
-<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="n">ds</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">()</span>                         <span class="c1"># as pylance&#39;s (blob columns per blob_mode)</span>
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="n">ds</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">()</span>                         <span class="c1"># as pylance's (blob columns per blob_mode)</span>
 </code></pre></div>
 <p>Other Lance implementations read the files nanolance writes: DuckDB's <code>lance</code> community extension
 (scans, filters, <code>lance_vector_search</code> and <code>lance_fts</code> over the IVF_PQ and INVERTED indexes
@@ -1677,10 +1677,10 @@ only for very large datasets.</p>
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

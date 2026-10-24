@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -27,10 +27,10 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -851,15 +851,15 @@ Do only the phase you are given.</p>
 <h2 id="0-context-budget-read-this-first">0. Context budget (read this first)<a class="headerlink" href="#0-context-budget-read-this-first" title="Permanent link">&para;</a></h2>
 <p>Budget about 200k tokens; aim for 120k:
 - Never read a large file whole: <code>grep -n</code>, then <code>sed -n 'A,Bp'</code> windows of at most ~120 lines. Big
-  ones: <code>src/fts_index_build.cpp</code>, <code>src/fts_search.cpp</code> (4.7k lines between the fts_* files),
+  ones: <code>src/index/fts/fts_index_build.cpp</code>, <code>src/index/fts/fts_search.cpp</code> (4.7k lines between the fts_* files),
   <code>bindings/python/nanolance/lance/dataset.py</code> (3.5k+), and Lance's Rust (read only what is named).
 - Cut output: <code>| tail -15</code> for pytest (add <code>-o addopts=</code>), <code>| tail -5</code> for <code>tools/pylance_suite.py</code>,
   <code>ninja 2&gt;&amp;1 | grep -E "error|warning:" | head</code>.</p>
 <h2 id="1-goal">1. Goal<a class="headerlink" href="#1-goal" title="Permanent link">&para;</a></h2>
 <p>pylance builds and searches INVERTED indexes on <code>list&lt;string&gt;</code>, <code>list&lt;large_string&gt;</code>,
 <code>large_list&lt;string&gt;</code> and <code>large_list&lt;large_string&gt;</code> columns. nanolance refuses them today:
-<code>an INVERTED index needs a string column; text is not one</code> (<code>src/fts_index_build.cpp</code> about line 715),
-<code>full-text search needs a string column</code> (<code>src/fts_search.cpp</code> about line 1274), and
+<code>an INVERTED index needs a string column; text is not one</code> (<code>src/index/fts/fts_index_build.cpp</code> about line 715),
+<code>full-text search needs a string column</code> (<code>src/index/fts/fts_search.cpp</code> about line 1274), and
 <code>full-text search over list elements</code> (<code>bindings/python/nanolance/lance/query.py</code> about line 50).
 Target: pylance's <code>test_fts_on_list</code> (L1) and the four <code>test_fts_on_list_elements[*]</code> (L2), in
 <code>.deps/pylance-tests/v12.0.0/tests/test_scalar_index.py</code> (lines 1755-1900): read them first.</p>
@@ -906,9 +906,9 @@ Target: pylance's <code>test_fts_on_list</code> (L1) and the four <code>test_fts
   <code>src/scalar/inverted/index/flat_search.rs</code> about lines 600-660 and 890-930).</p>
 <h2 id="3-where-things-are-in-nanolance">3. Where things are in nanolance<a class="headerlink" href="#3-where-things-are-in-nanolance" title="Permanent link">&para;</a></h2>
 <ul>
-<li>Build: <code>src/fts_index_build.cpp</code> (the column-type check about line 715; the docs writer: <code>grep -n
-  "_num_tokens" src/fts_index_build.cpp</code>). Search: <code>src/fts_search.cpp</code> (flat search over unindexed
-  fragments and the column check about line 1274). Tokenizer: <code>src/fts_tokenizer.cpp</code>.</li>
+<li>Build: <code>src/index/fts/fts_index_build.cpp</code> (the column-type check about line 715; the docs writer: <code>grep -n
+  "_num_tokens" src/index/fts/fts_index_build.cpp</code>). Search: <code>src/index/fts/fts_search.cpp</code> (flat search over unindexed
+  fragments and the column check about line 1274). Tokenizer: <code>src/index/fts/fts_tokenizer.cpp</code>.</li>
 <li>Python: <code>bindings/python/nanolance/lance/query.py</code> (<code>DocumentGranularity</code>, <code>_granularity</code>, the
   MatchQuery / PhraseQuery constructors), <code>dataset.py</code> (<code>create_scalar_index</code> and its parameters about
   line 1337; <code>_fts_query_json</code>; the <code>_score</code> column). <code>bindings/python/src/nanolance_bindings.cpp</code> passes
@@ -1053,10 +1053,10 @@ list-element ones (pre-existing); staged distributed builds over list elements a
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

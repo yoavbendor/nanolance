@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -31,10 +31,10 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -4015,9 +4015,9 @@ files nanolance had just written. The ownership contract is now uniform and docu
 <p>The definition-level layer built in 1.1 was fixed-width only, which left the most common thing a
 pandas or pyarrow user does — a text column with missing values — refused. It now works, both
 directions, plain and zstd:</p>
-<div class="language-python highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="o">&gt;&gt;&gt;</span> <span class="n">nanolance</span><span class="o">.</span><span class="n">write_table</span><span class="p">(</span><span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">({</span><span class="s2">&quot;s&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;x&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;zz&quot;</span><span class="p">]}),</span> <span class="s2">&quot;out.lance&quot;</span><span class="p">)</span>
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="o">&gt;&gt;&gt;</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">&quot;out.lance&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span><span class="o">.</span><span class="n">column</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">to_pylist</span><span class="p">()</span>
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="p">[</span><span class="s1">&#39;x&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="s1">&#39;zz&#39;</span><span class="p">]</span>
+<div class="language-python highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="o">&gt;&gt;&gt;</span> <span class="n">nanolance</span><span class="o">.</span><span class="n">write_table</span><span class="p">(</span><span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">({</span><span class="s2">"s"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"x"</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"zz"</span><span class="p">]}),</span> <span class="s2">"out.lance"</span><span class="p">)</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="o">&gt;&gt;&gt;</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"out.lance"</span><span class="p">)</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span><span class="o">.</span><span class="n">column</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">to_pylist</span><span class="p">()</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="p">[</span><span class="s1">'x'</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="s1">'zz'</span><span class="p">]</span>
 </code></pre></div>
 <p>On the write side this is the same layer applied to a different value encoding: the variable-width
 <code>MiniBlockLayout</code> gains the <code>f2</code> repdef encoding and <code>layers = [3]</code>, and each chunk gains its level
@@ -4043,7 +4043,7 @@ one-row all-null page, against nanolance's own reader <strong>and</strong> stock
 The reason was one protobuf field: stock Lance wraps every variable-width column in
 <code>CompressiveEncoding</code> field 6, which is <strong>FSST</strong> (Fast Static Symbol Table), with the real value
 encoding nested inside it.</p>
-<p>nanolance now decompresses FSST (<code>src/fsst.cpp</code>, ~90 lines). Only the decoder: the symbol-table
+<p>nanolance now decompresses FSST (<code>src/encoding/fsst.cpp</code>, ~90 lines). Only the decoder: the symbol-table
 <em>construction</em> is the whole algorithm, the decode is a table lookup, and nanolance has no reason to
 produce FSST when the uncompressed <code>Variable</code> pages it already writes are what stock Lance reads.</p>
 <p>Two things about the format were worth the trouble to get exactly right:</p>
@@ -4101,7 +4101,7 @@ changed.</p>
 a string column with few distinct values. Lance writes it as a dictionary page whose dictionary block
 is <code>General{LZ4, Variable}</code>, and nanolance read that block raw and died on its header with "dict
 block header invalid" -- naming the symptom rather than the missing decoder.</p>
-<p><strong>LZ4 is now decompressed in-tree</strong> (<code>src/lz4_block.cpp</code>, ~90 lines), with no new dependency. This is
+<p><strong>LZ4 is now decompressed in-tree</strong> (<code>src/encoding/lz4_block.cpp</code>, ~90 lines), with no new dependency. This is
 the LZ4 <em>block</em> format, not the framed one: a token byte, a run of literals, and a back-reference,
 with no entropy coder and no checksums. Vendoring a library to read that would have cost more than it
 saved -- nanolance carries zstd only because zstd genuinely needs it. Lance's wrapper around the
@@ -4543,7 +4543,7 @@ manifests into V1 form, after which the same reads came back correct.</p>
 <h3 id="2-deletion-files-were-not-read-at-all">2. Deletion files were not read at all<a class="headerlink" href="#2-deletion-files-were-not-read-at-all" title="Permanent link">&para;</a></h3>
 <p>Lance records deleted rows in <code>_deletions/{fragment}-{read_version}-{id}.{suffix}</code> and picks the
 shape by density: an <strong>Arrow IPC file</strong> of u32 offsets when sparse, a <strong>roaring bitmap</strong> above 5000.</p>
-<p>Both are parsed directly, in <code>src/deletion_vector.cpp</code>, rather than through a library. The Arrow
+<p>Both are parsed directly, in <code>src/table/deletion_vector.cpp</code>, rather than through a library. The Arrow
 route would otherwise mean enabling nanoarrow's <code>NANOARROW_IPC_WITH_ZSTD</code>, which pulls a
 <code>find_package(zstd REQUIRED)</code> into a build that deliberately vendors zstd -- a portability
 regression on exactly the platforms CI had only just started covering. So the file carries a minimal
@@ -5104,7 +5104,7 @@ piece of work (an FSST encoder), not a tweak — so it is listed below rather th
 <h2 id="the-one-parser-with-no-fuzzer-had-an-unbounded-expansion-in-it">The one parser with no fuzzer had an unbounded expansion in it<a class="headerlink" href="#the-one-parser-with-no-fuzzer-had-an-unbounded-expansion-in-it" title="Permanent link">&para;</a></h2>
 <p>Asked whether nanolance should be using <code>nanom</code> (the sister parser-combinator library) for its binary
 parsing, I went looking at what the hand-rolled parsers actually are. The audit's most useful output
-was not an answer about nanom: it was noticing that <code>src/deletion_vector.cpp</code> — 547 lines of
+was not an answer about nanom: it was noticing that <code>src/table/deletion_vector.cpp</code> — 547 lines of
 untrusted-input parsing added in this same session — was <strong>the only parser in the tree without a
 libFuzzer target</strong>. <code>fuzz_decode</code>, <code>fuzz_page_layout</code>, <code>fuzz_fsst</code> and <code>fuzz_lz4</code> cover everything
 else, and none of them reach a deletion file: <code>fuzz_decode</code> stops at the data file and never opens
@@ -5507,8 +5507,8 @@ agreed: a pylance struct has no physical column for the parent, only its flatten
 obvious reading was that nanolance expected a parent column that Lance does not write.</p>
 <p>That reading was wrong, and one experiment showed it. Put <strong>any</strong> column ahead of the struct and the
 same file reads perfectly:</p>
-<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>lance.write_dataset(pa.table({&quot;s&quot;: struct_col}), ...)               -&gt; FAILS
-<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>lance.write_dataset(pa.table({&quot;lead&quot;: ints, &quot;s&quot;: struct_col}), ...) -&gt; reads fine
+<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>lance.write_dataset(pa.table({"s": struct_col}), ...)               -&gt; FAILS
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>lance.write_dataset(pa.table({"lead": ints, "s": struct_col}), ...) -&gt; reads fine
 </code></pre></div>
 <p>A missing decoder does not care what position a column is in. Field <strong>ids</strong> do.</p>
 <p>Lance's <code>Field.parent_id</code> is a proto3 <code>int32</code>, and <strong>proto3 does not put a zero on the wire</strong>. A
@@ -5662,7 +5662,7 @@ compressive wrapper rather than with repetition levels.</p>
    every one of them installed into a clean virtualenv and smoke-tested. The log shows the
    placeholder resolving and the test importing the <em>installed</em> package rather than the repo, which
    is the property the smoke test exists to prove:</p>
-<div class="language-text highlight"><pre><span></span><code>   + sh -c &#39;python /project/bindings/python/tests/wheel_smoke.py&#39;
+<div class="language-text highlight"><pre><span></span><code>   + sh -c 'python /project/bindings/python/tests/wheel_smoke.py'
    nanolance 0.2.0 from /tmp/.../venv/lib/python3.13/site-packages/nanolance/__init__.py
    wheel smoke passed
 </code></pre></div>
@@ -5715,7 +5715,7 @@ compressive wrapper rather than with repetition levels.</p>
 <p>20 wheels and an sdist, each installed into a clean virtualenv and smoke-tested against the
    <em>installed</em> package. Both bugs show in a single log line — the path resolving under
    <code>bindings/python</code>, on a runner that exists:</p>
-<div class="language-text highlight"><pre><span></span><code>   + /bin/sh -c &#39;python .../bindings/python/tests/wheel_smoke.py&#39;
+<div class="language-text highlight"><pre><span></span><code>   + /bin/sh -c 'python .../bindings/python/tests/wheel_smoke.py'
    nanolance 0.2.0 from .../venv-test-x86_64/lib/python3.13/site-packages/nanolance/__init__.py
    wheel smoke passed
 </code></pre></div>
@@ -5776,7 +5776,7 @@ page size: nanolance writes ~10 rows per page for a 768-dim float32 vector (road
 <p><code>list</code> and <code>large_list</code> columns written by pylance now read — the largest type gap this project had.
 Design first (<a href="../NESTED_COLUMNS/">NESTED_COLUMNS.md</a>), then three pieces:</p>
 <ul>
-<li><strong>The unraveler</strong> (<code>src/repdef.cpp</code>), a port of Lance's <code>RepDefUnraveler</code>: repetition and
+<li><strong>The unraveler</strong> (<code>src/encoding/repdef.cpp</code>), a port of Lance's <code>RepDefUnraveler</code>: repetition and
   definition levels in, per-layer offsets and validity out. Pure computation, tested case by case
   against the vectors in Lance's own <code>repdef.rs</code>, and fuzzed on its own with Arrow's list invariants
   asserted on every accepted input (6.8M inputs, clean).</li>
@@ -5972,7 +5972,7 @@ pages (pylance's and nanolance's), ran 662,109 executions clean; CI seeds it wit
 <p>pylance compresses high-cardinality strings -- ids, URLs, free text -- with FSST, and nanolance only
 read FSST, so on exactly that shape its files were 1.5-4x larger. nanolance now writes FSST too.</p>
 <ul>
-<li><strong>The encoder</strong> (<code>fsst::train</code>, <code>fsst::compress_value</code> in <code>src/fsst.cpp</code>) builds the symbol table
+<li><strong>The encoder</strong> (<code>fsst::train</code>, <code>fsst::compress_value</code> in <code>src/encoding/fsst.cpp</code>) builds the symbol table
   the way Lance does (<code>build_symbol_table</code> in <code>rust/compression/fsst</code>): six rounds over a ~16 KiB
   sample, counting symbols and adjacent pairs, keeping the 255 with the highest count x length
   (single bytes x8), and returning the table from the round that compressed the sample best. Three
@@ -6487,7 +6487,7 @@ writer:
     start-up dominates);
   - creating a 2M-row dataset: 0.98–1.11x.</p>
 <h3 id="page-descriptors-through-nanom">Page descriptors through nanom<a class="headerlink" href="#page-descriptors-through-nanom" title="Permanent link">&para;</a></h3>
-<p><code>src/page_layout.cpp</code> no longer parses protobuf by hand. A page's <code>/lance.encodings21.PageLayout</code>
+<p><code>src/encoding/page_layout.cpp</code> no longer parses protobuf by hand. A page's <code>/lance.encodings21.PageLayout</code>
 descriptor is decoded with nanom's model (<code>nanom/formats/lance_encodings.hpp</code>). The model's
 encoding children are <code>pb_lazy</code>, so the descriptor tree is decoded node by node without
 allocating. The result is converted to the same <code>Compressive</code> / <code>MiniBlock</code> / <code>Constant</code> /
@@ -6505,7 +6505,7 @@ allocating. The result is converted to the same <code>Compressive</code> / <code
 decodes got faster. Reading a 4,000-fragment dataset of 12,000 small pages, where per-page cost
 matters most, took 120-127 ms against 122-129 ms (best of 15, four alternating runs).</p>
 <h3 id="format-20-encodings-through-nanom">Format 2.0 encodings through nanom<a class="headerlink" href="#format-20-encodings-through-nanom" title="Permanent link">&para;</a></h3>
-<p><code>src/lance_v20_decoder.cpp</code> reads a 2.0 page's <code>/lance.encodings.ArrayEncoding</code> tree, and a
+<p><code>src/encoding/lance_v20_decoder.cpp</code> reads a 2.0 page's <code>/lance.encodings.ArrayEncoding</code> tree, and a
 column's <code>ColumnEncoding</code> (the blob marker), with nanom's model. The <code>Enc</code> tree the decoder
 dispatches on is unchanged.</p>
 <p>To make that possible, nanolance's own sources now compile as C++23. That adds no requirement:
@@ -6521,8 +6521,8 @@ dispatches on is unchanged.</p>
 case (a 4,000-fragment 2.0 dataset of 12,000 small pages) reads in 116.6-119.0 ms against
 114.8-116.3 ms (best of 15, three alternating runs): about 1.5% slower, on the legacy format only.</p>
 <h3 id="page-descriptors-written-through-nanom">Page descriptors written through nanom<a class="headerlink" href="#page-descriptors-written-through-nanom" title="Permanent link">&para;</a></h3>
-<p><code>src/data_file_writer.cpp</code> no longer assembles page descriptors from byte strings and hand-placed
-keys and lengths. A small internal helper, <code>src/lance_descriptors.hpp</code>, builds each
+<p><code>src/file/data_file_writer.cpp</code> no longer assembles page descriptors from byte strings and hand-placed
+keys and lengths. A small internal helper, <code>src/encoding/lance_descriptors.hpp</code>, builds each
 CompressiveEncoding (Flat, Variable, OutOfLineBitpacking, InlineBitpacking, Fsst, Rle,
 ByteStreamSplit, General, FixedSizeList) and each layout (MiniBlock, Constant, FullZip) on nanom's
 model, and nanom computes every length prefix and varint. The column encoding is built the same
@@ -6544,7 +6544,7 @@ difference. 56/56 ctest and the Python suite (1,808 tests, pylance interop inclu
 <h3 id="lz4-and-byte-stream-split-from-nanom">LZ4 and byte-stream-split from nanom<a class="headerlink" href="#lz4-and-byte-stream-split-from-nanom" title="Permanent link">&para;</a></h3>
 <p>nanolance had its own copies of two kernels nanom already ships, and parquet2nanoarrow already uses
 them. Both copies are gone:
-- <code>src/lz4_block.cpp</code> keeps only Lance's envelope: the <code>[u32 size]</code> prefix, the decoded-size limit
+- <code>src/encoding/lz4_block.cpp</code> keeps only Lance's envelope: the <code>[u32 size]</code> prefix, the decoded-size limit
   and the 255x bound checked before allocating. The block is decoded by nanom's
   <code>codec::lz4_block_decompress</code>.
 - <code>include/nanolance/byte_stream_split.hpp</code> is deleted. The writer and the reader call nanom's
@@ -6576,7 +6576,7 @@ source. Reading them is at parity: 13.6-14.4 ms best of 15, old and new interlea
 <h3 id="fsst-in-nanom">FSST in nanom<a class="headerlink" href="#fsst-in-nanom" title="Permanent link">&para;</a></h3>
 <p>The FSST codec moved into nanom: <code>nanom/fsst.hpp</code> reads the table and decodes,
 <code>nanom/fsst_encode.hpp</code> trains, compresses and serializes. <code>include/nanolance/fsst.hpp</code> and
-<code>src/fsst.cpp</code> are now an adapter that keeps nanolance's calling convention (byte vectors, error
+<code>src/encoding/fsst.cpp</code> are now an adapter that keeps nanolance's calling convention (byte vectors, error
 strings with the size, symbol or code in them) over nanom's span API, so every caller, test and fuzzer
 is unchanged.</p>
 <p><strong>Same answers.</strong> The old and new codecs were compiled side by side under ASan / UBSan:
@@ -6621,7 +6621,7 @@ and new interleaved on one core), 1.35x. It reads back equal to the source.</p>
 </ul>
 <h3 id="every-core-and-real-training-data">Every core, and real training data<a class="headerlink" href="#every-core-and-real-training-data" title="Permanent link">&para;</a></h3>
 <p>Asked: use more cores without a large library and without slowing one core; prove it on a widely
-used dataset. Done with a ~200-line <code>std::thread</code> pool (<code>src/parallel.cpp</code>) and no dependency:</p>
+used dataset. Done with a ~200-line <code>std::thread</code> pool (<code>src/base/parallel.cpp</code>) and no dependency:</p>
 <ul>
 <li><strong>Reads</strong> cut a fragment into row ranges decoded side by side, one Arrow batch each (no
   concatenation). Cuts need pages that give up a row range: list pages via their repetition index,
@@ -6649,7 +6649,7 @@ Verified with ASAN and ThreadSanitizer, and the suites run at 1, 4, and 8 thread
 results, at about pylance's speed, starting with the scalar indexes (the plan: BTree, Bitmap and
 LabelList; then IVF_PQ / IVF_FLAT; then LanceDB's full-text defaults).</p>
 <ul>
-<li><strong>Building</strong> (<code>src/scalar_index.cpp</code>): the column is scanned with row addresses (deleted rows left
+<li><strong>Building</strong> (<code>src/index/scalar/scalar_index.cpp</code>): the column is scanned with row addresses (deleted rows left
   out), its values -- a label list's elements -- ordered nulls first, then ascending (IEEE total order
   for floats), ties by row address, and written as Lance writes them: BTree's <code>page_data.lance</code> and
   <code>page_lookup.lance</code> (4096-row pages, min / max / null count, <code>batch_size</code> metadata), Bitmap's and
@@ -6658,7 +6658,7 @@ LabelList; then IVF_PQ / IVF_FLAT; then LanceDB's full-text defaults).</p>
   key prefixes taken past the column's common prefix; a bitmap groups by hash and sorts only the
   distinct values. Standalone Lance files with schema metadata and extra global buffers came first
   (<code>write_lance_file</code>), and the reader learned files with more than one global buffer.</li>
-<li><strong>Using</strong> (<code>src/index_search.cpp</code>): a filter's AND / OR / NOT structure over single-column
+<li><strong>Using</strong> (<code>src/dataset/index_search.cpp</code>): a filter's AND / OR / NOT structure over single-column
   predicates (<code>expr::Condition</code>, <code>expr::Predicate</code>), each evaluated with the filter engine's own
   semantics on an index's keys or a BTree page's bounds, gives per covered fragment the rows that may
   pass; the reader decodes only those (<code>read_candidate_rows</code>) and applies the whole filter to them.</li>
@@ -6690,12 +6690,12 @@ index serves pylance and nanolance with the same results, at about pylance's spe
   probe count (a k-dependent margin, floor and cap for IVF_FLAT under L2 / cosine; a factor of the
   nearest centroid's distance otherwise), its 4-bit PQ's u8-quantized distance tables, and ties
   broken by row id.</li>
-<li><strong>Searching</strong> (<code>src/vector_search.cpp</code>): <code>nearest=</code> on pylance-built or nanolance-built indexes
+<li><strong>Searching</strong> (<code>src/index/vector/vector_search.cpp</code>): <code>nearest=</code> on pylance-built or nanolance-built indexes
   returns pylance's rows, order and distances (IVF_FLAT and 8-bit IVF_PQ; 4-bit up to the order of
   equal quantized distances), with refine, prefilter / post-filter, deletions, unindexed fragments
   searched exactly, <code>fast_search</code>, <code>distance_range</code>, metric overrides and exact search without an
   index. Partitions are scored on the thread pool; PQ tables sweep a transposed codebook.</li>
-<li><strong>Building</strong> (<code>src/vector_index_build.cpp</code>): Lance's k-means and defaults, PQ by L2 on residuals
+<li><strong>Building</strong> (<code>src/index/vector/vector_index_build.cpp</code>): Lance's k-means and defaults, PQ by L2 on residuals
   (as Lance's v3 builder trains it -- training or encoding dot indexes by dot instead cost them most
   of their recall), files and manifest entry as Lance writes them. pylance lists, searches and
   <code>optimize_indices</code> them.</li>
@@ -6727,21 +6727,21 @@ about pylance's speed.</p>
 <li>Unindexed fragments use the index's statistics plus their live (and prefiltered) rows'.</li>
 <li>A string query is the best of the indexed columns.</li>
 <li>A column without an index is Lance's flat search, with the bare simple tokenizer.</li>
-<li><strong>The analyzer</strong> (<code>src/fts_tokenizer.cpp</code>) produces Lance's tokens byte for byte:</li>
+<li><strong>The analyzer</strong> (<code>src/index/fts/fts_tokenizer.cpp</code>) produces Lance's tokens byte for byte:</li>
 <li>The Unicode alphanumeric, lower-case and folding tables and the stop words are generated from
     the Rust crates by a small Rust tool (<code>tools/fts_tables</code>).</li>
 <li>The Snowball English stemmer is machine-translated from frostem's Rust (<code>tools/fts_stem_translate.py</code>).</li>
 <li>It was checked on 177k words and 98k lines; 3,000 lines are kept as goldens.</li>
-<li><strong>The FST</strong> (<code>src/fts_fst.cpp</code>) ports the <code>fst</code> crate's reader and builder: node encodings,
+<li><strong>The FST</strong> (<code>src/index/fts/fts_fst.cpp</code>) ports the <code>fst</code> crate's reader and builder: node encodings,
   suffix sharing through the same registry, and the CRC32C trailer. Built maps equal the crate's
   byte for byte (goldens from the crate). The reader survives 3,000 corrupted maps under ASan.</li>
-<li><strong>Searching</strong> (<code>src/fts_search.cpp</code>): Match (OR / AND, boost), MultiMatch, Boost and Boolean
+<li><strong>Searching</strong> (<code>src/index/fts/fts_search.cpp</code>): Match (OR / AND, boost), MultiMatch, Boost and Boolean
   queries, with filters before or after, deletions, unindexed fragments, <code>fast_search</code> and several
   partitions or segments. Scores accumulate in dense per-document arrays. With a limit, each
   match keeps only its best rows. A one-word search walks runs of 128 postings by their exact best
   weight and stops when no run can beat the rows kept: a top-10 for a word in 90% of 500k
   documents went from 16.9 ms to 0.3 ms.</li>
-<li><strong>Building</strong> (<code>src/fts_index_build.cpp</code>): parallel tokenizing, token ids by first appearance, and
+<li><strong>Building</strong> (<code>src/index/fts/fts_index_build.cpp</code>): parallel tokenizing, token ids by first appearance, and
   Lance's block scores and impacts. For the same data, the files equal pylance's and LanceDB
   0.39's, byte for byte, except the partition number and document order when Lance's workers take
   fragments out of order. pylance and LanceDB search such an index with the same scores, and
@@ -6777,7 +6777,7 @@ about pylance's speed.</p>
 and the planned lance-c work (wire vector and full-text search into the C API; UPDATE_IF and
 include_deleted_rows).</p>
 <ul>
-<li><strong>optimize_indices</strong> (<code>src/index_optimize.cpp</code>, <code>include/nanolance/index_optimize.hpp</code>), as Lance's
+<li><strong>optimize_indices</strong> (<code>src/dataset/index_optimize.cpp</code>, <code>include/nanolance/index_optimize.hpp</code>), as Lance's
   <code>lance/src/index/append.rs</code> does it:</li>
 <li>segment selection by <code>num_indices_to_merge</code> (default 1; 0 adds a delta segment) and <code>retrain</code>;</li>
 <li>one new segment per index, over the replaced segments' live fragments and every uncovered one,
@@ -6788,10 +6788,10 @@ include_deleted_rows).</p>
     seeded k-means, keeping only centroids that win rows; join those under a quarter of it into the
     nearest of their 64 nearest survivors with room; also with nothing new to fold in.</li>
 <li>The builders were split into "write a segment over these fragments" and a commit
-    (<code>src/index_build.hpp</code>), so creating and optimizing share one path.</li>
+    (<code>src/index/segment.hpp</code>, with each kind's inputs in its own header), so creating and optimizing share one path.</li>
 <li><strong>Compaction</strong> folds its rewritten fragments back into the indexes that covered them (a second
   version; <code>CompactionOptions::reindex</code>, Python <code>compact_files(reindex=False)</code>).</li>
-<li><strong>lance-c</strong> (<code>src/lance_c.cpp</code>): vector index creation and <code>nearest</code> with every setter; INVERTED
+<li><strong>lance-c</strong> (<code>src/api/lance_c.cpp</code>): vector index creation and <code>nearest</code> with every setter; INVERTED
   in <code>create_scalar_index</code> (<code>params_json</code>); <code>full_text_search</code> and prepared Match contexts with
   STRICT / INDEX_ONLY coverage; <code>include_deleted_rows</code> (deleted rows with a NULL <code>_rowid</code>);
   <code>use_scalar_index</code>; merge insert <code>UPDATE_IF</code>, also in the core and in Python
@@ -6813,13 +6813,13 @@ include_deleted_rows).</p>
 <h2 id="ivf_hnsw_sq-searched-and-built">IVF_HNSW_SQ: searched and built<a class="headerlink" href="#ivf_hnsw_sq-searched-and-built" title="Permanent link">&para;</a></h2>
 <p>Asked: IVF_HNSW_SQ, the next index gap on the roadmap -- its format, search and build.</p>
 <ul>
-<li><strong>Search</strong> (<code>src/vector_search.cpp</code>): Lance's HNSW graphs (<code>index.idx</code>) and 8-bit SQ codes
+<li><strong>Search</strong> (<code>src/index/vector/vector_search.cpp</code>): Lance's HNSW graphs (<code>index.idx</code>) and 8-bit SQ codes
   (<code>auxiliary.idx</code>), searched with Lance's greedy descent, level-0 beam (<code>ef</code>), prefilter rules
   (plain / exact under 10% passing / filtered beam) and <code>distance_range</code>, ties ranked as Rust's
   <code>BinaryHeap</code> ranks them; partitions past the first probes searched <code>query_parallelism</code> at a time as
   Lance does. Also 0-bit bit-packed definition levels (no level buffer), which pylance writes for the
   neighbour lists.</li>
-<li><strong>Build</strong> (<code>src/hnsw_build.cpp</code>, <code>src/vector_index_build.cpp</code>): <code>create_index(..., "IVF_HNSW_SQ",
+<li><strong>Build</strong> (<code>src/index/vector/hnsw_build.cpp</code>, <code>src/index/vector/vector_index_build.cpp</code>): <code>create_index(..., "IVF_HNSW_SQ",
   m=, ef_construction=, max_level=)</code>; SQ bounds from a sample; each partition's graph after
   lance-index's <code>HnswBuilder</code> -- Lance's fixed-seed node levels and entry points exactly (rand 0.9
   <code>SmallRng</code>, seed 42), beam insertion, Algorithm 4 neighbour selection, reciprocal pruning, repair of
@@ -6839,14 +6839,14 @@ include_deleted_rows).</p>
 <h2 id="lance-c-index-segments">lance-c: index segments<a class="headerlink" href="#lance-c-index-segments" title="Permanent link">&para;</a></h2>
 <p>Asked: continue lance-c compatibility, function before speed, without degrading function or speed.</p>
 <ul>
-<li><strong>Index segments</strong> (<code>src/lance_c.cpp</code>, <code>src/index_segments.cpp</code>, <code>include/nanolance/index_segments.hpp</code>),
+<li><strong>Index segments</strong> (<code>src/api/lance_c.cpp</code>, <code>src/dataset/index_segments.cpp</code>, <code>include/nanolance/index_segments.hpp</code>),
   the last 20 functions that only returned <code>LANCE_ERR_NOT_SUPPORTED</code>:</li>
 <li>builders over chosen fragments with an assigned UUID, for BTREE / BITMAP / LABEL_LIST /
     INVERTED and IVF_FLAT / IVF_PQ / IVF_HNSW_SQ, with progress callbacks, Lance's default names
     and its name and UUID rules;</li>
 <li>IVF and PQ model training exported as Arrow with lance-c's provenance metadata, and models
     injected into builds (AUTO / LOCAL_TRAIN / PRECOMPUTED); the core's builders gained a fixed
-    UUID, progress stages, a train-only mode and partial models (<code>src/index_build.hpp</code>);</li>
+    UUID, progress stages, a train-only mode and partial models (<code>src/index/segment.hpp</code>);</li>
 <li>segment metadata parsing and accessors; commit as Lance's <code>commit_existing_index_segments</code>
     (validation, stale-coverage pruning, coverage-driven replacement, vector compatibility);
     listing;</li>
@@ -6868,14 +6868,14 @@ include_deleted_rows).</p>
 <p>Asked: continue toward feature completeness and performance parity; new features function first,
 without degrading current function or speed.</p>
 <ul>
-<li><strong>Read</strong> (<code>src/fts_search.cpp</code>): Lance 12's positions (<code>shared_stream_v2</code>, <code>packed_delta_v1</code> and
+<li><strong>Read</strong> (<code>src/index/fts/fts_search.cpp</code>): Lance 12's positions (<code>shared_stream_v2</code>, <code>packed_delta_v1</code> and
   <code>varint_doc_delta_v2</code>), decoded per token on first use and cached. Other layouts are refused for
   phrases only.</li>
 <li><strong>Search</strong>: <code>PhraseQuery</code> with slop, and a string in double quotes, as Lance does them (exact and
   slop checks from <code>wand.rs</code>, the flat check for unindexed rows from <code>flat_search.rs</code>, query
   positions counted from the first term kept); pylance's errors for a missing column or an index
   without positions. lance-c's <code>lance_dataset_prepare_fts_phrase_query</code> works.</li>
-<li><strong>Build</strong> (<code>src/fts_index_build.cpp</code>): <code>with_position=True</code> writes positions as Lance 12 does,
+<li><strong>Build</strong> (<code>src/index/fts/fts_index_build.cpp</code>): <code>with_position=True</code> writes positions as Lance 12 does,
   with the same contents as pylance's build; pylance's phrase queries and <code>optimize_indices</code> use it.</li>
 <li><strong>Verified</strong>: 1,050 random phrases (pylance-built and nanolance-built indexes, unindexed and
   deleted rows, limits) give pylance's rows and scores; <code>test_fts_phrase.py</code>; the lance-c phrase
@@ -6889,10 +6889,10 @@ without degrading current function or speed.</p>
 <p>Asked: work through the Tier 1 list of <code>docs/ROADMAP.md</code> (what pylance users hit most), function
 first, without degrading function or speed.</p>
 <ul>
-<li><strong>Append some of the columns</strong> (<code>src/writer.cpp</code> <code>writer_project_append</code>): the new files hold the
+<li><strong>Append some of the columns</strong> (<code>src/dataset/write_session.cpp</code> <code>writer_project_append</code>): the new files hold the
   given columns alone, with the dataset's field ids, as pylance writes them; leaving out a
   non-nullable column, or giving one the dataset lacks, is pylance's error, word for word.</li>
-<li><strong>Reading columns a fragment lacks</strong> (<code>src/lance_table_reader.cpp</code>): a struct or list column
+<li><strong>Reading columns a fragment lacks</strong> (<code>src/scan/lance_table_reader.cpp</code>): a struct or list column
   whose fragment has no data reads as a null value, as in Lance (it read as a struct of nulls,
   and a missing list column could not be read at all).</li>
 <li><strong><code>merge_insert</code> with part of the columns</strong>: matched rows keep their values in the other
@@ -6909,8 +6909,8 @@ first, without degrading function or speed.</p>
 </ul>
 <h2 id="concurrent-writers">Concurrent writers<a class="headerlink" href="#concurrent-writers" title="Permanent link">&para;</a></h2>
 <ul>
-<li><strong>Retries, as Lance's</strong> (<code>src/dataset.cpp</code>, <code>src/manifest_writer.cpp</code>, <code>src/dataset_ops.cpp</code>,
-  <code>src/index_optimize.cpp</code>): a commit that loses its version is no longer refused when it still
+<li><strong>Retries, as Lance's</strong> (<code>src/dataset/dataset.cpp</code>, <code>src/table/manifest_writer.cpp</code>, <code>src/dataset/dataset_ops.cpp</code>,
+  <code>src/dataset/index_optimize.cpp</code>): a commit that loses its version is no longer refused when it still
   applies -- an append or overwrite is built again on the newer version; a change made from an
   older version is rebased when the other writers only added fragments (its own new fragments
   renumbered after theirs, with the index coverage that names them); a delete, update,
@@ -6953,7 +6953,7 @@ first, without degrading function or speed.</p>
 </ul>
 <h2 id="version-housekeeping">Version housekeeping<a class="headerlink" href="#version-housekeeping" title="Permanent link">&para;</a></h2>
 <ul>
-<li><strong>Tags</strong> (<code>src/dataset_refs.cpp</code>): <code>_refs/tags/&lt;name&gt;.json</code> in Lance's format (camelCase,
+<li><strong>Tags</strong> (<code>src/table/dataset_refs.cpp</code>): <code>_refs/tags/&lt;name&gt;.json</code> in Lance's format (camelCase,
   RFC 3339 times, manifest size, metadata), Lance's name rules and messages; created without
   replacing (hard link, as <code>put_if_absent</code>). pylance reads nanolance's tags and the reverse;
   <code>checkout_version("tag")</code>, <code>lance.dataset(uri, "tag")</code>.</li>
@@ -6994,7 +6994,7 @@ first, without degrading function or speed.</p>
 <li><strong>The bug</strong>: pylance, committing from a read version older than a version nanolance committed,
   failed with Lance's internal error "Dataset version N does not have a transaction file" -- any
   pylance writer sharing a dataset with a nanolance writer could hit it.</li>
-<li><strong>The fix</strong> (<code>src/transaction_file.cpp</code>): every commit (<code>publish_manifest</code>) writes
+<li><strong>The fix</strong> (<code>src/table/transaction_file.cpp</code>): every commit (<code>publish_manifest</code>) writes
   <code>_transactions/{read_version}-{uuid}.txn</code>, a lance.table.Transaction, before the manifest that
   names it (field 12), and removes it when the commit does not land. The operation is read off the
   change from the version before (fragments added / deletion files changed / fragments replaced,
@@ -7038,7 +7038,7 @@ first, without degrading function or speed.</p>
 <li><strong>The gap</strong>: JSON columns did not interoperate at all. pylance stores <code>pa.json_()</code> as JSONB
   (Databend's binary JSON, the <code>jsonb</code> crate) under logical type "json"; nanolance refused those
   datasets and wrote its own as text, which pylance refused.</li>
-<li><strong>JSONB</strong> (<code>src/jsonb.cpp</code>): the crate's lenient parser (single quotes, unquoted keys, NaN /
+<li><strong>JSONB</strong> (<code>src/arrow/jsonb.cpp</code>): the crate's lenient parser (single quotes, unquoted keys, NaN /
   Infinity, hex, <code>+1</code>, <code>.5</code>, <code>123.</code> as an integer; duplicate keys and trailing commas refused),
   its encoder (sorted keys, u64 / i64 / f64 number types, smallest integer width), its printer
   (compact; floats positional for exponents -5..15 with ".0" when integral, else <code>1e+20</code>; NaN and
@@ -7222,7 +7222,7 @@ publishes them.</p>
 </ul>
 <h2 id="stable-row-ids">Stable row ids<a class="headerlink" href="#stable-row-ids" title="Permanent link">&para;</a></h2>
 <ul>
-<li><strong>Format</strong> (<code>include/nanolance/row_ids.hpp</code>, <code>src/row_ids.cpp</code>): Lance's <code>RowIdSequence</code> (Range,
+<li><strong>Format</strong> (<code>include/nanolance/row_ids.hpp</code>, <code>src/table/row_ids.cpp</code>): Lance's <code>RowIdSequence</code> (Range,
   RangeWithHoles, RangeWithBitmap, SortedArray, Array segments; EncodedU64Array as U16 / U32 / U64;
   encoded as Lance picks, byte-identical to pylance's), <code>RowDatasetVersionSequence</code> run-length
   encoding, the fragment fields (5 / 7 / 9 inline; external 6 / 8 / 10 refused), <code>next_row_id</code>, the
@@ -7250,7 +7250,7 @@ publishes them.</p>
 <li><strong>What</strong>: <code>PackedBlobWriter</code>, <code>DedicatedBlobWriter</code> and <code>BlobDescriptorArrayBuilder</code> as pylance 12
   has them (<code>LanceFileSession.open_packed_blob_writer</code> / <code>open_dedicated_blob_writer</code>,
   <code>nanolance.lance.BlobDescriptorArrayBuilder</code>). The C++ data file writer takes descriptor-shaped
-  blob columns (<code>src/blob_v2_external.cpp</code>), so a <code>LanceFileSession.open_writer</code> file can hold them
+  blob columns (<code>src/file/blob_v2_external.cpp</code>), so a <code>LanceFileSession.open_writer</code> file can hold them
   and a <code>DataReplacement</code> commits them. <code>DataFile.create</code> reads only the footer's top-level names.</li>
 <li><strong>Found on the way</strong>: <code>DataReplacement</code> keeps the replaced fragment's row count, in pylance too, so
   a replacement with more or fewer rows than the fragment reads back wrong. A test precondition, not
@@ -7285,7 +7285,7 @@ own tests (<code>tests/test_multi_base.py</code>, <code>test_blob.py</code>, thr
 <li><strong>What</strong>: Lance's DataOverlay (<code>DataFragment.overlays</code>, field 11; operation field 115; feature flag 64,
   which pylance 12 honours only with <code>LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES</code>). Commit stamps each
   overlay's <code>committed_version</code>; scans, filters and takes merge an overlay's values in place of the
-  data file's before deletions are applied (<code>merge_column_rows</code> in <code>src/column_slice.cpp</code>, the hook in
+  data file's before deletions are applied (<code>merge_column_rows</code> in <code>src/encoding/column_slice.cpp</code>, the hook in
   <code>read_data_file_batches</code> / <code>decode_data_file_rows</code>); newest overlay wins, values by rank. Flat columns;
   nested, blob and dictionary columns are refused by name. An index older than an overlay on its field
   does not answer for that fragment (<code>fragments_stale_for_index</code>, used by scalar, vector and full-text
@@ -7411,10 +7411,10 @@ own tests (<code>tests/test_multi_base.py</code>, <code>test_blob.py</code>, thr
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>
