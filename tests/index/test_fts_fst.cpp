@@ -18,8 +18,8 @@
 #include <utility>
 #include <vector>
 
-#include "../src/index/fts/fts_fst.hpp"
-#include "../src/index/fts/fts_posting.hpp"
+#include "index/fts/fts_fst.hpp"
+#include "index/fts/fts_posting.hpp"
 
 using nano_lance::fts::FstBuilder;
 using nano_lance::fts::FstMap;

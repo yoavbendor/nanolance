@@ -158,7 +158,7 @@ options are per bucket and process-wide.
 S3 reader with `-Werror` and runs `test_object_store.py` / `test_object_store_writes.py`; the step fails on
 any skip and uploads moto's log on failure. lance-c: `lance_dataset_open(uri, storage_opts, version)`
 opens `s3://` datasets with Lance's option keys (one key mapping, `io::object_store_options_from`, shared
-with the Python binding); writes through lance-c still refuse URIs. `tests/lance_c_s3_read.cpp`, driven
+with the Python binding); writes through lance-c still refuse URIs. `tests/integration/lance_c_s3_read.cpp`, driven
 by `test_lance_c_reads_s3_dataset` (version, count and take after a delete, against pylance). Not done:
 wheels still build without S3 (bundling libcurl and OpenSSL into manylinux wheels is its own decision);
 a wheel refuses `s3://` by name.

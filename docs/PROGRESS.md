@@ -49,7 +49,7 @@ with no error and no warning, and stock Lance read those wrong values back witho
 now refuses a batch containing a null, naming the column, the row and the remedy.
 
 The detection handles the cases a naive check gets wrong, each covered by
-`tests/test_null_rejection.cpp`: Arrow's `null_count` is authoritative when non-negative but `-1`
+`tests/arrow/test_null_rejection.cpp`: Arrow's `null_count` is authoritative when non-negative but `-1`
 means "not computed", so the validity bitmap is scanned; `ArrowArray::offset` shifts that window, so
 a null outside it is not this array's row; an absent validity buffer is all-valid whatever a
 malformed positive `null_count` claims; and a null on a parent struct is caught, since it makes every
@@ -155,7 +155,7 @@ today's failure mode is the opposite, and worse: a stock-Lance int64 page is mis
 nanolance's layout assumptions and caught downstream by a size check, which is why a 3-row table
 decodes and a 5000-row one does not.
 
-`tests/test_page_layout.cpp` is the differential oracle: for every encoding the writer can emit, with
+`tests/encoding/test_page_layout.cpp` is the differential oracle: for every encoding the writer can emit, with
 zstd off and on, it asserts the parsed descriptor **agrees** with the legacy metadata — two
 independent signals in the same file, across the writer's whole output space. That is the safety net
 the plan calls for, and it is what makes re-rooting decode a provable change rather than a rewrite.
@@ -354,7 +354,7 @@ with "Inline bitpacking width 67108864 exceeds 64-bit values".
 The stock-Lance read matrix, re-measured column by column, is in the README. What is left: run-length
 definition levels, LZ4 buffers, and `list`/`struct` at the manifest level.
 
-New coverage: `tests/test_fsst.cpp` (refusals, escapes, passthrough, accumulation),
+New coverage: `tests/encoding/test_fsst.cpp` (refusals, escapes, passthrough, accumulation),
 `tests/fuzz/fuzz_fsst.cpp` (contract-asserting: a refusal carries a reason, a decode expands by at
 most 8x, passthrough copies exactly, decoding appends and is deterministic), and the safety
 workflow's PageLayout corpus is now seeded from **stock-Lance-written** datasets too -- FSST strings,
@@ -718,7 +718,7 @@ of which this branch already found. Slicing `ColumnValues` instead makes every v
 byte-addressed -- `bool` is a *byte* per value until the Arrow buffer is assembled -- leaving exactly
 one thing that needs bit arithmetic: the validity bitmap.
 
-So `slice_column_values` is one function in one file, and `tests/test_column_slice.cpp` brute-forces
+So `slice_column_values` is one function in one file, and `tests/encoding/test_column_slice.cpp` brute-forces
 it: every `(total, first, count)` combination up to 40 rows, across fixed-width, 32- and 64-bit
 variable-width, nullable and not, compared bit by bit against a reference built from plain per-row
 vectors. 40 rows spans five bitmap bytes, so every `first % 8` and `count % 8` pair appears many
@@ -1053,7 +1053,7 @@ lseek         9,546 -> 8,793
 wall clock    78 ms -> 68 ms      (best of 15, interleaved)
 ```
 
-`tests/test_data_file_reader.cpp` guards it, and the guard took two attempts. The first version
+`tests/file/test_data_file_reader.cpp` guards it, and the guard took two attempts. The first version
 replaced the file with `ofstream` truncation and passed even with validation ripped out entirely —
 truncating in place keeps the inode, and a cached handle follows the inode, so nothing was being
 tested. It now unlinks first, and checks both directions of the stale-size bound: a read past a
@@ -1141,7 +1141,7 @@ lifetime changes. `commit()` defaults `is_append` to whatever `open()` was given
 after the first successful commit, so the argument that was easiest to get wrong has a right answer
 by default.
 
-`tests/test_writer_api.cpp` is about **equivalence**, not coverage: the options struct against the
+`tests/api/test_writer_api.cpp` is about **equivalence**, not coverage: the options struct against the
 equivalent setters, a zeroed struct and a `NULL` pointer against plain `init`,
 `disable_structural_encoding` against `set_structural_encoding(false)`, and the RAII writer against
 the hand-rolled C sequence — each compared as **byte-identical data files**. A second way to write
@@ -2211,7 +2211,7 @@ batch through the Python writer):
 | 8 MiB | 15.4 MiB | 7 |
 | 2 MiB | 7.6 MiB | 16 |
 
-and in C++ (`tests/test_writer_memory.cpp`, kernel high-water mark): 52 MiB of rows peak at 138-145
+and in C++ (`tests/api/test_writer_memory.cpp`, kernel high-water mark): 52 MiB of rows peak at 138-145
 MiB unbounded and 15-17 MiB under a 4 MiB budget. So plan for about 3-4x the budget plus one batch:
 buffers grow by doubling, and encoding a fragment needs room of its own (FSST's worst-case scratch,
 page buffers). Encoding at about twice the pending data is the next thing to shrink if it matters.
@@ -2417,7 +2417,7 @@ Truncated or malformed messages are still rejected.
 **Checked:**
 - All 56 ctest targets and the 1,826-test Python suite pass, including `test_index_preservation.py`,
   `test_scalar_index.py` and the pylance interop tests.
-- New in `tests/test_lance_minimal_pb.cpp`:
+- New in `tests/table/test_lance_minimal_pb.cpp`:
   - a manifest written by the hand-written encoder, kept as bytes, decodes field for field;
   - deletion files round-trip;
   - unmodelled fields of a manifest, a field and a fragment survive a rewrite, while the in-file
@@ -2801,7 +2801,7 @@ include_deleted_rows).
     either) and compares with pylance: segments, coverage, filter rows, full-text scores bit for bit,
     vector distances and partition counts.
   - `test_pylance_compat.py`: conditional upserts give pylance's rows.
-  - `tests/test_lance_c_search.cpp` drives the C API end to end against nanolance's own search; clean
+  - `tests/api/test_lance_c_search.cpp` drives the C API end to end against nanolance's own search; clean
     under ASan, UBSan and LeakSanitizer.
   - lance-c's suite stays at 90 of 106 (the rest need index segments).
   - 257 of pylance's own tests pass (254 before).
@@ -2856,7 +2856,7 @@ Asked: continue lance-c compatibility, function before speed, without degrading 
 - **Fixed**: a prepared full-text context took only one segment of a multi-segment index when
   another index was listed first; `tools/lance_c_suite.py` now gives each test binary fresh
   fixtures, as upstream does.
-- **Verified**: lance-c's suite 106 of 106 (90 before); `tests/test_lance_c_search.cpp` checks
+- **Verified**: lance-c's suite 106 of 106 (90 before); `tests/api/test_lance_c_search.cpp` checks
   that per-segment searches merged equal the whole search, the commit rules, scoped scans and
   per-segment FTS scores; pylance lists, searches and uses the indexes committed this way; ctest,
   the Python suite and pylance's suite (257) unchanged. Speed: index builds and vector,
@@ -3251,7 +3251,7 @@ publishes them.
   must skip deleted rows; `restore` lost the `next_row_id` high-water mark (ids repeated);
   `to_table(columns=[system columns], filter=..., with_row_id=True)` dropped `_rowid`.
 - **Verified**: `tests/test_stable_row_ids.py` (14 tests against pylance, both directions, indexes
-  included), `tests/test_row_ids.cpp`, `tests/test_lance_c_stable_row_ids.cpp`; pylance's suite.
+  included), `tests/table/test_row_ids.cpp`, `tests/api/test_lance_c_stable_row_ids.cpp`; pylance's suite.
 
 ## Prepared-layout blob writers
 

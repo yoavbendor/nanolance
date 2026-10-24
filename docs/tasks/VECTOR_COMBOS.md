@@ -109,7 +109,7 @@ Files changed, per-test status, decisions, questions.
 - Order (agreed): (a) IVF_HNSW_FLAT, (b) IVF_SQ, (c) IVF_HNSW_PQ. Tests go in
   `bindings/python/tests/test_hnsw.py`.
 - C2 will need: lance_c.cpp ~2459 (`vector_options` refuses these kinds at build), dataset.py ~1136 and
-  ~1280 (create_index refusals), and `tests/test_lance_c_search.cpp` ~358 asserts an IVF_HNSW_PQ build
+  ~1280 (create_index refusals), and `tests/api/test_lance_c_search.cpp` ~358 asserts an IVF_HNSW_PQ build
   is refused.
 
 **C1 outcome (2026-10-15):** done. IvfIndex has Storage {Flat, Pq, Sq} x SubIndex {Flat, Hnsw}; one

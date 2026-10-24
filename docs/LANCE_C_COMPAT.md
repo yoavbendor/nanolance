@@ -72,7 +72,7 @@ URIs: local paths, `file://`, and `memory://` (a directory private to the proces
   in all of Lance's layouts -- inline, packed, dedicated, external -- by `lance_dataset_write`, as by
   the Python module, and read in all of them; pylance reads what lance-c writes.)
 
-`tests/test_lance_c_search.cpp` drives the search API end to end through the C API (a dataset
+`tests/api/test_lance_c_search.cpp` drives the search API end to end through the C API (a dataset
 written with `lance_dataset_write`, its indexes built with lance-c's calls) and compares every
 result with nanolance's own search, which the Python tests check against pylance: rows, order,
 `_distance` / `_score`, the columns, offset and limit, filters, contexts and their coverage modes,

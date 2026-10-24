@@ -85,7 +85,7 @@ engines, ids and scores equal (scores to 1e-6), plus a pylance-built nested inde
 and the reverse, an append, a delete, optimize_indices. S: in `bindings/python/tests/test_small_apis.py`
 or a new file: a pylance dataset with its `.txn` files removed reads its transactions through nanolance
 and a nanolance commit racing it is classified normally (C++ two-writer test in
-`tests/test_commit_conflicts.cpp`); migration of a V1-named dataset (write one with pylance's
+`tests/table/test_commit_conflicts.cpp`); migration of a V1-named dataset (write one with pylance's
 `enable_v2_manifest_paths=False`), then both engines open it.
 
 ## 6. Rules

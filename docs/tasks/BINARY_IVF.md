@@ -155,7 +155,7 @@ line (`hamming_to_centroids`, `hamming_into_heap`) and a dead Hamming branch rem
 search interleaved A/B (k=10, 100k x 128, 4 alternations): 1.12 vs 1.15 ms median, within noise.
 Decisions for H2: keep nanolance's plan text format (pylance's differs for float IVF too); lance-c
 `LANCE_METRIC_HAMMING` over uint8 queries in H2, with Hamming still refused on float scanners
-(`tests/test_lance_c_search.cpp` ~317 stays); benchmarks: never overwrite `bench/results/*.json`
+(`tests/api/test_lance_c_search.cpp` ~317 stays); benchmarks: never overwrite `bench/results/*.json`
 (copy it back after a run).
 
 **H2 outcome (2026-10-20): task done.** nanolance builds Hamming IVF_FLAT indexes (Lance's k-modes:

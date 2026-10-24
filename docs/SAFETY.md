@@ -152,7 +152,7 @@ Not asserted — exercised in CI ([`.github/workflows/memory-safety.yml`](https:
   capped by the manifest's own `num_deleted_rows`; a bitmap container whose popcount, or a run
   container whose expansion, disagrees with its declared cardinality is refused outright; and the
   output reserve is capped rather than trusting the declared total, because the fuzzer turned that
-  trust into a 4 GiB `malloc` from a few kilobytes. `tests/test_read_safety.cpp` pins the budget with
+  trust into a 4 GiB `malloc` from a few kilobytes. `tests/base/test_read_safety.cpp` pins the budget with
   a 41 KB input that asks for a gigabyte.
 
   The same target then found the Arrow IPC side: a buffer's int64 uncompressed-length prefix was
@@ -177,7 +177,7 @@ Not asserted — exercised in CI ([`.github/workflows/memory-safety.yml`](https:
   was only reachable once the previous one was fixed — the memory-safety bug was six rounds deep.
   Every reproducer is checked in beside the others.
 
-- **Negative-corpus tests** ([`tests/test_read_safety.cpp`](https://github.com/yoavbendor/nanolance/blob/main/tests/test_read_safety.cpp)) — hand-built
+- **Negative-corpus tests** ([`tests/base/test_read_safety.cpp`](https://github.com/yoavbendor/nanolance/blob/main/tests/test_read_safety.cpp)) — hand-built
   malformed footers (oversized column count, overflowing descriptor bounds) and garbage protobuf must
   be *rejected cleanly*, and the checked-math/`load_le` helpers are unit-tested.
 

@@ -2,7 +2,7 @@
 // no floating-point std::to_chars below macOS 13.3, so the comparison runs only where it exists;
 // the fixed expectations run everywhere.
 
-#include "../src/base/float_text.hpp"
+#include "base/float_text.hpp"
 
 #include <cmath>
 #include <cstdint>
