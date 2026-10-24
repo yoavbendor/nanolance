@@ -890,6 +890,9 @@ class LanceDataset(pa.dataset.Dataset):
         row_addr_blocklist=None,
         **kwargs,
     ) -> "LanceScanner":
+        if kwargs:
+            # pylance's scanner() takes no other keywords: a misspelled option is an error, not a full scan.
+            raise TypeError(f"scanner() got an unexpected keyword argument '{next(iter(kwargs))}'")
         options = dict(self._default_scan_options)
         given = dict(
             columns=columns, filter=filter, limit=limit, offset=offset, nearest=nearest, batch_size=batch_size,
@@ -974,8 +977,8 @@ class LanceDataset(pa.dataset.Dataset):
         return IOStats(*(now - before for now, before in zip(current, mark)))
 
     def count_rows(self, filter=None, **kwargs) -> int:
-        if filter is not None:
-            return self.scanner(filter=filter).count_rows()
+        if filter is not None or kwargs:
+            return self.scanner(filter=filter, **kwargs).count_rows()
         return sum(int(f["physical_rows"]) - int(f["deleted_rows"]) for f in self._info["fragments"])
 
     def take(self, indices, columns=None) -> pa.Table:
