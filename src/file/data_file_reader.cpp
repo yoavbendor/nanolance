@@ -247,7 +247,11 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
 
     auto* file = find_or_open_data_file(path, error);
     if (file == nullptr) {
-        error = "data file is too small or unreadable";
+        // Keep why: a file that cleanup removed while it was being opened is "not found", which a reader
+        // racing a cleanup expects (and pylance says the same).
+        if (error.empty()) {
+            error = "data file is too small or unreadable";
+        }
         return false;
     }
     const std::uint64_t file_size = file->file_size;

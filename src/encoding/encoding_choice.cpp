@@ -259,7 +259,7 @@ bool variable_column_dict_rle_beneficial(nano_lance::ColumnValues& cv) {
             if (sk < 0 || ek < sk || static_cast<std::size_t>(ek) > data_size) {
                 return false;
             }
-            if (static_cast<std::size_t>(ek - sk) != len0 || std::memcmp(base + sk, base + s0, len0) != 0) {
+            if (static_cast<std::size_t>(ek - sk) != len0 || (len0 != 0U && std::memcmp(base + sk, base + s0, len0) != 0)) {
                 break;
             }
             ++run;
