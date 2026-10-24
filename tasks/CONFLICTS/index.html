@@ -1058,7 +1058,7 @@ UpdateBases).</p>
   rows are now all deleted, as Lance does). Without affected rows, retryable (as Lance).</li>
 </ul>
 <h2 id="5-tests-you-write">5. Tests you write<a class="headerlink" href="#5-tests-you-write" title="Permanent link">&para;</a></h2>
-<p>C++: <code>tests/test_commit_conflicts.cpp</code> (add to CMake like the other <code>tests/test_*.cpp</code>). A two-writer
+<p>C++: <code>tests/table/test_commit_conflicts.cpp</code> (add to CMake like the other <code>tests/test_*.cpp</code>). A two-writer
 harness: open at v1, commit "theirs" through the public API, then commit "ours" from the stale v1
 manifest. One test per row of section 2 (outcome and row count), plus each compatible pair of C2 / C3
 asserting <strong>rebased, not re-run</strong> via the counter, plus: a version without a transaction file is
@@ -1092,7 +1092,7 @@ per-pair status, tails, decisions.</p>
 <p><strong>C1 outcome (2026-10-20, first session):</strong> verdicts implemented (<code>src/commit_conflicts.{hpp,cpp}</code>, decoder
 moved to <code>src/dataset_operation.{hpp,cpp}</code>, <code>classify_concurrent</code> in <code>commit_next_version</code>, counters in
 <code>include/nanolance/dataset_commit.hpp</code>, <code>_errors.py</code> maps "Incompatible transaction:" to OSError,
-<code>tests/test_commit_conflicts.cpp</code> at verdict level). Reviewer found: <strong>the probe of section 2 is unchanged
+<code>tests/table/test_commit_conflicts.cpp</code> at verdict level). Reviewer found: <strong>the probe of section 2 is unchanged
 end to end</strong>, because nanolance's Python mutations never race from a stale handle -- <code>delete_once</code>
 (<code>src/dataset/dataset_ops.cpp</code> ~791) and the other <code>*_once</code> functions <code>load_latest</code>, so a handle opened at v1
 deletes from v3. pylance commits from the handle's own version (<code>read_version</code>), then resolves.
@@ -1128,7 +1128,7 @@ Reviewer's answers to the session's questions:
 columns, compaction, update_config and table / schema metadata (the last two now retry too). The probe:
 "delete vs overwrite" and "update_config same key" raise pylance's OSError; the four "re-run: keep" rows
 succeed; all other rows unchanged. <code>bindings/python/tests/test_commit_conflicts.py</code> (20),
-<code>tests/test_commit_conflicts.cpp</code> two-writer tests. Reviewer: removed <code>load_latest</code> (unused; the wasm
+<code>tests/table/test_commit_conflicts.cpp</code> two-writer tests. Reviewer: removed <code>load_latest</code> (unused; the wasm
 build's clang <code>-Werror</code> failed on it). Decisions:
 - A reader-form <code>add_columns</code> (stream, not replayable) surfaces a retryable verdict as a commit conflict
   instead of re-running: accepted (pylance surfaces that pair too).

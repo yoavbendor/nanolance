@@ -906,7 +906,7 @@ returns a silently different result. nanolance is not affiliated with the Lance 
   in all of Lance's layouts -- inline, packed, dedicated, external -- by <code>lance_dataset_write</code>, as by
   the Python module, and read in all of them; pylance reads what lance-c writes.)</li>
 </ul>
-<p><code>tests/test_lance_c_search.cpp</code> drives the search API end to end through the C API (a dataset
+<p><code>tests/api/test_lance_c_search.cpp</code> drives the search API end to end through the C API (a dataset
 written with <code>lance_dataset_write</code>, its indexes built with lance-c's calls) and compares every
 result with nanolance's own search, which the Python tests check against pylance: rows, order,
 <code>_distance</code> / <code>_score</code>, the columns, offset and limit, filters, contexts and their coverage modes,

@@ -1950,7 +1950,7 @@ repo hand-rolls the same lifecycle and <code>close()</code>-on-exception is curr
 only the lifetime changes. <code>commit()</code> defaults <code>is_append</code> to whatever <code>open()</code> was given, and flips
 to <code>true</code> after the first successful commit, so the one argument that was easy to get wrong now has a
 right answer by default.</p>
-<p>Both are guarded by <code>tests/test_writer_api.cpp</code>, which asserts <strong>byte-identical data files</strong> between
+<p>Both are guarded by <code>tests/api/test_writer_api.cpp</code>, which asserts <strong>byte-identical data files</strong> between
 the old spelling and the new one — for the options struct, for a zeroed struct against plain <code>init</code>,
 for a NULL options pointer, and for the RAII type against the hand-rolled C sequence. A second way to
 write files would be worse than none; the test is there to keep it the same way.</p>

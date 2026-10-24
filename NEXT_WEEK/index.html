@@ -1064,7 +1064,7 @@ feature. Compaction already remaps indexes; the FRI only serves deferred remap.<
   version discovery, deletion files, tags, index-segment checks. <code>wasm/weblance_glue.cpp</code>
   registers an https source (synchronous XHR in a worker, single-range <code>Range</code> headers -- no CORS
   preflight -- with the redirected CDN URL cached per file) and a Hugging Face tree-API lister;
-  <code>wasm/build_weblance.sh</code> builds the module; <code>tests/test_byte_source_remote.cpp</code> reads a dataset
+  <code>wasm/build_weblance.sh</code> builds the module; <code>tests/io/test_byte_source_remote.cpp</code> reads a dataset
   through a <code>mem://</code> store after deleting the local directory. The I/O rework measured level or
   faster natively (wide scans 2x, takes 15-37%, a stat storm of ~800 stats per take removed).</p>
 </li>

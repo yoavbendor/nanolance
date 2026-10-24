@@ -1603,7 +1603,7 @@ vectors) are byte-addressed and would need offset rebasing per layer. (b) is the
 </tr>
 <tr>
 <td>A3</td>
-<td><strong>proto3 defaulting hardening.</strong> <code>Field.type</code> (ours 2, proto3's 0) and <code>Field.encoding</code> (ours 1, proto3's 0) are the same shape as the <code>parent_id</code> bug. Neither is load-bearing on the read path today; make the decoder honour proto3 and add hand-built wire-byte tests like the <code>parent_id</code> ones in <code>tests/test_lance_minimal_pb.cpp</code>.</td>
+<td><strong>proto3 defaulting hardening.</strong> <code>Field.type</code> (ours 2, proto3's 0) and <code>Field.encoding</code> (ours 1, proto3's 0) are the same shape as the <code>parent_id</code> bug. Neither is load-bearing on the read path today; make the decoder honour proto3 and add hand-built wire-byte tests like the <code>parent_id</code> ones in <code>tests/table/test_lance_minimal_pb.cpp</code>.</td>
 <td>XS</td>
 <td>Sonnet</td>
 </tr>
@@ -2360,7 +2360,7 @@ still calls vector and full-text indexes out of scope; it should be updated alon
 <ol>
 <li>~~<strong>Wire what the core already does</strong>~~ -- <strong>done (2026-10-08)</strong>: vector index creation and
    search with every setter, INVERTED in <code>create_scalar_index</code>, <code>full_text_search</code> and prepared Match
-   contexts with both coverage modes (<code>tests/test_lance_c_search.cpp</code>).</li>
+   contexts with both coverage modes (<code>tests/api/test_lance_c_search.cpp</code>).</li>
 <li><strong>Wait on core features from the index gaps list:</strong></li>
 <li>~~<code>lance_scanner_set_ef</code>: HNSW indexes~~ -- done with IVF_HNSW_SQ (and
      <code>set_query_parallelism</code>, which Lance's HNSW search uses).</li>

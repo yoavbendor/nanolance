@@ -945,7 +945,7 @@ Files changed, per-test status, decisions, questions.</p>
 - Order (agreed): (a) IVF_HNSW_FLAT, (b) IVF_SQ, (c) IVF_HNSW_PQ. Tests go in
   <code>bindings/python/tests/test_hnsw.py</code>.
 - C2 will need: lance_c.cpp ~2459 (<code>vector_options</code> refuses these kinds at build), dataset.py ~1136 and
-  ~1280 (create_index refusals), and <code>tests/test_lance_c_search.cpp</code> ~358 asserts an IVF_HNSW_PQ build
+  ~1280 (create_index refusals), and <code>tests/api/test_lance_c_search.cpp</code> ~358 asserts an IVF_HNSW_PQ build
   is refused.</p>
 <p><strong>C1 outcome (2026-10-15):</strong> done. IvfIndex has Storage {Flat, Pq, Sq} x SubIndex {Flat, Hnsw}; one
 distance abstraction (SqDistance, FloatDistance, PqDistance) under both HNSW and the exhaustive scan;

@@ -1185,7 +1185,7 @@ bitpack/RLE/dict-RLE/constant/plain per column):</p>
   capped by the manifest's own <code>num_deleted_rows</code>; a bitmap container whose popcount, or a run
   container whose expansion, disagrees with its declared cardinality is refused outright; and the
   output reserve is capped rather than trusting the declared total, because the fuzzer turned that
-  trust into a 4 GiB <code>malloc</code> from a few kilobytes. <code>tests/test_read_safety.cpp</code> pins the budget with
+  trust into a 4 GiB <code>malloc</code> from a few kilobytes. <code>tests/base/test_read_safety.cpp</code> pins the budget with
   a 41 KB input that asks for a gigabyte.</p>
 <p>The same target then found the Arrow IPC side: a buffer's int64 uncompressed-length prefix was
   trusted up to the generic 8 GiB ceiling, so a 328-byte file could ask for 4 GiB. Cross-checking it
@@ -1207,7 +1207,7 @@ bitpack/RLE/dict-RLE/constant/plain per column):</p>
   was only reachable once the previous one was fixed — the memory-safety bug was six rounds deep.
   Every reproducer is checked in beside the others.</p>
 <ul>
-<li><strong>Negative-corpus tests</strong> (<a href="https://github.com/yoavbendor/nanolance/blob/main/tests/test_read_safety.cpp"><code>tests/test_read_safety.cpp</code></a>) — hand-built
+<li><strong>Negative-corpus tests</strong> (<a href="https://github.com/yoavbendor/nanolance/blob/main/tests/test_read_safety.cpp"><code>tests/base/test_read_safety.cpp</code></a>) — hand-built
   malformed footers (oversized column count, overflowing descriptor bounds) and garbage protobuf must
   be <em>rejected cleanly</em>, and the checked-math/<code>load_le</code> helpers are unit-tested.</li>
 </ul>

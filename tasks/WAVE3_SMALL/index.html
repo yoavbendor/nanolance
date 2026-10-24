@@ -922,7 +922,7 @@ engines, ids and scores equal (scores to 1e-6), plus a pylance-built nested inde
 and the reverse, an append, a delete, optimize_indices. S: in <code>bindings/python/tests/test_small_apis.py</code>
 or a new file: a pylance dataset with its <code>.txn</code> files removed reads its transactions through nanolance
 and a nanolance commit racing it is classified normally (C++ two-writer test in
-<code>tests/test_commit_conflicts.cpp</code>); migration of a V1-named dataset (write one with pylance's
+<code>tests/table/test_commit_conflicts.cpp</code>); migration of a V1-named dataset (write one with pylance's
 <code>enable_v2_manifest_paths=False</code>), then both engines open it.</p>
 <h2 id="6-rules">6. Rules<a class="headerlink" href="#6-rules" title="Permanent link">&para;</a></h2>
 <p><code>AGENTS.md</code> sections 5 and 7. No skipped or weakened tests; no <code>except Exception</code> around failures. The

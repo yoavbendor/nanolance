@@ -955,7 +955,7 @@ unchanged. +1 pylance test (1037).</p>
 - Pipeline: CodeLexTokenizer, WordDelimiterFilter only if split_identifiers, then remove-long, lower
   case, stem, stop words, ASCII folding (matches <code>Analyzer::emit</code> after the tokenizer).
 - No Python tokenize binding: token-list cases go to <code>tests/golden/fts_tokenizer/cases.txt</code>
-  (<code>tests/test_fts_tokenizer.cpp</code>, ctest <code>nano_lance_fts_tokenizer</code>).</p>
+  (<code>tests/index/test_fts_tokenizer.cpp</code>, ctest <code>nano_lance_fts_tokenizer</code>).</p>
 <p><strong>F3 outcome (2026-10-15):</strong> done. Code analyzer (<code>CodeLexTokenizer</code> + <code>WordDelimiterFilter</code> ported to
 <code>src/index/fts/fts_tokenizer.cpp</code>, exact Unicode Lowercase / Uppercase tables generated from Rust std by
 <code>tools/fts_tables</code>), its options, Lance's messages, default format 3, <code>code_config</code> in
