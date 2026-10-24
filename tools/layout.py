@@ -36,6 +36,7 @@ FILES = {
                  "values/bitpack.cpp", "values/bitpack.hpp", "values/general.cpp", "values/general.hpp",
                  "values/byte_stream_split.cpp", "values/byte_stream_split.hpp",
                  "values/rle.cpp", "values/rle.hpp",
+                 "values/dictionary.cpp", "values/dictionary.hpp",
                  "values/scalar_value.cpp", "values/scalar_value.hpp"],
     "file": ["data_file_reader.cpp", "data_file_writer.cpp", "lance_file_writer.cpp", "blob_v2_external.cpp"],
     "table": ["manifest_reader.cpp", "manifest_writer.cpp", "deletion_vector.cpp", "row_ids.cpp",

@@ -383,6 +383,7 @@ add_library(nanolance STATIC
     src/encoding/values/general.cpp
     src/encoding/values/byte_stream_split.cpp
     src/encoding/values/rle.cpp
+    src/encoding/values/dictionary.cpp
     src/encoding/values/scalar_value.cpp
     src/dataset/write_session.cpp
     src/api/nano_lance_writer.cpp
@@ -880,6 +881,11 @@ target_compile_features(nano_lance_encoding_rle_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_encoding_rle_test PRIVATE nanolance)
 target_include_directories(nano_lance_encoding_rle_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
 
+add_executable(nano_lance_encoding_dictionary_test tests/encoding/test_dictionary.cpp)
+target_compile_features(nano_lance_encoding_dictionary_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_encoding_dictionary_test PRIVATE nanolance)
+target_include_directories(nano_lance_encoding_dictionary_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+
 add_executable(nano_lance_roaring_bitmap_test tests/test_roaring_bitmap.cpp)
 target_compile_features(nano_lance_roaring_bitmap_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_roaring_bitmap_test PRIVATE nanolance)
@@ -1180,6 +1186,8 @@ add_test(NAME nano_lance_encoding_scalar_value COMMAND $<TARGET_FILE:nano_lance_
 set_tests_properties(nano_lance_encoding_scalar_value PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_encoding_rle COMMAND $<TARGET_FILE:nano_lance_encoding_rle_test>)
 set_tests_properties(nano_lance_encoding_rle PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_encoding_dictionary COMMAND $<TARGET_FILE:nano_lance_encoding_dictionary_test>)
+set_tests_properties(nano_lance_encoding_dictionary PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_roaring_bitmap COMMAND $<TARGET_FILE:nano_lance_roaring_bitmap_test>)
 add_test(NAME nano_lance_expr COMMAND $<TARGET_FILE:nano_lance_expr_test>)
 add_test(NAME nano_lance_deletion_vector COMMAND $<TARGET_FILE:nano_lance_deletion_vector_test>)

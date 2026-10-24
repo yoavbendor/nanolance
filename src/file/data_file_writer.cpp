@@ -7,6 +7,7 @@
 #include "encoding/values/bitpack.hpp"
 #include "encoding/values/general.hpp"
 #include "encoding/values/byte_stream_split.hpp"
+#include "encoding/values/dictionary.hpp"
 #include "encoding/values/rle.hpp"
 #include "encoding/values/scalar_value.hpp"
 #include "nanolance/parallel.hpp"
@@ -645,11 +646,6 @@ void append_le32(std::vector<std::uint8_t>& out, std::uint32_t value) {
     out.push_back(static_cast<std::uint8_t>((value >> 24U) & 0xFFU));
 }
 
-void append_le64(std::vector<std::uint8_t>& out, std::uint64_t value) {
-    append_le32(out, static_cast<std::uint32_t>(value & 0xFFFFFFFFU));
-    append_le32(out, static_cast<std::uint32_t>(value >> 32U));
-}
-
 // Assemble one miniblock chunk holding multiple buffers (has_large_chunk => u32 sizes), matching
 // Lance's decode_miniblock_chunk: [u16 num_levels=0][u32 size_i...][pad8]([buf_i][pad8])*.
 std::vector<std::uint8_t> build_multibuffer_chunk(const std::vector<std::vector<std::uint8_t>>& buffers) {
@@ -687,36 +683,6 @@ std::vector<std::uint8_t> page_layout_bytes_rle(std::uint8_t value_bits, std::ui
     m.value_compression = descriptor::rle(descriptor::flat(value_bits), descriptor::flat(length_bits));
     miniblock_tail(m, num_items, 2U);
     return descriptor::page_encoding(m);
-}
-
-// Build the dictionary's inner Variable block (Lance VariableEncoder block format):
-// [u32 bits_per_offset=32][u32 bytes_start_offset][u32 offsets (N+1, relative to data, start 0)][data].
-// For large_utf8 / large_binary every one of those words is a u64 and bits_per_offset is 64: Lance
-// decodes the dictionary straight into the column's Arrow type and refuses 32-bit offsets for a large
-// one ("expected 64-bit offsets but got 32-bit offsets"). Its descriptor says Flat(64) to match.
-std::vector<std::uint8_t> build_dict_variable_block(const std::vector<std::string_view>& distinct, bool large) {
-    const std::size_t n = distinct.size();
-    const std::size_t word = large ? 8U : 4U;
-    const auto put = [&](std::vector<std::uint8_t>& out, std::uint64_t v) {
-        if (large) {
-            append_le64(out, v);
-        } else {
-            append_le32(out, static_cast<std::uint32_t>(v));
-        }
-    };
-    std::vector<std::uint8_t> out;
-    put(out, large ? 64U : 32U);            // bits_per_offset
-    put(out, 2U * word + (n + 1U) * word);  // where the data bytes start
-    std::uint64_t cum = 0;
-    put(out, 0U);  // offset[0]
-    for (const auto& s : distinct) {
-        cum += s.size();
-        put(out, cum);
-    }
-    for (const auto& s : distinct) {
-        out.insert(out.end(), s.begin(), s.end());
-    }
-    return out;
 }
 
 /// The last byte of a Variable{offsets = Flat(bits)} node: the offset width.
@@ -1702,12 +1668,12 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
     }
     if (dictionary) {
         // Indices: InlineBitpacking(32). Dictionary: Variable{Flat(32 or 64)}, stored raw -- the same
-        // block the flat string path writes (build_dict_variable_block).
+        // block the flat string path writes (dictionary::encode_variable).
         const bool large = values.variable.large;
         mini.value_compression = descriptor::inline_bitpacking(32U);
         mini.dictionary = descriptor::variable(descriptor::flat(offset_bits_token(large)));
         mini.num_dictionary_items = distinct.size();
-        page.dictionary = build_dict_variable_block(distinct, large);
+        page.dictionary = dictionary::encode_variable(distinct, large);
     } else if (fsst) {
         mini.value_compression =
             descriptor::fsst(fsst_table, item_value_encoding(encoding, field, values.variable.large));
@@ -2288,12 +2254,10 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             std::vector<std::uint8_t> dict_encoding;
             if (variable) {
                 std::vector<std::string_view> views(entries.begin(), entries.end());
-                dict_block = build_dict_variable_block(views, large);
+                dict_block = dictionary::encode_variable(views, large);
                 dict_encoding = descriptor::variable(descriptor::flat(offset_bits_token(large)));
             } else {
-                for (const auto& e : entries) {
-                    dict_block.insert(dict_block.end(), e.begin(), e.end());
-                }
+                dict_block = dictionary::encode_fixed(entries);
                 dict_encoding = descriptor::flat(static_cast<std::uint32_t>(width * 8U));
             }
             const auto by_bytes = max_values_per_uncompressed_chunk(iw);
@@ -2566,7 +2530,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             chunk.bytes = chunk_bytes;
             const auto control = control_buffer_for({chunk});
             std::vector<std::uint8_t> dict_frame;
-            if (!general::zstd_frame(build_dict_variable_block(distinct, values.variable.large), compression_level,
+            if (!general::zstd_frame(dictionary::encode_variable(distinct, values.variable.large), compression_level,
                                    dict_frame, error)) {
                 return false;
             }
@@ -2658,7 +2622,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             }
             const auto payload = miniblock_payload(index_chunks);
             const auto control = control_buffer_for_index_chunks(index_chunks);
-            const auto dict_block = build_dict_variable_block(distinct, values.variable.large);
+            const auto dict_block = dictionary::encode_variable(distinct, values.variable.large);
 
             align64(out);
             const auto control_offset = pos(out);

@@ -14,6 +14,7 @@
 #include "encoding/values/general.hpp"
 #include "encoding/values/byte_stream_split.hpp"
 #include "encoding/values/rle.hpp"
+#include "encoding/values/dictionary.hpp"
 #include "encoding/values/scalar_value.hpp"
 #include "nanolance/column_slice.hpp"
 #include <nanom/fastlanes.hpp>
@@ -954,22 +955,7 @@ struct ColumnEncodingPlan {
 ///
 /// Both dictionary branches -- plain indices and RLE'd indices -- parse the same block, so they
 /// share this rather than keeping two copies that can drift apart.
-struct DictionaryBlock {
-    std::vector<std::uint8_t> bytes;
-    /// Variable-width: (start, length) per entry. Empty for a fixed-width dictionary.
-    std::vector<std::pair<std::size_t, std::size_t>> ranges;
-    /// Fixed-width: bytes per entry. Zero when the dictionary is variable-width.
-    std::size_t value_bytes = 0;
-    std::size_t count = 0;
-
-    bool is_fixed_width() const { return value_bytes != 0U; }
-    const std::uint8_t* entry(std::size_t index) const {
-        return bytes.data() + (is_fixed_width() ? index * value_bytes : ranges[index].first);
-    }
-    std::size_t entry_size(std::size_t index) const {
-        return is_fixed_width() ? value_bytes : ranges[index].second;
-    }
-};
+using DictionaryBlock = nano_lance::dictionary::Block;
 
 [[nodiscard]] bool decode_dictionary_block(const ColumnEncodingPlan& plan, const std::string& logical_type,
                                            const std::vector<std::uint8_t>& stored, DictionaryBlock& out,
@@ -977,100 +963,24 @@ struct DictionaryBlock {
     if (!decompress_dictionary_block(plan.dict_scheme, stored, out.bytes, error)) {
         return false;
     }
-    out.ranges.clear();
+    dictionary::Shape shape;
     if (plan.dict_value_bits != 0U) {
-        out.value_bytes = plan.dict_value_bits / 8U;
+        shape.fixed_value_bytes = plan.dict_value_bits / 8U;
         // The descriptor and the schema have to agree about how wide a value is. They always do in a
         // file Lance wrote; where they disagree, trusting either one alone would silently shift every
         // value, so refuse instead.
         const auto schema_bytes = lance_logical_type_value_bytes(logical_type);
-        if (out.value_bytes != schema_bytes) {
-            error = "dictionary declares " + std::to_string(out.value_bytes) +
+        if (shape.fixed_value_bytes != schema_bytes) {
+            error = "dictionary declares " + std::to_string(shape.fixed_value_bytes) +
                     "-byte values but the column's type is " + std::to_string(schema_bytes) + " bytes wide";
             return false;
         }
-        // A headerless block states neither its entry width nor its count, so `num_dictionary_items`
-        // is the only statement of how many there are. Lance pads the block, so it may be longer than
-        // the entries need -- it must never be shorter.
-        out.count = static_cast<std::size_t>(plan.dict_items);
-        std::uint64_t needed = 0;
-        if (out.count == 0U ||
-            !checked_mul(plan.dict_items, static_cast<std::uint64_t>(out.value_bytes), needed) ||
-            !fits_size_t(needed) || needed > default_read_limits().max_uncompressed_bytes) {
-            error = "dictionary declares an implausible " + std::to_string(plan.dict_items) + " entries of " +
-                    std::to_string(out.value_bytes) + " bytes";
-            return false;
-        }
-        if (plan.dict_out_of_line_bitpacked) {
-            std::vector<std::uint8_t> unpacked(static_cast<std::size_t>(needed));
-            if (!bitpack::decode_out_of_line(out.bytes, out.count, plan.dict_packed_width,
-                                                       out.value_bytes, unpacked.data(), "dictionary block",
-                                                       error)) {
-                return false;
-            }
-            out.bytes = std::move(unpacked);
-            return true;
-        }
-        if (plan.dict_inline_bitpacked) {
-            // The count is what bounds the walk, and the buffer is what bounds the count: a series of
-            // packed blocks is far smaller than the values it yields, so the size check below cannot
-            // be applied to the stored bytes. `bitpack::decode_series` refuses a count the
-            // buffer cannot actually supply, which is the same guarantee from the other direction.
-            std::vector<std::uint8_t> unpacked;
-            if (!bitpack::decode_series(out.bytes, out.count, out.value_bytes, unpacked, error)) {
-                return false;
-            }
-            out.bytes = std::move(unpacked);
-            return true;
-        }
-        if (static_cast<std::size_t>(needed) > out.bytes.size()) {
-            error = "dictionary declares " + std::to_string(plan.dict_items) + " entries of " +
-                    std::to_string(out.value_bytes) + " bytes but the block holds " +
-                    std::to_string(out.bytes.size());
-            return false;
-        }
-        return true;
+        shape.count = plan.dict_items;
+        shape.inline_bitpacked = plan.dict_inline_bitpacked;
+        shape.out_of_line_bitpacked = plan.dict_out_of_line_bitpacked;
+        shape.packed_width = plan.dict_packed_width;
     }
-
-    out.value_bytes = 0;
-    // [bits_per_offset][bytes_start][offsets (count + 1)][data], every word as wide as bits_per_offset
-    // says: 32, or 64 for a large_utf8 / large_binary dictionary.
-    if (out.bytes.size() < 8U) {
-        error = "dict block too short";
-        return false;
-    }
-    std::uint32_t bits_per_offset = 0;
-    std::memcpy(&bits_per_offset, out.bytes.data(), 4U);
-    const std::size_t word = bits_per_offset == 64U ? 8U : 4U;
-    const auto read_word = [&](std::size_t at) {
-        std::uint64_t v = 0;
-        std::memcpy(&v, out.bytes.data() + at, word);  // little-endian; the upper bytes stay 0 for u32
-        return v;
-    };
-    if (out.bytes.size() < 2U * word) {
-        error = "dict block too short";
-        return false;
-    }
-    const std::uint64_t bytes_start = read_word(word);
-    if (bytes_start < 3U * word || bytes_start > out.bytes.size() || (bytes_start - 2U * word) % word != 0U) {
-        error = "dict block header invalid";
-        return false;
-    }
-    out.count = static_cast<std::size_t>((bytes_start - 2U * word) / word - 1U);
-    out.ranges.resize(out.count);
-    for (std::size_t d = 0; d < out.count; ++d) {
-        const std::uint64_t a = read_word(2U * word + d * word);
-        const std::uint64_t b = read_word(2U * word + (d + 1U) * word);
-        // Compared without adding: `bytes_start + b` in u32 once wrapped for an offset near 2^32 and
-        // handed the copy below a ~4 GiB entry length (found by fuzz_column_decode); with u64 words
-        // the sum can wrap too.
-        if (b < a || b > out.bytes.size() - bytes_start) {
-            error = "dict offsets out of range";
-            return false;
-        }
-        out.ranges[d] = {static_cast<std::size_t>(bytes_start + a), static_cast<std::size_t>(b - a)};
-    }
-    return true;
+    return dictionary::decode(out, shape, error);
 }
 
 /// Appends `count` fixed_size_list ELEMENT validity bits, read LSB-first from the start of `src`, at
