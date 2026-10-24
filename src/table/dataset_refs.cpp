@@ -15,6 +15,7 @@
 #include "lance_minimal.pb.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -1946,7 +1947,9 @@ bool parse_duration(const std::string& text, std::int64_t& nanoseconds) {
         if (i == start) {
             return false;
         }
-        const double value = std::stod(text.substr(start, i - start));
+        // strtod, not stod: a digit string past the range of a double is infinity here (refused below), where
+        // stod throws out_of_range through a function that only ever reports false.
+        const double value = std::strtod(text.substr(start, i - start).c_str(), nullptr);
         while (i < text.size() && text[i] == ' ') {
             ++i;
         }
