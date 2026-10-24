@@ -2753,6 +2753,7 @@ bool flat_search(const std::filesystem::path& path, const NearestQuery& q, Vecto
     request.fragment_ids = &fragments;
     request.with_row_address = true;
     request.filter = q.filter && q.prefilter ? &*q.filter : nullptr;
+    request.index_candidates = nano_lance::index_candidates;
     ArrowSchema schema{};
     std::vector<ArrowArray> batches;
     if (!lance_dataset_scan(path, request, schema, batches, error)) {

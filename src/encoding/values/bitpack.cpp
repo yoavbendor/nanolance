@@ -25,7 +25,9 @@ namespace {
 template <class T>
 void encode_block_typed(const std::uint8_t* src, std::size_t count, std::vector<std::uint8_t>& out) {
     T in[1024];
-    std::memcpy(in, src, count * sizeof(T));
+    if (count != 0U) {  // src may be null for an empty block, and memcpy's pointers must not be
+        std::memcpy(in, src, count * sizeof(T));
+    }
     if (count < 1024U) {
         std::memset(in + count, 0, (1024U - count) * sizeof(T));
     }

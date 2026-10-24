@@ -138,8 +138,10 @@ struct LanceScanRequest {
     /// With a filter: read only the rows the dataset's scalar indices say may pass (BTree, Bitmap,
     /// LabelList), as `index_candidates` answers them. The rows returned are the same either way.
     bool use_scalar_index = true;
-    /// How the filter is answered from indices: the index layer's index_candidates (index_search.hpp),
-    /// set by the caller that plans the read. Null: no index is consulted (the scan does not know them).
+    /// How the filter is answered from indices: set it to nano_lance::index_candidates (index_search.hpp)
+    /// for `use_scalar_index` to have any effect. Null: no index is consulted and a filtered scan reads
+    /// every row -- the scan layer does not link the index code, so a reader built without indices stays
+    /// without them.
     IndexCandidatesFn index_candidates = nullptr;
     /// Row-address masks: only the rows the mask allows are read, before the filter, the range and any
     /// ranking. With a mask, `range` counts the rows that pass it (as with a filter). Null: no mask.

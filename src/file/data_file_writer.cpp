@@ -2364,7 +2364,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             std::vector<std::uint8_t> chunk_bytes;
             const std::span<const std::uint8_t> run_buffers[2] = {run_values, run_lengths};
             miniblock::append_chunk(chunk_bytes, 0U, {}, run_buffers);
-            const miniblock::ChunkMeta meta[1] = {{chunk_bytes.size(), rows}};
+            const miniblock::ChunkMeta meta[1] = {{chunk_bytes.size(), static_cast<std::size_t>(rows)}};
             const auto control = miniblock::control_buffer(meta);
             std::vector<std::uint8_t> dict_frame;
             if (!general::zstd_frame(dictionary::encode_variable(distinct, values.variable.large), compression_level,

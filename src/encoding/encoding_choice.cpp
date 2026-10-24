@@ -200,7 +200,7 @@ bool variable_column_constant_value(const nano_lance::ColumnValues& cv, std::vec
         const auto s = read_offset(i);
         const auto e = read_offset(i + 1);
         if (e - s != static_cast<std::int64_t>(len) ||
-            std::memcmp(cv.variable.data.data() + s, cv.variable.data.data() + start0, len) != 0) {
+            (len != 0U && std::memcmp(cv.variable.data.data() + s, cv.variable.data.data() + start0, len) != 0)) {
             return false;
         }
     }
