@@ -7,6 +7,7 @@
 #include "encoding/values/bitpack.hpp"
 #include "encoding/values/general.hpp"
 #include "encoding/values/byte_stream_split.hpp"
+#include "encoding/values/rle.hpp"
 #include "encoding/values/scalar_value.hpp"
 #include "nanolance/parallel.hpp"
 #include "nanolance/work_stats.hpp"
@@ -2449,13 +2450,8 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             std::vector<std::uint8_t> run_values;
             std::vector<std::uint8_t> run_lengths;  // Lance requires 8-bit run lengths
             auto emit_run = [&](std::size_t row, std::uint64_t run) {
-                for (std::uint64_t remaining = run; remaining > 0;) {
-                    const auto take = static_cast<std::uint8_t>(std::min<std::uint64_t>(255U, remaining));
-                    run_values.insert(run_values.end(), values.fixed_data() + row * bpv,
-                                      values.fixed_data() + (row + 1U) * bpv);
-                    run_lengths.push_back(take);
-                    remaining -= take;
-                }
+                rle::append_run(std::span<const std::uint8_t>(values.fixed_data() + row * bpv, bpv), run, run_values,
+                                run_lengths);
             };
             if (values.fixed_rle_plan.computed) {
                 // The write-side "is RLE beneficial?" heuristic already detected every run while
@@ -2534,12 +2530,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 // instead of re-scanning row-by-row and re-running RLE detection from scratch.
                 distinct = values.structural_dict_rle_plan.distinct;
                 for (const auto& [index, run_length] : values.structural_dict_rle_plan.runs) {
-                    for (std::uint64_t remaining = run_length; remaining > 0;) {
-                        const auto take = static_cast<std::uint8_t>(std::min<std::uint64_t>(255U, remaining));
-                        append_le32(run_values, index);
-                        run_lengths.push_back(take);
-                        remaining -= take;
-                    }
+                    rle::append_index_run(index, run_length, run_values, run_lengths);
                 }
             } else {
                 // Dictionary keyed by string_view into the stable column data buffer: no per-row heap
@@ -2566,12 +2557,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                     while (r + run < indices.size() && indices[r + run] == indices[r]) {
                         ++run;
                     }
-                    for (std::size_t remaining = run; remaining > 0;) {
-                        const std::size_t take = std::min<std::size_t>(255U, remaining);
-                        append_le32(run_values, indices[r]);
-                        run_lengths.push_back(static_cast<std::uint8_t>(take));
-                        remaining -= take;
-                    }
+                    rle::append_index_run(indices[r], run, run_values, run_lengths);
                     r += run;
                 }
             }

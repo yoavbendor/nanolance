@@ -13,6 +13,7 @@
 #include "encoding/values/bitpack.hpp"
 #include "encoding/values/general.hpp"
 #include "encoding/values/byte_stream_split.hpp"
+#include "encoding/values/rle.hpp"
 #include "encoding/values/scalar_value.hpp"
 #include "nanolance/column_slice.hpp"
 #include <nanom/fastlanes.hpp>
@@ -699,67 +700,8 @@ bool append_levels_to_validity(const std::uint16_t* levels, std::uint32_t count,
         error = "unsupported definition-level encoding: " + page_layout::describe_encoding(encoding);
         return false;
     }
-    const auto value_bits = values_node->bits_per_value;
-    const auto length_bits = lengths_node->bits_per_value;
-    if ((value_bits != 8U && value_bits != 16U) ||
-        (length_bits != 8U && length_bits != 16U && length_bits != 32U)) {
-        error = "run-length-encoded definition levels declare unsupported widths (" +
-                std::to_string(value_bits) + "-bit values, " + std::to_string(length_bits) +
-                "-bit run lengths)";
-        return false;
-    }
-    const std::size_t value_bytes = value_bits / 8U;
-    const std::size_t length_bytes = length_bits / 8U;
-
-    if (repdef.size() < 8U) {
-        error = "run-length definition-level buffer is too short for its header";
-        return false;
-    }
-    const auto values_size64 = load_le<std::uint64_t>(repdef.data());
-    if (!fits_size_t(values_size64) || static_cast<std::size_t>(values_size64) > repdef.size() - 8U) {
-        error = "run-length definition-level values buffer runs past the end of the block";
-        return false;
-    }
-    const auto values_size = static_cast<std::size_t>(values_size64);
-    if (values_size % value_bytes != 0U) {
-        error = "run-length definition-level values buffer is not a whole number of values";
-        return false;
-    }
-    const auto runs = values_size / value_bytes;
-    const auto lengths_size = repdef.size() - 8U - values_size;
-    if (lengths_size != runs * length_bytes) {
-        error = "run-length definition-level block has " + std::to_string(runs) + " run values but " +
-                std::to_string(lengths_size) + " bytes of run lengths";
-        return false;
-    }
-
-    const auto* values = repdef.data() + 8U;
-    const auto* lengths = values + values_size;
-    std::uint64_t written = 0;
-    for (std::size_t r = 0; r < runs; ++r) {
-        const std::uint16_t level = value_bytes == 1U ? values[r] : load_le<std::uint16_t>(values + r * 2U);
-        std::uint64_t run = 0;
-        switch (length_bytes) {
-            case 1U: run = lengths[r]; break;
-            case 2U: run = load_le<std::uint16_t>(lengths + r * 2U); break;
-            default: run = load_le<std::uint32_t>(lengths + r * 4U); break;
-        }
-        if (run > count || written + run > count) {
-            error = "run-length definition levels cover more than the chunk's " + std::to_string(count) +
-                    " values";
-            return false;
-        }
-        for (std::uint64_t i = 0; i < run; ++i) {
-            levels[written + i] = level;
-        }
-        written += run;
-    }
-    if (written != count) {
-        error = "run-length definition levels cover " + std::to_string(written) + " of the chunk's " +
-                std::to_string(count) + " values";
-        return false;
-    }
-    return true;
+    return rle::decode_levels(repdef, values_node->bits_per_value, lengths_node->bits_per_value, count, levels,
+                              error);
 }
 
 /// Decode one chunk's definition-level buffer, appending one bit per row to `out_validity` (an
@@ -2377,7 +2319,6 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
             internal = "utf8";
         }
         const auto bpv = lance_logical_type_value_bytes(internal);
-        const std::size_t length_bytes = 1U;  // Lance RLE uses 8-bit run lengths
         // Reserve the whole column upfront: without this, each run's append_repeated_value() call
         // resize()s out.fixed to an exact new size (no growth slack), so libstdc++ reallocates and
         // re-copies everything already written on essentially every run -- O(n^2) memcpy for a column
@@ -2412,24 +2353,8 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
                     error = "rle chunk is missing its run-lengths buffer";
                     return false;
                 }
-                const auto& values = chunk.values;
-                const auto& lengths = chunk.extra_buffers[0];
-                if (bpv == 0U || values.size() % bpv != 0U) {
-                    error = "rle chunk buffer sizes invalid";
+                if (!rle::decode(chunk.values, chunk.extra_buffers[0], bpv, out.fixed, error)) {
                     return false;
-                }
-                const std::size_t num_runs = values.size() / bpv;
-                if (num_runs != lengths.size() / length_bytes) {
-                    error = "rle run count mismatch between values and lengths";
-                    return false;
-                }
-                for (std::size_t r = 0; r < num_runs; ++r) {
-                    const std::uint64_t run = lengths[r];
-                    if (!append_repeated_value(out.fixed, values.data() + r * bpv, bpv,
-                                               static_cast<std::size_t>(run))) {
-                        error = "rle run expansion overflows";
-                        return false;
-                    }
                 }
             }
         }
