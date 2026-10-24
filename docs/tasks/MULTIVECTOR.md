@@ -7,7 +7,7 @@ indexes, **M3** builds. Do only the phase you are given.
 ## 0. Context budget (read this first)
 
 Budget about 200k tokens; aim for 120k. Never read a large file whole: `grep -n`, then `sed -n 'A,Bp'`
-windows of at most ~120 lines. Big ones: `src/vector_search.cpp`, `src/vector_index_build.cpp` (or
+windows of at most ~120 lines. Big ones: `src/index/vector/vector_search.cpp`, `src/index/vector/vector_index_build.cpp` (or
 wherever `grep -ln "IVF_FLAT" src/*.cpp` points), `bindings/python/nanolance/lance/dataset.py`
 (3.5k+). Lance's Rust: read only the functions named below. Cut output: `| tail -15` for pytest (add
 `-o addopts=`), `| tail -5` for `tools/pylance_suite.py`.
@@ -74,7 +74,7 @@ built the same way over the flattened vectors. Training samples: `index/vector/u
 ## 3. Where things are in nanolance
 
 - Python: `dataset.py` `nearest` parsing (`grep -n "_nearest_query\|multivector" bindings/python/nanolance/lance/dataset.py`).
-- C++ search: `include/nanolance/vector_search.hpp`, `src/vector_search.cpp` (the flat path, the IVF
+- C++ search: `include/nanolance/vector_search.hpp`, `src/index/vector/vector_search.cpp` (the flat path, the IVF
   partition search, refine). The existing KNN handles fixed-size lists only.
 - Builds: `grep -ln "train_ivf\|IVF_PQ" src/*.cpp`.
 - lance-c: `lance_scanner_nearest_multivector` (`compat/lance-c/include/lance/lance.h`): wire it in M2.

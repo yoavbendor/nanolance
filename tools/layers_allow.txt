@@ -1,0 +1,2 @@
+# Known layering violations: 'A -> B' means module A includes module B from a higher layer.
+# Maintained by tools/check_layers.py --write-allowlist. This list may only shrink.

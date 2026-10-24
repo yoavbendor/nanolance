@@ -47,6 +47,8 @@ def translate(message: str) -> Exception:
     for marker, kind in _FEATURE_FLAG_ERRORS:
         if marker in text:
             return kind(text[text.index(marker):])
+    if text.startswith("IO error: "):  # a file that cannot be read (a jieba dictionary): pylance's io::Error
+        return OSError(text)
     if "Incompatible transaction:" in text:  # refused, not retried: pylance raises it as an OSError too
         return OSError(text[text.index("Incompatible transaction:"):])
     # Filter errors, as pylance words them (DataFusion's planner behind "Invalid user input").
@@ -71,6 +73,8 @@ def translate(message: str) -> Exception:
     if "dimension must be a positive integer" in text:
         return OSError(text)
     if "already exists" in lower:
+        return OSError(text)
+    if text.startswith(("Stream ended before producing values", "Stream produced more values")):
         return OSError(text)
     if text.startswith("Invalid user input: CompactionOptions::"):
         return OSError(text)

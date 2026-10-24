@@ -7,8 +7,8 @@ only the phase you are given.
 ## 0. Context budget (read this first)
 
 Budget about 200k tokens; aim for 120k. Never read a large file whole: `grep -n`, then `sed -n 'A,Bp'`
-windows of at most ~120 lines. Big ones: `src/fts_index_build.cpp`, `src/fts_search.cpp`,
-`bindings/python/nanolance/lance/dataset.py` (5k+), `src/dataset.cpp`. Cut output: `| tail -15` for
+windows of at most ~120 lines. Big ones: `src/index/fts/fts_index_build.cpp`, `src/index/fts/fts_search.cpp`,
+`bindings/python/nanolance/lance/dataset.py` (5k+), `src/dataset/dataset.cpp`. Cut output: `| tail -15` for
 pytest (add `-o addopts=`), `| tail -5` for `tools/pylance_suite.py`.
 
 ## 1. Goal and targets
@@ -47,7 +47,7 @@ int64, `meta` struct<title: string, body: struct<text: string>> with a null `met
   file) **and** `_transactions/*.txn`. nanolance writes only the `.txn`. With the `.txn` files removed,
   pylance's `read_transaction(v)` still answers (from field 21); nanolance's returns None. Make
   nanolance read field 21 when there is no transaction file -- in `read_transaction` and in the C++
-  conflict classifier (`src/commit_conflicts.cpp` / `classify_concurrent` in `src/dataset.cpp`: today a
+  conflict classifier (`src/table/commit_conflicts.cpp` / `classify_concurrent` in `src/dataset/dataset.cpp`: today a
   version without a transaction file is a retryable conflict; with field 21 it is decided normally).
   Lance's layout of field 21: `lance-table-12.0.0/src/format/manifest.rs` and `lance-12.0.0/src/io/commit.rs`
   (grep `transaction_section`). Do **not** write field 21 (decided: no change to what nanolance writes).
@@ -61,13 +61,13 @@ int64, `meta` struct<title: string, body: struct<text: string>> with a null `met
 
 ## 3. Where things are in nanolance
 
-- INVERTED build / search: `src/fts_index_build.cpp`, `src/fts_search.cpp`; the nested refusal:
+- INVERTED build / search: `src/index/fts/fts_index_build.cpp`, `src/index/fts/fts_search.cpp`; the nested refusal:
   `grep -rn "nested column is not supported" src bindings/python/nanolance`.
 - FTS on list columns (ROADMAP Wave 1 item 1, `docs/tasks/FTS_LISTS.md`) changed how a document's text
   is collected from a column: the nested case is another source of text, not a new index format.
 - Nested path resolution for scalar indexes: `grep -n "resolve.*path\|case-insensitive" src/*.cpp`.
-- Transactions: `read_transaction` in `dataset.py` ~2011; manifest reading in `src/dataset.cpp`;
-  V1 / V2 manifest names in `src/manifest_writer.cpp` (nanolance already reads both).
+- Transactions: `read_transaction` in `dataset.py` ~2011; manifest reading in `src/dataset/dataset.cpp`;
+  V1 / V2 manifest names in `src/table/manifest_writer.cpp` (nanolance already reads both).
 
 ## 4. Phases
 

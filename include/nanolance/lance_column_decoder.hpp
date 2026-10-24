@@ -5,6 +5,7 @@
 
 #include "lance_minimal.pb.hpp"
 #include "nanolance/column_values.hpp"
+#include "nanolance/encodings_io.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -14,7 +15,7 @@
 namespace nano_lance {
 
 /// Decode one physical Lance column from a data file (writer encodings only).
-bool decode_lance_physical_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+bool decode_lance_physical_column(const EncodingsIo& io, const pb::Field& on_disk_field,
                                   const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error);
 
 /// Decode only `rows` of the column: physical row numbers within this data file, strictly ascending.
@@ -25,7 +26,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
 /// repetition index: a random batch of 64 images reads 64 images. Any other page is decoded whole and
 /// the rows picked out of it (`value_bytes` is the column's fixed value width, as for
 /// compact_column_values; 0 for variable width).
-bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+bool decode_lance_physical_column_rows(const EncodingsIo& io, const pb::Field& on_disk_field,
                                        const pb::ColumnMetadata& column_metadata,
                                        const std::vector<std::uint64_t>& rows, std::size_t value_bytes,
                                        ColumnValues& out, std::string& error);
@@ -45,21 +46,15 @@ std::uint32_t lance_page_list_depth(const pb::ColumnPage& page);
 /// Rows [first, first + count) of one column: the pages the range touches, decoded and trimmed --
 /// for a list page with a repetition index, only the chunks holding those rows. How a parallel read
 /// splits a fragment into row ranges it decodes independently (lance_table_reader.cpp).
-bool decode_lance_physical_column_range(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+bool decode_lance_physical_column_range(const EncodingsIo& io, const pb::Field& on_disk_field,
                                         const pb::ColumnMetadata& column_metadata, std::uint64_t first,
                                         std::uint64_t count, std::size_t value_bytes, ColumnValues& out,
                                         std::string& error);
 
 /// The dictionary entries of a column's dictionary pages (each entry's bytes), in page order, each
 /// value once: what an Arrow dictionary column was written with. Empty when no page has one.
-bool lance_column_dictionary_entries(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+bool lance_column_dictionary_entries(const EncodingsIo& io, const pb::Field& on_disk_field,
                                      const pb::ColumnMetadata& column_metadata, std::vector<std::string>& out,
                                      std::string& error);
-
-/// A buffer compressed by Lance's general buffer compressor (`Compression.scheme`: "zstd", "lz4" or
-/// "none"/empty), decompressed into `out`. Bounded: never more than zstd/lz4 can produce from the
-/// bytes given, nor the decoded-size limit.
-bool decompress_general_buffer(const std::string& scheme, const std::uint8_t* data, std::size_t size,
-                               std::vector<std::uint8_t>& out, std::string& error);
 
 }  // namespace nano_lance

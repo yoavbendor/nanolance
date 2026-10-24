@@ -42,7 +42,7 @@ compared, results are checked against pylance on the same files, in both directi
 | Statistics | `stats.dataset_stats`, `stats.data_stats` (bytes on disk per field, as Lance sums them), `stats.index_stats` / `index_statistics` (the same numbers as pylance's for BTree, Bitmap, LabelList, INVERTED, IVF_FLAT, IVF_PQ and IVF_HNSW_SQ, on either library's index), `validate` |
 | Transactions | `read_transaction`, `get_transactions` (as `Transaction` / `LanceOperation.*`, from the `_transactions/*.txn` file every commit writes; pylance and nanolance read either library's the same way), `transaction_properties=` and `commit_message=` on writes. Hand-built transactions: `LanceDataset.commit` of `Append`, `Overwrite`, `Delete`, `Update`, `Merge`, `Project`, `Rewrite`, `Restore`, `UpdateConfig`, `DataReplacement` and `CreateIndex` operations, or of a `Transaction`; `commit_batch` (Append transactions); `detached=True`; `max_retries`, `commit_timeout`. Each is applied as Lance's `build_manifest` applies it, after Lance's checks, and checked against the transactions committed since its read version by Lance's conflict rules (`lance.commit.CommitConflictError`, `retryable` or not); the transaction file records the operation as given. `MergeInsertBuilder.execute_uncommitted`. |
 | Fragments | `get_fragments`, `get_fragment`; `LanceFragment`: `fragment_id`, `metadata` (`FragmentMetadata`, `DataFile`, `DeletionFile`, as pylance shapes them: `to_json` / `from_json`, pickling), `count_rows`, `physical_rows`, `num_deletions`, `to_table`, `to_batches`, `scanner` (`include_deleted_rows`), `head`, `take`, `validate`. Writes apart from any commit, for a commit to publish: `lance.fragment.write_fragments` (fragments or, with `return_transaction`, the transaction), `LanceFragment.create`, `create_from_file`, `DataFile.create`, `delete` / `delete_rows` (a new deletion file), `merge_columns` (SQL expressions, a function of each batch, or data), `merge` (a join), `update_columns` (Lance's tombstoned layout, `with_offsets`). `add_columns` with a function or `lance.batch_udf` (and its checkpoint file). | New files can go to registered base paths: `write_fragments(target_bases=, target_all_bases=, initial_bases=)` (with `return_transaction`, an Overwrite that registers the bases) and `merge_insert(...).target_bases(...)` / `.target_all_bases(include_primary=)`, the same base ids and layout as pylance.
-| Filters | `filter=` on `to_table`, `to_batches`, `scanner`, `count_rows` and fragments: an SQL string or a pyarrow compute expression. Comparisons, `AND` / `OR` / `NOT` with SQL's three-valued logic, `IS [NOT] NULL`, `IN`, `BETWEEN`, `LIKE` / `ILIKE`, arithmetic, `CAST`, `DATE` / `TIMESTAMP` literals, struct fields (`s.a`), and the functions `lower`, `upper`, `length`, `abs`, `coalesce`, `starts_with`, `ends_with`, `contains`. With a filter, `offset` and `limit` count the rows that pass, as in pylance. |
+| Filters | `filter=` on `to_table`, `to_batches`, `scanner`, `count_rows` and fragments: an SQL string or a pyarrow compute expression. Comparisons, `AND` / `OR` / `NOT` with SQL's three-valued logic, `IS [NOT] NULL`, `IN`, `BETWEEN`, `LIKE` / `ILIKE`, arithmetic, `CAST`, `DATE` / `TIMESTAMP` literals, struct fields (`s.a`), and the functions `lower`, `upper`, `length`, `abs`, `coalesce`, `starts_with`, `ends_with`, `contains`. Strings are compared by character in every script, as pylance does: `LIKE`'s `_` is one character, `ILIKE` and `regexp_like(..., 'i')` compare Unicode case folds, `lower` / `upper` change every script's case, and `regexp_like`'s `.`, ranges, `\w`, `\d` and `\s` are Unicode (its `[[:alpha:]]`-style classes stay ASCII, as DataFusion's are; tests/test_unicode_filters.py). An unknown keyword argument to `scanner`, `to_table` or `count_rows` is a `TypeError`, as in pylance. With a filter, `offset` and `limit` count the rows that pass, as in pylance. |
 | Changes | `delete`, `update` (SQL values), `merge_insert` (`when_matched_update_all`, with or without a condition over `source.*` / `target.*`, `when_matched_delete`, `when_matched_fail`, `when_not_matched_insert_all`, `when_not_matched_by_source_delete`, `write_mode`, `execute`; `on` defaults to the schema's unenforced primary key; a source with part of the columns keeps the matched rows' other values and gives inserted rows nulls there, written as whole rows in every `write_mode`), `add_columns` (SQL expressions, a `pa.field` / schema of null columns, or a reader), `merge` (new columns joined on a key; not yet into a dataset with deleted rows), `drop_columns`, `alter_columns` (rename, nullability, data type), `optimize.compact_files`, `optimize.optimize_indices`. Each is one version (compaction of indexed
 fragments two: see "Keeping indexes up to date"), and writes what pylance writes: deletion files, a schema-only drop, a schema-only null column. |
 | Blobs | Blob v2 columns, read and written, every storage kind: `lance.blob_field` (with `inline_size_threshold`, `dedicated_size_threshold`, `pack_file_size_threshold`), `lance.blob_array`, `Blob`, `BlobType`, `BlobArray`, `BlobColumn`. A blob given as bytes is stored as Lance stores it -- inline in the data file, in a shared packed sidecar or a dedicated sidecar by size, with the same descriptors, blob ids and sidecar files -- and a URI as an external reference (`allow_external_blob_outside_bases=True`, as pylance requires; `external_blob_mode="ingest"` copies the bytes in; `blob_pack_file_size_threshold`). The prepared-layout writers (`PackedBlobWriter`, `DedicatedBlobWriter`, `BlobDescriptorArrayBuilder`) write the sidecars and descriptor columns for a `LanceFileSession.open_writer` file committed by `DataReplacement`, as pylance's do. Nulls, empties, whole-object externals, several blob columns, blob columns inside structs and lists (and lists of structs) -- paged as Lance pages them, with the parents' definition and the lists' repetition levels -- and beside any other column (a vector, a list, a struct), appends (either logical shape; a threshold that differs from the dataset's is refused), delete / update / merge_insert / compaction. The write-side checks and their errors are pylance's. Reading: `to_table` returns descriptions, `blob_handling="all_binary"` the bytes; `take_blobs` returns `lance.BlobFile` handles (`read`, `readall`, `readinto`, `seek`, `tell`, `size`, `read_range`, `read_ranges`), `read_blobs` the bytes (both also by a nested field path, `"info.blob"`), `read_blob_ranges` byte ranges per row, and `to_pandas(blob_mode="lazy" / "bytes" / "descriptions")` handles, bytes or descriptions. Legacy (v1) blob columns of formats 2.0 and 2.1 read the same ways; writing one is refused for 2.2, as Lance refuses it. |
@@ -61,10 +61,10 @@ columns, packed structs, deletions, ranges and takes.
 ### Scalar indexes: built and used
 
 `create_scalar_index(column, "BTREE" | "BITMAP" | "LABEL_LIST", name=None, replace=True)` builds
-Lance's scalar indexes in Lance's file layout (`src/scalar_index.cpp`), committed in the manifest as
+Lance's scalar indexes in Lance's file layout (`src/index/scalar/scalar_index.cpp`), committed in the manifest as
 pylance commits one; `drop_index`, `list_indices`, `describe_indices` and `has_index` work as in
 pylance. Filtered reads use any BTree, Bitmap or LabelList index the dataset has, whoever built it
-(`src/index_search.cpp`):
+(`src/index/index_search.cpp`):
 
 | index | files | answers |
 |---|---|---|
@@ -101,7 +101,7 @@ column -- a fixed-size list of floats -- as pylance does, and `create_index(colu
 "IVF_PQ" | "IVF_HNSW_SQ", metric=..., num_partitions=..., num_sub_vectors=..., num_bits=..., m=...,
 ef_construction=..., max_level=...)` builds Lance's index for it. The format and the search, step for step, are in `docs/VECTOR_INDEX.md`.
 
-- **Searching** (`src/vector_search.cpp`) an IVF_FLAT or IVF_PQ index -- built by pylance or by
+- **Searching** (`src/index/vector/vector_search.cpp`) an IVF_FLAT or IVF_PQ index -- built by pylance or by
   nanolance -- gives pylance's answer: the same rows, in the same order, with the same `_distance`,
   under L2, cosine and dot, for Lance's default (adaptive) probing, `nprobes` / `minimum_nprobes` /
   `maximum_nprobes`, `refine_factor` and `distance_range`. With 4-bit PQ, which ranks by quantized
@@ -110,7 +110,7 @@ ef_construction=..., max_level=...)` builds Lance's index for it. The format and
   re-scored), deleted rows and null vectors never come back, `prefilter=True` filters before the
   search and otherwise the k nearest are filtered, `fast_search` searches only what is indexed, and
   a `metric` other than the index's (or `use_index=False`, or no index) searches exactly.
-- **Building** (`src/vector_index_build.cpp`) follows Lance's defaults: k-means as Lance trains it
+- **Building** (`src/index/vector/vector_index_build.cpp`) follows Lance's defaults: k-means as Lance trains it
   (random initial centroids, at most 50 iterations, 256 training vectors a partition, hierarchical
   past 256 partitions), partitions from rows / 4096 (IVF_FLAT) or / 8192 (IVF_PQ), PQ codebooks
   trained and codes chosen by L2 on residuals, files and manifest entry as Lance writes them. pylance
@@ -182,7 +182,7 @@ with LanceDB's default analyzer or the settings given. `lance.query` has pylance
 `MatchQuery`, `MultiMatchQuery`, `BoostQuery`, `BooleanQuery` (and `&` / `|`), `PhraseQuery`.
 `docs/FTS_INDEX.md` has the format and the search, step for step.
 
-- **Searching** (`src/fts_search.cpp`) an INVERTED index, built by pylance or by nanolance, gives
+- **Searching** (`src/index/fts/fts_search.cpp`) an INVERTED index, built by pylance or by nanolance, gives
   pylance's answer: the same rows with the same `_score`, bit for bit. Lance's order among equal
   scores is arbitrary; nanolance's is by row id. Around the index it does what pylance does:
   - rows in fragments the index does not cover are tokenized on the fly and scored with the
@@ -194,7 +194,7 @@ with LanceDB's default analyzer or the settings given. `lance.query` has pylance
     the documents' own statistics.
 
   `_score` comes after the columns asked for, or where `columns` names it.
-- **Building** (`src/fts_index_build.cpp`) supports the simple, whitespace and raw tokenizers with
+- **Building** (`src/index/fts/fts_index_build.cpp`) supports the simple, whitespace and raw tokenizers with
   English stemming and stop words (or custom ones), lower-casing, ASCII folding and
   `max_token_length`. For the same data, the files hold what pylance's and LanceDB's builds hold,
   byte for byte: vocabulary (an `fst` map, ported), posting blocks, block scores and impact data.
@@ -245,7 +245,7 @@ same machinery to give its rewritten rows back to the indexes.
 
 Every commit nanolance makes
 -- append, delete, update, `merge_insert`, column changes, compaction, restore -- writes the
-version's indices into the new manifest by Lance's own rules (`src/index_maintenance.cpp`, after
+version's indices into the new manifest by Lance's own rules (`src/table/index_maintenance.cpp`, after
 lance-table's `index_maintenance.rs`), so pylance goes on using them:
 
 | nanolance commit | what happens to an index |

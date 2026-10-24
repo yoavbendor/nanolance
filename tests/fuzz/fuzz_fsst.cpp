@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 //
-// libFuzzer harness over the FSST decompressor (src/fsst.cpp), which reads a symbol table out of an
+// libFuzzer harness over the FSST decompressor (src/encoding/fsst.cpp), which reads a symbol table out of an
 // untrusted page descriptor and then walks untrusted code bytes against it.
 //
 // fuzz_decode does not reach here: it stops at the data file's footer and column metadata, and FSST

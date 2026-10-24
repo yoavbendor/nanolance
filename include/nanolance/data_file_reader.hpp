@@ -4,10 +4,12 @@
 #pragma once
 
 #include "lance_minimal.pb.hpp"
+#include "nanolance/encodings_io.hpp"
 
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <utility>
 
 namespace nano_lance {
 
@@ -59,6 +61,12 @@ bool read_lance_data_file_column_metadatas(const std::filesystem::path& path, co
 /// Caches keyed on a file's identity use this instead of stat'ing the path on every lookup.
 bool data_file_identity(const std::filesystem::path& path, std::uint64_t& size, std::int64_t& version);
 
+/// Closes every thread's cached handle on a data file whose path starts with `path_or_prefix` (one file,
+/// or everything under a directory). Called after files are deleted: a deleted file held open keeps its
+/// space, and on NFS lingers as a .nfsXXXX file, until the handle closes. Waits for a thread that is
+/// reading through such a handle to finish that read.
+void close_data_files_under(const std::string& path_or_prefix);
+
 class DataFileReadScope {
   public:
     DataFileReadScope();
@@ -75,5 +83,25 @@ class DataFileReadScope {
 /// Read a byte range from a Lance data file.
 bool read_lance_data_file_bytes(const std::filesystem::path& path, std::uint64_t offset, std::uint64_t size,
                                 std::vector<std::uint8_t>& out, std::string& error);
+
+/// A Lance data file as the page decoders see it: its bytes and identity, read through the same calls
+/// as `read_lance_data_file_bytes` and `data_file_identity` (and so the same read-scope handle cache).
+class DataFileIo final : public EncodingsIo {
+public:
+    explicit DataFileIo(std::filesystem::path path) : path_(std::move(path)), name_(path_.string()) {}
+
+    bool read(std::uint64_t offset, std::uint64_t size, std::vector<std::uint8_t>& out,
+              std::string& error) const override {
+        return read_lance_data_file_bytes(path_, offset, size, out, error);
+    }
+    bool identity(std::uint64_t& size, std::int64_t& version) const override {
+        return data_file_identity(path_, size, version);
+    }
+    const std::string& name() const override { return name_; }
+
+private:
+    std::filesystem::path path_;
+    std::string name_;
+};
 
 }  // namespace nano_lance

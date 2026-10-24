@@ -9,8 +9,8 @@ you are given. W4 (cleanup, drop, branches, clones, migrate) comes later: keep r
 ## 0. Context budget
 
 Budget about 200k tokens; aim for 120k. Never read a large file whole: `grep -n`, then `sed -n 'A,Bp'`
-windows of at most ~120 lines. Big ones: `src/vector_index_build.cpp`, `src/fts_index_build.cpp`,
-`src/scalar_index.cpp`, `bindings/python/nanolance/lance/dataset.py` (5k+). Cut output: `| tail -15` for
+windows of at most ~120 lines. Big ones: `src/index/vector/vector_index_build.cpp`, `src/index/fts/fts_index_build.cpp`,
+`src/index/scalar/scalar_index.cpp`, `bindings/python/nanolance/lance/dataset.py` (5k+). Cut output: `| tail -15` for
 pytest (add `-o addopts=`).
 
 ## 1. Goal
@@ -27,13 +27,13 @@ pytest (add `-o addopts=`).
 
 ## 2. Facts
 
-- Remaining filesystem calls on index build paths: `src/fts_index_build.cpp` ~915-972,
-  `src/vector_index_build.cpp` ~2061-2372, `src/scalar_index.cpp` ~1788-1883 (an index directory
-  created, and `remove_all` of it on failure), `src/index_optimize.cpp` ~475 (`remove_all` of a merged
+- Remaining filesystem calls on index build paths: `src/index/fts/fts_index_build.cpp` ~915-972,
+  `src/index/vector/vector_index_build.cpp` ~2061-2372, `src/index/scalar/scalar_index.cpp` ~1788-1883 (an index directory
+  created, and `remove_all` of it on failure), `src/dataset/index_optimize.cpp` ~475 (`remove_all` of a merged
   segment's directory). On an object store there are no directories: skip creating them
   (`io::is_object_store_output`), and replace `remove_all` of a failed build by removing the objects it
   wrote (`io::list_dir` + `io::remove_output`, best effort: an unreferenced index directory is harmless,
-  cleanup removes it). Index files themselves go through `src/index_files.cpp` `write_file` (check: does
+  cleanup removes it). Index files themselves go through `src/index/index_files.cpp` `write_file` (check: does
   it reach `io::open_output`?).
 - Python refusals to lift: `grep -n "refuse_object_store_write" bindings/python/nanolance/lance/dataset.py
   bindings/python/nanolance/lance/fragment.py` (the index ones for W3a; fragment / merge / UDF / commit for

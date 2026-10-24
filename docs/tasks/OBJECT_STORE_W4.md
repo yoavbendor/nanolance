@@ -8,7 +8,7 @@ Status: **delegated** (implementer: Claude Haiku 5.5, reviewer: Claude Opus 5.5)
 ## 0. Context budget
 
 Budget about 200k tokens; aim for 120k. Never read a large file whole: `grep -n`, then `sed -n 'A,Bp'`
-windows of at most ~120 lines. Big ones: `src/dataset_refs.cpp` (cleanup, branches, clones),
+windows of at most ~120 lines. Big ones: `src/table/dataset_refs.cpp` (cleanup, branches, clones),
 `bindings/python/nanolance/lance/dataset.py` (5k+). Cut output: `| tail -15` for pytest (add `-o addopts=`).
 
 ## 1. Goal
@@ -17,7 +17,7 @@ On an `s3://` dataset opened with pylance's `storage_options`, each of these doe
 and pylance agrees with the result:
 - `cleanup_old_versions` (every option: `older_than`, `retain_versions`, `delete_unverified`,
   `error_if_tagged_old_versions`), auto cleanup on commit (W1 skipped it on object stores:
-  `run_auto_cleanup` in `src/manifest_writer.cpp`), and its branch-aware rules (`docs/tasks/BRANCHES.md`
+  `run_auto_cleanup` in `src/table/manifest_writer.cpp`), and its branch-aware rules (`docs/tasks/BRANCHES.md`
   B2 outcome: versions a branch forks from are kept);
 - `LanceDataset.drop` (every object under the dataset's prefix);
 - branches: `create_branch`, `checkout_version((branch, v))`, writes on a branch (`tree/<B>/`),

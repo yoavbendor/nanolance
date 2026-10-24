@@ -102,7 +102,7 @@ def test_a_nanolance_append_onto_a_pylance_dataset_still_reads(lance_mod, tmp_pa
 # ── Deletion files ───────────────────────────────────────────────────────────────────────────────
 # Lance records deleted rows in `_deletions/{fragment}-{read_version}-{id}.{arrow|bin}` and picks the
 # shape by density: an Arrow IPC file of u32 offsets when sparse, a roaring bitmap above 5000. Both
-# are parsed directly (see src/deletion_vector.cpp); neither was read at all before, so a dataset
+# are parsed directly (see src/table/deletion_vector.cpp); neither was read at all before, so a dataset
 # that had ever had delete() called on it returned the deleted rows with no error.
 
 

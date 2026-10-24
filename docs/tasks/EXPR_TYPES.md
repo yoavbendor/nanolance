@@ -8,7 +8,7 @@ you could not finish rather than stretching the session.
 ## 0. Context budget
 
 About 100k tokens per session. `grep -n` then `sed -n` windows of at most ~120 lines; never read
-`src/expr.cpp` (3.3k lines), `src/scalar_index.cpp`, `src/index_search.cpp`,
+`src/expr/expr.cpp` (3.3k lines), `src/index/scalar/scalar_index.cpp`, `src/dataset/index_search.cpp`,
 `bindings/python/nanolance/lance/dataset.py` or `bindings/python/src/nanolance_bindings.cpp` whole.
 Cut all output (`| tail`, `| head`, `cut -c1-200`). For each item: read the named pylance tests
 (`.deps/pylance-tests/v12.0.0/tests/...`), measure the behaviour on real pylance 12.0.0 (`import lance`
@@ -16,19 +16,19 @@ in plain `python3`), then implement. Write nanolance's own code.
 
 ## 1. Where things are
 
-- Filter / projection expressions: `src/expr.cpp`. `detail::Kind` (line ~32: Null, Bool, Int, UInt,
+- Filter / projection expressions: `src/expr/expr.cpp`. `detail::Kind` (line ~32: Null, Bool, Int, UInt,
   Double, String, Binary, Date, Timestamp, List) and `detail::Value` (~35) hold one value. Column
-  values are read from Arrow arrays into `Value`s (grep `NANOARROW_TYPE_` in src/expr.cpp); literals
+  values are read from Arrow arrays into `Value`s (grep `NANOARROW_TYPE_` in src/expr/expr.cpp); literals
   are parsed (grep `Tok::`); `arrow_cast` is rewritten to `Op::Cast` at ~885 with a table of type
   names, and refuses the rest at ~908 (`arrow_cast to '...' is not supported in nanolance filters`).
-  Comparison of two Values: grep `compare(` in src/expr.cpp. `Expression::result_type` gives a
+  Comparison of two Values: grep `compare(` in src/expr/expr.cpp. `Expression::result_type` gives a
   projection's Arrow type.
-- Scalar index keys: `src/scalar_index.cpp`: `KeyKind` (grep `enum class KeyKind`), the type switch at
+- Scalar index keys: `src/index/scalar/scalar_index.cpp`: `KeyKind` (grep `enum class KeyKind`), the type switch at
   ~95-132 (DECIMAL128 -> `KeyKind::Decimal128` exists; DECIMAL256 and DURATION refuse with "a scalar
   index on a column of type ... is not supported"), `Int128` at ~244. Index search with a predicate's
-  literal: `src/index_search.cpp` (grep `Decimal128`).
+  literal: `src/dataset/index_search.cpp` (grep `Decimal128`).
 - ZONEMAP / BITMAP builders reuse the same key kinds (grep `KeyKind` in src/zone*.cpp,
-  src/scalar_index.cpp).
+  src/index/scalar/scalar_index.cpp).
 
 ## 2. Items
 
@@ -81,11 +81,11 @@ Measured on pylance 12.0.0 (session A0, 2026-10-16) -- the reviewer's decisions 
   `v / 2` -> (16,6), `abs(v)` -> (10,2); duration `arrow_cast(v, 'Duration(Second)')` -> duration[s]
   truncating. **Decision: phase A only compares decimals / durations and projects bare columns.**
 - Index files: not yet measured -- the page_data / page_lookup files live under
-  `_indices/<uuid>/`; open them with nanolance's `index_files::read_table` (src/index_files.cpp) or
+  `_indices/<uuid>/`; open them with nanolance's `index_files::read_table` (src/index/index_files.cpp) or
   `lance.file.LanceFileReader(path)` on the exact `.lance` file path, and match their column types.
 
 Code map from A0 (grep-located):
-- src/expr.cpp: `enum class Kind` (32), `struct Value` (35): add `Decimal` (four 64-bit limbs,
+- src/expr/expr.cpp: `enum class Kind` (32), `struct Value` (35): add `Decimal` (four 64-bit limbs,
   two's complement, + scale) and `Duration` (count + unit; `unit_to_ns` ~1330). `read_scalar` (~1313):
   DECIMAL128 / 256 and unit-aware DURATION, the scale threaded from bind (ColumnRef). `bind_node`
   (~1080-1160): `scalar_type()` already admits DURATION; decimals are excluded. Literal coercion
@@ -95,10 +95,10 @@ Code map from A0 (grep-located):
   their own name). `compare()` (~1376): exact cross-scale compare (rescale in 512 bits: 10^76 fits).
   `kind_name` (~1420). The vectorised literal compare (~2390) compares DURATION raw counts: it must
   fall back for Duration literals. Output append (~2130) appends DURATION through cast_value "bigint".
-- src/scalar_index.cpp: `KeyKind` (89), `key_kind_of` (91-131), `Int128` (246), `order_items<Int128>`
+- src/index/scalar/scalar_index.cpp: `KeyKind` (89), `key_kind_of` (91-131), `Int128` (246), `order_items<Int128>`
   (407), `zone_extrema<Int128>` (906); the uuid refusal at ~1563 (`extension_name` -> "a scalar index on
   an extension type is not supported"): key the storage type, keep what page_data stores (measure).
-- src/index_search.cpp: grep `Decimal128` for the literal-to-key path.
+- src/dataset/index_search.cpp: grep `Decimal128` for the literal-to-key path.
 
 **A1 outcome (2026-10-16):** decimal128 / decimal256 in filters, exact (46 tests); rounding half away
 from zero, pylance's overflow and float-literal messages (pylance quotes the type: `'Decimal128(10,
@@ -167,7 +167,7 @@ rules it shows:
 
 **Reviewer's decisions:** (1) filters keep their semantics (they return rows where pylance's
 literal coercion refuses `i16 > 40000` / `i32 = 7.0`) -- a recorded divergence; the typed rules
-apply to projections only (a mode of evaluation inside src/expr.cpp, not a planning change).
+apply to projections only (a mode of evaluation inside src/expr/expr.cpp, not a planning change).
 (2) u64 with a signed int -> decimal128(21,0) / (38,0), as pylance. (3) match ts - ts, ts +/- dur,
 d32 - d32; refuse mixed-unit duration arithmetic (pylance's month_day_nano interval) with a clear
 error. Phase C is split: **C1** integers and floats (a typed pass through `guess()` /

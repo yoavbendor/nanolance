@@ -42,6 +42,10 @@ bool put_if_absent(const std::string& path_or_uri, const std::vector<std::uint8_
 /// Removes one file / object; a missing one is not an error.
 bool remove_output(const std::string& path_or_uri, std::string& error);
 
+/// Called with each local path remove_output removes. The data-file reader registers one that closes its
+/// cached handles on the file (it lives in the library above this one, so it registers rather than is called).
+void set_output_removed_hook(void (*hook)(const std::string& path));
+
 /// Whether `path_or_uri` is written through a registered backend (an object store) rather than as a
 /// local file. Such datasets have no directories: creating one is a no-op.
 bool is_object_store_output(const std::string& path_or_uri);

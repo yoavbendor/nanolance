@@ -530,7 +530,7 @@ def test_reads_run_length_definition_levels_on_a_string_column(tmp_path):
 # A string column with few distinct values -- a categorical column -- comes back from Lance as a
 # dictionary page whose dictionary block is General{LZ4, Variable}. nanolance read that block raw and
 # died on its header with "dict block header invalid", which named the symptom rather than the
-# missing decoder. It now decompresses it (src/lz4_block.cpp; the LZ4 *block* format, not the framed
+# missing decoder. It now decompresses it (src/encoding/lz4_block.cpp; the LZ4 *block* format, not the framed
 # one, and no new dependency: decompression is a token, a literal run and a back-reference).
 
 

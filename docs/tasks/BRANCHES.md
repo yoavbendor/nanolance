@@ -9,7 +9,7 @@ you are given.
 
 Budget about 200k tokens; aim for 120k. Never read a large file whole: `grep -n`, then `sed -n 'A,Bp'`
 windows of at most ~120 lines. Big ones: `bindings/python/nanolance/lance/dataset.py` (5k+),
-`src/dataset.cpp`, `src/manifest_writer.cpp`, `src/dataset_ops.cpp`, `bindings/python/src/nanolance_bindings.cpp`.
+`src/dataset/dataset.cpp`, `src/table/manifest_writer.cpp`, `src/dataset/dataset_ops.cpp`, `bindings/python/src/nanolance_bindings.cpp`.
 Lance's Rust: read only the files named here. Cut output: `| tail -15` for pytest (add `-o addopts=`),
 `| tail -5` for `tools/pylance_suite.py`.
 
@@ -97,14 +97,14 @@ Lance's code (sources under `/root/.cargo/registry/src/index.crates.io-1949cf8c6
 
 ## 3. Where things are in nanolance
 
-- Base paths are read and written already: `include/nanolance/base_paths.hpp`, `src/base_paths.cpp`
+- Base paths are read and written already: `include/nanolance/base_paths.hpp`, `src/table/base_paths.cpp`
   (`read_base_paths`, `write_base_paths`, data-file resolution by `base_id`); multi-base datasets are done
   (`docs/tasks/MULTI_BASE.md`).
-- Manifests: `src/dataset.cpp` (reading, line ~281 reads base paths), `src/manifest_writer.cpp`
+- Manifests: `src/dataset/dataset.cpp` (reading, line ~281 reads base paths), `src/table/manifest_writer.cpp`
   (feature flags, unknown-field preservation: check field 20 survives a commit).
 - Transaction files: `grep -rn "Clone\|write_transaction" src/*.cpp | head`.
 - Tags (Python): `dataset.py` near line 2460 (`Tags`); refs JSON reading in `_namespace_dir.py` near 1670.
-- Commit retries / version numbering: `src/dataset.cpp` (`rebase`), `src/manifest_writer.cpp`.
+- Commit retries / version numbering: `src/dataset/dataset.cpp` (`rebase`), `src/table/manifest_writer.cpp`.
 
 ## 4. Phases
 

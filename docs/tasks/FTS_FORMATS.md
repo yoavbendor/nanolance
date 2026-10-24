@@ -6,7 +6,7 @@ Status: **delegated** (implementer: Claude Haiku 5.5, reviewer: Claude Opus 5.5)
 ## 0. Context budget
 
 About 100k tokens per session. `grep -n` then `sed -n` windows of at most ~120 lines; never read
-`src/fts_search.cpp` (2k lines), `src/fts_index_build.cpp`, `dataset.py` (3.5k+) or Lance's
+`src/index/fts/fts_search.cpp` (2k lines), `src/index/fts/fts_index_build.cpp`, `dataset.py` (3.5k+) or Lance's
 `tokenizer.rs` (1.8k) whole. Cut all output (`| tail -15`; pytest with `-o addopts=` for a summary
 line; `tools/pylance_suite.py ... | tail -5`; `ninja 2>&1 | grep -E "error|warning:" | head`). Only
 your phase. Lance's Rust source is the reference, unpacked here:
@@ -26,8 +26,8 @@ nanolance today builds and reads **format_version 2** only: posting blocks of 12
 refuses `format_version`, `block_size`, `analyzer`, `split_identifiers`, `split_on_numerics`,
 `preserve_original`, `index_operators` (`_INVERTED_OPTIONS` / `_inverted_params`,
 `bindings/python/nanolance/lance/dataset.py` ~1015); the native side refuses block size != 128
-(`src/fts_index_build.cpp` ~561); the reader refuses format != "2" and block != "128"
-(`load_inverted`, `src/fts_search.cpp` ~716).
+(`src/index/fts/fts_index_build.cpp` ~561); the reader refuses format != "2" and block != "128"
+(`load_inverted`, `src/index/fts/fts_search.cpp` ~716).
 
 Lance's rules (`index/format.rs`, `tokenizer.rs`):
 - `format_version` accepts `1 | 2 | 3 | "1" | "v1" | "V1" | ...`; anything else -> ValueError
@@ -45,7 +45,7 @@ Lance's rules (`index/format.rs`, `tokenizer.rs`):
 - **V3 with block 128 is byte-identical to V2** except `format_version = "3"` (docs / tokens files
   equal, invert differs only in its metadata) -- verified.
 - **V1** = `posting_tail_codec = fixed32_v1` (tail block stores doc ids / frequencies as plain u32;
-  nanolance's decoder already has `TailCodec::Fixed32`, `src/fts_posting.cpp` ~111 -- but the reader
+  nanolance's decoder already has `TailCodec::Fixed32`, `src/index/fts/fts_posting.cpp` ~111 -- but the reader
   looks for the string `"fixed32"`, pylance writes `"fixed32_v1"`: fix it). With `with_position`, V1
   has **no** `positions_layout`: `invert.lance` has an extra column
   `_position: list<list<large_binary>>` -- per posting list, per document, a compressed position
@@ -53,14 +53,14 @@ Lance's rules (`index/format.rs`, `tokenizer.rs`):
   `compress_positions\|POSITION_COL` there). nanolance currently reports that layout as unsupported
   (`positions_error`); F1 reads and writes it.
 - **Block 256** (`encoding.rs` 66-330): full blocks are `BitPacker8x` (8 lanes x 32, same scheme as
-  the 4x one in `src/fts_posting.cpp`, 8 interleaved lanes instead of 4): doc ids as a sorted block
+  the 4x one in `src/index/fts/fts_posting.cpp`, 8 interleaved lanes instead of 4): doc ids as a sorted block
   `[u32 first doc][u8 bits][packed deltas]`, then frequencies **patched FOR**
   `[u8 width][u8 exception count][packed body][exceptions: (u8 index, varint high bits)...]`
   (`compress_pfor_block_with` -- copy its width choice exactly so bytes match). **No 4-byte block max
   score prefix** on any 256 block, including the remainder (`posting_block_score_prefix_len`). The
   tail (remainder < 256) uses the tail codec as today. Impact skip data (`_impacts`) uses the same
   entry encoding for every block size, one entry per posting block and one per 32 blocks
-  (`impact.rs` top; nanolance's `encode_impact_entry` in `src/fts_index_build.cpp` ~100-130).
+  (`impact.rs` top; nanolance's `encode_impact_entry` in `src/index/fts/fts_index_build.cpp` ~100-130).
 - Code analyzer (`analyzer="code"`, or `base_tokenizer="code"`): params JSON written into `params`:
   `"base_tokenizer":"code"`, `"stem":false`, `"remove_stop_words":false`, `"lower_case":true`,
   `"ascii_folding":true`, and four extra keys (nanolance already writes them, as false):
@@ -88,7 +88,7 @@ Lance's rules (`index/format.rs`, `tokenizer.rs`):
   same data (one partition: compare `part_0_invert.lance` columns). Oracle:
   `test_create_scalar_index_fts_block_size`, `test_code_analyzer_does_not_split_identifiers_by_default[256]`
   passes only after F3.
-- **F3 -- code analyzer.** Tokenizer in `src/fts_tokenizer.cpp` (C++ port of the two Rust files;
+- **F3 -- code analyzer.** Tokenizer in `src/index/fts/fts_tokenizer.cpp` (C++ port of the two Rust files;
   same token texts and positions), options, errors, params, details proto; query-side tokenization
   through the same analyzer. Oracle: all 8 `test_code_analyzer_*` (grep `def test_code_analyzer`
   in `.deps/pylance-tests/v12.0.0/tests/test_scalar_index.py`).
@@ -115,7 +115,7 @@ _nanolance.cpython-311-x86_64-linux-gnu.so /usr/local/lib/python3.11/dist-packag
 Stop and ask (question first) if pylance's files differ from section 1, if V1's legacy position
 encoding needs more than ~150 lines, if 256-block bytes cannot be matched after comparing with
 pylance's, or if the code analyzer needs Unicode tables nanolance lacks (`is_alphanumeric` on
-non-ASCII: check what `src/fts_tokenizer.cpp` uses for the simple tokenizer first and reuse it).
+non-ASCII: check what `src/index/fts/fts_tokenizer.cpp` uses for the simple tokenizer first and reuse it).
 
 ## 5. Done per phase -- report (under 40 lines, sent once)
 
@@ -145,7 +145,7 @@ unchanged. +1 pylance test (1037).
 - Reviewer's answer on Unicode: `WordDelimiterFilter` uses `char::is_lowercase` / `is_uppercase`
   (~148-158). Generate exact **Lowercase and Uppercase range tables** from Rust std with
   `tools/fts_tables` (it builds offline in ~30 s against lance-tokenizer 12.0.0), the same way `kAlnum`
-  is generated, into `src/fts_tables.inc`. `is_alphanumeric` = existing `kAlnum` (`src/fts_tokenizer.cpp`
+  is generated, into `src/index/fts/fts_tables.inc`. `is_alphanumeric` = existing `kAlnum` (`src/index/fts/fts_tokenizer.cpp`
   ~58). The Rust oracle in `tools/fts_tables` can also emit golden token lists for the code analyzer.
 - Params JSON key order already matches pylance (`params_json`); write the four flags' real values for
   code indexes only, so text-analyzer params stay byte-identical.
@@ -161,7 +161,7 @@ unchanged. +1 pylance test (1037).
   (`tests/test_fts_tokenizer.cpp`, ctest `nano_lance_fts_tokenizer`).
 
 **F3 outcome (2026-10-15):** done. Code analyzer (`CodeLexTokenizer` + `WordDelimiterFilter` ported to
-`src/fts_tokenizer.cpp`, exact Unicode Lowercase / Uppercase tables generated from Rust std by
+`src/index/fts/fts_tokenizer.cpp`, exact Unicode Lowercase / Uppercase tables generated from Rust std by
 `tools/fts_tables`), its options, Lance's messages, default format 3, `code_config` in
 InvertedIndexDetails (bytes equal to pylance's), details decoded in `describe_indices`. 528 golden
 code-analyzer token cases from Lance's own crate; all 8 `test_code_analyzer_*` pass (+8, 1045).

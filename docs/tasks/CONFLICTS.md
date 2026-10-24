@@ -9,15 +9,15 @@ given.
 ## 0. Context budget (read this first)
 
 Budget about 200k tokens; aim for 120k. Never read a large file whole: `grep -n`, then `sed -n 'A,Bp'`
-windows of at most ~120 lines. Big ones: `src/dataset_ops.cpp` (2k+), `src/dataset_transaction.cpp`,
-`src/transaction_file.cpp`, `bindings/python/nanolance/lance/dataset.py` (5k+). Lance's Rust: only
+windows of at most ~120 lines. Big ones: `src/dataset/dataset_ops.cpp` (2k+), `src/table/dataset_transaction.cpp`,
+`src/table/transaction_file.cpp`, `bindings/python/nanolance/lance/dataset.py` (5k+). Lance's Rust: only
 `/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/lance-12.0.0/src/io/commit/conflict_resolver.rs`
 (5.6k lines; the functions named below, by `grep -n "fn check_"`). Cut output: `| tail -15` for pytest
 (add `-o addopts=`), `| tail -5` for `tools/pylance_suite.py`.
 
 ## 1. Goal
 
-When a C++ commit (`commit_next_version`, `src/dataset.cpp` ~line 182) loses the race for its version,
+When a C++ commit (`commit_next_version`, `src/dataset/dataset.cpp` ~line 182) loses the race for its version,
 nanolance today does one of two things: `rebase` (same file, ~line 92) succeeds only when the other
 writers did nothing but add fragments; anything else is a "commit conflict" and the operation's
 `retry_on_conflict` wrapper re-runs it from scratch on the new version. Two consequences:
@@ -68,10 +68,10 @@ row counts are what must match. The wording to use (Lance's `retryable_conflict_
 
 - incompatible: `Incompatible transaction: This {Ours} transaction is incompatible with concurrent
   transaction {Theirs} at version {v}.` -- through Python an `OSError` (not `CommitConflictError`);
-  through lance-c the error code pylance's maps to (see `src/lance_c.cpp` ~line 202, which already maps
+  through lance-c the error code pylance's maps to (see `src/api/lance_c.cpp` ~line 202, which already maps
   "commit conflict").
 - retryable: keep nanolance's `commit conflict: ...` prefix (that is what `retry_on_conflict` and
-  `src/lance_c.cpp` key on), followed by Lance's text `Retryable commit conflict for version {v}: This
+  `src/api/lance_c.cpp` key on), followed by Lance's text `Retryable commit conflict for version {v}: This
   {Ours} transaction was preempted by concurrent transaction {Theirs} at version {v}. Please retry.`
   -- seen only when the retries run out, or by operations that do not retry.
 
@@ -81,23 +81,23 @@ UpdateBases).
 
 ## 3. Where things are in nanolance
 
-- `src/dataset.cpp`: `rebase` (~92), `commit_next_version` (~182; the retry loop ~227).
+- `src/dataset/dataset.cpp`: `rebase` (~92), `commit_next_version` (~182; the retry loop ~227).
 - What a commit *is*, as Lance's transaction: `derive_transaction_operation(parent, next)`
-  (`src/transaction_file.hpp`) -- the same derivation that writes `_transactions/*.txn` on every commit.
+  (`src/table/transaction_file.hpp`) -- the same derivation that writes `_transactions/*.txn` on every commit.
   The other writers' transactions: each intervening manifest's `transaction_file`
   (`_transactions/<name>`), written by nanolance and by pylance alike. A version with no transaction file
   (old datasets) is a **retryable** conflict (today's behaviour).
-- Decoding and applying a transaction: `src/dataset_transaction.cpp` -- `decode_operation` (~295),
+- Decoding and applying a transaction: `src/table/dataset_transaction.cpp` -- `decode_operation` (~295),
   `struct Operation` (~259), `apply_operation(base, op, next, ...)` (~847), used by the Python
-  `LanceDataset.commit` path. Move what you need into an internal header (`src/dataset_transaction_ops.hpp`
+  `LanceDataset.commit` path. Move what you need into an internal header (`src/table/dataset_transaction_ops.hpp`
   or similar); do not duplicate the decoder.
 - The Python transaction API's own port of the matrix: `bindings/python/nanolance/lance/_transactions.py`
   `conflict_with` (~1002). It covers hand-built transactions without affected rows; the C++ port must
   agree with it on every pair it covers (a test asserts this for the pairs both can express). Do not
   change the Python commit path in this task.
 - Re-run wrappers: `grep -n "retry_on_conflict" src/*.cpp src/*.hpp` (delete, update, merge_insert,
-  compaction, optimize_indices). Index builds (`src/scalar_index.cpp` ~1882 / ~2127,
-  `src/vector_index_build.cpp` ~2187, `src/fts_index_build.cpp` ~955, `src/index_segments.cpp` ~397)
+  compaction, optimize_indices). Index builds (`src/index/scalar/scalar_index.cpp` ~1882 / ~2127,
+  `src/index/vector/vector_index_build.cpp` ~2187, `src/index/fts/fts_index_build.cpp` ~955, `src/dataset/index_segments.cpp` ~397)
   call `commit_next_version` directly.
 
 ## 4. Phases
@@ -169,7 +169,7 @@ moved to `src/dataset_operation.{hpp,cpp}`, `classify_concurrent` in `commit_nex
 `include/nanolance/dataset_commit.hpp`, `_errors.py` maps "Incompatible transaction:" to OSError,
 `tests/test_commit_conflicts.cpp` at verdict level). Reviewer found: **the probe of section 2 is unchanged
 end to end**, because nanolance's Python mutations never race from a stale handle -- `delete_once`
-(`src/dataset_ops.cpp` ~791) and the other `*_once` functions `load_latest`, so a handle opened at v1
+(`src/dataset/dataset_ops.cpp` ~791) and the other `*_once` functions `load_latest`, so a handle opened at v1
 deletes from v3. pylance commits from the handle's own version (`read_version`), then resolves.
 Reviewer's answers to the session's questions:
 1-2. `Update.inserted_rows_filter` and `update_mode`: record them in `derive_transaction_operation` as
@@ -228,7 +228,7 @@ build's clang `-Werror` failed on it). Decisions:
   the C++-vs-Python agreement test over the pairs both can express.
 
 **C2 outcome (2026-10-20):** compatible pairs rebase by applying our operation to the latest manifest
-(`rebase_operation`, `src/dataset_transaction.cpp`; the append-only `rebase` is gone); index builds and
+(`rebase_operation`, `src/table/dataset_transaction.cpp`; the append-only `rebase` is gone); index builds and
 restore commit from the handle's version; `_transactions.py` `conflict_with` agrees with the C++ port
 over all ordered pairs of 15 operations (`_commit_verdict` test). Measured: pylance writes
 `inserted_rows_filter` only for merge_insert on an unenforced primary key, `update_mode` only for

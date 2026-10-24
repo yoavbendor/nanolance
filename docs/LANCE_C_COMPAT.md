@@ -27,7 +27,7 @@ lance_scanner_to_arrow_stream(sc, &stream);
 
 The headers in `compat/lance-c/include/lance/` are lance-c's own, copied unmodified (Apache-2.0,
 The Lance Authors) from the commit in `compat/lance-c/UPSTREAM`. Every one of the 127 functions they
-declare is defined in `src/lance_c.cpp`, and does the work, except for a few options and index kinds
+declare is defined in `src/api/lance_c.cpp`, and does the work, except for a few options and index kinds
 (below). Those fail
 the way lance-c reports any failure: the function's documented error value, with
 `lance_last_error_code()` set to `LANCE_ERR_NOT_SUPPORTED` and a message naming the feature. It never

@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "nanolance/fts_search.hpp"
+#include "nanolance/index_search.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/scalar_index.hpp"
 #include "nanolance/vector_search.hpp"
@@ -159,6 +160,7 @@ std::uint64_t scan_rows(const fs::path& dataset, const ScalarQuery& q) {
     LanceScanRequest request;
     request.columns = q.columns ? &*q.columns : nullptr;
     request.filter = &q.filter;
+    request.index_candidates = nano_lance::index_candidates;
     ArrowSchema schema{};
     std::vector<ArrowArray> batches;
     std::string error;

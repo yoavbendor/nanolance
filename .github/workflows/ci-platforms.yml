@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# The library and its test suite on macOS and Windows.
+# The library and its test suite on macOS and Windows, and the layering check of src/ (on Linux).
 #
 # Every other workflow here runs on Linux, so "builds on macOS/Windows" has been an untested claim.
 # This job is what makes it a tested one -- and, for Windows, what decides whether wheels can be
@@ -44,6 +44,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  layers:
+    # The layering of src/ (src/README.md): no file includes a higher layer's header beyond the violations
+    # tools/layers_allow.txt still lists, and that list only shrinks. Seconds; no build.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the layers
+        run: python3 tools/check_layers.py
+      - name: Test the check
+        run: |
+          python3 -m pip install --quiet pytest
+          python3 -m pytest -q -p no:cacheprovider tools/test_check_layers.py
+
   macos:
     # macos-14 is deprecated; a retired runner label queues forever instead of failing.
     runs-on: macos-15

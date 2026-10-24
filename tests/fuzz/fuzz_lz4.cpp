@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 //
-// libFuzzer harness over the LZ4 block decompressor (src/lz4_block.cpp), which walks untrusted
+// libFuzzer harness over the LZ4 block decompressor (src/encoding/lz4_block.cpp), which walks untrusted
 // tokens, literal runs and back-references from a Lance-written buffer.
 //
 // fuzz_decode does not reach here: it stops at the data file's footer and column metadata, and LZ4

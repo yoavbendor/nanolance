@@ -29,6 +29,7 @@
 // Build with -DNANOLANCE_BUILD_FUZZERS=ON on a Clang toolchain.
 
 #include "nanolance/column_values.hpp"
+#include "nanolance/data_file_reader.hpp"
 #include "nanolance/lance_column_decoder.hpp"
 #include "nanolance/schema_mapper.hpp"
 
@@ -87,7 +88,8 @@ std::filesystem::path temp_path() {
 
 bool decode_once(const std::filesystem::path& file, const nano_lance::pb::Field& field,
                  const nano_lance::pb::ColumnMetadata& column, nano_lance::ColumnValues& out, std::string& error) {
-    return nano_lance::decode_lance_physical_column(file, field, column, out, error);
+    const nano_lance::DataFileIo io(file);
+    return nano_lance::decode_lance_physical_column(io, field, column, out, error);
 }
 
 }  // namespace

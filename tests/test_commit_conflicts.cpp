@@ -4,7 +4,7 @@
 // Lance 12's verdict (check_txn) for pairs of operations, as nanolance classifies a commit that lost its
 // race: compatible, retryable, or incompatible. Operations are built by hand; the rows of the
 // pylance probe (CONFLICTS.md section 2) are checked through the same verdicts in the Python tests.
-#include "commit_conflicts.hpp"
+#include "table/commit_conflicts.hpp"
 
 #include "nanolance/dataset.hpp"
 #include "nanolance/dataset_commit.hpp"

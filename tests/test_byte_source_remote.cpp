@@ -10,6 +10,7 @@
 // each kind of file was read through the interface.
 #include "nanolance/byte_source.hpp"
 #include "nanolance/dataset_ops.hpp"
+#include "nanolance/index_search.hpp"
 #include "nanolance/index_segments.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/manifest_reader.hpp"
@@ -238,6 +239,7 @@ Reads read_all_ways(const std::string& dataset, std::uint64_t latest_version) {
 
     LanceScanRequest indexed = req;
     indexed.filter = &indexed_filter;
+    indexed.index_candidates = index_candidates;  // the planner's part: answer the filter from indexes
     require_err(lance_dataset_scan(path, indexed, schema, batches, err), "indexed scan", err);
     r.indexed = ids_of(schema, batches);
 

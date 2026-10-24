@@ -1,0 +1,120 @@
+# The --fast profile of tools/local_validate.py: which tests it runs, and what each one covers.
+# Entries are relative to the directory they are run from: [pytest] from bindings/python, [pylance] from
+# pylance's tests/ (tools/pylance_suite.py --files). "file::test" runs one test with all its parameters.
+# The seconds after each entry are its share of the full run's serial time (4 cores; measured with other work
+# on the machine, so a quieter one is faster). The whole [pytest] list took about 210 s in the measured run.
+
+[pytest]
+# Dataset writes and reads: write, append, overwrite, streaming writes, the manifest
+tests/test_lance_parity.py          # write/read/append/overwrite cycles against pylance (6.0 s)
+tests/test_full_cycle.py            # Python -> nanolance -> Python round trips (0.0 s)
+tests/test_chunked_writer.py        # the streaming writer: write_batch, flush, close (0.2 s)
+tests/test_partial_schema.py        # writes with part of the schema, merge_insert (0.3 s)
+tests/test_writer_tail.py           # shapes the writer used to refuse: empty structs, null elements (0.7 s)
+tests/test_metadata.py              # read_schema and count_rows, answered from the manifest (0.1 s)
+tests/test_format_v2_0.py           # file format 2.0, written and read against pylance (0.3 s)
+
+# Scans with filters, order_by, SQL projections, system columns
+tests/test_expr_types.py            # filter expressions over every value type (7.8 s)
+tests/test_order_by.py              # order_by in scans, nulls and ties (0.3 s)
+tests/test_sql_surface.py::test_projection_with_filters_limit_and_offset   # SQL projection with a filter (2.5 s)
+tests/test_sql_surface.py::test_sql_unsupported_constructs_are_named       # SQL errors are named (0.5 s)
+tests/test_system_columns.py        # _rowid and _rowaddr in scans (0.4 s)
+
+# Random access and fragments
+tests/test_take.py                  # take, take_rows, lance_table_take (4.8 s)
+tests/test_fragment_writes.py       # fragment-level writes and hand-built transactions (0.2 s)
+tests/test_row_addr_masks.py        # row-address masks and allowlists (0.2 s)
+
+# Deletes, updates, merge_insert, schema evolution
+tests/test_stable_row_ids.py        # stable row ids across merge_insert, updates and deletes (0.4 s)
+tests/test_lance_mutations.py       # datasets pylance modified: deletes, updates, added columns (0.3 s)
+tests/test_pylance_compat.py        # the pylance-compatible API against pylance: updates, merge_insert (3.0 s)
+tests/test_small_apis.py            # small dataset APIs: stats, field metadata, transactions (1.1 s)
+
+# Compaction, cleanup, versions, tags, branches
+tests/test_compaction_plan.py       # compaction planning matches pylance (1.9 s)
+tests/test_version_housekeeping.py  # tags, cleanup of old versions, drop (2.0 s)
+tests/test_branches.py              # branches written by pylance (1.6 s)
+tests/test_index_optimize.py        # optimize_indices folds appended rows into an index (2.5 s)
+tests/test_frag_reuse.py            # searching through the fragment-reuse index of a compaction (0.9 s)
+
+# Transactions and conflicts
+tests/test_transactions.py          # a transaction file for every commit (0.5 s)
+tests/test_commit_conflicts.py      # lost races decided as Lance 12 decides them (0.8 s)
+tests/test_concurrent_writers.py    # writers racing from processes and threads (0.5 s)
+tests/test_manifest_transactions.py # inline transactions and manifest migration (0.1 s)
+
+# Scalar indexes: BTREE, BITMAP, LABEL_LIST, ZONEMAP, NGRAM
+tests/test_scalar_index.py          # BTREE, BITMAP and LABEL_LIST built by nanolance (1.7 s)
+tests/test_zoned_indexes.py         # ZONEMAP (5.0 s)
+tests/test_ngram_json_index.py      # NGRAM, on JSON and text (6.3 s)
+tests/test_count_from_index.py      # count_rows answered from a scalar index (0.5 s)
+
+# Full-text search: the simple tokenizer, phrases, list and nested columns
+tests/test_fts.py::test_unindexed_fragments_and_deletions    # INVERTED index, unindexed fragments (3.8 s)
+tests/test_fts.py::test_create_index_fts_alias_and_replace   # index creation and replacement (0.0 s)
+tests/test_fts_phrase.py            # phrase queries on an index with positions (5.6 s)
+tests/test_fts_lists.py             # full-text search over list<string> columns (8.8 s)
+tests/test_fts_nested.py            # full-text search over struct leaves (1.0 s)
+
+# Full-text search: the jieba and lindera base tokenizers
+tests/test_fts_jieba.py::test_jieba_index_built_and_searched_by_both_engines[False-user]   # (7.5 s)
+tests/test_fts_jieba.py::test_jieba_model_errors_as_pylance  # a missing model errors as pylance does (0.0 s)
+tests/test_fts_lindera.py           # the lindera base tokenizer, whole file (12.5 s)
+
+# Vector indexes: IVF_FLAT and IVF_PQ, HNSW, IVF_RQ, binary and float16 vectors, multivectors
+tests/test_vector_search.py         # nearest= on IVF_FLAT and IVF_PQ, against pylance (9.4 s)
+tests/test_hnsw.py::test_nanolance_builds_describe_like_pylance     # IVF_HNSW builds, described (1.8 s)
+tests/test_hnsw.py::test_built_kinds_take_appended_rows_by_optimize # IVF_HNSW after appends (2.8 s)
+tests/test_ivf_rq.py::test_refuses_what_pylance_refuses             # IVF_RQ refusals (0.1 s)
+tests/test_ivf_rq.py::test_filters_before_and_after_the_search      # IVF_RQ with filters (0.6 s)
+tests/test_ivf_rq.py::test_approx_modes_with_filters_and_deletions  # IVF_RQ with deletions (1.2 s)
+tests/test_binary_ivf.py            # Hamming IVF_FLAT on uint8 vectors (2.3 s)
+tests/test_float16_vectors.py       # searches over float16 vector columns (1.0 s)
+tests/test_multivector.py::test_built_index_layout_matches_pylance  # ColBERT-style multivector index (0.1 s)
+
+# Blobs
+tests/test_blob_kinds.py            # every kind of Lance blob, written by either library (7.8 s)
+tests/test_blob_writers.py          # PackedBlobWriter, DedicatedBlobWriter, descriptor builders (0.6 s)
+
+# Namespaces
+tests/test_namespace.py             # DirectoryNamespace's catalog and the REST spec (2.0 s)
+
+# Object store on moto: s3:// reads, writes and commits (tests/test_object_store*.py)
+tests/test_object_store.py          # s3:// datasets read, checked against pylance (5.2 s)
+tests/test_object_store_writes.py   # gs:// and az:// writes refused (0.0 s)
+tests/test_object_store_commits.py::test_racing_writers_lose_and_double_nothing     # two writers on s3 (3.5 s)
+tests/test_object_store_commits.py::test_create_append_overwrite_read_by_pylance    # create/append/overwrite on s3 (0.5 s)
+tests/test_object_store_commits.py::test_drop_on_s3_removes_every_object_of_the_dataset_and_no_sibling  # drop on s3 (0.6 s)
+
+# Interop: the engines people read Lance with
+tests/test_interop.py               # DuckDB, Polars, pandas and LanceDB read nanolance datasets (1.5 s)
+
+# Large-list and nested readers and writers, nullable and encoded columns
+tests/test_take_large_list_pages.py::test_take_from_nanolance_list_pages   # take from large-list pages (7.8 s)
+tests/test_take_large_list_pages.py::test_audio_clips_are_one_page_of_many_chunks  # many-chunk pages (0.1 s)
+tests/test_lance_lists.py           # list columns written by pylance, read by nanolance (5.6 s)
+tests/test_lance_list_writes.py     # list, map and null-struct columns written by nanolance (4.6 s)
+tests/test_fsl_in_lists.py          # fixed_size_list values under a list (0.4 s)
+tests/test_lance_read_matrix.py::test_stock_lance_column_reads_back   # stock Lance columns across types (2.6 s)
+tests/test_write_encoding_matrix.py::test_one_dataset_holding_every_shape_at_once  # every encoding in one file (4.5 s)
+
+# Types, memory safety, feature flags
+tests/test_type_support_matrix.py   # which Arrow types are supported, in each direction (1.1 s)
+tests/test_json_columns.py          # JSON columns, against pylance (1.0 s)
+tests/test_memory_safety.py         # memory-safety smoke tests for the bindings (2.2 s)
+tests/test_feature_flags.py         # refusals with pylance's exception type and message (0.3 s)
+
+[pylance]
+# pylance 12's own test files, run against nanolance.lance; the verdict covers their expected-pass tests.
+test_dataset.py          # datasets: create, append, overwrite, take, scans with filters, versions, tags (24 s)
+test_scalar_index.py     # BTREE, BITMAP, LABEL_LIST, NGRAM and ZONEMAP scalar indexes (20 s)
+test_vector_index.py     # IVF_PQ, IVF_FLAT and HNSW vector indexes, nearest= (8 s)
+test_fragment.py         # fragments: counts, deletions, fragment-level scans (4 s)
+test_blob.py             # blob columns: read, write, take (4 s)
+test_namespace_dir.py    # directory namespaces (3 s)
+test_optimize.py         # compaction and optimize (1.4 s)
+test_schema_evolution.py # add, drop and alter columns (0.4 s)
+test_filter.py           # filter expressions (0.8 s)
+test_lance.py            # the basic API: open, count, scan, schema (0.6 s)

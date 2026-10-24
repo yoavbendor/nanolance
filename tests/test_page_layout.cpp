@@ -216,10 +216,11 @@ void check_metadata_is_not_load_bearing(const std::filesystem::path& dataset, co
         require(col < columns.size(), label + ": more fields than columns");
         const std::string where = label + "/" + field.name;
 
+        const nano_lance::DataFileIo io(data_file);
         nano_lance::ColumnValues with_metadata;
         std::string with_error;
         const bool with_ok =
-            nano_lance::decode_lance_physical_column(data_file, field, columns[col], with_metadata, with_error);
+            nano_lance::decode_lance_physical_column(io, field, columns[col], with_metadata, with_error);
         check(with_ok, where + ": decode failed: " + with_error);
 
         // Strip every nanolance:* key. `lance-encoding:*` keys stay -- those are Lance-standard and a
@@ -237,7 +238,7 @@ void check_metadata_is_not_load_bearing(const std::filesystem::path& dataset, co
 
         nano_lance::ColumnValues without_metadata;
         std::string without_error;
-        const bool without_ok = nano_lance::decode_lance_physical_column(data_file, stripped, columns[col],
+        const bool without_ok = nano_lance::decode_lance_physical_column(io, stripped, columns[col],
                                                                         without_metadata, without_error);
         check(without_ok, where + ": decode WITHOUT nanolance metadata failed (" +
                               std::to_string(removed) + " keys stripped): " + without_error);

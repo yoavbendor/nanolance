@@ -1,7 +1,7 @@
 // Lance 12's full-text analyzer (LanceDB defaults), run by the crates Lance runs: the reference
 // nanolance's C++ analyzer is generated from and checked against.
 //
-//   cargo run --release --offline -- tables > ../../src/fts_tables.inc   # the Unicode / stop word tables
+//   cargo run --release --offline -- tables > ../../src/index/fts/fts_tables.inc   # the Unicode / stop word tables
 //   cargo run --release --offline -- tokenize < lines.txt                # tokens@positions, one line each
 //   cargo run --release --offline -- stem < words.txt                    # the English stemmer alone
 use lance_tokenizer::{AsciiFoldingFilter, CodeLexTokenizer, Language, LowerCaser, RemoveLongFilter,

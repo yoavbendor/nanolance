@@ -4,6 +4,7 @@
 #pragma once
 
 #include "nanolance/expr.hpp"
+#include "nanolance/lance_table_reader.hpp"
 
 #include "lance_minimal.pb.hpp"
 
@@ -17,18 +18,6 @@
 /// nanolance): which rows of which fragments may pass. A scan then reads only those rows and still
 /// applies the whole filter to them, so an index changes how much is read, never what a read returns.
 namespace nano_lance {
-
-struct IndexCandidates {
-    /// The fragments the indices answered for, each with its rows (physical offsets, deleted rows
-    /// counted, ascending) that may pass. Every other fragment is read in full.
-    std::map<std::uint64_t, std::vector<std::uint32_t>> rows;
-    /// What answered: "ScalarIndexQuery: query=[<predicate>]@<index>(<type>)", one per predicate an
-    /// index answered, as Lance's plans name it.
-    std::vector<std::string> used;
-    /// True when `rows` is exactly the set of rows that pass the filter in the covered fragments (every
-    /// predicate answered by a BTREE or BITMAP, combined so no side is left to a scan).
-    bool exact = false;
-};
 
 /// `filter` must be bound. Nothing in `out` when no index applies to it. False only when an index
 /// that applies cannot be read.

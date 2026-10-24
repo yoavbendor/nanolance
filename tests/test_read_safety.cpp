@@ -311,12 +311,13 @@ void test_declared_rows_cannot_force_an_allocation() {
     field.name = "c";
     field.logical_type = "int64";
     const auto path = write_temp({}, "declared_rows");
+    const nano_lance::DataFileIo io(path);
     nano_lance::ColumnValues out;
     std::string error;
     bool ok = true;
     bool threw = false;
     try {
-        ok = nano_lance::decode_lance_physical_column(path, field, column, out, error);
+        ok = nano_lance::decode_lance_physical_column(io, field, column, out, error);
     } catch (...) {
         threw = true;
     }

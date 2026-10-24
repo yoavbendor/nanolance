@@ -6,7 +6,7 @@ Status: **delegated** (implementer: Claude Haiku 5.5, reviewer: Claude Opus 5.5)
 
 About 100k tokens per session:
 - Never read a large file whole: `grep -n`, then `sed -n 'A,Bp'` windows of at most ~120 lines.
-  Big ones: `src/scalar_index.cpp` (~1.1k), `src/index_search.cpp` (~800), `src/index_optimize.cpp`,
+  Big ones: `src/index/scalar/scalar_index.cpp` (~1.1k), `src/dataset/index_search.cpp` (~800), `src/dataset/index_optimize.cpp`,
   `bindings/python/nanolance/lance/dataset.py` (3.5k+), and Lance's own Rust (below, 3-5k lines each:
   read only the functions named here).
 - Cut output: `| tail -15` for pytest (add `-o addopts=`; the config passes `-q`), `| tail -5` for
@@ -37,7 +37,7 @@ Default `rows_per_zone` = 8192 (ZONEMAP) and `number_of_items` = 8192 (BLOOMFILT
 fragment_id: uint64 not null, zone_start: uint64 not null, zone_length: uint64 not null`.
 Schema metadata: `rows_per_zone` (decimal string), `null_bitmap` (decimal index of a **global buffer**
 holding a serialized RowAddrTreeMap of the null rows -- nanolance already writes that serialization:
-`serialize_treemap` in `src/scalar_index.cpp`). Manifest: `details_type_url` =
+`serialize_treemap` in `src/index/scalar/scalar_index.cpp`). Manifest: `details_type_url` =
 `/lance.table.ZoneMapIndexDetails`, empty details message; `index_version` 0. Example (10000 int64 rows,
 2 fragments of 6000 / 4000): two rows `{min:0,max:5999,null_count:0,nan_count:0,fragment_id:0,
 zone_start:0,zone_length:6000}`, `{min:6000,max:9999,...,fragment_id:1,zone_length:4000}`; file 1798 bytes.
@@ -60,18 +60,18 @@ before anything else (the test in section 5 does).
 
 ## 3. Where things are in nanolance
 
-- Scalar index build: `src/scalar_index.cpp` (`ScalarIndexType`, BTree / Bitmap / LabelList writers,
+- Scalar index build: `src/index/scalar/scalar_index.cpp` (`ScalarIndexType`, BTree / Bitmap / LabelList writers,
   `serialize_treemap`), header `include/nanolance/scalar_index.hpp`; Python `create_scalar_index` in
   `bindings/python/nanolance/lance/dataset.py` (grep "unsupported index type").
-- Search: `src/index_search.cpp`: `Search::predicate` tries each index of the field and returns a
+- Search: `src/dataset/index_search.cpp`: `Search::predicate` tries each index of the field and returns a
   `RowSet` of rows that *may* pass (`covered` fragments, `rows` per fragment). Verify the scan
   re-applies the filter to those rows (it must, for inexact indexes -- check, do not assume) and that
   the plan line names the index (`used.push_back("ScalarIndexQuery: ...")`, pylance's wording).
 - Stable row ids: nanolance's indexes hold row ids on such datasets (`AddressToRowId` in
   `include/nanolance/row_ids.hpp`); Lance's zoned indexes keep **addresses** with fragment ids -- check
   `test_zonemap_with_stable_row_ids_after_compaction` and copy pylance.
-- Maintenance: `src/index_optimize.cpp` (optimize_indices), and how compaction / updates keep or
-  narrow BTree indexes (`src/dataset_ops.cpp`, `include/nanolance/index_maintenance.hpp`). Zoned
+- Maintenance: `src/dataset/index_optimize.cpp` (optimize_indices), and how compaction / updates keep or
+  narrow BTree indexes (`src/dataset/dataset_ops.cpp`, `include/nanolance/index_maintenance.hpp`). Zoned
   indexes: new fragments get new zones (append rows to the file, as Lance's update does).
 - Distributed segments (`create_index_uncommitted` / `merge_existing_index_segments` /
   `commit_existing_index_segments`): see how BTree does it in `dataset.py` (grep "merge_existing").
@@ -150,4 +150,4 @@ Lance, which leaves rewritten fragments unindexed until optimize_indices); BTree
 - Oracle tests also need `stats.index_stats` for BLOOMFILTER (num_blocks = zone count,
   number_of_items, probability), `describe_indices`, distributed segments.
 
-**Z2 outcome (BLOOMFILTER):** built, searched (`=`, IN, IS NULL), maintained (append, delete, optimize_indices, compaction, stable row ids) and in distributed segments; `index_stats` matches pylance. The filter bytes, the zone spans, `has_null` and the metadata are identical to pylance's files (int8 to timestamp, string, float64 with NaN, nulls, four `number_of_items`/`probability` settings). Manifest type URL is `/lance.index.pb.BloomFilterIndexDetails` (pylance ignores `/lance.table.` one). Floats: a 0 or NaN literal keeps every zone; date and time literals are not probed (every zone kept, answered). Refused: bool, decimal, float16, fixed-size binary, lists, structs. XXH64 and SBBF are in `src/bloom_filter.cpp`.
+**Z2 outcome (BLOOMFILTER):** built, searched (`=`, IN, IS NULL), maintained (append, delete, optimize_indices, compaction, stable row ids) and in distributed segments; `index_stats` matches pylance. The filter bytes, the zone spans, `has_null` and the metadata are identical to pylance's files (int8 to timestamp, string, float64 with NaN, nulls, four `number_of_items`/`probability` settings). Manifest type URL is `/lance.index.pb.BloomFilterIndexDetails` (pylance ignores `/lance.table.` one). Floats: a 0 or NaN literal keeps every zone; date and time literals are not probed (every zone kept, answered). Refused: bool, decimal, float16, fixed-size binary, lists, structs. XXH64 and SBBF are in `src/index/scalar/bloom_filter.cpp`.

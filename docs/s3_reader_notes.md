@@ -18,7 +18,7 @@ pylance on the blob-fetch benchmark, the swappable SigV4 crypto backend, what a 
 ## 1. What it is
 
 `nanolance` only needs to **read byte ranges** out of external blobs (see
-`src/nano_lance_external_blob.cpp`). The built-in reader provides exactly that and nothing more:
+`src/api/nano_lance_external_blob.cpp`). The built-in reader provides exactly that and nothing more:
 
 - A `S3MinStreamFactory` that opens `s3://bucket/key` as a **seekable, read-ahead-buffered
   `std::istream`** backed by libcurl range `GET`s + AWS SigV4 signing.
@@ -313,4 +313,4 @@ because nothing here is GPL.
 | `NANOLANCE_S3_TARGET` / `_INCLUDE_DIR` | use an external S3 reader instead of the built-in one |
 
 Source of truth: `src/s3_min_reader.cpp`, `include/nanolance/s3_min_reader.h`,
-`src/nano_lance_external_blob.cpp`, `bench/blob_fetch_bench.sh`, `bench/fetch_pylance.py`.
+`src/api/nano_lance_external_blob.cpp`, `bench/blob_fetch_bench.sh`, `bench/fetch_pylance.py`.

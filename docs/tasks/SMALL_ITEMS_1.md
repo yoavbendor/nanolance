@@ -6,7 +6,7 @@ items; do them in order, one session may finish all three.
 ## 0. Context budget
 
 About 100k tokens. `grep -n` then `sed -n` windows of at most ~120 lines (`dataset.py` 3.5k+,
-`src/lance_table_reader.cpp` 3k+, `src/vector_search.cpp` 2k+). Cut all output (`| tail -15`; pytest
+`src/scan/lance_table_reader.cpp` 3k+, `src/index/vector/vector_search.cpp` 2k+). Cut all output (`| tail -15`; pytest
 with `-o addopts=` for a summary line; `tools/pylance_suite.py ... | tail -5`). The pylance tests are
 the spec: read only the named ones. When unclear, run the same calls on real pylance (`import lance`).
 
@@ -18,7 +18,7 @@ Facts (measured):
 - `serialize_row_addrs([0, 2, 4, ...])` returns Lance's **RowAddrTreeMap** serialization: u32 count of
   fragments, then per fragment ascending `[u32 fragment id][u32 byte size][portable Roaring bitmap of
   the row offsets]`. nanolance already writes exactly this (`serialize_treemap` in
-  `src/scalar_index.cpp`) and reads it (`read_treemap` in `src/index_search.cpp`). For
+  `src/index/scalar/scalar_index.cpp`) and reads it (`read_treemap` in `src/dataset/index_search.cpp`). For
   `[1, 2, (1<<32)|5]` pylance returns 58 bytes starting `02 00 00 00 00 00 00 00 14 00 00 00 3a 30 ...`
   -- your Python output must be byte-identical (compare with pylance in your test). The Python roaring
   encoder exists: `_serialize_roaring` in `bindings/python/nanolance/lance/bitmap.py`.
@@ -28,11 +28,11 @@ Facts (measured):
   its top-k over the surviving rows (`test_knn_topk_is_computed_over_masked_rows`). Malformed bytes:
   an error matching `(?i)row address mask|invalid`.
 - Implementation hint: masks are row sets per fragment, like the scalar-index candidates the scan
-  already takes (`PlannedFile::candidates` in `src/lance_table_reader.cpp`; how `index_candidates`
-  feeds them in). Vector search has a `RowMask` (`src/vector_search.cpp`), full-text search a `RowMask`
-  in `src/fts_search.cpp`: intersect the caller's mask there. Pass the mask from Python as bytes to the
+  already takes (`PlannedFile::candidates` in `src/scan/lance_table_reader.cpp`; how `index_candidates`
+  feeds them in). Vector search has a `RowMask` (`src/index/vector/vector_search.cpp`), full-text search a `RowMask`
+  in `src/index/fts/fts_search.cpp`: intersect the caller's mask there. Pass the mask from Python as bytes to the
   native call; decode it once in C++.
-- The two `test_overlay_stale_replay_*` tests need data overlays, which now work (`src/overlays.cpp`):
+- The two `test_overlay_stale_replay_*` tests need data overlays, which now work (`src/table/overlays.cpp`):
   they must pass once the mask is applied on every row source.
 
 ## 2. `lance.dataset.VectorIndexReader`
@@ -44,7 +44,7 @@ with `with_vector=True` the storage column: `flat` (FixedSizeList<float32>[dim])
 `__pq_code` (FixedSizeList<uint8>[m]) for IVF_PQ -- copy the exact schema and row order real pylance
 returns on the same index, for IVF_FLAT, IVF_PQ and IVF_HNSW_SQ (`__sq_code`). The partition data is
 in the index's `auxiliary.idx` (offsets/lengths per partition are in the IVF model nanolance already
-decodes: `load_ivf` / `IvfIndex` in `src/vector_search.cpp`). With stable row ids `_rowid` is the id.
+decodes: `load_ivf` / `IvfIndex` in `src/index/vector/vector_search.cpp`). With stable row ids `_rowid` is the id.
 
 ## 3. `_take_rows` of a deleted row's address
 
@@ -52,7 +52,7 @@ decodes: `load_ivf` / `IvfIndex` in `src/vector_search.cpp`). With stable row id
 out (datasets without stable row ids). Reproduce: `write_dataset` 300 rows, `delete("id % 4 = 1")`,
 `_take_rows([(0 << 32) | 5])` -> pylance `[]`. Fix where `_take_rows` resolves addresses
 (`grep -n "def _take_rows" bindings/python/nanolance/lance/dataset.py`, and `resolve_row_ids` in
-`src/row_ids.cpp`, which skips deleted rows only for stable ids). Add the case to
+`src/table/row_ids.cpp`, which skips deleted rows only for stable ids). Add the case to
 `bindings/python/tests/test_take.py` against pylance.
 
 ## 4. Rules, builds, stop rules, done
@@ -77,7 +77,7 @@ Report under 40 lines: files, per-item status, tails, decisions, questions.
 **Session 1 (2026-10-15):** `serialize_row_addrs` done (byte-identical to pylance;
 `tests/test_row_addr_masks.py`). Stopped at the stop rule on the scan mask. **Reviewer's design for the
 rest of item 1:**
-- In the reader (`src/lance_table_reader.cpp`), a row the mask excludes is dropped exactly like a
+- In the reader (`src/scan/lance_table_reader.cpp`), a row the mask excludes is dropped exactly like a
   deleted row: build the fragment's `keep` vector from its deletion file AND the mask (allowlist: only
   listed offsets; blocklist: listed offsets off), so slicing, compaction and row ids keep working.
   A fragment with no allowed rows is skipped at planning.
@@ -101,5 +101,5 @@ a mask with `include_deleted_rows` masks the table scan only (untested). Items 2
 either engine; `_take_rows` of a deleted row's address leaves it out (`resolve_row_ids(skip_deleted)`).
 Reviewer: a KNN on a nested vector (`data.embedding`) over unindexed fragments failed in the exhaustive
 scan (it projected the dotted path); it now reads the root struct and descends
-(`vector_sub_path`, src/vector_search.cpp). Left: `test_read_partition_nested_vector_quoted_field`
+(`vector_sub_path`, src/index/vector/vector_search.cpp). Left: `test_read_partition_nested_vector_quoted_field`
 needs a Hamming index (roadmap). +2 pylance tests (1035).

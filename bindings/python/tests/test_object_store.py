@@ -177,7 +177,7 @@ def test_storage_option_spellings_agree(uri):
 
 
 WRITES = {
-    "cleanup_old_versions": lambda ds, uri: ds.cleanup_old_versions(retain_versions=1),
+    "migrate_manifest_paths_v2": lambda ds, uri: ds.migrate_manifest_paths_v2(),
 }
 
 

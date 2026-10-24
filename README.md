@@ -442,7 +442,7 @@ transparently, so the data you read back is identical either way.
 ## Threads
 
 nanolance uses the machine's cores for reads and writes, with nothing to add: a ~200-line pool on
-`std::thread` (`src/parallel.cpp`), no runtime library.
+`std::thread` (`src/base/parallel.cpp`), no runtime library.
 
 | | What runs side by side |
 |---|---|

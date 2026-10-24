@@ -66,6 +66,7 @@ struct DirEntry {
     std::string name;
     std::uint64_t size = 0;  // filled for remote listings; for local ones only when asked for
     bool is_dir = false;
+    std::int64_t modified_ns = 0;  // last modification, ns since the epoch: remote listings only (0: not known)
 };
 
 /// Lists the entries of a directory URI. A registered lister for a scheme must return every entry

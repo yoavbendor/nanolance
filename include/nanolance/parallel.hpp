@@ -27,4 +27,9 @@ void set_threads(std::size_t n);
 /// With threads() == 1 or n <= 1 this is a plain loop.
 void for_each(std::size_t n, const std::function<void(std::size_t)>& task);
 
+/// A scope every pool thread runs its share of a for_each inside: `run(work)` must call `work()` once.
+/// A layer above registers what its per-operation state needs (the data-file reader opens a read scope,
+/// so a pool thread's file lookups are one operation as the caller's are); none by default.
+void set_worker_scope(void (*run)(const std::function<void()>& work));
+
 }  // namespace nano_lance::parallel

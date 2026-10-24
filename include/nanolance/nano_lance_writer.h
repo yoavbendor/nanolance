@@ -175,6 +175,13 @@ int nano_lance_writer_finish(NanoLanceWriter* writer, int mode, uint64_t* versio
 /// Staged writers only: a table config entry to record if the finishing commit creates the dataset.
 int nano_lance_writer_set_initial_config(NanoLanceWriter* writer, const char* key, const char* value);
 
+/* Staged writers only: a global buffer of the data file the writer writes, after the schema's (the
+   first one added is global buffer 1). Its bytes are listed in the file's footer. */
+int nano_lance_writer_add_global_buffer(NanoLanceWriter* writer, const uint8_t* data, size_t size);
+/* Staged writers only: sets one key of the schema metadata the data file (and the dataset) records. */
+int nano_lance_writer_set_schema_metadata_entry(NanoLanceWriter* writer, const char* key, const uint8_t* value,
+                                                size_t size);
+
 /* Create the dataset with stable row ids (an append to one keeps them either way). */
 int nano_lance_writer_set_stable_row_ids(NanoLanceWriter* writer, int enable);
 /// Create the dataset with these base paths (Lance's initial_bases; ids count from 1 in the order

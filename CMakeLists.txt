@@ -48,6 +48,13 @@ if(NANOLANCE_STANDALONE)
     endif()
 endif()
 
+# nanom (a dependency) uses C++23 `if consteval`, which GCC supports from 12. Say so up front rather
+# than failing deep inside a header. CI builds with GCC 13 (and Clang for wasm / macOS).
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 12)
+    message(FATAL_ERROR "nanolance needs GCC 12 or newer (found ${CMAKE_CXX_COMPILER_VERSION}). "
+                        "Install g++-13 and configure with CC=gcc-13 CXX=g++-13 (a fresh build directory).")
+endif()
+
 option(ENABLE_NANO_LANCE_WRITER "Build nanolance (legacy cache name; OFF skips this tree)" ON)
 if(DEFINED ENABLE_NANO_LANCE_WRITER AND NOT ENABLE_NANO_LANCE_WRITER)
     message(STATUS "nanolance: disabled (ENABLE_NANO_LANCE_WRITER=OFF)")
@@ -73,6 +80,7 @@ option(NANOLANCE_ENABLE_S3 "S3 external blob support (needs NANOLANCE_S3_TARGET 
 # pack_1024/unpack_1024 kernels (and whatever else the compiler can auto-vectorize wider) when the
 # *whole* translation unit is compiled at this target -- unlike a scoped per-function target attribute,
 # which was measured to give no benefit here since it blocks inlining across the attribute boundary.
+option(NANOLANCE_TARGET_CLONES "Build the k-means kernel for AVX2 too, picked by a CPU check at run time (GCC, x86-64)" ON)
 option(NANOLANCE_ENABLE_AVX2 "Compile with -march=haswell (AVX2+BMI2+FMA); raises minimum CPU requirement" OFF)
 
 set(NANOLANCE_S3_TARGET "" CACHE STRING "Target for S3 reads (e.g. stream_helper_s3)")
@@ -243,18 +251,22 @@ endif()
 add_library(nanolance_nanom INTERFACE)
 target_include_directories(nanolance_nanom SYSTEM INTERFACE "${nanom_SOURCE_DIR}/include")
 
-add_library(nanolance_proto STATIC generated/lance_minimal.pb.cpp src/roaring_bitmap.cpp src/page_layout.cpp)
+add_library(nanolance_proto STATIC generated/lance_minimal.pb.cpp src/base/roaring_bitmap.cpp src/encoding/page_layout.cpp)
 target_compile_features(nanolance_proto PUBLIC cxx_std_20 PRIVATE cxx_std_23)
 target_include_directories(nanolance_proto PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/generated")
 target_include_directories(nanolance_proto PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+# Private headers are included by their path below src/ ("index/fts/fts_fst.hpp"), the layer they belong to.
+set(NANOLANCE_PRIVATE_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(nanolance_proto PRIVATE "${NANOLANCE_PRIVATE_INCLUDE}")
 target_link_libraries(nanolance_proto PRIVATE nanolance_nanom)
 
 add_library(nanolance_reader STATIC
-    src/byte_source.cpp
-    src/byte_sink.cpp
-    src/manifest_reader.cpp
-    src/nano_lance_reader.cpp
-    src/nano_lance_external_blob.cpp
+    src/io/byte_source.cpp
+    src/io/byte_sink.cpp
+    src/table/manifest_reader.cpp
+    src/api/nano_lance_reader.cpp
+    src/io/external_blob.cpp
+    src/api/nano_lance_external_blob.cpp
 )
 target_compile_features(nanolance_reader PUBLIC cxx_std_20)
 target_include_directories(nanolance_reader PUBLIC
@@ -262,6 +274,7 @@ target_include_directories(nanolance_reader PUBLIC
     "${_NANOLANCE_GEN_INCLUDE}"
 )
 target_link_libraries(nanolance_reader PUBLIC nanolance_proto)
+target_include_directories(nanolance_reader PRIVATE "${NANOLANCE_PRIVATE_INCLUDE}")
 
 set(NANOLANCE_S3_CRYPTO "openssl" CACHE STRING
     "SigV4 crypto backend, forwarded to nanos3reader: openssl (default) | bundled")
@@ -287,70 +300,98 @@ elseif(NANOLANCE_ENABLE_S3)
     # still builds -- the wrapper version-gates on NANOS3READER_VERSION.
     FetchContent_Declare(nanos3reader
         GIT_REPOSITORY ${NANOLANCE_GIT_URL_NANOS3READER}
-        GIT_TAG d178546eb03973f78d2a3dac01387df0fd8359ff)
+        GIT_TAG a2133ce1b5d364593e38872c64124956264c3600)
     FetchContent_MakeAvailable(nanos3reader)
     target_link_libraries(nanolance_reader PRIVATE nanos3reader::nanos3reader)
     target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_READER_HAS_S3=1)
     # s3:// datasets: the byte source and lister over S3Client (registered for "s3" by byte_source.cpp).
-    target_sources(nanolance_reader PRIVATE src/s3_byte_source.cpp src/s3_byte_sink.cpp)
+    target_sources(nanolance_reader PRIVATE src/io/s3_byte_source.cpp src/io/s3_byte_sink.cpp)
     target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_HAS_S3_BYTE_SOURCE=1)
     set(NANOLANCE_S3_NANOS3READER_ACTIVE ON)
 endif()
 
+# The jieba base tokenizer (base_tokenizer "jieba/<model>") compiles in jieba-rs's HMM model (about 170 KB,
+# zstd-compressed). Off in the wasm build, where a jieba index is refused by name.
+if(EMSCRIPTEN)
+    set(_nanolance_jieba_default OFF)
+else()
+    set(_nanolance_jieba_default ON)
+endif()
+option(NANOLANCE_WITH_JIEBA "Build the jieba tokenizer (embeds its HMM model)" ${_nanolance_jieba_default})
+
 add_library(nanolance STATIC
-    src/version.cpp
-    src/array_accessor.cpp
-    src/blob_builder.cpp
-    src/blob_v2_external.cpp
-    src/buffer_pool.cpp
-    src/column_slice.cpp
-    src/frag_reuse.cpp
-    src/index_maintenance.cpp
-    src/lance_file_writer.cpp
-    src/scalar_index.cpp
-    src/bloom_filter.cpp
-    src/index_search.cpp
-    src/index_files.cpp
-    src/vector_search.cpp
-    src/vector_index_build.cpp
-    src/hnsw_build.cpp
-    src/index_segments.cpp
-    src/fts_tokenizer.cpp
-    src/fts_fst.cpp
-    src/fts_posting.cpp
-    src/fts_search.cpp
-    src/fts_index_build.cpp
-    src/index_optimize.cpp
-    src/data_file_reader.cpp
-    src/deletion_vector.cpp
-    src/base_paths.cpp
-    src/overlays.cpp
-    src/proto_wire.hpp
-    src/row_ids.cpp
-    src/data_file_writer.cpp
-    src/fsst.cpp
-    src/lz4_block.cpp
-    src/lance_column_decoder.cpp
-    src/lance_v20_decoder.cpp
-    src/lance_table_reader.cpp
-    src/parallel.cpp
-    src/repdef.cpp
-    src/nano_lance_table_reader_c.cpp
-    src/manifest_writer.cpp
-    src/dataset.cpp
-    src/dataset_refs.cpp
-    src/transaction_file.cpp
-    src/jsonb.cpp
-    src/expr.cpp
-    src/arrow_slice.cpp
-    src/dataset_ops.cpp
-    src/dataset_transaction.cpp
-    src/dataset_operation.cpp
-    src/commit_conflicts.cpp
-    src/dataset_stitcher.cpp
-    src/schema_mapper.cpp
-    src/writer.cpp
-    src/writer_cxx.cpp
+    src/base/version.cpp
+    src/arrow/array_accessor.cpp
+    src/arrow/blob_builder.cpp
+    src/file/blob_v2_external.cpp
+    src/base/buffer_pool.cpp
+    src/encoding/column_slice.cpp
+    src/table/frag_reuse.cpp
+    src/table/index_maintenance.cpp
+    src/file/lance_file_writer.cpp
+    src/index/scalar/scalar_index.cpp
+    src/index/scalar/bloom_filter.cpp
+    src/index/index_search.cpp
+    src/index/index_files.cpp
+    src/base/unicode.cpp
+    src/base/uuid.cpp
+    src/arrow/arrow_owned.cpp
+    src/table/index_location.cpp
+    src/index/vector/vector_search.cpp
+    src/index/vector/vector_index_build.cpp
+    src/index/vector/hnsw_build.cpp
+    src/dataset/index_segments.cpp
+    src/index/fts/fts_tokenizer.cpp
+    src/index/fts/fts_jieba.cpp
+    src/index/fts/fts_lindera.cpp
+    src/index/fts/fts_fst.cpp
+    src/index/fts/fts_posting.cpp
+    src/index/fts/fts_search.cpp
+    src/index/fts/fts_index_build.cpp
+    src/dataset/index_optimize.cpp
+    src/file/data_file_reader.cpp
+    src/table/deletion_vector.cpp
+    src/table/base_paths.cpp
+    src/table/overlays.cpp
+    src/base/proto_wire.hpp
+    src/table/row_ids.cpp
+    src/file/data_file_writer.cpp
+    src/encoding/fsst.cpp
+    src/encoding/lz4_block.cpp
+    src/encoding/lance_column_decoder.cpp
+    src/encoding/lance_v20_decoder.cpp
+    src/encoding/blob_v2_layout.cpp
+    src/scan/lance_table_reader.cpp
+    src/base/parallel.cpp
+    src/encoding/repdef.cpp
+    src/api/nano_lance_table_reader_c.cpp
+    src/table/manifest_writer.cpp
+    src/dataset/dataset.cpp
+    src/table/dataset_refs.cpp
+    src/table/transaction_file.cpp
+    src/arrow/jsonb.cpp
+    src/expr/expr.cpp
+    src/arrow/arrow_slice.cpp
+    src/dataset/dataset_ops.cpp
+    src/table/dataset_transaction.cpp
+    src/table/dataset_operation.cpp
+    src/table/commit_conflicts.cpp
+    src/table/mem_wal.cpp
+    src/dataset/dataset_stitcher.cpp
+    src/arrow/schema_mapper.cpp
+    src/encoding/encoding_choice.cpp
+    src/encoding/values/bitpack.cpp
+    src/encoding/values/general.cpp
+    src/encoding/values/byte_stream_split.cpp
+    src/encoding/values/rle.cpp
+    src/encoding/values/dictionary.cpp
+    src/encoding/values/scalar_value.cpp
+    src/encoding/layout/miniblock.cpp
+    src/encoding/layout/full_zip.cpp
+    src/dataset/write_session.cpp
+    src/dataset/dataset_scan.cpp
+    src/api/nano_lance_writer.cpp
+    src/api/writer_cxx.cpp
 )
 # The library's own sources compile as C++23 (nanom, which reads and writes Lance's protobuf, needs
 # it; nanolance_proto already does). Its public headers and API stay C++20.
@@ -370,6 +411,10 @@ target_link_libraries(nanolance PUBLIC
     "${NANOLANCE_ZSTD_TARGET}"
 )
 target_link_libraries(nanolance PRIVATE nanolance_nanom)
+target_include_directories(nanolance PRIVATE "${NANOLANCE_PRIVATE_INCLUDE}")
+if(NANOLANCE_WITH_JIEBA)
+    target_compile_definitions(nanolance PRIVATE NANOLANCE_WITH_JIEBA=1)
+endif()
 
 add_library(nanolance::nanolance ALIAS nanolance)
 
@@ -378,7 +423,8 @@ add_library(nanolance::nanolance ALIAS nanolance)
 # (LanceC::lance_c) as lance-c's; see docs/LANCE_C_COMPAT.md.
 option(NANOLANCE_BUILD_LANCE_C "Build liblance_c, lance-c's C API over nanolance" ON)
 if(NANOLANCE_BUILD_LANCE_C)
-    add_library(lance_c STATIC src/lance_c.cpp)
+    add_library(lance_c STATIC src/api/lance_c.cpp)
+    target_include_directories(lance_c PRIVATE "${NANOLANCE_PRIVATE_INCLUDE}")
     target_compile_features(lance_c PUBLIC cxx_std_20)
     target_include_directories(lance_c PUBLIC
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/compat/lance-c/include>")
@@ -428,7 +474,7 @@ if(NANOLANCE_WARNING_FLAGS)
     # GCC 13's libstdc++ std::regex raises a false -Wmaybe-uninitialized, inlined into expr.cpp's regex
     # construction under -O2 with sanitizers. Downgrade that one warning for this file on GCC only.
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        set_source_files_properties(src/expr.cpp PROPERTIES COMPILE_OPTIONS "-Wno-error=maybe-uninitialized")
+        set_source_files_properties(src/expr/expr.cpp PROPERTIES COMPILE_OPTIONS "-Wno-error=maybe-uninitialized")
     endif()
 endif()
 
@@ -437,6 +483,9 @@ if(NANOLANCE_ENABLE_AVX2)
     target_compile_options(nanolance_proto PRIVATE -march=haswell)
     target_compile_options(nanolance_reader PRIVATE -march=haswell)
     target_compile_options(nanolance PRIVATE -march=haswell)
+endif()
+if(NOT NANOLANCE_TARGET_CLONES)
+    target_compile_definitions(nanolance PRIVATE NANOLANCE_NO_TARGET_CLONES=1)
 endif()
 
 # ── libFuzzer harness over the untrusted decode path (opt-in, Clang only) ─────────────────────────
@@ -619,13 +668,13 @@ target_link_libraries(nano_lance_writer_lifecycle_test PRIVATE nanolance)
 
 add_executable(test_commit_conflicts tests/test_commit_conflicts.cpp)
 target_compile_features(test_commit_conflicts PRIVATE cxx_std_23)
-target_include_directories(test_commit_conflicts PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(test_commit_conflicts PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
 target_link_libraries(test_commit_conflicts PRIVATE nanolance)
 add_test(NAME commit_conflicts COMMAND $<TARGET_FILE:test_commit_conflicts>)
 
 add_executable(nano_lance_int128_test tests/test_int128.cpp)
 target_compile_features(nano_lance_int128_test PRIVATE cxx_std_20)
-target_include_directories(nano_lance_int128_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(nano_lance_int128_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
 target_link_libraries(nano_lance_int128_test PRIVATE nanolance)
 
 add_executable(nano_lance_row_ids_test tests/test_row_ids.cpp)
@@ -684,6 +733,10 @@ if(TARGET lance_c)
     add_test(NAME nano_lance_lance_c_stable_row_ids COMMAND $<TARGET_FILE:nano_lance_lance_c_stable_row_ids_test>
              "${CMAKE_CURRENT_BINARY_DIR}/lance_c_stable_tmp")
 endif()
+
+add_executable(nano_lance_fts_multiscript_test tests/test_fts_multiscript.cpp)
+target_compile_features(nano_lance_fts_multiscript_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_fts_multiscript_test PRIVATE nanolance)
 
 add_executable(nano_lance_fts_fst_test tests/test_fts_fst.cpp)
 target_compile_features(nano_lance_fts_fst_test PRIVATE cxx_std_20)
@@ -811,9 +864,114 @@ add_executable(nano_lance_column_slice_test tests/test_column_slice.cpp)
 target_compile_features(nano_lance_column_slice_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_column_slice_test PRIVATE nanolance)
 
+add_executable(nano_lance_encoding_bitpack_test tests/encoding/test_bitpack.cpp)
+target_compile_features(nano_lance_encoding_bitpack_test PRIVATE cxx_std_23)  # nanom's FastLanes kernels
+target_link_libraries(nano_lance_encoding_bitpack_test PRIVATE nanolance nanolance_nanom)
+target_include_directories(nano_lance_encoding_bitpack_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+
+add_executable(nano_lance_encoding_general_test tests/encoding/test_general.cpp)
+target_compile_features(nano_lance_encoding_general_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_encoding_general_test PRIVATE nanolance)
+target_include_directories(nano_lance_encoding_general_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+
+add_executable(nano_lance_encoding_byte_stream_split_test tests/encoding/test_byte_stream_split.cpp)
+target_compile_features(nano_lance_encoding_byte_stream_split_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_encoding_byte_stream_split_test PRIVATE nanolance)
+target_include_directories(nano_lance_encoding_byte_stream_split_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+
+add_executable(nano_lance_encoding_scalar_value_test tests/encoding/test_scalar_value.cpp)
+target_compile_features(nano_lance_encoding_scalar_value_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_encoding_scalar_value_test PRIVATE nanolance)
+target_include_directories(nano_lance_encoding_scalar_value_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+
+add_executable(nano_lance_encoding_rle_test tests/encoding/test_rle.cpp)
+target_compile_features(nano_lance_encoding_rle_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_encoding_rle_test PRIVATE nanolance)
+target_include_directories(nano_lance_encoding_rle_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+
+add_executable(nano_lance_encoding_dictionary_test tests/encoding/test_dictionary.cpp)
+target_compile_features(nano_lance_encoding_dictionary_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_encoding_dictionary_test PRIVATE nanolance)
+target_include_directories(nano_lance_encoding_dictionary_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+
+add_executable(nano_lance_unicode_test tests/test_unicode.cpp)
+target_compile_features(nano_lance_unicode_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_unicode_test PRIVATE nanolance)
+target_include_directories(nano_lance_unicode_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+
+add_executable(nano_lance_encoding_miniblock_test tests/encoding/test_miniblock.cpp)
+target_compile_features(nano_lance_encoding_miniblock_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_encoding_miniblock_test PRIVATE nanolance)
+target_include_directories(nano_lance_encoding_miniblock_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+
+add_executable(nano_lance_encoding_full_zip_test tests/encoding/test_full_zip.cpp)
+target_compile_features(nano_lance_encoding_full_zip_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_encoding_full_zip_test PRIVATE nanolance)
+target_include_directories(nano_lance_encoding_full_zip_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+
 add_executable(nano_lance_roaring_bitmap_test tests/test_roaring_bitmap.cpp)
 target_compile_features(nano_lance_roaring_bitmap_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_roaring_bitmap_test PRIVATE nanolance)
+
+add_executable(nano_lance_deletion_vector_test tests/test_deletion_vector.cpp)
+target_compile_features(nano_lance_deletion_vector_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_deletion_vector_test PRIVATE nanolance)
+
+add_executable(nano_lance_base_paths_test tests/test_base_paths.cpp)
+target_compile_features(nano_lance_base_paths_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_base_paths_test PRIVATE nanolance)
+
+add_executable(nano_lance_overlays_test tests/test_overlays.cpp)
+target_compile_features(nano_lance_overlays_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_overlays_test PRIVATE nanolance)
+
+add_executable(nano_lance_index_location_test tests/test_index_location.cpp)
+target_compile_features(nano_lance_index_location_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_index_location_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_index_location_test PRIVATE nanolance)
+
+add_executable(nano_lance_index_maintenance_test tests/test_index_maintenance.cpp)
+target_compile_features(nano_lance_index_maintenance_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_index_maintenance_test PRIVATE nanolance)
+
+add_executable(nano_lance_dataset_operation_test tests/test_dataset_operation.cpp)
+target_compile_features(nano_lance_dataset_operation_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_dataset_operation_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_dataset_operation_test PRIVATE nanolance)
+
+add_executable(nano_lance_transaction_file_test tests/test_transaction_file.cpp)
+target_compile_features(nano_lance_transaction_file_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_transaction_file_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_transaction_file_test PRIVATE nanolance)
+
+add_executable(nano_lance_encoding_choice_test tests/test_encoding_choice.cpp)
+target_compile_features(nano_lance_encoding_choice_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_encoding_choice_test PRIVATE nanolance)
+target_include_directories(nano_lance_encoding_choice_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+add_executable(nano_lance_blob_v2_layout_test tests/test_blob_v2_layout.cpp)
+target_compile_features(nano_lance_blob_v2_layout_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_blob_v2_layout_test PRIVATE nanolance)
+add_executable(nano_lance_manifest_writer_test tests/test_manifest_writer.cpp)
+target_compile_features(nano_lance_manifest_writer_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_manifest_writer_test PRIVATE nanolance)
+add_executable(nano_lance_dataset_refs_test tests/test_dataset_refs.cpp)
+target_compile_features(nano_lance_dataset_refs_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_dataset_refs_test PRIVATE nanolance)
+add_executable(nano_lance_mem_wal_test tests/test_mem_wal.cpp)
+target_compile_features(nano_lance_mem_wal_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_mem_wal_test PRIVATE nanolance)
+add_executable(nano_lance_frag_reuse_test tests/test_frag_reuse.cpp)
+target_compile_features(nano_lance_frag_reuse_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_frag_reuse_test PRIVATE nanolance)
+
+add_executable(nano_lance_lance_table_reader_test tests/test_lance_table_reader.cpp)
+target_compile_features(nano_lance_lance_table_reader_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_lance_table_reader_test PRIVATE nanolance)
+
+add_executable(nano_lance_write_session_test tests/test_write_session.cpp)
+target_compile_features(nano_lance_write_session_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_write_session_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_write_session_test PRIVATE nanolance)
 
 add_executable(nano_lance_byte_source_remote_test tests/test_byte_source_remote.cpp)
 target_compile_features(nano_lance_byte_source_remote_test PRIVATE cxx_std_20)
@@ -822,6 +980,90 @@ target_link_libraries(nano_lance_byte_source_remote_test PRIVATE nanolance nanol
 add_executable(nano_lance_external_blob_test tests/test_nano_lance_external_blob.cpp)
 target_compile_features(nano_lance_external_blob_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_external_blob_test PRIVATE nanolance_reader)
+
+add_executable(nano_lance_shared_cache_test tests/test_shared_cache.cpp)
+target_compile_features(nano_lance_shared_cache_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_shared_cache_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_shared_cache_test PRIVATE nanolance)
+
+add_executable(nano_lance_uuid_test tests/test_uuid.cpp)
+target_compile_features(nano_lance_uuid_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_uuid_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_uuid_test PRIVATE nanolance)
+
+add_executable(nano_lance_bytes_test tests/test_bytes.cpp)
+target_compile_features(nano_lance_bytes_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_bytes_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_bytes_test PRIVATE nanolance)
+
+add_executable(nano_lance_parallel_test tests/test_parallel.cpp)
+target_compile_features(nano_lance_parallel_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_parallel_test PRIVATE nanolance)
+
+add_executable(nano_lance_buffer_pool_test tests/test_buffer_pool.cpp)
+target_compile_features(nano_lance_buffer_pool_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_buffer_pool_test PRIVATE nanolance)
+
+add_executable(nano_lance_work_stats_test tests/test_work_stats.cpp)
+target_compile_features(nano_lance_work_stats_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_work_stats_test PRIVATE nanolance)
+
+add_executable(nano_lance_byte_sink_test tests/test_byte_sink.cpp)
+target_compile_features(nano_lance_byte_sink_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_byte_sink_test PRIVATE nanolance nanolance_reader)
+
+add_executable(nano_lance_external_blob_io_test tests/test_external_blob_io.cpp)
+target_compile_features(nano_lance_external_blob_io_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_external_blob_io_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_external_blob_io_test PRIVATE nanolance_reader)
+
+add_executable(nano_lance_arrow_owned_test tests/test_arrow_owned.cpp)
+target_compile_features(nano_lance_arrow_owned_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_arrow_owned_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_arrow_owned_test PRIVATE nanolance)
+
+add_executable(nano_lance_arrow_slice_test tests/test_arrow_slice.cpp)
+target_compile_features(nano_lance_arrow_slice_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_arrow_slice_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_arrow_slice_test PRIVATE nanolance)
+
+add_executable(nano_lance_jsonb_test tests/test_jsonb.cpp)
+target_compile_features(nano_lance_jsonb_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_jsonb_test PRIVATE nanolance)
+
+add_executable(nano_lance_bloom_filter_test tests/test_bloom_filter.cpp)
+target_compile_features(nano_lance_bloom_filter_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_bloom_filter_test PRIVATE nanolance)
+add_test(NAME bloom_filter COMMAND $<TARGET_FILE:nano_lance_bloom_filter_test>)
+set_tests_properties(bloom_filter PROPERTIES LABELS "smoke")
+
+add_executable(nano_lance_index_segment_test tests/test_index_segment.cpp)
+target_compile_features(nano_lance_index_segment_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_index_segment_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_index_segment_test PRIVATE nanolance)
+add_test(NAME index_segment COMMAND $<TARGET_FILE:nano_lance_index_segment_test>)
+set_tests_properties(index_segment PROPERTIES LABELS "smoke")
+
+add_executable(nano_lance_index_files_test tests/test_index_files.cpp)
+target_compile_features(nano_lance_index_files_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_index_files_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_index_files_test PRIVATE nanolance)
+add_test(NAME index_files COMMAND $<TARGET_FILE:nano_lance_index_files_test>)
+set_tests_properties(index_files PROPERTIES LABELS "smoke")
+
+add_executable(nano_lance_index_candidates_test tests/test_index_candidates.cpp)
+target_compile_features(nano_lance_index_candidates_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_index_candidates_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_index_candidates_test PRIVATE nanolance)
+add_test(NAME index_candidates COMMAND $<TARGET_FILE:nano_lance_index_candidates_test>)
+set_tests_properties(index_candidates PROPERTIES LABELS "smoke")
+
+add_executable(nano_lance_lance_file_writer_test tests/test_lance_file_writer.cpp)
+target_compile_features(nano_lance_lance_file_writer_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_lance_file_writer_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_lance_file_writer_test PRIVATE nanolance)
+add_test(NAME lance_file_writer COMMAND $<TARGET_FILE:nano_lance_lance_file_writer_test>)
+set_tests_properties(lance_file_writer PROPERTIES LABELS "smoke")
 
 # Live S3 integration test (only with the nanos3reader provider): range GETs against a real S3-compatible
 # endpoint; skips unless NANOLANCE_S3_TEST_URI (+ AWS_* env) is set. tests/s3_minio_integration.sh wires
@@ -886,6 +1128,8 @@ set_tests_properties(nano_lance_typed_blob_writer PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_fts_tokenizer COMMAND $<TARGET_FILE:nano_lance_fts_tokenizer_test>
          "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/fts_tokenizer/cases.txt")
 set_tests_properties(nano_lance_fts_tokenizer PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_fts_multiscript COMMAND $<TARGET_FILE:nano_lance_fts_multiscript_test>)
+set_tests_properties(nano_lance_fts_multiscript PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_fts_fst COMMAND $<TARGET_FILE:nano_lance_fts_fst_test>
          "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/fts_fst")
 set_tests_properties(nano_lance_fts_fst PROPERTIES LABELS "smoke")
@@ -973,14 +1217,85 @@ add_test(NAME nano_lance_table_stream COMMAND $<TARGET_FILE:nano_lance_table_str
 set_tests_properties(nano_lance_table_stream PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_column_slice COMMAND $<TARGET_FILE:nano_lance_column_slice_test>)
+add_test(NAME nano_lance_encoding_bitpack COMMAND $<TARGET_FILE:nano_lance_encoding_bitpack_test>)
+set_tests_properties(nano_lance_encoding_bitpack PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_encoding_general COMMAND $<TARGET_FILE:nano_lance_encoding_general_test>)
+set_tests_properties(nano_lance_encoding_general PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_encoding_byte_stream_split COMMAND $<TARGET_FILE:nano_lance_encoding_byte_stream_split_test>)
+set_tests_properties(nano_lance_encoding_byte_stream_split PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_encoding_scalar_value COMMAND $<TARGET_FILE:nano_lance_encoding_scalar_value_test>)
+set_tests_properties(nano_lance_encoding_scalar_value PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_encoding_rle COMMAND $<TARGET_FILE:nano_lance_encoding_rle_test>)
+set_tests_properties(nano_lance_encoding_rle PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_encoding_dictionary COMMAND $<TARGET_FILE:nano_lance_encoding_dictionary_test>)
+set_tests_properties(nano_lance_encoding_dictionary PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_unicode COMMAND $<TARGET_FILE:nano_lance_unicode_test>)
+set_tests_properties(nano_lance_unicode PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_encoding_miniblock COMMAND $<TARGET_FILE:nano_lance_encoding_miniblock_test>)
+set_tests_properties(nano_lance_encoding_miniblock PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_encoding_full_zip COMMAND $<TARGET_FILE:nano_lance_encoding_full_zip_test>)
+set_tests_properties(nano_lance_encoding_full_zip PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_roaring_bitmap COMMAND $<TARGET_FILE:nano_lance_roaring_bitmap_test>)
 add_test(NAME nano_lance_expr COMMAND $<TARGET_FILE:nano_lance_expr_test>)
+add_test(NAME nano_lance_deletion_vector COMMAND $<TARGET_FILE:nano_lance_deletion_vector_test>)
+set_tests_properties(nano_lance_deletion_vector PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_base_paths COMMAND $<TARGET_FILE:nano_lance_base_paths_test>)
+set_tests_properties(nano_lance_base_paths PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_overlays COMMAND $<TARGET_FILE:nano_lance_overlays_test>)
+set_tests_properties(nano_lance_overlays PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_index_location COMMAND $<TARGET_FILE:nano_lance_index_location_test>)
+set_tests_properties(nano_lance_index_location PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_index_maintenance COMMAND $<TARGET_FILE:nano_lance_index_maintenance_test>)
+set_tests_properties(nano_lance_index_maintenance PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_dataset_operation COMMAND $<TARGET_FILE:nano_lance_dataset_operation_test>)
+set_tests_properties(nano_lance_dataset_operation PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_transaction_file COMMAND $<TARGET_FILE:nano_lance_transaction_file_test>)
+set_tests_properties(nano_lance_transaction_file PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_encoding_choice COMMAND $<TARGET_FILE:nano_lance_encoding_choice_test>)
+set_tests_properties(nano_lance_encoding_choice PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_blob_v2_layout COMMAND $<TARGET_FILE:nano_lance_blob_v2_layout_test>)
+set_tests_properties(nano_lance_blob_v2_layout PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_manifest_writer COMMAND $<TARGET_FILE:nano_lance_manifest_writer_test>)
+set_tests_properties(nano_lance_manifest_writer PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_dataset_refs COMMAND $<TARGET_FILE:nano_lance_dataset_refs_test>)
+set_tests_properties(nano_lance_dataset_refs PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_mem_wal COMMAND $<TARGET_FILE:nano_lance_mem_wal_test>)
+set_tests_properties(nano_lance_mem_wal PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_frag_reuse COMMAND $<TARGET_FILE:nano_lance_frag_reuse_test>)
+set_tests_properties(nano_lance_frag_reuse PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_lance_table_reader COMMAND $<TARGET_FILE:nano_lance_lance_table_reader_test>)
+set_tests_properties(nano_lance_lance_table_reader PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_write_session COMMAND $<TARGET_FILE:nano_lance_write_session_test>)
+set_tests_properties(nano_lance_write_session PROPERTIES LABELS "smoke")
 set_tests_properties(nano_lance_column_slice PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_byte_source_remote COMMAND $<TARGET_FILE:nano_lance_byte_source_remote_test>)
 set_tests_properties(nano_lance_byte_source_remote PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_external_blob COMMAND $<TARGET_FILE:nano_lance_external_blob_test>)
 set_tests_properties(nano_lance_external_blob PROPERTIES LABELS "smoke")
+
+add_test(NAME nano_lance_shared_cache COMMAND $<TARGET_FILE:nano_lance_shared_cache_test>)
+set_tests_properties(nano_lance_shared_cache PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_uuid COMMAND $<TARGET_FILE:nano_lance_uuid_test>)
+set_tests_properties(nano_lance_uuid PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_bytes COMMAND $<TARGET_FILE:nano_lance_bytes_test>)
+set_tests_properties(nano_lance_bytes PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_parallel COMMAND $<TARGET_FILE:nano_lance_parallel_test>)
+set_tests_properties(nano_lance_parallel PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_buffer_pool COMMAND $<TARGET_FILE:nano_lance_buffer_pool_test>)
+set_tests_properties(nano_lance_buffer_pool PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_work_stats COMMAND $<TARGET_FILE:nano_lance_work_stats_test>)
+set_tests_properties(nano_lance_work_stats PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_byte_sink COMMAND $<TARGET_FILE:nano_lance_byte_sink_test>)
+set_tests_properties(nano_lance_byte_sink PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_external_blob_io COMMAND $<TARGET_FILE:nano_lance_external_blob_io_test>)
+set_tests_properties(nano_lance_external_blob_io PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_arrow_owned COMMAND $<TARGET_FILE:nano_lance_arrow_owned_test>)
+set_tests_properties(nano_lance_arrow_owned PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_arrow_slice COMMAND $<TARGET_FILE:nano_lance_arrow_slice_test>)
+set_tests_properties(nano_lance_arrow_slice PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_jsonb COMMAND $<TARGET_FILE:nano_lance_jsonb_test>)
+set_tests_properties(nano_lance_jsonb PROPERTIES LABELS "smoke")
 
 if(NANOLANCE_S3_NANOS3READER_ACTIVE)
     # Live S3 integration: skips (CTest code 77) unless NANOLANCE_S3_TEST_URI + AWS_* env are set. Not in

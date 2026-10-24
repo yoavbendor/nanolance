@@ -17,7 +17,7 @@ import os
 import re
 import uuid
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, TypedDict, Union
 
@@ -27,6 +27,7 @@ import pyarrow.dataset
 
 from nanolance import _nanolance
 from nanolance.lance import _native_log
+from nanolance.lance import mem_wal as _mem_wal
 from nanolance.lance._errors import NotSupportedError, index_build, native, refuse_object_store_write, unsupported
 from nanolance.lance._sql import SqlQueryBuilder
 from nanolance.lance.base_path import (_base_data_dir, _DatasetBases, _fragment_targets, _new_base_dicts)
@@ -577,6 +578,59 @@ class LanceDataset(pa.dataset.Dataset):
 
     # ── versions ──────────────────────────────────────────────────────────────────────────────────
 
+    def tracked_files(self, progress=None) -> pa.RecordBatchReader:
+        """Every file the dataset's versions reference: each version's manifest, transaction, data and
+        deletion files. Schema: version (int64), base_uri, path (relative to base_uri), type. The order
+        is not defined."""
+        manifest_name = lambda version: f"_versions/{2**64 - 1 - version}.manifest"  # Lance's v2 names
+        txn_dir = os.path.join(self._uri, "_transactions")
+        txns = {}  # the version a transaction file commits: its read version + 1
+        for name in (os.listdir(txn_dir) if os.path.isdir(txn_dir) else []):
+            head = name.split("-", 1)[0]
+            if head.isdigit():
+                txns.setdefault(int(head) + 1, []).append(name)
+        rows = []  # (version, path, type)
+        for entry in self._versions_raw():
+            version = int(entry["version"])
+            with native():
+                info = _nanolance._ds_info(self._uri, version)
+            rows.append((version, manifest_name(version), "manifest"))
+            rows += [(version, f"_transactions/{name}", "transaction file") for name in txns.get(version, [])]
+            for fragment in info["fragments"]:
+                rows += [(version, f"data/{fi['path']}", "data file") for fi in fragment["files"]]
+                if fragment["deletion_file"]:
+                    rows.append((version, fragment["deletion_file"], "deletion file"))
+        schema = pa.schema([pa.field("version", pa.int64()), pa.field("base_uri", _DICT_I32),
+                            pa.field("path", pa.utf8()), pa.field("type", _DICT_I8)])
+        batch = pa.RecordBatch.from_arrays(
+            [pa.array([r[0] for r in rows], pa.int64()), _dictionary([self._uri] * len(rows), pa.int32()),
+             pa.array([r[1] for r in rows], pa.utf8()), _dictionary([r[2] for r in rows], pa.int8())],
+            schema=schema)
+        return pa.RecordBatchReader.from_batches(schema, [batch])
+
+    def all_files(self) -> pa.RecordBatchReader:
+        """Every file physically present under the dataset's root (the primary store only). Schema:
+        base_uri, path (relative to base_uri), size_bytes, last_modified (UTC)."""
+        rows = []
+        for dirpath, _, names in os.walk(self._uri):
+            for name in names:
+                full = os.path.join(dirpath, name)
+                stat = os.stat(full)
+                rows.append((os.path.relpath(full, self._uri).replace(os.sep, "/"), stat.st_size,
+                             datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)))
+        schema = pa.schema([pa.field("base_uri", _DICT_I32), pa.field("path", pa.utf8()),
+                            pa.field("size_bytes", pa.int64()),
+                            pa.field("last_modified", pa.timestamp("us", tz="UTC"))])
+        batch = pa.RecordBatch.from_arrays(
+            [_dictionary([self._uri] * len(rows), pa.int32()), pa.array([r[0] for r in rows], pa.utf8()),
+             pa.array([r[1] for r in rows], pa.int64()),
+             pa.array([r[2] for r in rows], pa.timestamp("us", tz="UTC"))], schema=schema)
+        return pa.RecordBatchReader.from_batches(schema, [batch])
+
+    def _versions_raw(self) -> List[dict]:
+        with native():
+            return _nanolance._ds_versions(self._uri)
+
     def versions(self) -> List[Version]:
         with native():
             raw = _nanolance._ds_versions(self._uri)
@@ -634,8 +688,6 @@ class LanceDataset(pa.dataset.Dataset):
 
     def _cleanup(self, older_than, retain_versions, delete_unverified, error_if_tagged, delete_rate_limit, versions,
                  execute, max_files):
-        if execute:
-            refuse_object_store_write(self._uri, "cleanup")
         if older_than is None and retain_versions is None and versions is None:
             older_than = timedelta(days=14)
         older_than_ns = None
@@ -838,6 +890,9 @@ class LanceDataset(pa.dataset.Dataset):
         row_addr_blocklist=None,
         **kwargs,
     ) -> "LanceScanner":
+        if kwargs:
+            # pylance's scanner() takes no other keywords: a misspelled option is an error, not a full scan.
+            raise TypeError(f"scanner() got an unexpected keyword argument '{next(iter(kwargs))}'")
         options = dict(self._default_scan_options)
         given = dict(
             columns=columns, filter=filter, limit=limit, offset=offset, nearest=nearest, batch_size=batch_size,
@@ -873,12 +928,15 @@ class LanceDataset(pa.dataset.Dataset):
                    *, prefilter=None, with_row_id=None, with_row_address=None, use_stats=None, full_text_query=None,
                    io_buffer_size=None, late_materialization=None, use_scalar_index=None,
                    strict_batch_size=None, order_by=None, **kwargs) -> Iterator[pa.RecordBatch]:
-        return self.scanner(
+        scanner = self.scanner(
             columns=columns, filter=filter, limit=limit, offset=offset, nearest=nearest, batch_size=batch_size,
             batch_size_bytes=batch_size_bytes,
             full_text_query=full_text_query, with_row_id=with_row_id, with_row_address=with_row_address,
             order_by=order_by, use_scalar_index=use_scalar_index, prefilter=prefilter, **kwargs,
-        ).to_batches()
+        )
+        if strict_batch_size and batch_size:  # every batch of the size asked, the last one shorter
+            return scanner._rebatch(scanner.to_table(), strict=True)
+        return scanner.to_batches()
 
     def to_pandas(self, columns=None, filter=None, limit=None, offset=None, nearest=None, batch_size=None,
                   batch_readahead=None, fragment_readahead=None, scan_in_order=None, *, prefilter=None,
@@ -899,6 +957,10 @@ class LanceDataset(pa.dataset.Dataset):
         return self.to_table(limit=num_rows, **kwargs)
 
     def slice(self, start: int, end: int, columns=None) -> pa.Table:
+        if start < 0:
+            raise ValueError(f"start must be non-negative, got {start}")
+        if end < start:
+            raise ValueError(f"end ({end}) must be >= start ({start})")
         n = self.count_rows()
         start, end, _ = slice(start, end).indices(n)
         return self.to_table(columns=columns, offset=start, limit=max(end - start, 0))
@@ -915,8 +977,8 @@ class LanceDataset(pa.dataset.Dataset):
         return IOStats(*(now - before for now, before in zip(current, mark)))
 
     def count_rows(self, filter=None, **kwargs) -> int:
-        if filter is not None:
-            return self.scanner(filter=filter).count_rows()
+        if filter is not None or kwargs:
+            return self.scanner(filter=filter, **kwargs).count_rows()
         return sum(int(f["physical_rows"]) - int(f["deleted_rows"]) for f in self._info["fragments"])
 
     def take(self, indices, columns=None) -> pa.Table:
@@ -1164,12 +1226,14 @@ class LanceDataset(pa.dataset.Dataset):
         Schema), or data (a table / reader with one row per row of the dataset)."""
         if isinstance(transforms, dict):
             columns = [(str(k), str(v)) for k, v in transforms.items()]
+            self._check_new_columns([(name, None) for name, _ in columns])
             with native():
                 _nanolance._ds_add_columns_sql(self._uri, columns, self._version)
         elif isinstance(transforms, (pa.Field, pa.Schema)) or (
             isinstance(transforms, list) and transforms and all(isinstance(f, pa.Field) for f in transforms)
         ):
             fields = [transforms] if isinstance(transforms, pa.Field) else list(transforms)
+            self._check_new_columns([(f.name, f.type) for f in fields])
             with native():
                 _nanolance._ds_add_columns_nulls(self._uri, pa.schema(fields), self._version)
         elif callable(transforms):
@@ -1177,9 +1241,23 @@ class LanceDataset(pa.dataset.Dataset):
             return
         else:
             reader = _coerce_reader(transforms, reader_schema)
+            self._check_new_columns([(f.name, f.type) for f in reader.schema])
             with native():
                 _nanolance._ds_add_columns_stream(self._uri, reader, self._version)
         self._refresh_latest("Merge")
+
+    def _check_new_columns(self, columns) -> None:
+        """Refuses new columns named as a column of the dataset, as pylance does: the same type is
+        "already exists", another type a conflict. ``columns`` is (name, type), the type None for a SQL
+        expression, whose type is not known yet."""
+        existing = {f.name: f.type for f in self._data_schema}
+        for name, new_type in columns:
+            if name not in existing:
+                continue
+            if new_type is None or new_type == existing[name]:
+                raise OSError(f"Invalid user input: Column {name} already exists in the dataset")
+            raise OSError(f"Invalid user input: Type conflicts between {name}({_arrow_display(existing[name])}) "
+                          f"and {name}({_arrow_display(new_type)})")
 
     def _add_columns_udf(self, transforms, read_columns, batch_size) -> None:
         """New columns computed by a function of each batch: a new data file per fragment, then one
@@ -1252,11 +1330,20 @@ class LanceDataset(pa.dataset.Dataset):
         for a in alterations:
             if not isinstance(a, dict) or "path" not in a:
                 raise ValueError("each alteration must be a dict with a 'path'")
-            unknown = set(a) - {"path", "name", "nullable", "data_type"}
+            unknown = [k for k in a if k not in ("path", "name", "nullable", "data_type")]
             if unknown:
-                raise ValueError(f"unknown alteration keys: {sorted(unknown)}")
+                raise ValueError(f"Unknown key: {unknown[0]}")
+            if not ({"name", "nullable", "data_type"} & set(a)):
+                raise ValueError("At least one of name, nullable, or data_type must be specified")
             item = dict(a)
+            if _resolve_path(self._data_schema, a["path"]) is None:
+                raise OSError(f'Invalid user input: Column "{a["path"]}" does not exist in the dataset')
             if item.get("data_type") is not None:
+                # pylance casts a column only within its family: integers, floats, or strings.
+                old = {f.name: f.type for f in self._data_schema}.get(a["path"])
+                if old is not None and _cast_family(old) != _cast_family(item["data_type"]):
+                    raise OSError(f'Invalid user input: Cannot cast column "{a["path"]}" from {_arrow_display(old)} '
+                                  f'to {_arrow_display(item["data_type"])}')
                 item["data_type"] = pa.field("x", item["data_type"])
             items.append(item)
         with native():
@@ -1355,7 +1442,9 @@ class LanceDataset(pa.dataset.Dataset):
     _INVERTED_OPTIONS = ("base_tokenizer", "language", "with_position", "max_token_length", "lower_case", "stem",
                          "remove_stop_words", "custom_stop_words", "ascii_folding", "min_ngram_length",
                          "max_ngram_length", "prefix_only", "format_version", "block_size", "analyzer",
-                         "split_identifiers", "split_on_numerics", "preserve_original", "index_operators")
+                         "split_identifiers", "split_on_numerics", "preserve_original", "index_operators",
+                         # nanolance's own, for text in many scripts (fts_tokenizer.hpp, AnalyzerParams)
+                         "unicode_normalize", "remove_marks", "arabic_normalize", "ascii_folding_keep_original")
     _CODE_FLAGS = ("split_identifiers", "split_on_numerics", "preserve_original", "index_operators")
     # The languages Lance's tokenizer knows (case-sensitive). pylance rejects any other name, whatever the
     # stemming and stop-word settings are.
@@ -1982,7 +2071,18 @@ class LanceDataset(pa.dataset.Dataset):
             details["runtime_hints"] = dict(hints)
         return details
 
+    def remap_row_addrs(self, row_addrs) -> Optional[pa.Array]:
+        """Row addresses from before a deferred-remap compaction, followed to where those rows are now
+        (null for a row the compaction dropped). None when the dataset has no fragment-reuse index."""
+        addresses = pa.array(row_addrs, pa.uint64()).to_pylist() if not isinstance(row_addrs, pa.Array) else \
+            row_addrs.cast(pa.uint64()).to_pylist()
+        with native():
+            mapped = _nanolance._ds_remap_row_addrs(self.uri, self._version, addresses)
+        return None if mapped is None else pa.array(mapped, pa.uint64())
+
     def describe_indices(self) -> List["IndexDescription"]:
+        from datetime import timezone
+
         with native():
             indices = _nanolance._ds_list_indices(self._uri, self._version)
         by_name: Dict[str, List[dict]] = {}
@@ -1991,6 +2091,18 @@ class LanceDataset(pa.dataset.Dataset):
         out = []
         for name, segments in by_name.items():
             first = segments[0]
+            if name == _mem_wal.INDEX_NAME:
+                # The MemWAL index has no size and covers no fragments; its creation time is UTC, as pylance's is.
+                out.append(IndexDescription(
+                    name=name, type_url=first["type_url"], index_type=first["type"], fields=[], field_names=[],
+                    num_rows_indexed=0, total_size_bytes=None, details={},
+                    segments=[IndexSegmentDescription(
+                        uuid=s["uuid"], fragment_ids=set(), index_version=s["index_version"],
+                        dataset_version_at_last_update=s["dataset_version"], size_bytes=None,
+                        created_at=datetime.fromtimestamp(s["created_at"] / 1000, tz=timezone.utc)
+                        if s["created_at"] else None, base_id=None, covering_fields=[]) for s in segments],
+                ))
+                continue
             out.append(IndexDescription(
                 name=name, type_url=first["type_url"], index_type=first["type"] if first["type_url"] else "Unknown",
                 fields=list(first["field_ids"]), field_names=list(first["fields"]),
@@ -2004,6 +2116,89 @@ class LanceDataset(pa.dataset.Dataset):
                     base_id=None, covering_fields=list(first["field_ids"])) for s in segments],
             ))
         return out
+
+    def initialize_mem_wal(self, *, maintained_indexes: Optional[List[str]] = None,
+                           bucket_column: Optional[str] = None, num_buckets: Optional[int] = None,
+                           identity_column: Optional[str] = None, unsharded: bool = False,
+                           durable_write: Optional[bool] = None, max_wal_buffer_size: Optional[int] = None,
+                           max_wal_flush_interval_ms: Optional[int] = None,
+                           max_memtable_size: Optional[int] = None, max_memtable_rows: Optional[int] = None,
+                           max_memtable_batches: Optional[int] = None,
+                           max_unflushed_memtable_bytes: Optional[int] = None,
+                           manifest_scan_batch_size: Optional[int] = None,
+                           backpressure_log_interval_ms: Optional[int] = None,
+                           stats_log_interval_ms: Optional[int] = None,
+                           hnsw_params: Optional[Dict[str, Dict[str, int]]] = None) -> None:
+        """Initialize MemWAL on this dataset.
+
+        Must be called once before any calls to `mem_wal_writer`. Append-only
+        tables may omit primary-key metadata; primary keys are only required
+        for primary-key lookup and last-write-wins deduplication workflows.
+
+        At most one sharding mode may be selected: bucket sharding
+        (``bucket_column`` + ``num_buckets``), identity sharding
+        (``identity_column``), or ``unsharded``. With none selected, shards are
+        managed manually by passing shard IDs to `mem_wal_writer`.
+
+        Any writer-configuration keyword arguments (``durable_write``,
+        ``max_memtable_size``, ``max_wal_flush_interval_ms``, etc. -- the same
+        knobs accepted by `mem_wal_writer`) are recorded as the default
+        `~lance.mem_wal.ShardWriter` configuration in the MemWAL index, so
+        every writer starts from the same defaults.
+
+        Parameters
+        ----------
+        maintained_indexes : list of str, optional
+            Names of existing indexes to keep updated as data is written
+            through the MemWAL. Must reference indexes that already exist.
+        hnsw_params : dict, optional
+            Per-index HNSW build-parameter overrides recorded as writer-config
+            defaults, keyed by maintained vector index name. Each value is a dict
+            with any of ``num_edges`` (graph degree; level 0 keeps
+            ``2 * num_edges``, equivalent to FAISS's ``M``), ``ef_construction``,
+            and ``max_level``. Without an override an index uses the default
+            parameters. These are writer config -- they affect the MemTable a
+            writer builds and may be overridden per-writer in
+            :meth:`mem_wal_writer`.
+        bucket_column : str, optional
+            With ``num_buckets``, hash-bucket writes by this scalar column.
+        num_buckets : int, optional
+            Number of hash buckets (shards). Required with ``bucket_column``.
+        identity_column : str, optional
+            Shard by the raw value of this scalar column.
+        unsharded : bool, default False
+            Route every write to a single shard.
+
+        Raises
+        ------
+        IOError
+            - An entry in *maintained_indexes* does not exist on the dataset.
+            - MemWAL has already been initialized on this dataset.
+        ValueError
+            More than one sharding mode was selected, or bucket sharding was
+            given only one of ``bucket_column`` / ``num_buckets``.
+        """
+        _mem_wal.initialize(
+            self, maintained_indexes=maintained_indexes, bucket_column=bucket_column, num_buckets=num_buckets,
+            identity_column=identity_column, unsharded=unsharded, durable_write=durable_write,
+            max_wal_buffer_size=max_wal_buffer_size, max_wal_flush_interval_ms=max_wal_flush_interval_ms,
+            max_memtable_size=max_memtable_size, max_memtable_rows=max_memtable_rows,
+            max_memtable_batches=max_memtable_batches, max_unflushed_memtable_bytes=max_unflushed_memtable_bytes,
+            manifest_scan_batch_size=manifest_scan_batch_size,
+            backpressure_log_interval_ms=backpressure_log_interval_ms,
+            stats_log_interval_ms=stats_log_interval_ms, hnsw_params=hnsw_params)
+
+    def mem_wal_index_details(self) -> Optional[dict]:
+        """Return the MemWAL index details, or ``None`` if not initialized.
+
+        Returns
+        -------
+        dict or None
+            A dict with ``num_shards``, ``maintained_indexes``,
+            ``writer_config_defaults``, and ``sharding_specs``, or ``None`` when
+            MemWAL has not been initialized on this dataset.
+        """
+        return _mem_wal.index_details(self)
 
     @property
     def optimize(self) -> "DatasetOptimizer":
@@ -2229,7 +2424,7 @@ class LanceDataset(pa.dataset.Dataset):
         path = _path_of(base_uri)
         if detached:
             if _exists(path) and not _uses_v2_manifest_paths(path):
-                raise OSError("Invalid user input: Detached commits cannot be used with v1 manifest paths")
+                raise OSError("Not supported: detached commits cannot be used with v1 manifest paths")
             if read_version is None or not _exists(path):
                 raise OSError("Invalid user input: a detached commit needs a dataset and a read version")
             field, message = encode_operation(operation)
@@ -2315,7 +2510,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def __getattr__(self, name: str):
         known = {
-            "create_index",
+            "create_index", "mem_wal_writer", "prewarm_mem_wal", "list_mem_wal_latest_shard_ids",
             "create_branch", "sql",
             "join",
             "prewarm_index",
@@ -3113,6 +3308,18 @@ def _nearest_query(ds, nearest, limit=None) -> dict:
     return dict(shared, q=rows[0].tolist(), vectors=1)
 
 
+def _search_filter_parts(filter):
+    """(the filter, a full-text query filter): `filter=MatchQuery(...)` is a query filter alone; a dict
+    is `{"expr_filter": ..., "search_filter": ...}`."""
+    from nanolance.lance.query import FullTextQuery
+
+    if isinstance(filter, dict) and ("search_filter" in filter or "expr_filter" in filter):
+        return filter.get("expr_filter"), filter.get("search_filter")
+    if isinstance(filter, FullTextQuery):
+        return None, filter
+    return filter, None
+
+
 def _filter_sql(filter) -> Optional[str]:
     """A filter as SQL: a string as given, a pyarrow compute expression translated."""
     if filter is None:
@@ -3157,7 +3364,54 @@ def _expression_sql(expr) -> str:
     text = "".join(part if i % 2 else temporal(part) for i, part in enumerate(parts))
     # pyarrow quotes strings with double quotes; SQL uses single.
     text = re.sub(r'"((?:[^"\\]|\\.)*)"', lambda m: "'" + m.group(1).replace("'", "''") + "'", text)
-    return text
+    return _drop_null_guards(text)
+
+
+def _split_call(text: str, start: int):
+    """The arguments of the call whose "(" is at ``start`` (top-level commas, quotes respected) and the
+    index just past its ")"; None when unbalanced."""
+    depth, quote, args, begin = 0, False, [], start + 1
+    for i in range(start, len(text)):
+        c = text[i]
+        if c == "'":
+            quote = not quote
+        elif quote:
+            continue
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                args.append(text[begin:i].strip())
+                return args, i + 1
+        elif c == "," and depth == 1:
+            args.append(text[begin:i].strip())
+            begin = i + 1
+    return None
+
+
+def _drop_null_guards(text: str) -> str:
+    """DuckDB (2.0) pushes ``s IN (...)`` down as ``if_else(is_valid(s), (s IN (...)), null[bool])``. That
+    is exactly ``s IN (...)`` (NULL when s is NULL either way), so it becomes that. Any other if_else
+    is left as is, for the parser to refuse."""
+    import re
+
+    out, pos = [], 0
+    for m in re.finditer(r"\bif_else\(", text):
+        if m.start() < pos:
+            continue
+        split = _split_call(text, m.end() - 1)
+        if split is None:
+            break
+        args, end = split
+        guard = re.fullmatch(r"is_valid\((\w+)\)", args[0]) if len(args) == 3 else None
+        if guard and re.fullmatch(r"null\[\w+\]", args[2]) and \
+                re.fullmatch(r"\(\s*" + re.escape(guard.group(1)) + r" IN \(.*\)\s*\)", args[1], re.S):
+            out.append(text[pos:m.start()])
+            out.append(args[1])
+            pos = end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 class MergeInsertBuilder:
@@ -3207,8 +3461,9 @@ class MergeInsertBuilder:
         return self
 
     def write_mode(self, mode: str) -> "MergeInsertBuilder":
-        """How the merged rows are written. nanolance gives every mode the same results, written as
-        whole rows ('rewrite_rows'); 'rewrite_columns' is checked as Lance checks it."""
+        """How the merged rows are written: 'auto' and 'rewrite_rows' write whole rows to new fragments;
+        'rewrite_columns' patches the source's columns into the fragments that hold the matched rows
+        (an update_all merge without a condition; one with a condition is written as whole rows)."""
         if mode not in ("auto", "rewrite_rows", "rewrite_columns"):
             raise ValueError(f"Invalid write_mode: {mode}. Expected one of 'auto', 'rewrite_rows', 'rewrite_columns'")
         self._write_mode = mode
@@ -3313,6 +3568,8 @@ class MergeInsertBuilder:
                        else "")
                     + "Use MergeInsertWriteMode::Auto or RewriteRows instead."
                 )
+            if self._update_all and not self._delete_by_source and not self._update_condition:
+                return self._rewrite_columns(reader.read_all())
         if len(reader.schema.names) < len(target.names):
             reader = self._fill_missing_columns(reader, target)
         blob_columns = [i for i, f in enumerate(target) if _is_blob_v2(f)]
@@ -3335,6 +3592,49 @@ class MergeInsertBuilder:
 
     _uncommitted = False
     _transaction = None
+    _columns_transaction = None
+
+    def _rewrite_columns(self, source: pa.Table) -> Dict[str, int]:
+        """write_mode("rewrite_columns"): the source's columns patched into the fragments holding the
+        matched rows (LanceFragment.update_columns, joined on each row's address), committed as one
+        Update with update_mode rewrite_columns. No fragment is added or renumbered, and the columns
+        the source lacks are neither read nor written."""
+        for k in self._on:
+            if k not in source.column_names:
+                raise ValueError(f"the source has no key column '{k}'")
+        names = [f"k{i}" for i in range(len(self._on))]
+        keys = self._ds.to_table(columns=self._on, with_row_address=True)
+        left = pa.table({**{n: source.column(k) for n, k in zip(names, self._on)},
+                         "__source": pa.array(range(source.num_rows), pa.int64())})
+        right = pa.table({**{n: keys.column(k) for n, k in zip(names, self._on)},
+                          "__addr": keys.column("_rowaddr")})
+        joined = left.join(right, keys=names, join_type="inner")
+        if len(set(joined.column("__source").to_pylist())) != joined.num_rows:
+            raise ValueError("merge insert: a source row matches more than one row of the dataset")
+        if len(set(joined.column("__addr").to_pylist())) != joined.num_rows:
+            raise ValueError("merge insert: a dataset row matches more than one source row")
+        values = source.drop_columns(self._on)
+        patch = values.take(joined.column("__source")).append_column("_rowaddr", joined.column("__addr"))
+        by_fragment: Dict[int, List[int]] = {}
+        for i, addr in enumerate(patch.column("_rowaddr").to_pylist()):
+            by_fragment.setdefault(addr >> 32, []).append(i)
+        updated, offsets, fields = [], {}, []
+        for fragment_id, rows in sorted(by_fragment.items()):
+            fragment = self._ds.get_fragment(fragment_id)
+            metadata, fields, matched = fragment.update_columns(
+                patch.take(pa.array(rows, pa.int64())), left_on="_rowaddr", with_offsets=True)
+            updated.append(metadata)
+            offsets[metadata.id] = matched
+        operation = LanceOperation.Update(updated_fragments=updated, fields_modified=fields,
+                                          update_mode="rewrite_columns", updated_fragment_offsets=offsets or None)
+        stats = {"num_inserted_rows": 0, "num_updated_rows": joined.num_rows, "num_deleted_rows": 0}
+        if self._uncommitted:
+            self._columns_transaction = Transaction(self._ds.version, operation)
+            return stats
+        if updated:
+            LanceDataset.commit(self._ds.uri, operation, read_version=self._ds.version)
+            self._ds._refresh_latest("Update")
+        return stats
 
     def _targets(self) -> Tuple[List[str], List[int]]:
         """Where the new data files go, as the native merge takes them: directories and base ids."""
@@ -3350,10 +3650,13 @@ class MergeInsertBuilder:
         from nanolance.lance._transactions import _operation
 
         self._uncommitted = True
+        self._columns_transaction = None
         try:
             stats = self.execute(data_obj, schema=schema)
         finally:
             self._uncommitted = False
+        if self._columns_transaction is not None:
+            return self._columns_transaction, stats
         read_version, field, message = self._transaction
         operation = _operation(int(field), bytes(message))
         for fragment in getattr(operation, "new_fragments", None) or getattr(operation, "fragments", None) or []:
@@ -3803,6 +4106,23 @@ class LanceScanner(pa.dataset.Scanner):
         if include_deleted_rows and (nearest is not None or full_text_query is not None):
             raise ValueError("Cannot include deleted rows in a vector or full-text search")
         self._include_deleted = bool(include_deleted_rows)
+        # A full-text query as the filter (Lance's query filter: `filter=MatchQuery(...)`, or a dict of
+        # `search_filter` and `expr_filter`). With a vector search and prefilter, the search runs over the
+        # rows it matches; without prefilter, the k nearest are kept where they match. Errors are Lance's,
+        # raised when the scan runs.
+        filter, self._search_filter = _search_filter_parts(filter)
+        self._search_filter_error = None
+        if self._search_filter is not None:
+            from nanolance.lance.query import MatchQuery
+
+            if self._nearest is None and self._fts is None:
+                self._search_filter_error = ValueError(
+                    "Invalid user input: Query filter can only be used with full text search or vector search")
+            elif self._nearest is None:
+                raise unsupported("a full-text query filter with a full-text search")
+            elif not self._prefilter and not isinstance(self._search_filter, MatchQuery):
+                self._search_filter_error = ValueError(
+                    "Not supported: Only Match queries are supported currently when using FTS as a post-filter")
         self._filter = _filter_sql(filter)
         # A filter on _rowid / _rowaddr is evaluated here, over the rows the scan returns with their
         # addresses, before limit and offset (the scan cannot push it down).
@@ -3869,7 +4189,8 @@ class LanceScanner(pa.dataset.Scanner):
         self._batch_size = batch_size
         self._fragment_ids = None if fragments is None else [int(getattr(f, "fragment_id", f)) for f in fragments]
         self._with_row_id = bool(with_row_id)
-        self._with_row_address = bool(with_row_address)
+        # A full-text post-filter matches the k nearest by row address.
+        self._with_row_address = bool(with_row_address) or (self._search_filter is not None and not self._prefilter)
         self._use_scalar_index = use_scalar_index is not False
         # Row-address masks (serialize_row_addrs bytes): the native scan decodes them and applies them
         # before the filter, the range and any ranking; offset and limit then count the rows they allow.
@@ -3949,7 +4270,30 @@ class LanceScanner(pa.dataset.Scanner):
             taken = self._ds._take(addrs.tolist(), late, addresses=True, blob_handling=self._blob_handling)
         return pa.table({n: (taken.column(n) if n in late else head.column(n)) for n in self._scan_names()})
 
+    def _restrict_to_indexed_fragments(self) -> None:
+        """fast_search on a filtered scan: when the filter is answered through scalar indexes (Lance's
+        index expression, which the explain lines name), only the fragments every one of those indexes
+        covers are read, as Lance skips the unindexed ones. Without such an index nothing changes."""
+        if not self._fast_search or self._filter is None or not self._use_scalar_index or \
+                getattr(self, "_fast_fragments_done", False):
+            return
+        self._fast_fragments_done = True
+        with native():
+            lines = _nanolance._ds_explain_filter(self._ds.uri, self._ds.version, self._filter)
+        used = set(re.findall(r"@([^\s(@\]]+)\(", " ".join(l for l in lines if "ScalarIndexQuery" in l)))
+        if not used:
+            return
+        covered = None
+        for index in self._ds.list_indices():
+            if index["name"] in used:
+                covered = set(index["fragment_ids"]) if covered is None else covered & set(index["fragment_ids"])
+        if covered is None:
+            return
+        ids = [f.fragment_id for f in self._ds.get_fragments()] if self._fragment_ids is None else self._fragment_ids
+        self._fragment_ids = [i for i in ids if i in covered]
+
     def _read(self, stream: bool):
+        self._restrict_to_indexed_fragments()
         if self._include_deleted:
             return self._read_with_deleted()
         late = self._late_columns()
@@ -4097,6 +4441,8 @@ class LanceScanner(pa.dataset.Scanner):
         return frame
 
     def _to_table(self) -> pa.Table:
+        if self._search_filter_error is not None:
+            raise self._search_filter_error
         if self._order_by:
             return self._sorted_table()
         if self._nearest is not None:
@@ -4187,7 +4533,24 @@ class LanceScanner(pa.dataset.Scanner):
         """The k nearest rows. A batch (``self._nearest`` a list) runs each query in turn, its rows in query
         order with a leading ``query_index``; offset and limit then apply to the whole result."""
         batch = isinstance(self._nearest, list)
+        matching = None
+        if self._search_filter is not None:
+            matching = self._search_filter_rows()
+            if self._prefilter:
+                if self._mask["row_addr_allowlist"] is not None:
+                    raise unsupported("a full-text query filter with a row-address allowlist")
+                self._mask["row_addr_allowlist"] = serialize_row_addrs(matching.tolist())
+                self._masked = True
+                matching = None
         tables = [self._nearest_one(n) for n in (self._nearest if batch else [self._nearest])]
+        if matching is not None:  # the k nearest, kept where the query matches
+            import pyarrow.compute as pc
+
+            kept = []
+            for t in tables:
+                t = t.filter(pc.is_in(t["_rowaddr"], value_set=pa.array(matching, pa.uint64())))
+                kept.append(t if self._asked_row_address else t.drop_columns(["_rowaddr"]))
+            tables = kept
         out = tables[0] if len(tables) == 1 else pa.concat_tables(tables)
         if batch:
             index = np.repeat(np.arange(len(tables), dtype=np.int32), [t.num_rows for t in tables])
@@ -4215,6 +4578,13 @@ class LanceScanner(pa.dataset.Scanner):
         if meta and out.schema.metadata != meta:
             out = out.replace_schema_metadata(meta)
         return out
+
+    def _search_filter_rows(self) -> np.ndarray:
+        """The row addresses the full-text query filter matches (every match, unranked)."""
+        found = self._ds.scanner(full_text_query=self._search_filter, columns=[], with_row_address=True,
+                                 fragments=None if self._fragment_ids is None else
+                                 [self._ds.get_fragment(i) for i in self._fragment_ids]).to_table()
+        return found["_rowaddr"].to_numpy().astype(np.uint64)
 
     def _fts_search(self):
         limit = None if self._limit is None else self._offset + self._limit
@@ -4259,11 +4629,13 @@ class LanceScanner(pa.dataset.Scanner):
         table = self.to_table()
         return pa.RecordBatchReader.from_batches(table.schema, self._rebatch(table))
 
-    def _rebatch(self, table: pa.Table) -> Iterator[pa.RecordBatch]:
+    def _rebatch(self, table: pa.Table, strict: bool = False) -> Iterator[pa.RecordBatch]:
         size = self._batch_size or os.environ.get("LANCE_DEFAULT_BATCH_SIZE")
         if not size and self._batch_size_bytes and table.num_rows:
             # About that many bytes a batch, by the rows' average in-memory size.
             size = max(1, self._batch_size_bytes * table.num_rows // max(table.nbytes, 1))
+        if size and strict:  # batches of exactly `size` rows: one chunk per column, so no batch stops at one
+            return iter(table.combine_chunks().to_batches(max_chunksize=int(size)))
         if size:
             return iter(table.to_batches(max_chunksize=int(size)))
         return iter(table.to_batches())
@@ -4302,6 +4674,7 @@ class LanceScanner(pa.dataset.Scanner):
     def count_rows(self) -> int:
         if self._fts is not None:
             return len(self._fts_search()[0][self._offset:])
+        self._restrict_to_indexed_fragments()
         counted = self._count_from_index()
         if counted is not None:
             return counted[0] + counted[3]
@@ -4354,6 +4727,8 @@ class LanceScanner(pa.dataset.Scanner):
         late = self._late_columns()
         tail = f", metrics=[{', '.join(read_metrics)}]" if read_metrics else ""
         if not late:
+            # The read takes the filter's columns too (Lance's LanceRead lists them, even under columns=[]).
+            names = names + [n for n in self._filter_columns() if n not in names]
             return [f"  LanceRead: projection=[{', '.join(names)}]{tail}"]
         eager = [n for n in names if n not in late]
         return [f"  LanceRead: projection=[{', '.join(eager)}]{tail}",
@@ -4545,6 +4920,41 @@ def _json_out(table: pa.Table) -> pa.Table:
     return pa.Table.from_arrays(columns, schema=_json_out_schema(table.schema))
 
 
+_ARROW_DISPLAY = {"int8": "Int8", "int16": "Int16", "int32": "Int32", "int64": "Int64", "uint8": "UInt8",
+                  "uint16": "UInt16", "uint32": "UInt32", "uint64": "UInt64", "halffloat": "Float16",
+                  "float": "Float32", "double": "Float64", "string": "Utf8", "large_string": "LargeUtf8",
+                  "bool": "Boolean", "binary": "Binary", "large_binary": "LargeBinary"}
+
+
+def _arrow_display(tp: pa.DataType) -> str:
+    """An Arrow type as pylance's errors name it (Int64, Float32, Utf8, ...)."""
+    return _ARROW_DISPLAY.get(str(tp), str(tp))
+
+
+def _cast_family(tp: pa.DataType) -> str:
+    """The types a column may be cast between (pylance's alter_columns): within integers, within
+    floats, within strings. Anything else is cast only to its own type."""
+    if pa.types.is_integer(tp):
+        return "integer"
+    if pa.types.is_floating(tp):
+        return "floating"
+    if pa.types.is_string(tp) or pa.types.is_large_string(tp):
+        return "string"
+    return str(tp)
+
+
+_DICT_I32 = pa.dictionary(pa.int32(), pa.utf8())
+_DICT_I8 = pa.dictionary(pa.int8(), pa.utf8())
+
+
+def _dictionary(values: List[str], index_type: pa.DataType) -> pa.DictionaryArray:
+    """A dictionary-encoded string column of `values`, with indices of `index_type`."""
+    uniques = list(dict.fromkeys(values))
+    where = {v: i for i, v in enumerate(uniques)}
+    return pa.DictionaryArray.from_arrays(pa.array([where[v] for v in values], index_type),
+                                          pa.array(uniques, pa.utf8()))
+
+
 def _coerce_reader(data_obj: ReaderLike, schema: Optional[pa.Schema] = None) -> pa.RecordBatchReader:
     """Any of the inputs pylance's write_dataset takes, as a RecordBatchReader, with JSON columns
     (arrow.json) as the JSONB Lance stores (lance.json)."""
@@ -4726,6 +5136,12 @@ def write_dataset(
         if initial_bases or target_bases or target_all_bases:
             raise unsupported("base paths on object stores")
     reader = _coerce_reader(data_obj, schema)
+    for key, value in (reader.schema.metadata or {}).items():
+        try:
+            value.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError(f"Metadata key {key!r} is not valid utf8. "
+                             "Consider base64 encode for generic binary metadata.") from None
     exists = _exists(path)
     in_memory = not isinstance(uri, LanceDataset) and os.fspath(uri).startswith("memory://")
     if mode == "create" and exists and in_memory:

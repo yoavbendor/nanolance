@@ -67,6 +67,21 @@ def _u32_value(value) -> int:
     return n
 
 
+class BitmapIterator:
+    """The iterator over a Bitmap's values, ascending (pylance's ``BitmapIterator``)."""
+
+    __slots__ = ("_it",)
+
+    def __init__(self, ids: set):
+        self._it = iter(sorted(ids))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> int:
+        return next(self._it)
+
+
 class Bitmap(MutableSet):
     __slots__ = ("_ids",)
 
@@ -77,7 +92,7 @@ class Bitmap(MutableSet):
         return value in self._ids
 
     def __iter__(self):
-        return iter(sorted(self._ids))
+        return BitmapIterator(self._ids)
 
     def __len__(self) -> int:
         return len(self._ids)
@@ -127,7 +142,12 @@ class Bitmap(MutableSet):
         return None.__hash__()  # unhashable, as a set
 
     def __repr__(self) -> str:
-        return f"Bitmap({sorted(self._ids)!r})" if self._ids else "Bitmap()"
+        # pylance shows the first 20 values, then the length when there are more.
+        values = sorted(self._ids)
+        shown = ", ".join(str(v) for v in values[:20])
+        if len(values) > 20:
+            return f"Bitmap({{{shown}, ...}}, len={len(values)})"
+        return f"Bitmap({{{shown}}})"
 
 
 def _serialize_roaring(values: Iterable[int]) -> bytes:

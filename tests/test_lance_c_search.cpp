@@ -1111,7 +1111,8 @@ void test_nested(const std::filesystem::path& dir) {
 int main(int argc, char** argv) {
     const std::filesystem::path dir =
         argc > 1 ? std::filesystem::path(argv[1]) : std::filesystem::temp_directory_path() / "nl_lance_c_search";
-    std::filesystem::remove_all(dir);
+    std::error_code ec;  // never throw on cleanup: on NFS, files the index caches keep open cannot be removed yet
+    std::filesystem::remove_all(dir, ec);
     std::filesystem::create_directories(dir);
     for (const auto type : {LANCE_INDEX_IVF_FLAT, LANCE_INDEX_IVF_PQ, LANCE_INDEX_IVF_HNSW_SQ}) {
         const char* kind = type == LANCE_INDEX_IVF_FLAT ? "IVF_FLAT" : (type == LANCE_INDEX_IVF_PQ ? "IVF_PQ" : "IVF_HNSW_SQ");
@@ -1147,7 +1148,7 @@ int main(int argc, char** argv) {
     test_rq_approx_mode((dir / "rq.lance").string());
     test_hamming(dir);
     if (std::getenv("NANOLANCE_KEEP_TEST_DATA") == nullptr) {
-        std::filesystem::remove_all(dir);
+        std::filesystem::remove_all(dir, ec);
     }
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);

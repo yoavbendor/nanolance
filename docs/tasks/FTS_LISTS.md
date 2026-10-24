@@ -8,7 +8,7 @@ Do only the phase you are given.
 
 Budget about 200k tokens; aim for 120k:
 - Never read a large file whole: `grep -n`, then `sed -n 'A,Bp'` windows of at most ~120 lines. Big
-  ones: `src/fts_index_build.cpp`, `src/fts_search.cpp` (4.7k lines between the fts_* files),
+  ones: `src/index/fts/fts_index_build.cpp`, `src/index/fts/fts_search.cpp` (4.7k lines between the fts_* files),
   `bindings/python/nanolance/lance/dataset.py` (3.5k+), and Lance's Rust (read only what is named).
 - Cut output: `| tail -15` for pytest (add `-o addopts=`), `| tail -5` for `tools/pylance_suite.py`,
   `ninja 2>&1 | grep -E "error|warning:" | head`.
@@ -17,8 +17,8 @@ Budget about 200k tokens; aim for 120k:
 
 pylance builds and searches INVERTED indexes on `list<string>`, `list<large_string>`,
 `large_list<string>` and `large_list<large_string>` columns. nanolance refuses them today:
-`an INVERTED index needs a string column; text is not one` (`src/fts_index_build.cpp` about line 715),
-`full-text search needs a string column` (`src/fts_search.cpp` about line 1274), and
+`an INVERTED index needs a string column; text is not one` (`src/index/fts/fts_index_build.cpp` about line 715),
+`full-text search needs a string column` (`src/index/fts/fts_search.cpp` about line 1274), and
 `full-text search over list elements` (`bindings/python/nanolance/lance/query.py` about line 50).
 Target: pylance's `test_fts_on_list` (L1) and the four `test_fts_on_list_elements[*]` (L2), in
 `.deps/pylance-tests/v12.0.0/tests/test_scalar_index.py` (lines 1755-1900): read them first.
@@ -70,9 +70,9 @@ Re-run any time: `python3 /tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2
 
 ## 3. Where things are in nanolance
 
-- Build: `src/fts_index_build.cpp` (the column-type check about line 715; the docs writer: `grep -n
-  "_num_tokens" src/fts_index_build.cpp`). Search: `src/fts_search.cpp` (flat search over unindexed
-  fragments and the column check about line 1274). Tokenizer: `src/fts_tokenizer.cpp`.
+- Build: `src/index/fts/fts_index_build.cpp` (the column-type check about line 715; the docs writer: `grep -n
+  "_num_tokens" src/index/fts/fts_index_build.cpp`). Search: `src/index/fts/fts_search.cpp` (flat search over unindexed
+  fragments and the column check about line 1274). Tokenizer: `src/index/fts/fts_tokenizer.cpp`.
 - Python: `bindings/python/nanolance/lance/query.py` (`DocumentGranularity`, `_granularity`, the
   MatchQuery / PhraseQuery constructors), `dataset.py` (`create_scalar_index` and its parameters about
   line 1337; `_fts_query_json`; the `_score` column). `bindings/python/src/nanolance_bindings.cpp` passes

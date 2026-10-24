@@ -242,7 +242,7 @@ on-disk size shrank.
 
 ## 6a. Threads: rules for code on the read and write paths
 
-Reads, takes and writes run on several threads (`src/parallel.cpp`; README "Threads"). Keep it safe:
+Reads, takes and writes run on several threads (`src/base/parallel.cpp`; README "Threads"). Keep it safe:
 
 - **No shared mutable state without a lock.** Per-call scratch is `thread_local` (see the `packed`,
   `scratch` and zstd context buffers); process-wide caches take a mutex. A new `static` that is written
@@ -288,8 +288,8 @@ still passes when the rows come back right but slowly. Don't time it (CI machine
 1. Find the authoritative format in the Lance Rust source (`protos/encodings_v2_1.proto` for the
    `PageLayout` / `CompressiveEncoding` field numbers; `rust/lance-encoding/src/encodings/...` for the
    byte layout). Don't guess from prose docs — verify against real `lance` output bytes.
-2. Writer: build the exact `PageLayout` protobuf + data buffer in `src/data_file_writer.cpp`.
-3. Reader: invert it in `src/lance_column_decoder.cpp`. The decoder dispatches on the on-disk field's
+2. Writer: build the exact `PageLayout` protobuf + data buffer in `src/file/data_file_writer.cpp`.
+3. Reader: invert it in `src/encoding/lance_column_decoder.cpp`. The decoder dispatches on the on-disk field's
    `encoding` and `nanolance:*` metadata tags set by the writer (Lance ignores those tags and reads the
    real `PageLayout`).
 4. Validate both directions: nanolance write → nanolance read, **and** nanolance write → `lance` read.

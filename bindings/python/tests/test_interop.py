@@ -79,7 +79,25 @@ DUCKDB_QUERIES = [
     "select id from {t} where ts < timestamp '2020-01-02 03:00:00' order by id",
     "select id, l[2] from {t} where text like '%apple%' and id < 60 order by id",
     "select count(*) from {t} where n is not null and not b",
+    # DuckDB 2.0 pushes IN down under a null guard: if_else(is_valid(s), s IN (...), null).
+    "select id from {t} where s not in ('x2', 'x4') and id < 80 order by id",
+    "select id from {t} where (s in ('x1') or id in (3, 5)) and id < 90 order by id",
 ]
+
+
+@pytest.mark.parametrize("pushed, sql", [
+    ("(if_else(is_valid(s), (s IN ('x2', 'x4')), null[bool]) and (d >= 1))", "((s IN ('x2', 'x4')) and (d >= 1))"),
+    ("invert(if_else(is_valid(s), (s IN ('a')), null[bool]))", "invert((s IN ('a')))"),
+    ("if_else(is_valid(s), (s IN ('a,b', ')')), null[bool])", "(s IN ('a,b', ')'))"),
+    # Not the null-guard shape: left for the filter parser to refuse.
+    ("if_else((a > 1), (b IN (1)), null[bool])", "if_else((a > 1), (b IN (1)), null[bool])"),
+    ("if_else(is_valid(s), (t IN (1)), null[bool])", "if_else(is_valid(s), (t IN (1)), null[bool])"),
+    ("if_else(is_valid(s), (s IN (1)), false)", "if_else(is_valid(s), (s IN (1)), false)"),
+])
+def test_null_guarded_in_lists_become_in_lists(pushed, sql):
+    import sys
+
+    assert sys.modules["nanolance.lance.dataset"]._drop_null_guards(pushed) == sql
 
 
 @pytest.mark.parametrize("query", DUCKDB_QUERIES)

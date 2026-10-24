@@ -7,8 +7,8 @@ for AI users", Wave 0, item T1. One session.
 
 Budget about 200k tokens; aim for 100k:
 - Never read a large file whole: `grep -n`, then `sed -n 'A,Bp'` windows of at most ~120 lines.
-  Big ones: `src/dataset.cpp`, `src/dataset_ops.cpp`, `src/dataset_transaction.cpp`,
-  `src/manifest_writer.cpp`, `bindings/python/nanolance/lance/dataset.py` (3.5k+ lines).
+  Big ones: `src/dataset/dataset.cpp`, `src/dataset/dataset_ops.cpp`, `src/table/dataset_transaction.cpp`,
+  `src/table/manifest_writer.cpp`, `bindings/python/nanolance/lance/dataset.py` (3.5k+ lines).
 - Cut output: `| tail -15` for pytest (add `-o addopts=`), `| tail -5` for `tools/pylance_suite.py`,
   `ninja 2>&1 | grep -E "error|warning:" | head`.
 
@@ -59,14 +59,14 @@ writer flags field 10 (tag `0x50`), each followed by the varint value. Rewrite t
 
 ## 3. Where things are in nanolance
 
-- Every manifest is decoded in one place: `load_manifest_source` in `src/manifest_reader.cpp` (about
+- Every manifest is decoded in one place: `load_manifest_source` in `src/table/manifest_reader.cpp` (about
   line 194, `pb::decode_manifest`). The paired-bit check and the reader check go there or right after,
   so the C++ library, the Python binding and lance-c all refuse.
 - Flag constants: `generated/lance_minimal.pb.hpp` (about line 173, `kFlag*`) and
   `include/nanolance/overlays.hpp` (`kFlagDataOverlays`). Add the supported mask there as one constant.
 - Writes: find the one function every commit's manifest goes through (`grep -n "write_manifest\|commit_next_version" src/*.cpp`).
   Check the writer word of the manifest the write was made from, and of the latest version when a
-  commit rebases. `src/manifest_writer.cpp` (about line 433) copies the prior manifest's flags into
+  commit rebases. `src/table/manifest_writer.cpp` (about line 433) copies the prior manifest's flags into
   the new one: that is how an unknown bit is carried forward today.
 - Python error types: see how the binding turns a C++ error into `ValueError` or `OSError`
   (`grep -n "OSError\|ValueError" bindings/python/nanolance/lance/dataset.py | head -40`). Match pylance's

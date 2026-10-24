@@ -113,7 +113,8 @@ std::vector<int64_t> take_ids(LanceDataset* ds, const std::vector<uint64_t>& row
 
 int main(int argc, char** argv) {
     const std::string uri = (argc > 1 ? std::string(argv[1]) : std::string("lance_c_stable_tmp")) + "/d.lance";
-    std::filesystem::remove_all(uri);
+    std::error_code ec;  // never throw on cleanup: on NFS, files still open cannot be removed yet
+    std::filesystem::remove_all(uri, ec);
     std::filesystem::create_directories(std::filesystem::path(uri).parent_path());
 
     ArrowSchema schema;
@@ -166,6 +167,6 @@ int main(int argc, char** argv) {
     check((taken == std::vector<int64_t>{10, 7, 10}), "take_rows by stable row id");
 
     lance_dataset_close(ds);
-    std::filesystem::remove_all(std::filesystem::path(uri).parent_path());
+    std::filesystem::remove_all(std::filesystem::path(uri).parent_path(), ec);
     return failures == 0 ? 0 : 1;
 }

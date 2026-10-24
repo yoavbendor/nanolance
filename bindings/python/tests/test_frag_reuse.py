@@ -1,7 +1,7 @@
 """Searching through the fragment-reuse index a deferred compaction writes.
 
 pylance compacts with defer_index_remap=True: the indexes keep the row addresses they were built with,
-and the __lance_frag_reuse system index maps them to the rewritten rows (src/frag_reuse.cpp). nanolance
+and the __lance_frag_reuse system index maps them to the rewritten rows (src/table/frag_reuse.cpp). nanolance
 reads such a dataset as pylance does: the index answers (its coverage moved to the new fragments, its
 addresses are translated), the same rows come back, and the system index is listed. Each test indexes
 a dataset with pylance, compacts it with pylance, and checks nanolance against pylance (rows and plan).

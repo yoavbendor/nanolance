@@ -1,6 +1,9 @@
 # Design: writes to object stores (ROADMAP Wave 3, item 8)
 
-Status: W1 done (2026-10-20, Opus); W2-W4 delegated next, W5 by Opus.
+Status: W1-W4 done (2026-10-20/21); every write works on `s3://` except `migrate_manifest_paths_v2`
+(local only, 3.2). `cleanup_old_versions` dates objects by the listing's LastModified (nanos3reader
+`ObjectInfo::last_modified_ns`); an object the store does not date is treated as just written (kept).
+Auto cleanup on commit runs on object stores too (2026-10-22, as Lance's). W5: races and the S3 checker are in CI; uploading while encoding is left (section 7).
 
 ## 1. Goal
 
@@ -33,10 +36,10 @@ endpoints from pylance's `storage_options`.
 ### 3.1 Write side: `io::ByteSink`
 
 All bytes nanolance writes go through six places (`std::ofstream` / `fopen`): the Lance file writer
-(`src/data_file_writer.cpp`, also used by every index file via `src/index_files.cpp`), deletion files
-(`src/deletion_vector.cpp`), manifests (`src/manifest_writer.cpp`), transaction files
-(`src/transaction_file.cpp`), Blob v2 sidecars (`src/blob_v2_external.cpp`), and refs JSON
-(`src/dataset_refs.cpp`). Add the write-side twin of `io::ByteSource`:
+(`src/file/data_file_writer.cpp`, also used by every index file via `src/index/index_files.cpp`), deletion files
+(`src/table/deletion_vector.cpp`), manifests (`src/table/manifest_writer.cpp`), transaction files
+(`src/table/transaction_file.cpp`), Blob v2 sidecars (`src/file/blob_v2_external.cpp`), and refs JSON
+(`src/table/dataset_refs.cpp`). Add the write-side twin of `io::ByteSource`:
 
 ```cpp
 namespace nano_lance::io {
@@ -132,7 +135,10 @@ No credentials in tests or logs beyond moto's `testing` keys.
 
 ## 7. Later, not now
 
-- Streaming multipart uploads from memory (no temp file) for the Lance file writer.
+- Streaming multipart uploads from memory (no temp file) for the Lance file writer, so parts go up while
+  the file is still being encoded. Measured 2026-10-21 on moto (`bench/s3_upload_speed.py`): 512 MiB in
+  4.6 s vs pylance's 4.3 s with 8 parts in flight (4.7 / 6.7 s before, with 4); 16 MiB in 0.19 s vs
+  0.12 s, the encode-then-upload gap this would close.
 - Parallel uploads of a commit's files (index builds write many).
 - `gs://` and `az://` native clients (today S3-compatible endpoints only).
 

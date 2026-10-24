@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -37,6 +39,9 @@ struct OptimizeIndicesOptions {
     std::vector<std::string> index_names;
     std::optional<std::uint32_t> num_indices_to_merge;
     bool retrain = false;
+    /// Per index name: fold in only these of its unindexed fragments (a compaction's reindex takes back the
+    /// fragments that replaced ones the index covered, and leaves other unindexed fragments to the scan).
+    std::map<std::string, std::set<std::uint64_t>> only_fragments;
 };
 
 struct OptimizeIndicesResult {

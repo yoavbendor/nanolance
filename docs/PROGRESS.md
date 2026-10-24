@@ -316,7 +316,7 @@ The reason was one protobuf field: stock Lance wraps every variable-width column
 `CompressiveEncoding` field 6, which is **FSST** (Fast Static Symbol Table), with the real value
 encoding nested inside it.
 
-nanolance now decompresses FSST (`src/fsst.cpp`, ~90 lines). Only the decoder: the symbol-table
+nanolance now decompresses FSST (`src/encoding/fsst.cpp`, ~90 lines). Only the decoder: the symbol-table
 *construction* is the whole algorithm, the decode is a table lookup, and nanolance has no reason to
 produce FSST when the uncompressed `Variable` pages it already writes are what stock Lance reads.
 
@@ -385,7 +385,7 @@ a string column with few distinct values. Lance writes it as a dictionary page w
 is `General{LZ4, Variable}`, and nanolance read that block raw and died on its header with "dict
 block header invalid" -- naming the symptom rather than the missing decoder.
 
-**LZ4 is now decompressed in-tree** (`src/lz4_block.cpp`, ~90 lines), with no new dependency. This is
+**LZ4 is now decompressed in-tree** (`src/encoding/lz4_block.cpp`, ~90 lines), with no new dependency. This is
 the LZ4 *block* format, not the framed one: a token byte, a run of literals, and a back-reference,
 with no entropy coder and no checksums. Vendoring a library to read that would have cost more than it
 saved -- nanolance carries zstd only because zstd genuinely needs it. Lance's wrapper around the
@@ -812,7 +812,7 @@ The **writer** mattered as much as the reader, in two ways I did not anticipate:
 Lance records deleted rows in `_deletions/{fragment}-{read_version}-{id}.{suffix}` and picks the
 shape by density: an **Arrow IPC file** of u32 offsets when sparse, a **roaring bitmap** above 5000.
 
-Both are parsed directly, in `src/deletion_vector.cpp`, rather than through a library. The Arrow
+Both are parsed directly, in `src/table/deletion_vector.cpp`, rather than through a library. The Arrow
 route would otherwise mean enabling nanoarrow's `NANOARROW_IPC_WITH_ZSTD`, which pulls a
 `find_package(zstd REQUIRED)` into a build that deliberately vendors zstd -- a portability
 regression on exactly the platforms CI had only just started covering. So the file carries a minimal
@@ -1309,7 +1309,7 @@ piece of work (an FSST encoder), not a tweak — so it is listed below rather th
 
 Asked whether nanolance should be using `nanom` (the sister parser-combinator library) for its binary
 parsing, I went looking at what the hand-rolled parsers actually are. The audit's most useful output
-was not an answer about nanom: it was noticing that `src/deletion_vector.cpp` — 547 lines of
+was not an answer about nanom: it was noticing that `src/table/deletion_vector.cpp` — 547 lines of
 untrusted-input parsing added in this same session — was **the only parser in the tree without a
 libFuzzer target**. `fuzz_decode`, `fuzz_page_layout`, `fuzz_fsst` and `fuzz_lz4` cover everything
 else, and none of them reach a deletion file: `fuzz_decode` stops at the data file and never opens
@@ -1930,7 +1930,7 @@ page size: nanolance writes ~10 rows per page for a 768-dim float32 vector (road
 `list` and `large_list` columns written by pylance now read — the largest type gap this project had.
 Design first ([NESTED_COLUMNS.md](NESTED_COLUMNS.md)), then three pieces:
 
-- **The unraveler** (`src/repdef.cpp`), a port of Lance's `RepDefUnraveler`: repetition and
+- **The unraveler** (`src/encoding/repdef.cpp`), a port of Lance's `RepDefUnraveler`: repetition and
   definition levels in, per-layer offsets and validity out. Pure computation, tested case by case
   against the vectors in Lance's own `repdef.rs`, and fuzzed on its own with Arrow's list invariants
   asserted on every accepted input (6.8M inputs, clean).
@@ -2120,7 +2120,7 @@ pages (pylance's and nanolance's), ran 662,109 executions clean; CI seeds it wit
 pylance compresses high-cardinality strings -- ids, URLs, free text -- with FSST, and nanolance only
 read FSST, so on exactly that shape its files were 1.5-4x larger. nanolance now writes FSST too.
 
-- **The encoder** (`fsst::train`, `fsst::compress_value` in `src/fsst.cpp`) builds the symbol table
+- **The encoder** (`fsst::train`, `fsst::compress_value` in `src/encoding/fsst.cpp`) builds the symbol table
   the way Lance does (`build_symbol_table` in `rust/compression/fsst`): six rounds over a ~16 KiB
   sample, counting symbols and adjacent pairs, keeping the 255 with the highest count x length
   (single bytes x8), and returning the table from the round that compressed the sample best. Three
@@ -2446,7 +2446,7 @@ Truncated or malformed messages are still rejected.
 
 ### Page descriptors through nanom
 
-`src/page_layout.cpp` no longer parses protobuf by hand. A page's `/lance.encodings21.PageLayout`
+`src/encoding/page_layout.cpp` no longer parses protobuf by hand. A page's `/lance.encodings21.PageLayout`
 descriptor is decoded with nanom's model (`nanom/formats/lance_encodings.hpp`). The model's
 encoding children are `pb_lazy`, so the descriptor tree is decoded node by node without
 allocating. The result is converted to the same `Compressive` / `MiniBlock` / `Constant` /
@@ -2469,7 +2469,7 @@ matters most, took 120-127 ms against 122-129 ms (best of 15, four alternating r
 
 ### Format 2.0 encodings through nanom
 
-`src/lance_v20_decoder.cpp` reads a 2.0 page's `/lance.encodings.ArrayEncoding` tree, and a
+`src/encoding/lance_v20_decoder.cpp` reads a 2.0 page's `/lance.encodings.ArrayEncoding` tree, and a
 column's `ColumnEncoding` (the blob marker), with nanom's model. The `Enc` tree the decoder
 dispatches on is unchanged.
 
@@ -2490,8 +2490,8 @@ case (a 4,000-fragment 2.0 dataset of 12,000 small pages) reads in 116.6-119.0 m
 
 ### Page descriptors written through nanom
 
-`src/data_file_writer.cpp` no longer assembles page descriptors from byte strings and hand-placed
-keys and lengths. A small internal helper, `src/lance_descriptors.hpp`, builds each
+`src/file/data_file_writer.cpp` no longer assembles page descriptors from byte strings and hand-placed
+keys and lengths. A small internal helper, `src/encoding/lance_descriptors.hpp`, builds each
 CompressiveEncoding (Flat, Variable, OutOfLineBitpacking, InlineBitpacking, Fsst, Rle,
 ByteStreamSplit, General, FixedSizeList) and each layout (MiniBlock, Constant, FullZip) on nanom's
 model, and nanom computes every length prefix and varint. The column encoding is built the same
@@ -2518,7 +2518,7 @@ difference. 56/56 ctest and the Python suite (1,808 tests, pylance interop inclu
 
 nanolance had its own copies of two kernels nanom already ships, and parquet2nanoarrow already uses
 them. Both copies are gone:
-- `src/lz4_block.cpp` keeps only Lance's envelope: the `[u32 size]` prefix, the decoded-size limit
+- `src/encoding/lz4_block.cpp` keeps only Lance's envelope: the `[u32 size]` prefix, the decoded-size limit
   and the 255x bound checked before allocating. The block is decoded by nanom's
   `codec::lz4_block_decompress`.
 - `include/nanolance/byte_stream_split.hpp` is deleted. The writer and the reader call nanom's
@@ -2559,7 +2559,7 @@ source. Reading them is at parity: 13.6-14.4 ms best of 15, old and new interlea
 
 The FSST codec moved into nanom: `nanom/fsst.hpp` reads the table and decodes,
 `nanom/fsst_encode.hpp` trains, compresses and serializes. `include/nanolance/fsst.hpp` and
-`src/fsst.cpp` are now an adapter that keeps nanolance's calling convention (byte vectors, error
+`src/encoding/fsst.cpp` are now an adapter that keeps nanolance's calling convention (byte vectors, error
 strings with the size, symbol or code in them) over nanom's span API, so every caller, test and fuzzer
 is unchanged.
 
@@ -2615,7 +2615,7 @@ and new interleaved on one core), 1.35x. It reads back equal to the source.
 ### Every core, and real training data
 
 Asked: use more cores without a large library and without slowing one core; prove it on a widely
-used dataset. Done with a ~200-line `std::thread` pool (`src/parallel.cpp`) and no dependency:
+used dataset. Done with a ~200-line `std::thread` pool (`src/base/parallel.cpp`) and no dependency:
 
 - **Reads** cut a fragment into row ranges decoded side by side, one Arrow batch each (no
   concatenation). Cuts need pages that give up a row range: list pages via their repetition index,
@@ -2645,7 +2645,7 @@ Asked: build and use Lance's indexes, so that the same index serves pylance and 
 results, at about pylance's speed, starting with the scalar indexes (the plan: BTree, Bitmap and
 LabelList; then IVF_PQ / IVF_FLAT; then LanceDB's full-text defaults).
 
-- **Building** (`src/scalar_index.cpp`): the column is scanned with row addresses (deleted rows left
+- **Building** (`src/index/scalar/scalar_index.cpp`): the column is scanned with row addresses (deleted rows left
   out), its values -- a label list's elements -- ordered nulls first, then ascending (IEEE total order
   for floats), ties by row address, and written as Lance writes them: BTree's `page_data.lance` and
   `page_lookup.lance` (4096-row pages, min / max / null count, `batch_size` metadata), Bitmap's and
@@ -2654,7 +2654,7 @@ LabelList; then IVF_PQ / IVF_FLAT; then LanceDB's full-text defaults).
   key prefixes taken past the column's common prefix; a bitmap groups by hash and sorts only the
   distinct values. Standalone Lance files with schema metadata and extra global buffers came first
   (`write_lance_file`), and the reader learned files with more than one global buffer.
-- **Using** (`src/index_search.cpp`): a filter's AND / OR / NOT structure over single-column
+- **Using** (`src/dataset/index_search.cpp`): a filter's AND / OR / NOT structure over single-column
   predicates (`expr::Condition`, `expr::Predicate`), each evaluated with the filter engine's own
   semantics on an index's keys or a BTree page's bounds, gives per covered fragment the rows that may
   pass; the reader decodes only those (`read_candidate_rows`) and applies the whole filter to them.
@@ -2687,12 +2687,12 @@ index serves pylance and nanolance with the same results, at about pylance's spe
   probe count (a k-dependent margin, floor and cap for IVF_FLAT under L2 / cosine; a factor of the
   nearest centroid's distance otherwise), its 4-bit PQ's u8-quantized distance tables, and ties
   broken by row id.
-- **Searching** (`src/vector_search.cpp`): `nearest=` on pylance-built or nanolance-built indexes
+- **Searching** (`src/index/vector/vector_search.cpp`): `nearest=` on pylance-built or nanolance-built indexes
   returns pylance's rows, order and distances (IVF_FLAT and 8-bit IVF_PQ; 4-bit up to the order of
   equal quantized distances), with refine, prefilter / post-filter, deletions, unindexed fragments
   searched exactly, `fast_search`, `distance_range`, metric overrides and exact search without an
   index. Partitions are scored on the thread pool; PQ tables sweep a transposed codebook.
-- **Building** (`src/vector_index_build.cpp`): Lance's k-means and defaults, PQ by L2 on residuals
+- **Building** (`src/index/vector/vector_index_build.cpp`): Lance's k-means and defaults, PQ by L2 on residuals
   (as Lance's v3 builder trains it -- training or encoding dot indexes by dot instead cost them most
   of their recall), files and manifest entry as Lance writes them. pylance lists, searches and
   `optimize_indices` them.
@@ -2725,21 +2725,21 @@ about pylance's speed.
   - Unindexed fragments use the index's statistics plus their live (and prefiltered) rows'.
   - A string query is the best of the indexed columns.
   - A column without an index is Lance's flat search, with the bare simple tokenizer.
-- **The analyzer** (`src/fts_tokenizer.cpp`) produces Lance's tokens byte for byte:
+- **The analyzer** (`src/index/fts/fts_tokenizer.cpp`) produces Lance's tokens byte for byte:
   - The Unicode alphanumeric, lower-case and folding tables and the stop words are generated from
     the Rust crates by a small Rust tool (`tools/fts_tables`).
   - The Snowball English stemmer is machine-translated from frostem's Rust (`tools/fts_stem_translate.py`).
   - It was checked on 177k words and 98k lines; 3,000 lines are kept as goldens.
-- **The FST** (`src/fts_fst.cpp`) ports the `fst` crate's reader and builder: node encodings,
+- **The FST** (`src/index/fts/fts_fst.cpp`) ports the `fst` crate's reader and builder: node encodings,
   suffix sharing through the same registry, and the CRC32C trailer. Built maps equal the crate's
   byte for byte (goldens from the crate). The reader survives 3,000 corrupted maps under ASan.
-- **Searching** (`src/fts_search.cpp`): Match (OR / AND, boost), MultiMatch, Boost and Boolean
+- **Searching** (`src/index/fts/fts_search.cpp`): Match (OR / AND, boost), MultiMatch, Boost and Boolean
   queries, with filters before or after, deletions, unindexed fragments, `fast_search` and several
   partitions or segments. Scores accumulate in dense per-document arrays. With a limit, each
   match keeps only its best rows. A one-word search walks runs of 128 postings by their exact best
   weight and stops when no run can beat the rows kept: a top-10 for a word in 90% of 500k
   documents went from 16.9 ms to 0.3 ms.
-- **Building** (`src/fts_index_build.cpp`): parallel tokenizing, token ids by first appearance, and
+- **Building** (`src/index/fts/fts_index_build.cpp`): parallel tokenizing, token ids by first appearance, and
   Lance's block scores and impacts. For the same data, the files equal pylance's and LanceDB
   0.39's, byte for byte, except the partition number and document order when Lance's workers take
   fragments out of order. pylance and LanceDB search such an index with the same scores, and
@@ -2776,7 +2776,7 @@ Asked: the next index phase from the roadmap (indexes kept up to date after appe
 and the planned lance-c work (wire vector and full-text search into the C API; UPDATE_IF and
 include_deleted_rows).
 
-- **optimize_indices** (`src/index_optimize.cpp`, `include/nanolance/index_optimize.hpp`), as Lance's
+- **optimize_indices** (`src/dataset/index_optimize.cpp`, `include/nanolance/index_optimize.hpp`), as Lance's
   `lance/src/index/append.rs` does it:
   - segment selection by `num_indices_to_merge` (default 1; 0 adds a delta segment) and `retrain`;
   - one new segment per index, over the replaced segments' live fragments and every uncovered one,
@@ -2787,10 +2787,10 @@ include_deleted_rows).
     seeded k-means, keeping only centroids that win rows; join those under a quarter of it into the
     nearest of their 64 nearest survivors with room; also with nothing new to fold in.
   - The builders were split into "write a segment over these fragments" and a commit
-    (`src/index_build.hpp`), so creating and optimizing share one path.
+    (`src/index/segment.hpp`, with each kind's inputs in its own header), so creating and optimizing share one path.
 - **Compaction** folds its rewritten fragments back into the indexes that covered them (a second
   version; `CompactionOptions::reindex`, Python `compact_files(reindex=False)`).
-- **lance-c** (`src/lance_c.cpp`): vector index creation and `nearest` with every setter; INVERTED
+- **lance-c** (`src/api/lance_c.cpp`): vector index creation and `nearest` with every setter; INVERTED
   in `create_scalar_index` (`params_json`); `full_text_search` and prepared Match contexts with
   STRICT / INDEX_ONLY coverage; `include_deleted_rows` (deleted rows with a NULL `_rowid`);
   `use_scalar_index`; merge insert `UPDATE_IF`, also in the core and in Python
@@ -2813,13 +2813,13 @@ include_deleted_rows).
 
 Asked: IVF_HNSW_SQ, the next index gap on the roadmap -- its format, search and build.
 
-- **Search** (`src/vector_search.cpp`): Lance's HNSW graphs (`index.idx`) and 8-bit SQ codes
+- **Search** (`src/index/vector/vector_search.cpp`): Lance's HNSW graphs (`index.idx`) and 8-bit SQ codes
   (`auxiliary.idx`), searched with Lance's greedy descent, level-0 beam (`ef`), prefilter rules
   (plain / exact under 10% passing / filtered beam) and `distance_range`, ties ranked as Rust's
   `BinaryHeap` ranks them; partitions past the first probes searched `query_parallelism` at a time as
   Lance does. Also 0-bit bit-packed definition levels (no level buffer), which pylance writes for the
   neighbour lists.
-- **Build** (`src/hnsw_build.cpp`, `src/vector_index_build.cpp`): `create_index(..., "IVF_HNSW_SQ",
+- **Build** (`src/index/vector/hnsw_build.cpp`, `src/index/vector/vector_index_build.cpp`): `create_index(..., "IVF_HNSW_SQ",
   m=, ef_construction=, max_level=)`; SQ bounds from a sample; each partition's graph after
   lance-index's `HnswBuilder` -- Lance's fixed-seed node levels and entry points exactly (rand 0.9
   `SmallRng`, seed 42), beam insertion, Algorithm 4 neighbour selection, reciprocal pruning, repair of
@@ -2840,14 +2840,14 @@ Asked: IVF_HNSW_SQ, the next index gap on the roadmap -- its format, search and 
 
 Asked: continue lance-c compatibility, function before speed, without degrading function or speed.
 
-- **Index segments** (`src/lance_c.cpp`, `src/index_segments.cpp`, `include/nanolance/index_segments.hpp`),
+- **Index segments** (`src/api/lance_c.cpp`, `src/dataset/index_segments.cpp`, `include/nanolance/index_segments.hpp`),
   the last 20 functions that only returned `LANCE_ERR_NOT_SUPPORTED`:
   - builders over chosen fragments with an assigned UUID, for BTREE / BITMAP / LABEL_LIST /
     INVERTED and IVF_FLAT / IVF_PQ / IVF_HNSW_SQ, with progress callbacks, Lance's default names
     and its name and UUID rules;
   - IVF and PQ model training exported as Arrow with lance-c's provenance metadata, and models
     injected into builds (AUTO / LOCAL_TRAIN / PRECOMPUTED); the core's builders gained a fixed
-    UUID, progress stages, a train-only mode and partial models (`src/index_build.hpp`);
+    UUID, progress stages, a train-only mode and partial models (`src/index/segment.hpp`);
   - segment metadata parsing and accessors; commit as Lance's `commit_existing_index_segments`
     (validation, stale-coverage pruning, coverage-driven replacement, vector compatibility);
     listing;
@@ -2870,14 +2870,14 @@ Asked: continue lance-c compatibility, function before speed, without degrading 
 Asked: continue toward feature completeness and performance parity; new features function first,
 without degrading current function or speed.
 
-- **Read** (`src/fts_search.cpp`): Lance 12's positions (`shared_stream_v2`, `packed_delta_v1` and
+- **Read** (`src/index/fts/fts_search.cpp`): Lance 12's positions (`shared_stream_v2`, `packed_delta_v1` and
   `varint_doc_delta_v2`), decoded per token on first use and cached. Other layouts are refused for
   phrases only.
 - **Search**: `PhraseQuery` with slop, and a string in double quotes, as Lance does them (exact and
   slop checks from `wand.rs`, the flat check for unindexed rows from `flat_search.rs`, query
   positions counted from the first term kept); pylance's errors for a missing column or an index
   without positions. lance-c's `lance_dataset_prepare_fts_phrase_query` works.
-- **Build** (`src/fts_index_build.cpp`): `with_position=True` writes positions as Lance 12 does,
+- **Build** (`src/index/fts/fts_index_build.cpp`): `with_position=True` writes positions as Lance 12 does,
   with the same contents as pylance's build; pylance's phrase queries and `optimize_indices` use it.
 - **Verified**: 1,050 random phrases (pylance-built and nanolance-built indexes, unindexed and
   deleted rows, limits) give pylance's rows and scores; `test_fts_phrase.py`; the lance-c phrase
@@ -2892,10 +2892,10 @@ without degrading current function or speed.
 Asked: work through the Tier 1 list of `docs/ROADMAP.md` (what pylance users hit most), function
 first, without degrading function or speed.
 
-- **Append some of the columns** (`src/writer.cpp` `writer_project_append`): the new files hold the
+- **Append some of the columns** (`src/dataset/write_session.cpp` `writer_project_append`): the new files hold the
   given columns alone, with the dataset's field ids, as pylance writes them; leaving out a
   non-nullable column, or giving one the dataset lacks, is pylance's error, word for word.
-- **Reading columns a fragment lacks** (`src/lance_table_reader.cpp`): a struct or list column
+- **Reading columns a fragment lacks** (`src/scan/lance_table_reader.cpp`): a struct or list column
   whose fragment has no data reads as a null value, as in Lance (it read as a struct of nulls,
   and a missing list column could not be read at all).
 - **`merge_insert` with part of the columns**: matched rows keep their values in the other
@@ -2912,8 +2912,8 @@ first, without degrading function or speed.
 
 ## Concurrent writers
 
-- **Retries, as Lance's** (`src/dataset.cpp`, `src/manifest_writer.cpp`, `src/dataset_ops.cpp`,
-  `src/index_optimize.cpp`): a commit that loses its version is no longer refused when it still
+- **Retries, as Lance's** (`src/dataset/dataset.cpp`, `src/table/manifest_writer.cpp`, `src/dataset/dataset_ops.cpp`,
+  `src/dataset/index_optimize.cpp`): a commit that loses its version is no longer refused when it still
   applies -- an append or overwrite is built again on the newer version; a change made from an
   older version is rebased when the other writers only added fragments (its own new fragments
   renumbered after theirs, with the index coverage that names them); a delete, update,
@@ -2956,7 +2956,7 @@ first, without degrading function or speed.
 
 ## Version housekeeping
 
-- **Tags** (`src/dataset_refs.cpp`): `_refs/tags/<name>.json` in Lance's format (camelCase,
+- **Tags** (`src/table/dataset_refs.cpp`): `_refs/tags/<name>.json` in Lance's format (camelCase,
   RFC 3339 times, manifest size, metadata), Lance's name rules and messages; created without
   replacing (hard link, as `put_if_absent`). pylance reads nanolance's tags and the reverse;
   `checkout_version("tag")`, `lance.dataset(uri, "tag")`.
@@ -2997,7 +2997,7 @@ first, without degrading function or speed.
 - **The bug**: pylance, committing from a read version older than a version nanolance committed,
   failed with Lance's internal error "Dataset version N does not have a transaction file" -- any
   pylance writer sharing a dataset with a nanolance writer could hit it.
-- **The fix** (`src/transaction_file.cpp`): every commit (`publish_manifest`) writes
+- **The fix** (`src/table/transaction_file.cpp`): every commit (`publish_manifest`) writes
   `_transactions/{read_version}-{uuid}.txn`, a lance.table.Transaction, before the manifest that
   names it (field 12), and removes it when the commit does not land. The operation is read off the
   change from the version before (fragments added / deletion files changed / fragments replaced,
@@ -3041,7 +3041,7 @@ first, without degrading function or speed.
 - **The gap**: JSON columns did not interoperate at all. pylance stores `pa.json_()` as JSONB
   (Databend's binary JSON, the `jsonb` crate) under logical type "json"; nanolance refused those
   datasets and wrote its own as text, which pylance refused.
-- **JSONB** (`src/jsonb.cpp`): the crate's lenient parser (single quotes, unquoted keys, NaN /
+- **JSONB** (`src/arrow/jsonb.cpp`): the crate's lenient parser (single quotes, unquoted keys, NaN /
   Infinity, hex, `+1`, `.5`, `123.` as an integer; duplicate keys and trailing commas refused),
   its encoder (sorted keys, u64 / i64 / f64 number types, smallest integer width), its printer
   (compact; floats positional for exponents -5..15 with ".0" when integral, else `1e+20`; NaN and
@@ -3230,7 +3230,7 @@ publishes them.
 
 ## Stable row ids
 
-- **Format** (`include/nanolance/row_ids.hpp`, `src/row_ids.cpp`): Lance's `RowIdSequence` (Range,
+- **Format** (`include/nanolance/row_ids.hpp`, `src/table/row_ids.cpp`): Lance's `RowIdSequence` (Range,
   RangeWithHoles, RangeWithBitmap, SortedArray, Array segments; EncodedU64Array as U16 / U32 / U64;
   encoded as Lance picks, byte-identical to pylance's), `RowDatasetVersionSequence` run-length
   encoding, the fragment fields (5 / 7 / 9 inline; external 6 / 8 / 10 refused), `next_row_id`, the
@@ -3258,7 +3258,7 @@ publishes them.
 - **What**: `PackedBlobWriter`, `DedicatedBlobWriter` and `BlobDescriptorArrayBuilder` as pylance 12
   has them (`LanceFileSession.open_packed_blob_writer` / `open_dedicated_blob_writer`,
   `nanolance.lance.BlobDescriptorArrayBuilder`). The C++ data file writer takes descriptor-shaped
-  blob columns (`src/blob_v2_external.cpp`), so a `LanceFileSession.open_writer` file can hold them
+  blob columns (`src/file/blob_v2_external.cpp`), so a `LanceFileSession.open_writer` file can hold them
   and a `DataReplacement` commits them. `DataFile.create` reads only the footer's top-level names.
 - **Found on the way**: `DataReplacement` keeps the replaced fragment's row count, in pylance too, so
   a replacement with more or fewer rows than the fragment reads back wrong. A test precondition, not
@@ -3295,7 +3295,7 @@ own tests (`tests/test_multi_base.py`, `test_blob.py`, through `tools/pylance_su
 - **What**: Lance's DataOverlay (`DataFragment.overlays`, field 11; operation field 115; feature flag 64,
   which pylance 12 honours only with `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES`). Commit stamps each
   overlay's `committed_version`; scans, filters and takes merge an overlay's values in place of the
-  data file's before deletions are applied (`merge_column_rows` in `src/column_slice.cpp`, the hook in
+  data file's before deletions are applied (`merge_column_rows` in `src/encoding/column_slice.cpp`, the hook in
   `read_data_file_batches` / `decode_data_file_rows`); newest overlay wins, values by rank. Flat columns;
   nested, blob and dictionary columns are refused by name. An index older than an overlay on its field
   does not answer for that fragment (`fragments_stale_for_index`, used by scalar, vector and full-text

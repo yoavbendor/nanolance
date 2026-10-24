@@ -86,6 +86,17 @@ jobs:
           pytest -o addopts= -q -rs tests/test_object_store.py tests/test_object_store_writes.py tests/test_object_store_commits.py | tee /tmp/object-store-tests.log
           if grep -q skipped /tmp/object-store-tests.log; then echo "object-store tests must not skip here"; exit 1; fi
 
+      # The checker users run against a real bucket (tools/s3_real_check.py), here on moto with the fault
+      # and large-upload checks: every check must pass (it found the 0-byte upload of objects over 8 MiB).
+      - name: Run the S3 checker against moto
+        env:
+          AWS_ACCESS_KEY_ID: testing
+          AWS_SECRET_ACCESS_KEY: testing
+          AWS_REGION: us-east-1
+        run: |
+          python3 tools/s3_real_check.py s3://nl-test/s3-check --endpoint http://127.0.0.1:5055 --allow-http \
+            --faults --large --report /tmp/s3-check.json
+
       - name: Upload the S3 server log
         if: failure()
         uses: actions/upload-artifact@v4

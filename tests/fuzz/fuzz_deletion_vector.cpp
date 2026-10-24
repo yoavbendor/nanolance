@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 //
-// libFuzzer harness over the deletion-file parsers (src/deletion_vector.cpp): a hand-written Arrow
+// libFuzzer harness over the deletion-file parsers (src/table/deletion_vector.cpp): a hand-written Arrow
 // IPC file reader (magic, continuation markers, a flatbuffer vtable walk, a zstd-compressed body)
 // and a roaring bitmap reader (two cookies, an optional run-flag header, an optional offset header,
 // and three container shapes).
