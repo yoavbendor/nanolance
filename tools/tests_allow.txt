@@ -6,3 +6,8 @@ fts_index_build  no header of its own (declared in fts_search.hpp and the segmen
 vector_index_build  no header of its own (declared in vector_search.hpp and vector_segment.hpp); tested by nano_lance_vector_search and nano_lance_vector_segment
 s3_byte_source  needs nanos3reader and an S3 endpoint (NANOLANCE_ENABLE_S3); tested against moto by bindings/python/tests/test_object_store.py
 s3_byte_sink  needs nanos3reader and an S3 endpoint (NANOLANCE_ENABLE_S3); tested against moto by bindings/python/tests/test_object_store_commits.py
+dataset_scan  defines lance_dataset_scan and LanceTableStream::open_request, declared in lance_table_reader.hpp; tested by nano_lance_lance_table_reader, nano_lance_index_segments and nano_lance_index_optimize
+lance_c  implements compat/lance-c/include/lance/lance.h; tested by nano_lance_lance_c_dataset, nano_lance_lance_c_search, nano_lance_lance_c_stable_row_ids and tools/lance_c_suite.py
+nano_lance_external_blob  implements calls declared in nano_lance_reader.h; tested by nano_lance_external_blob
+nano_lance_table_reader_c  implements the nano_lance_table_* calls of nano_lance_reader.h; tested by nano_lance_table_stream and the Python module
+writer_cxx  implements writer.hpp; tested by nano_lance_writer_api

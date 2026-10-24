@@ -173,6 +173,20 @@ status, where it is implemented, and the tests that prove it, marked *unit* (nan
 test exists and that every module has a test of its own.
 
 <!-- spec-summary:start -->
+| layer | done | partial | missing | n/a | modules with a test in their layer |
+|---|---|---|---|---|---|
+| [base](src/base/README.md#spec-coverage) | 14 | 0 | 0 | 1 | 16/16 |
+| [io](src/io/README.md#spec-coverage) | 7 | 2 | 2 | 0 | 5/7 |
+| [arrow](src/arrow/README.md#spec-coverage) | 16 | 4 | 1 | 1 | 7/7 |
+| [encoding](src/encoding/README.md#spec-coverage) | 22 | 4 | 7 | 1 | 19/19 |
+| [file](src/file/README.md#spec-coverage) | 13 | 3 | 4 | 1 | 4/4 |
+| [table](src/table/README.md#spec-coverage) | 36 | 16 | 14 | 1 | 17/17 |
+| [expr](src/expr/README.md#spec-coverage) | 17 | 1 | 3 | 0 | 1/1 |
+| [scan](src/scan/README.md#spec-coverage) | 19 | 2 | 1 | 1 | 1/1 |
+| [index](src/index/README.md#spec-coverage) | 31 | 14 | 9 | 0 | 18/20 |
+| [dataset](src/dataset/README.md#spec-coverage) | 22 | 4 | 0 | 0 | 6/7 |
+| [api](src/api/README.md#spec-coverage) | 13 | 2 | 1 | 0 | 5/9 |
+| **all** | **210** | **52** | **42** | **6** | |
 <!-- spec-summary:end -->
 
 What the tables mark missing is the roadmap's raw material ([docs/ROADMAP.md](docs/ROADMAP.md)).

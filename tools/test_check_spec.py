@@ -130,3 +130,17 @@ def test_a_wrong_table_header_fails(tmp_path):
     (root / "src" / "low" / "README.md").write_text("## Spec coverage\n\n| ID | Status |\n|---|---|\n")
     code, out = run(root)
     assert code == 1 and "table header is" in out
+
+
+def test_the_readme_summary_must_be_current(tmp_path):
+    root = tree(tmp_path, GOOD_LOW, GOOD_HIGH)
+    (root / "README.md").write_text("# x\n\n<!-- spec-summary:start -->\n<!-- spec-summary:end -->\n\nafter\n")
+    code, out = run(root)
+    assert code == 1 and "spec summary is stale" in out
+    p = subprocess.run([sys.executable, str(root / "tools" / "check_spec.py"), "--write-summary"],
+                       capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout
+    text = (root / "README.md").read_text()
+    assert "| [low](src/low/README.md#spec-coverage) | 1 | 0 | 1 | 0 | 1/1 |" in text and text.endswith("after\n")
+    code, out = run(root)
+    assert code == 0, out

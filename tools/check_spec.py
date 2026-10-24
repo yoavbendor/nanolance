@@ -20,6 +20,9 @@ A done or partial row names an implementation and at least one test. Separately,
 files in tools/layout.py) must have a C++ test under tests/<layer>/ that includes it, unless it is listed in
 tools/tests_allow.txt as `<module>  <reason>` (a list that may only shrink). Prints the table of each layer's
 coverage counts, and exits 1 with every problem listed.
+
+The top-level README.md carries the same counts between `<!-- spec-summary:start -->` and
+`<!-- spec-summary:end -->`; the check fails when they are stale, and `--write-summary` rewrites them.
 """
 from __future__ import annotations
 
@@ -198,16 +201,53 @@ def check_module_tests(problems: list[str]) -> dict[str, tuple[int, int]]:
     return out
 
 
+SUMMARY_START = "<!-- spec-summary:start -->"
+SUMMARY_END = "<!-- spec-summary:end -->"
+
+
+def summary_markdown(rows: list[tuple[str, dict[str, int], tuple[int, int]]]) -> str:
+    """The README's table of each layer's counts, linking the layer READMEs."""
+    out = ["| layer | done | partial | missing | n/a | modules with a test in their layer |", "|---|---|---|---|---|---|"]
+    total = {s: 0 for s in STATUSES}
+    for layer, c, (t, n) in rows:
+        out.append(f"| [{layer}](src/{layer}/README.md#spec-coverage) | {c['done']} | {c['partial']} | {c['missing']} "
+                   f"| {c['n/a']} | {t}/{n} |")
+        for s in STATUSES:
+            total[s] += c[s]
+    out.append(f"| **all** | **{total['done']}** | **{total['partial']}** | **{total['missing']}** | **{total['n/a']}** | |")
+    return "\n".join(out)
+
+
+def check_summary(table: str, write: bool, problems: list[str]) -> None:
+    path = os.path.join(ROOT, "README.md")
+    if not os.path.isfile(path):
+        return
+    text = open(path, encoding="utf-8").read()
+    start, end = text.find(SUMMARY_START), text.find(SUMMARY_END)
+    if start < 0 or end < start:
+        return
+    want = text[:start] + SUMMARY_START + "\n" + table + "\n" + text[end:]
+    if want == text:
+        return
+    if write:
+        open(path, "w", encoding="utf-8").write(want)
+    else:
+        problems.append("README.md: the spec summary is stale; run python3 tools/check_spec.py --write-summary")
+
+
 def main() -> int:
     problems: list[str] = []
     ctests = registered_ctests()
     seen: dict[str, str] = {}
     print(f"{'layer':10s} {'done':>5s} {'partial':>8s} {'missing':>8s} {'n/a':>5s}   modules tested")
     module_counts = check_module_tests(problems)
+    rows = []
     for layer, _, _ in layout.LAYERS:
         c = check_readme(layer, ctests, seen, problems)
         t, n = module_counts[layer]
+        rows.append((layer, c, (t, n)))
         print(f"{layer:10s} {c['done']:5d} {c['partial']:8d} {c['missing']:8d} {c['n/a']:5d}   {t}/{n}")
+    check_summary(summary_markdown(rows), "--write-summary" in sys.argv[1:], problems)
     if problems:
         print(f"\n{len(problems)} problem(s):")
         for p in problems:
