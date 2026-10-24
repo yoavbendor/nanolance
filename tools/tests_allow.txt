@@ -1,0 +1,8 @@
+# Modules with no C++ test under tests/<layer>/ that includes them, and why (tools/check_spec.py).
+# This list only shrinks: when a module gets a test, remove its line.
+#
+# <module>  <reason>
+fts_index_build  no header of its own (declared in fts_search.hpp and the segment headers); tested by nano_lance_fts_search and nano_lance_inverted_segment
+vector_index_build  no header of its own (declared in vector_search.hpp and vector_segment.hpp); tested by nano_lance_vector_search and nano_lance_vector_segment
+s3_byte_source  needs nanos3reader and an S3 endpoint (NANOLANCE_ENABLE_S3); tested against moto by bindings/python/tests/test_object_store.py
+s3_byte_sink  needs nanos3reader and an S3 endpoint (NANOLANCE_ENABLE_S3); tested against moto by bindings/python/tests/test_object_store_commits.py
