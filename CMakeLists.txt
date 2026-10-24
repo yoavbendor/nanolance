@@ -333,6 +333,7 @@ add_library(nanolance STATIC
     src/index/scalar/bloom_filter.cpp
     src/index/index_search.cpp
     src/index/index_files.cpp
+    src/base/unicode.cpp
     src/base/uuid.cpp
     src/arrow/arrow_owned.cpp
     src/table/index_location.cpp
@@ -888,6 +889,11 @@ target_compile_features(nano_lance_encoding_dictionary_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_encoding_dictionary_test PRIVATE nanolance)
 target_include_directories(nano_lance_encoding_dictionary_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
 
+add_executable(nano_lance_unicode_test tests/test_unicode.cpp)
+target_compile_features(nano_lance_unicode_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_unicode_test PRIVATE nanolance)
+target_include_directories(nano_lance_unicode_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+
 add_executable(nano_lance_encoding_miniblock_test tests/encoding/test_miniblock.cpp)
 target_compile_features(nano_lance_encoding_miniblock_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_encoding_miniblock_test PRIVATE nanolance)
@@ -1216,6 +1222,8 @@ add_test(NAME nano_lance_encoding_rle COMMAND $<TARGET_FILE:nano_lance_encoding_
 set_tests_properties(nano_lance_encoding_rle PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_encoding_dictionary COMMAND $<TARGET_FILE:nano_lance_encoding_dictionary_test>)
 set_tests_properties(nano_lance_encoding_dictionary PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_unicode COMMAND $<TARGET_FILE:nano_lance_unicode_test>)
+set_tests_properties(nano_lance_unicode PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_encoding_miniblock COMMAND $<TARGET_FILE:nano_lance_encoding_miniblock_test>)
 set_tests_properties(nano_lance_encoding_miniblock PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_encoding_full_zip COMMAND $<TARGET_FILE:nano_lance_encoding_full_zip_test>)

@@ -25,7 +25,7 @@ LAYERS = [
 FILES = {
     "base": ["buffer_pool.cpp", "parallel.cpp", "version.cpp", "roaring_bitmap.cpp", "float16.hpp",
              "float_text.hpp", "int128.hpp", "proto_wire.hpp", "fts_json.hpp", "shared_cache.hpp", "uuid.hpp",
-             "uuid.cpp", "bytes.hpp"],
+             "uuid.cpp", "bytes.hpp", "unicode.hpp", "unicode.cpp", "unicode_tables.inc"],
     "io": ["byte_source.cpp", "byte_sink.cpp", "external_blob.cpp", "external_blob.hpp", "s3_byte_source.cpp", "s3_byte_source.hpp", "s3_byte_sink.cpp",
            "s3_byte_sink.hpp"],
     "arrow": ["schema_mapper.cpp", "array_accessor.cpp", "arrow_slice.cpp", "blob_builder.cpp", "jsonb.cpp",
