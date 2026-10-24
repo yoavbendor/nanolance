@@ -980,6 +980,40 @@ add_executable(nano_lance_jsonb_test tests/test_jsonb.cpp)
 target_compile_features(nano_lance_jsonb_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_jsonb_test PRIVATE nanolance)
 
+add_executable(nano_lance_bloom_filter_test tests/test_bloom_filter.cpp)
+target_compile_features(nano_lance_bloom_filter_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_bloom_filter_test PRIVATE nanolance)
+add_test(NAME bloom_filter COMMAND $<TARGET_FILE:nano_lance_bloom_filter_test>)
+set_tests_properties(bloom_filter PROPERTIES LABELS "smoke")
+
+add_executable(nano_lance_index_segment_test tests/test_index_segment.cpp)
+target_compile_features(nano_lance_index_segment_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_index_segment_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_index_segment_test PRIVATE nanolance)
+add_test(NAME index_segment COMMAND $<TARGET_FILE:nano_lance_index_segment_test>)
+set_tests_properties(index_segment PROPERTIES LABELS "smoke")
+
+add_executable(nano_lance_index_files_test tests/test_index_files.cpp)
+target_compile_features(nano_lance_index_files_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_index_files_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_index_files_test PRIVATE nanolance)
+add_test(NAME index_files COMMAND $<TARGET_FILE:nano_lance_index_files_test>)
+set_tests_properties(index_files PROPERTIES LABELS "smoke")
+
+add_executable(nano_lance_index_candidates_test tests/test_index_candidates.cpp)
+target_compile_features(nano_lance_index_candidates_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_index_candidates_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_index_candidates_test PRIVATE nanolance)
+add_test(NAME index_candidates COMMAND $<TARGET_FILE:nano_lance_index_candidates_test>)
+set_tests_properties(index_candidates PROPERTIES LABELS "smoke")
+
+add_executable(nano_lance_lance_file_writer_test tests/test_lance_file_writer.cpp)
+target_compile_features(nano_lance_lance_file_writer_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_lance_file_writer_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_lance_file_writer_test PRIVATE nanolance)
+add_test(NAME lance_file_writer COMMAND $<TARGET_FILE:nano_lance_lance_file_writer_test>)
+set_tests_properties(lance_file_writer PROPERTIES LABELS "smoke")
+
 # Live S3 integration test (only with the nanos3reader provider): range GETs against a real S3-compatible
 # endpoint; skips unless NANOLANCE_S3_TEST_URI (+ AWS_* env) is set. tests/s3_minio_integration.sh wires
 # this up against a throwaway MinIO. The SigV4 signer vectors now live in the nanos3reader repo's own tests.
