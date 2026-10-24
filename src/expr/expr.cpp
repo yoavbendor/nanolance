@@ -23,6 +23,7 @@
 #include <limits>
 #include <optional>
 #include <regex>
+#include "base/unicode.hpp"
 #include <chrono>
 #include <sstream>
 #include <unordered_map>
@@ -565,6 +566,89 @@ struct ColumnRef {
     int32_t item_scale = 0;
 };
 
+/// A regular expression over characters, not bytes. An ASCII pattern on ASCII text runs as the byte regex it
+/// always was; anything else runs over code points, with \w, \d and \s answered from Unicode's tables and the
+/// case fold for 'i', as DataFusion's regex crate answers them. Its [[:alpha:]]-style classes stay ASCII, as
+/// that crate's are (except [[:digit:]] and [[:space:]], which the C++ library cannot tell from \d and \s).
+class Regex {
+public:
+    Regex(std::string_view pattern, bool icase)
+        : ascii_pattern_(unicode::is_ascii(pattern)),
+          bytes_(ascii_pattern_ ? std::regex(std::string(pattern), flags<std::regex>(icase)) : std::regex()),
+          wide_(widen(pattern), flags<Wide>(icase)) {}
+
+    bool search(std::string_view s) const {
+        if (ascii_pattern_ && unicode::is_ascii(s)) {
+            return std::regex_search(s.begin(), s.end(), bytes_);
+        }
+        const auto w = widen(s);
+        return std::regex_search(w.begin(), w.end(), wide_);
+    }
+
+private:
+    struct Traits : std::regex_traits<wchar_t> {
+        using Base = std::regex_traits<wchar_t>;
+        wchar_t translate_nocase(wchar_t c) const {
+            return static_cast<wchar_t>(unicode::fold(static_cast<std::uint32_t>(c)));
+        }
+        bool isctype(wchar_t c, char_class_type f) const {
+            if (static_cast<std::uint32_t>(c) < 0x80U) {
+                return Base::isctype(c, f);
+            }
+            const auto cp = static_cast<std::uint32_t>(c);
+            const auto has = [&](const char_class_type& m) { return m != char_class_type() && (f & m) == m; };
+            return (has(classes().word) && unicode::is_word(cp)) || (has(classes().digit) && unicode::is_digit(cp)) ||
+                   (has(classes().space) && unicode::is_space(cp));
+        }
+
+    private:
+        struct Classes {
+            char_class_type word, digit, space;
+        };
+        static const Classes& classes() {
+            static const Classes c = [] {
+                const Base t;
+                const auto look = [&t](const wchar_t* name) {
+                    return t.lookup_classname(name, name + std::char_traits<wchar_t>::length(name));
+                };
+                return Classes{look(L"w"), look(L"d"), look(L"s")};
+            }();
+            return c;
+        }
+    };
+    using Wide = std::basic_regex<wchar_t, Traits>;
+
+    template <typename R>
+    static typename R::flag_type flags(bool icase) {
+        return icase ? R::ECMAScript | R::icase : R::ECMAScript;
+    }
+
+    /// UTF-32 where wchar_t is 32 bits (Linux, macOS, wasm); UTF-16, with surrogate pairs, where it is 16.
+    static std::wstring widen(std::string_view s) {
+        std::wstring out;
+        out.reserve(s.size());
+        for (std::size_t i = 0; i < s.size();) {
+            std::size_t len = 0;
+            const auto cp = unicode::decode(s, i, len);
+            if constexpr (sizeof(wchar_t) == 2) {
+                if (cp >= 0x10000U) {
+                    out.push_back(static_cast<wchar_t>(0xD800U + ((cp - 0x10000U) >> 10U)));
+                    out.push_back(static_cast<wchar_t>(0xDC00U + ((cp - 0x10000U) & 0x3FFU)));
+                    i += len;
+                    continue;
+                }
+            }
+            out.push_back(static_cast<wchar_t>(cp));
+            i += len;
+        }
+        return out;
+    }
+
+    bool ascii_pattern_;
+    std::regex bytes_;
+    Wide wide_;
+};
+
 struct Node {
     Op op = Op::Literal;
     Value literal;
@@ -572,7 +656,7 @@ struct Node {
     std::string name;  // Func: lower-cased name; Cast: target type name
     std::string source;  // Literal numbers: the text as written ("-2.50"), for exact arrow_cast folding
     std::vector<std::unique_ptr<Node>> args;
-    std::shared_ptr<const std::regex> regex;  // regexp_*: the pattern, when it is a literal
+    std::shared_ptr<const Regex> regex;  // regexp_*: the pattern, when it is a literal
     enum class Family : std::uint8_t { Other, Json, Regexp } family = Family::Other;  // Func, set at parse
 };
 
@@ -1332,13 +1416,11 @@ private:
         }
         if ((n->name == "regexp_match" || n->name == "regexp_like") && n->args.size() >= 2U &&
             n->args[1]->op == Op::Literal && n->args[1]->literal.kind == Kind::String) {
-            auto flags = std::regex::ECMAScript;
-            if (n->args.size() == 3U && n->args[2]->op == Op::Literal && n->args[2]->literal.kind == Kind::String &&
-                std::string_view(n->args[2]->literal.s).find('i') != std::string_view::npos) {
-                flags |= std::regex::icase;
-            }
+            const bool icase = n->args.size() == 3U && n->args[2]->op == Op::Literal &&
+                               n->args[2]->literal.kind == Kind::String &&
+                               std::string_view(n->args[2]->literal.s).find('i') != std::string_view::npos;
             try {
-                n->regex = std::make_shared<const std::regex>(std::string(n->args[1]->literal.s), flags);
+                n->regex = std::make_shared<const Regex>(n->args[1]->literal.s, icase);
             } catch (const std::regex_error& e) {
                 return fail("invalid regular expression '" + std::string(n->args[1]->literal.s) + "': " + e.what());
             }
@@ -2165,28 +2247,34 @@ const char* kind_name(Kind k) {
     return "?";
 }
 
-/// SQL LIKE: % any run, _ one character, \ escapes.
-bool like(std::string_view s, std::string_view p, bool fold) {
-    auto eq = [&](char a, char b) {
-        return fold ? std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b)) : a == b;
-    };
+/// The length of the UTF-8 character that starts with byte `b` (a stray continuation byte counts as one).
+inline std::size_t utf8_char_len(unsigned char b) { return b < 0xC0U ? 1U : b < 0xE0U ? 2U : b < 0xF0U ? 3U : 4U; }
+
+/// SQL LIKE by byte, for an exact match (LIKE, not ILIKE): the pattern's literal characters match the text's
+/// bytes (a character can only match a whole character, since UTF-8 never starts one inside another), while _
+/// takes one whole character and %'s backtracking resumes at the next character, so positions stay on
+/// character boundaries. ASCII pays one comparison per _ and per backtrack.
+bool like_bytes(std::string_view s, std::string_view p) {
     std::size_t si = 0;
     std::size_t pi = 0;
     std::size_t star = std::string_view::npos;
     std::size_t mark = 0;
     while (si < s.size()) {
-        if (pi < p.size() && p[pi] == '\\' && pi + 1 < p.size() && eq(p[pi + 1], s[si])) {
+        if (pi < p.size() && p[pi] == '\\' && pi + 1 < p.size() && p[pi + 1] == s[si]) {
             pi += 2;
             ++si;
-        } else if (pi < p.size() && p[pi] != '%' && p[pi] != '\\' && (p[pi] == '_' || eq(p[pi], s[si]))) {
+        } else if (pi < p.size() && p[pi] != '%' && p[pi] != '\\' && (p[pi] == '_' || p[pi] == s[si])) {
+            const auto b = static_cast<unsigned char>(s[si]);
+            si += p[pi] == '_' && b >= 0xC0U ? std::min(s.size() - si, utf8_char_len(b)) : 1U;
             ++pi;
-            ++si;
         } else if (pi < p.size() && p[pi] == '%') {
             star = pi++;
             mark = si;
         } else if (star != std::string_view::npos) {
             pi = star + 1;
-            si = ++mark;
+            const auto b = static_cast<unsigned char>(s[mark]);
+            mark += b >= 0xC0U ? std::min(s.size() - mark, utf8_char_len(b)) : 1U;
+            si = mark;
         } else {
             return false;
         }
@@ -2195,6 +2283,83 @@ bool like(std::string_view s, std::string_view p, bool fold) {
         ++pi;
     }
     return pi == p.size();
+}
+
+/// SQL LIKE (`fold`: ILIKE): % any run, _ one character, \ escapes. LIKE by byte (like_bytes). ILIKE by
+/// character: the pattern decoded once, the text a character at a time (ASCII
+/// inline, other characters decoded where they are met), % backtracking over whole characters; ILIKE compares
+/// Unicode simple case folds.
+bool like(std::string_view s, std::string_view p, bool fold) {
+    if (!fold) {
+        return like_bytes(s, p);
+    }
+    std::array<std::uint32_t, 64> small{};
+    std::vector<std::uint32_t> large;
+    std::uint32_t* pat = small.data();
+    std::size_t np = 0;
+    if (p.size() > small.size()) {
+        large.resize(p.size());
+        pat = large.data();
+    }
+    for (std::size_t i = 0; i < p.size();) {
+        const auto b = static_cast<unsigned char>(p[i]);
+        if (b < 0x80U) {
+            pat[np++] = b;
+            ++i;
+            continue;
+        }
+        std::size_t len = 0;
+        pat[np++] = unicode::decode(p, i, len);
+        i += len;
+    }
+    const auto eq = [fold](std::uint32_t a, std::uint32_t b) {
+        if (a == b || !fold) {
+            return a == b;
+        }
+        if (a < 0x80U && b < 0x80U) {
+            return (a | 0x20U) == (b | 0x20U) && (a | 0x20U) >= 'a' && (a | 0x20U) <= 'z';
+        }
+        return unicode::fold(a) == unicode::fold(b);
+    };
+    const auto char_at = [&s](std::size_t i, std::uint32_t& cp) -> std::size_t {
+        const auto b = static_cast<unsigned char>(s[i]);
+        if (b < 0x80U) {
+            cp = b;
+            return 1;
+        }
+        std::size_t len = 0;
+        cp = unicode::decode(s, i, len);
+        return len;
+    };
+    std::size_t si = 0;
+    std::size_t pi = 0;
+    std::size_t star = static_cast<std::size_t>(-1);
+    std::size_t mark = 0;
+    while (si < s.size()) {
+        std::uint32_t sc = 0;
+        const std::size_t slen = char_at(si, sc);
+        if (pi < np && pat[pi] == '\\' && pi + 1 < np && eq(pat[pi + 1], sc)) {
+            pi += 2;
+            si += slen;
+        } else if (pi < np && pat[pi] != '%' && pat[pi] != '\\' && (pat[pi] == '_' || eq(pat[pi], sc))) {
+            ++pi;
+            si += slen;
+        } else if (pi < np && pat[pi] == '%') {
+            star = pi++;
+            mark = si;
+        } else if (star != static_cast<std::size_t>(-1)) {
+            std::uint32_t mc = 0;
+            mark += char_at(mark, mc);
+            pi = star + 1;
+            si = mark;
+        } else {
+            return false;
+        }
+    }
+    while (pi < np && pat[pi] == '%') {
+        ++pi;
+    }
+    return pi == np;
 }
 
 std::size_t utf8_length(std::string_view s) {
@@ -2793,19 +2958,19 @@ Value eval(const Node& n, int64_t row, Context& ctx) {
                 if (a.kind != Kind::String) {
                     return ctx.fail(f + "() needs a string");
                 }
-                std::shared_ptr<const std::regex> re = n.regex;
+                std::shared_ptr<const Regex> re = n.regex;
                 if (!re) {
                     const Value p = eval(*n.args[1], row, ctx);
                     if (p.is_null()) {
                         return p;
                     }
                     try {
-                        re = std::make_shared<const std::regex>(std::string(p.s));
+                        re = std::make_shared<const Regex>(p.s, false);
                     } catch (const std::regex_error& e) {
                         return ctx.fail("invalid regular expression: " + std::string(e.what()));
                     }
                 }
-                return Value::boolean(std::regex_search(a.s.begin(), a.s.end(), *re));
+                return Value::boolean(re->search(a.s));
             }
             if (f == "coalesce") {
                 for (const auto& a : n.args) {
@@ -2917,10 +3082,10 @@ Value eval(const Node& n, int64_t row, Context& ctx) {
                 return ctx.fail(f + "() needs a string");
             }
             if (f == "lower") {
-                return Value::string(lower(std::string(a.s)));
+                return Value::string(unicode::to_lower(a.s));
             }
             if (f == "upper") {
-                return Value::string(upper(std::string(a.s)));
+                return Value::string(unicode::to_upper(a.s));
             }
             if (f == "length" || f == "char_length" || f == "character_length") {
                 return Value::integer(static_cast<std::int64_t>(utf8_length(a.s)));
