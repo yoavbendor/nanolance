@@ -1640,6 +1640,13 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
     }
     std::vector<fts::Token> query_tokens;
     c.index->analyzer.tokenize(q.text, query_tokens);
+    if (phrase_) {
+        // ascii_folding_keep_original: a phrase matches on the folded forms, which every indexed word has;
+        // its originals would otherwise be required too.
+        query_tokens.erase(std::remove_if(query_tokens.begin(), query_tokens.end(),
+                                          [](const fts::Token& t) { return t.original; }),
+                           query_tokens.end());
+    }
     // Fuzzy (pylance's rule, measured): the indexed rows match each token's expansions, one budget for
     // the query; the unindexed fragments match the query's exact tokens, scored as an exact query would.
     // The fragments are a pass of their own (exact tokens, no indexed rows), merged into this one's hits.

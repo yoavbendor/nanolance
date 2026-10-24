@@ -28,7 +28,34 @@ nanolance's analyzer (`src/index/fts/fts_tokenizer.cpp`) produces Lance's tokens
 tables and stemmer are generated from the Rust crates (`tools/fts_tables`,
 `tools/fts_stem_translate.py`). `tests/golden/fts_tokenizer` holds 3,000 lines tokenized by Lance.
 It supports `simple`, `whitespace` and `raw` with English. Other settings are refused: `icu`,
-`ngram`, `code`, `jieba/*`, `lindera/*`, other languages, and JSON documents.
+`ngram`, `code`, `jieba/*`, `lindera/*`, other languages, and JSON documents. See below for the
+settings nanolance adds for text in many scripts.
+
+### Text in many scripts (nanolance's own settings)
+
+Lance's analyzer treats every character as it comes: a pointed Hebrew word (שָׁלוֹם) is another token than
+the unpointed one (שלום), a decomposed é (e + combining accent) loses its accent as a word break, and
+`ascii_folding` keeps only the folded form, so a query with diacritics cannot rank its exact spelling
+first. nanolance adds four settings, all off by default:
+
+| setting | what it does |
+|---|---|
+| `unicode_normalize` | the text in NFC before it is split into words (a decomposed é is é), and Romanian's cedilla ş ţ as the comma ș ț |
+| `remove_marks` | Hebrew niqqud and cantillation, Arabic harakat and tatweel (and Syriac and Thaana marks) removed: pointed and unpointed text make the same tokens; implies `unicode_normalize` |
+| `arabic_normalize` | أ إ آ ٱ as ا, ى as ي, ة as ه (these merge some distinct words, so they are a switch of their own); implies `unicode_normalize` |
+| `ascii_folding_keep_original` | with `ascii_folding`, a word whose folded form differs is indexed both ways at one position: a query without diacritics finds every spelling, one with them scores the exact spelling higher (it matches both tokens); a phrase matches on the folded forms |
+
+```python
+ds.create_scalar_index("text", "INVERTED", remove_marks=True, unicode_normalize=True,
+                       ascii_folding_keep_original=True)
+```
+
+Queries go through the same analyzer, so they are normalized the same way. Each setting is written into
+the `params` JSON only when it is on, so an index without them is Lance's to the byte. An index with any
+of them names its tokenizer `nanolance/<base>` (in `params` and in the index details): pylance then refuses
+to search it ("unknown base tokenizer nanolance/simple") instead of searching it with different tokens,
+and reads the dataset and its other indexes as usual. Hebrew's attached prefixes (ה, ו, ב, ל, מ, ש, כ)
+are not split off, and stemming and stop words remain English only.
 
 ## Files
 

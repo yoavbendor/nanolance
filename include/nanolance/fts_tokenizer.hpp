@@ -51,6 +51,21 @@ struct AnalyzerParams {
     bool split_on_numerics = false;
     bool preserve_original = false;
     bool index_operators = false;
+    /// nanolance's own settings for text in many scripts (Lance has none of them; each is written into the
+    /// params JSON only when it is on, so an index without them is Lance's to the byte).
+    /// unicode_normalize: each word in NFC (a decomposed é is é) and Romanian's cedilla ş / ţ as the comma
+    /// ș / ț. remove_marks: Hebrew niqqud and cantillation, Arabic harakat and tatweel removed (so a pointed
+    /// and an unpointed word are one token); implies unicode_normalize. arabic_normalize: the hamza forms of
+    /// alef as alef, alef maqsura as yeh, teh marbuta as heh; implies unicode_normalize.
+    /// ascii_folding_keep_original: with ascii_folding, a word whose folded form differs is indexed both ways
+    /// at one position, so a query without diacritics finds it and one with them ranks it first.
+    bool unicode_normalize = false;
+    bool remove_marks = false;
+    bool arabic_normalize = false;
+    bool ascii_folding_keep_original = false;
+
+    bool normalizes() const { return unicode_normalize || remove_marks || arabic_normalize; }
+    bool extended() const { return normalizes() || ascii_folding_keep_original; }
 };
 
 /// The format version an index with `params` is (or would be) written in.
@@ -60,6 +75,10 @@ inline std::uint32_t resolved_format_version(const AnalyzerParams& params) {
     }
     return params.block_size == 256U ? 3U : 2U;
 }
+
+/// The base_tokenizer prefix of an index with nanolance's own settings (AnalyzerParams::extended): Lance does
+/// not know the tokenizer, so it refuses the index instead of searching it with different tokens.
+inline constexpr std::string_view kNanolanceBase = "nanolance/";
 
 /// Lance's params JSON (metadata.lance's `params`). Fields it leaves out keep their defaults.
 bool parse_params(std::string_view json, AnalyzerParams& out, std::string& error);
@@ -78,6 +97,9 @@ std::vector<std::uint32_t> ngram_tokens(std::string_view folded);
 struct Token {
     std::string text;
     std::uint32_t position = 0;
+    /// The word as written, beside its folded form at the same position (ascii_folding_keep_original). A
+    /// phrase query matches on the folded forms only, which every word has.
+    bool original = false;
 };
 
 class Jieba;

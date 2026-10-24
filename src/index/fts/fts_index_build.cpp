@@ -82,7 +82,8 @@ std::string posting_tail_codec(std::uint32_t format_version) {
 
 std::vector<std::uint8_t> index_details(const fts::AnalyzerParams& p, DocGranularity granularity) {
     std::vector<std::uint8_t> out;
-    put_string(out, 1, p.base_tokenizer);
+    // An index with nanolance's own settings names its tokenizer as params_json does, so Lance refuses it.
+    put_string(out, 1, p.extended() ? std::string(fts::kNanolanceBase) + p.base_tokenizer : p.base_tokenizer);
     put_string(out, 2, fts::json::quote(p.language));
     if (p.with_position) {
         put_uint(out, 3, 1);

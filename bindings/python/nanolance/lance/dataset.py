@@ -1442,7 +1442,9 @@ class LanceDataset(pa.dataset.Dataset):
     _INVERTED_OPTIONS = ("base_tokenizer", "language", "with_position", "max_token_length", "lower_case", "stem",
                          "remove_stop_words", "custom_stop_words", "ascii_folding", "min_ngram_length",
                          "max_ngram_length", "prefix_only", "format_version", "block_size", "analyzer",
-                         "split_identifiers", "split_on_numerics", "preserve_original", "index_operators")
+                         "split_identifiers", "split_on_numerics", "preserve_original", "index_operators",
+                         # nanolance's own, for text in many scripts (fts_tokenizer.hpp, AnalyzerParams)
+                         "unicode_normalize", "remove_marks", "arabic_normalize", "ascii_folding_keep_original")
     _CODE_FLAGS = ("split_identifiers", "split_on_numerics", "preserve_original", "index_operators")
     # The languages Lance's tokenizer knows (case-sensitive). pylance rejects any other name, whatever the
     # stemming and stop-word settings are.

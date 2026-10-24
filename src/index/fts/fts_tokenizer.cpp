@@ -18,6 +18,8 @@
 #include <iterator>
 #include <string>
 
+#include "base/unicode.hpp"
+
 namespace nano_lance::fts {
 namespace {
 
@@ -288,7 +290,9 @@ bool parse_params(std::string_view text, AnalyzerParams& out, std::string& error
             }
         };
         if (key == "base_tokenizer" && v.kind == json::Value::String) {
-            out.base_tokenizer = v.s;
+            // "nanolance/<base>": an index with nanolance's own settings (params_json), named so Lance refuses
+            // it rather than reading it with a tokenizer that makes other tokens.
+            out.base_tokenizer = v.s.rfind(kNanolanceBase, 0) == 0 ? v.s.substr(kNanolanceBase.size()) : v.s;
         } else if (key == "language" && v.kind == json::Value::String) {
             out.language = v.s;
         } else if (key == "lance_tokenizer" && v.kind == json::Value::String) {
@@ -337,6 +341,14 @@ bool parse_params(std::string_view text, AnalyzerParams& out, std::string& error
             flag(out.preserve_original);
         } else if (key == "index_operators") {
             flag(out.index_operators);
+        } else if (key == "unicode_normalize") {
+            flag(out.unicode_normalize);
+        } else if (key == "remove_marks") {
+            flag(out.remove_marks);
+        } else if (key == "arabic_normalize") {
+            flag(out.arabic_normalize);
+        } else if (key == "ascii_folding_keep_original") {
+            flag(out.ascii_folding_keep_original);
         }
     }
     return true;
@@ -344,8 +356,9 @@ bool parse_params(std::string_view text, AnalyzerParams& out, std::string& error
 
 std::string params_json(const AnalyzerParams& p) {
     const auto b = [](bool v) { return v ? "true" : "false"; };
+    const std::string base = p.extended() ? std::string(kNanolanceBase) + p.base_tokenizer : p.base_tokenizer;
     std::string out = "{\"lance_tokenizer\":" + json::quote(p.lance_tokenizer) + ",\"base_tokenizer\":" +
-                      json::quote(p.base_tokenizer) + ",\"language\":" + json::quote(p.language) +
+                      json::quote(base) + ",\"language\":" + json::quote(p.language) +
                       ",\"with_position\":" + b(p.with_position) + ",\"max_token_length\":" +
                       (p.max_token_length ? std::to_string(*p.max_token_length) : std::string("null")) +
                       ",\"lower_case\":" + b(p.lower_case) + ",\"stem\":" + b(p.stem) +
@@ -363,7 +376,17 @@ std::string params_json(const AnalyzerParams& p) {
            std::to_string(p.min_ngram_length) + ",\"max_ngram_length\":" + std::to_string(p.max_ngram_length) +
            ",\"prefix_only\":" + b(p.prefix_only) + ",\"block_size\":" + std::to_string(p.block_size) +
            ",\"split_identifiers\":" + b(p.split_identifiers) + ",\"split_on_numerics\":" + b(p.split_on_numerics) +
-           ",\"preserve_original\":" + b(p.preserve_original) + ",\"index_operators\":" + b(p.index_operators) + "}";
+           ",\"preserve_original\":" + b(p.preserve_original) + ",\"index_operators\":" + b(p.index_operators);
+    // nanolance's own settings, only when on: an index without them stays Lance's to the byte.
+    for (const auto& [name, on] : {std::pair<const char*, bool>{"unicode_normalize", p.unicode_normalize},
+                                   {"remove_marks", p.remove_marks},
+                                   {"arabic_normalize", p.arabic_normalize},
+                                   {"ascii_folding_keep_original", p.ascii_folding_keep_original}}) {
+        if (on) {
+            out += std::string(",\"") + name + "\":true";
+        }
+    }
+    out += "}";
     return out;
 }
 
@@ -419,6 +442,10 @@ bool Analyzer::init(const AnalyzerParams& params, std::string& error) {
     if (params.base_tokenizer != "code" && (params.split_identifiers || params.split_on_numerics ||
                                             params.preserve_original || params.index_operators)) {
         error = "code analyzer flags require base_tokenizer='code'";
+        return false;
+    }
+    if (params.ascii_folding_keep_original && !params.ascii_folding) {
+        error = "ascii_folding_keep_original requires ascii_folding";
         return false;
     }
     if (params.lance_tokenizer != "text") {
@@ -565,6 +592,40 @@ void ngram_grams(std::string_view text, std::size_t min_gram, std::size_t max_gr
 
 }  // namespace
 
+namespace {
+
+/// Text as the multi-script settings normalize it, before it is split into words (a decomposed é's accent
+/// would otherwise end the word) and before Lance's filters (see AnalyzerParams).
+std::string normalize_text(std::string_view text, const AnalyzerParams& p) {
+    std::string s = p.remove_marks ? unicode::remove_semitic_marks(text) : unicode::nfc(text);
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size();) {
+        std::size_t len = 0;
+        auto cp = unicode::decode(s, i, len);
+        switch (cp) {
+            case 0x15EU: cp = 0x218U; break;  // Ş -> Ș
+            case 0x15FU: cp = 0x219U; break;  // ş -> ș
+            case 0x162U: cp = 0x21AU; break;  // Ţ -> Ț
+            case 0x163U: cp = 0x21BU; break;  // ţ -> ț
+            default: break;
+        }
+        if (p.arabic_normalize) {
+            switch (cp) {
+                case 0x622U: case 0x623U: case 0x625U: case 0x671U: cp = 0x627U; break;  // آ أ إ ٱ -> ا
+                case 0x649U: cp = 0x64AU; break;  // ى -> ي
+                case 0x629U: cp = 0x647U; break;  // ة -> ه
+                default: break;
+            }
+        }
+        unicode::append(out, cp);
+        i += len;
+    }
+    return out;
+}
+
+}  // namespace
+
 void Analyzer::emit(std::string_view word, std::uint32_t position, std::vector<Token>& out) const {
     if (params_.max_token_length && word.size() >= *params_.max_token_length) {
         return;
@@ -584,12 +645,21 @@ void Analyzer::emit(std::string_view word, std::uint32_t position, std::vector<T
         return;
     }
     if (params_.ascii_folding) {
-        text = ascii_fold(text);
+        std::string folded = ascii_fold(text);
+        if (params_.ascii_folding_keep_original && folded != text) {
+            out.push_back(Token{std::move(text), position, true});
+        }
+        text = std::move(folded);
     }
-    out.push_back(Token{std::move(text), position});
+    out.push_back(Token{std::move(text), position, false});
 }
 
 void Analyzer::tokenize(std::string_view text, std::vector<Token>& out) const {
+    std::string normalized;
+    if (params_.normalizes() && !unicode::is_ascii(text)) {
+        normalized = normalize_text(text, params_);
+        text = normalized;
+    }
     std::uint32_t position = 0;
     if (params_.base_tokenizer == "raw") {
         emit(text, 0, out);
