@@ -76,7 +76,8 @@ def parse_table(text: str) -> tuple[list[list[str]], str | None]:
 def registered_ctests() -> set[str]:
     names: set[str] = set()
     for cm in [os.path.join(ROOT, "CMakeLists.txt")] + glob.glob(os.path.join(ROOT, "tests", "**", "CMakeLists.txt"),
-                                                                 recursive=True):
+                                                                 recursive=True) + \
+            glob.glob(os.path.join(ROOT, "tests", "**", "*.cmake"), recursive=True):
         names.update(re.findall(r"add_test\(\s*NAME\s+([A-Za-z0-9_.\-]+)", open(cm, encoding="utf-8").read()))
     return names
 

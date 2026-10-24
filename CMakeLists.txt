@@ -1425,6 +1425,11 @@ if(NANOLANCE_BUILD_TOOLS)
     endif()
 endif()
 
+# Each layer's later tests (tests/<layer>/tests.cmake), in this directory's scope so they are labelled below.
+foreach(_nl_layer_dir IN ITEMS base io arrow encoding file table expr scan index dataset api integration)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/tests/${_nl_layer_dir}/tests.cmake")
+endforeach()
+
 # Each test's layer: the folder of its source under tests/ (tests/<layer>/, src/README.md), as the label
 # layer:<layer>, so `ctest -L layer:table` runs one layer's tests. A test whose target is not built from one
 # (the smoke scripts, the app checks) is a cross-layer test, layer:integration.
