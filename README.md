@@ -2,136 +2,76 @@
 
 [![linux-bench](https://github.com/yoavbendor/nanolance/actions/workflows/linux-bench.yml/badge.svg)](https://github.com/yoavbendor/nanolance/actions/workflows/linux-bench.yml) [![memory-safety](https://github.com/yoavbendor/nanolance/actions/workflows/memory-safety.yml/badge.svg)](https://github.com/yoavbendor/nanolance/actions/workflows/memory-safety.yml) [![Python bindings](https://github.com/yoavbendor/nanolance/actions/workflows/bindings-python.yml/badge.svg)](https://github.com/yoavbendor/nanolance/actions/workflows/bindings-python.yml) [![docs](https://img.shields.io/badge/docs-yoavbendor.github.io%2Fnanolance-indigo)](https://yoavbendor.github.io/nanolance/)
 
-Standalone C++ Arrow ↔ Lance writer and reader — write **Lance v2.2** datasets with minimal protobuf overhead (no Rust `lance` core), and read back what you wrote. Its headline feature: rows keep large payloads external (referenced by `uri` + offset + size, never copied) — so a Lance table of pcap packets stays single-digit bytes per row of references *regardless of packet size*, while the payload bytes live once in the source capture and are fetched on demand (numbers in [bench/linux-ci-results.md](bench/linux-ci-results.md)).
+A C++20 implementation of the [Lance](https://lance.org/format/) columnar format, without the Rust `lance` core:
+it writes and reads Lance datasets, builds and searches Lance's indexes, and changes datasets the way Lance does
+(appends, deletes, updates, merge-insert, schema changes, compaction, versions, tags, branches), on local disk and
+on S3-compatible object stores. What it writes, pylance reads; what pylance writes, it reads; the two use each
+other's indexes with the same answers (checked against `pylance` 12.0.0 in CI).
 
-nanolance itself depends only on **nanoarrow + zstd**, plus the header-only **[nanom](https://github.com/yoavbendor/nanom)** for Lance's protobuf metadata (manifests, schemas, column metadata: one declared model, a proto3 codec checked against Google's protobuf; compiled as C++23 in one internal file, so nanolance's API stays C++20) — no packet-parsing machinery. The repo also ships **[`examples/pcapng2lance`](examples/pcapng2lance/)**, a streaming pcapng → Lance converter built on the sister **[nanotins](https://github.com/yoavbendor/nanotins)** parsing stack — **soatins** (reflection: describe a struct once → SoA + Arrow) and **nanotins** (pcap/pcapng + L2/L3/L4 decode via the wire_spec core + the spec_dag DAG/FSM dispatcher). That stack is the **example's** dependency, not the library's: it's vendored as a git submodule under [`examples/pcapng2lance/extern/nanotins`](examples/pcapng2lance/extern/nanotins/). (A GPU/CUDA executor layer is a planned future addition, developed separately.)
+It depends on **nanoarrow** and **zstd**, plus the header-only **[nanom](https://github.com/yoavbendor/nanom)** for
+Lance's protobuf metadata. A program links only the parts it calls: a writer of local datasets is under 1 MB.
 
-📖 **[Documentation site](https://yoavbendor.github.io/nanolance/)** ·
-🛡️ **[Memory safety & Rust reviewers](docs/SAFETY.md)** ·
-🤖 **[AI agent integration guide](AGENTS.md)** ·
-📊 **[Benchmarks](bench/linux-ci-results.md)** ·
-🤖 **[llms.txt](llms.txt)** (machine-readable index)
+📖 [Documentation site](https://yoavbendor.github.io/nanolance/) ·
+🧱 [How the code is organized](#how-the-code-is-organized) ·
+📋 [Spec coverage](#spec-coverage) ·
+🛡️ [Memory safety](docs/SAFETY.md) ·
+📊 [Benchmarks](#benchmarks) ·
+🤖 [Agent integration guide](AGENTS.md)
 
-> **Cloning:** building the `pcapng2lance` example needs the nanotins submodule — clone with `git clone --recursive`, or run `git submodule update --init --recursive`. Building nanolance itself (library, tools, tests) needs no submodule.
+## What it does
 
-> Integrating programmatically (or via an AI agent)? See [AGENTS.md](AGENTS.md) for the current
-> include path / CMake targets, the write API, and how to enable each compression measure.
+- **Files:** writes Lance file format 2.2 and reads 2.0, 2.1 and 2.2, with Lance's encodings:
+  bitpacking, run-length, dictionary, FSST, byte-stream split, zstd and LZ4, constant and all-null pages,
+  mini-block and full-zip layouts, nested and repeated columns ([src/encoding](src/encoding/README.md),
+  [src/file](src/file/README.md)).
+- **Tables:** manifests, fragments, deletion files, stable row ids, data overlays, transactions with Lance's
+  conflict rules, versions, tags and branches ([src/table](src/table/README.md)).
+- **Indexes,** built and searched in Lance's format: scalar (BTree, Bitmap, LabelList, ZoneMap, BloomFilter,
+  NGram), full-text (INVERTED, with phrase, fuzzy and boolean queries), and vector (IVF_FLAT, IVF_PQ, IVF_SQ,
+  IVF_RQ, IVF_HNSW_FLAT/PQ/SQ). An index survives the dataset's appends, deletes, updates and compactions
+  ([src/index](src/index/README.md)).
+- **External payloads:** a row can reference bytes that live elsewhere (`uri` + `position` + `size`, a local file
+  or `s3://`) instead of copying them in, so a table of packets costs a few bytes a row whatever the payload
+  size; the bytes are fetched on demand.
+- **Object stores:** reads and writes on `s3://` and S3-compatible stores (MinIO, R2), with Lance's commit
+  semantics, through [nanos3reader](https://github.com/yoavbendor/nanos3reader) (libcurl + SigV4, no AWS SDK).
+- **Text in any script:** filters compare by character (`LIKE`, `ILIKE`, `lower`, `upper`, `regexp_like` answer as
+  pylance does for Hebrew, Arabic, Cyrillic, Greek...), and full-text indexes can ignore Hebrew and Arabic
+  pointing and match words with and without diacritics ([docs/FTS_INDEX.md](docs/FTS_INDEX.md)).
+- **Three ways in:** a C++ library; a C writer/reader API; `liblance_c`, lance-c's C API over nanolance (code
+  written for lance-c links unchanged, [docs/LANCE_C_COMPAT.md](docs/LANCE_C_COMPAT.md)); and Python bindings
+  whose `nanolance.lance` module speaks pylance's API ([docs/PYLANCE_COMPAT.md](docs/PYLANCE_COMPAT.md)).
+- **A hardened reader:** every size and offset read from a file is bounds- and overflow-checked before it drives
+  an allocation or a copy, allocations are budgeted, paths are jailed, and the decode path runs under ASan, UBSan
+  and libFuzzer in CI ([docs/SAFETY.md](docs/SAFETY.md)).
+- **WebAssembly:** the reader builds for the browser and reads datasets over HTTP range requests (`wasm/`).
 
-## Rust roots, hardened read path
+## Quick start
 
-nanolance's format is Lance — a Rust-native columnar format. If you're weighing this C++ implementation
-against reaching for the Rust crate directly, the question is always the same one: does the C++ side
-give up Rust's memory-safety guarantees to get there? The **writer is trusted** (it serializes your own
-in-memory Arrow data); the **reader** — the only code that touches untrusted bytes, whether an on-disk
-manifest/data-file or an external blob fetched by `(uri, position, size)` — is hardened the same way a
-Rust parser would be, and it's proven, not asserted:
+### Python
 
-- Overflow-checked bounds arithmetic on every disk-derived size/offset before it drives an allocation or
-  `memcpy` — no `checked_add`/`checked_mul` wraps into a too-small buffer that a later copy overflows.
-- No `reinterpret_cast` of disk bytes to a typed pointer — multi-byte integers load via byte-assembly +
-  `std::bit_cast`.
-- A tunable allocation budget caps what a hostile file can make the reader allocate (declared zstd size,
-  row/column/manifest-element counts).
-- A path jail confines every manifest-derived data-file path under the dataset directory; the external
-  `file://` blob fetch rejects `..` traversal.
-- Mid-read failures release everything already built — no leaked `ArrowArray`/`ArrowSchema`.
-- Continuous **ASan + UBSan + LSan CI** and **libFuzzer** targets for every untrusted format, page decoding included.
-
-All of it validates once per page/header, not once per value, so the safety cost doesn't show up in a
-profile — proven by a read-throughput parity benchmark (`trusted_input=true`, which skips only the
-untrusted-input DoS budget checks, measures **0.985x** vs. the default fully-checked read — noise, not a
-speedup). Full details, the threat model, and a reviewer checklist: **[docs/SAFETY.md](docs/SAFETY.md)**.
-
-## At a glance
-
-- **What it is:** a write-centric C++ library that emits **Lance v2.2** datasets and reads back what it
-  wrote — no Rust `lance` core. Everything it writes is readable by stock `lance`
-  (verified against `pylance` 12.0.0) **unless** a feature is marked *nanolance-only* below.
-  It reads Lance file formats 2.0, 2.1 and 2.2 — 2.0 being what most LanceDB tables on the Hugging
-  Face Hub are in ([docs/REAL_DATASETS.md](docs/REAL_DATASETS.md)). It builds and uses Lance's
-  indexes in Lance's own format -- scalar (BTree, Bitmap, LabelList), vector (IVF_FLAT, IVF_PQ:
-  [docs/VECTOR_INDEX.md](docs/VECTOR_INDEX.md)) and full-text (INVERTED, LanceDB's defaults:
-  [docs/FTS_INDEX.md](docs/FTS_INDEX.md)). pylance and LanceDB use an index nanolance built, and
-  nanolance one they built, with the same results. A dataset's other indexes survive its appends,
-  deletes, updates and compactions. It also reads datasets on S3-compatible object stores
-  (`lance.dataset("s3://...", storage_options=...)`, when built with libcurl); writes stay local.
-- **Headline benefit:** rows keep big payloads **external** (`uri` + `position` + `size`, never copied),
-  so a packet table costs a few bytes/row regardless of payload size; bytes are fetched on demand (local
-  file or `s3://`).
-- **Type coverage:** the Arrow C scalar types (int/uint 8–64, `float`, `double`, `bool`) +
-  `utf8`/`binary`/`fixed_size_binary`, the temporal types (`timestamp` with or without a timezone,
-  `date32/64`, `time32/64`), `decimal128/256`, `float16`, `duration`, `fixed_size_list` vectors,
-  nested structs, `list`/`large_list` and `map` — including lists of structs, structs of lists and
-  null structs. Everything it writes, it reads back; every type it cannot round-trip is **refused at
-  `write_batch`** rather than written. See [Type coverage](#type-coverage) for the exact list.
-  **Nulls are stored**, in fixed- and variable-width columns alike.
-- **Links:** `nanolance` to write; `nanolance_reader` alone if you only fetch external blobs.
-- **Python:** fast zero-copy bindings — `pip install -e bindings/python` then `import nanolance` (see
-  [bindings/python/README.md](bindings/python/README.md)). Uses the Arrow PyCapsule interface; no hard
-  pyarrow dependency at runtime. Does **not** shadow `import lance` (the official `pylance` SDK).
-
-### Quick start (Python)
+```bash
+pip install -e bindings/python        # wheels: .github/workflows/wheels.yml
+```
 
 ```python
 import pyarrow as pa
-import nanolance
+import nanolance.lance as lance       # pylance's API; or nanolance.lance.install_as_lance(), then `import lance`
 
-table = pa.table({"id": [1, 2, 3], "name": ["alpha", "beta", "gamma"]})
-nanolance.write_table(table, "out.lance", compression=True)
-assert pa.table(nanolance.read_table("out.lance")).equals(table)
-
-# Read a column subset, and larger-than-memory datasets a fragment at a time:
-nanolance.read_table("out.lance", columns=["name"])
-for batch in pa.RecordBatchReader.from_stream(nanolance.open_stream("out.lance")):
-    ...
-```
-
-Already using pylance? `nanolance.lance` speaks its API: the reads, writes, filters, versions,
-fragments, row ids, dataset changes (delete, update, merge insert, schema evolution, compaction) and
-file API that pylance 12's own test suite exercises, run against nanolance in CI:
-
-```python
-import nanolance.lance as lance          # or nanolance.lance.install_as_lance(), then `import lance`
-
-ds = lance.write_dataset(table, "out.lance", mode="append")
-ds.to_table(columns=["name"], filter="id > 10 AND name LIKE 'a%'", limit=10, with_row_id=True)
-ds.delete("id < 3")
+table = pa.table({"id": [1, 2, 3], "text": ["שלום עולם", "hello world", "fată frumoasă"]})
+ds = lance.write_dataset(table, "out.lance")
+ds.create_scalar_index("id", "BTREE")
+ds.create_scalar_index("text", "INVERTED")
+ds.to_table(filter="id > 1", columns=["text"])
+ds.to_table(full_text_query="hello")
+ds.delete("id = 3")
 lance.dataset("out.lance", version=1).take([2, 0])
 ```
 
-What it covers, what raises `NotImplementedError`, and how many of pylance's tests pass:
-[docs/PYLANCE_COMPAT.md](docs/PYLANCE_COMPAT.md).
+The smaller native API (`nanolance.write_table`, `read_table`, `open_stream`) and the `nanolance` command line
+(`convert` from Parquet, `inspect`) are described in [bindings/python/README.md](bindings/python/README.md).
 
-From C or C++, nanolance builds `liblance_c`: lance-c's C API (`#include <lance/lance.h>`,
-`LanceC::lance_c`) over nanolance, so code written for lance-c links unchanged, without a Rust
-toolchain. lance-c's own tests run against it in CI: [docs/LANCE_C_COMPAT.md](docs/LANCE_C_COMPAT.md).
-
-Lance's own Rust encoding tests (lance-encoding and lance-file) run nightly with every round trip
-and file they write also read back by nanolance: [docs/RUST_SUITE.md](docs/RUST_SUITE.md).
-
-To try it on real data: `tools/real_lance_check.py` downloads Lance datasets people have published on
-the Hugging Face Hub and checks nanolance against pylance on them. The datasets hold embeddings,
-images, audio, video and LanceDB tables. How to run it, what it found, and the COCO / Speech
-Commands benchmark are in [docs/REAL_DATASETS.md](docs/REAL_DATASETS.md).
-
-Already have parquet? Convert it and compare, without writing any code:
-
-```console
-$ nanolance convert events.parquet events.lance --compress   # or: python -m nanolance convert ...
-200,000 rows  events.parquet -> events.lance
-  parquet :    2.0 MiB
-  lance   :  530.3 KiB   (3.92x smaller)
-```
-
-It converts a batch at a time, so a file larger than memory is fine, and `nanolance inspect
-events.lance` prints rows, size and schema.
-
-Install for development: `pip install -e "bindings/python[test]"` then `pytest` in that directory.
-Self-contained wheels (nanoarrow and zstd linked in statically, nothing to install alongside) are
-built for manylinux and macOS by [`.github/workflows/wheels.yml`](.github/workflows/wheels.yml) and
-published to PyPI on a version tag; until the first tag, the development install above is the way in.
-
-### Quick start (C write)
+### C
 
 ```c
 #include "nanolance/nano_lance_writer.h"
@@ -139,379 +79,159 @@ published to PyPI on a version tag; until the first tag, the development install
 
 NanoLanceWriteOptions options = {0};                 // zeroed == the defaults
 options.compression_level = 3;
-options.compression = true;                          // Lance-compatible compression (off by default)
-
-NanoLanceWriter w = {0};
-nano_lance_writer_open(&w, "out.lance", &options);   // every option, before there is anything to order it against
-nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // repeatable; schema locks after batch #1
-nano_lance_writer_commit(&w, /*is_append=*/false);   // false = create, true = append a fragment
-nano_lance_writer_close(&w);
-// On any non-zero return: nano_lance_writer_last_error(&w). Read back with
-// nano_lance::lance_table_read_dataset(...) or nano_lance_fetch_external_blob(uri, position, size, ...).
-```
-
-In C++, `nano_lance::Writer` ([`writer.hpp`](include/nanolance/writer.hpp)) owns the handle, so an
-early return closes it for you:
-
-```cpp
-nano_lance::Writer writer;
-if (!writer.open("out.lance", {.compression_level = 3, .compression = true})) { return writer.error(); }
-if (!writer.write_batch(&arrow_array, &arrow_schema)) { return writer.error(); }
-if (!writer.commit()) { return writer.error(); }     // is_append follows what open() was given
-```
-
-### Gotchas & lifecycle
-
-- **Schema locks after the first `write_batch`** — every batch in a session shares it.
-- **Pass options to `nano_lance_writer_open`.** The older `nano_lance_writer_init` + `set_*` calls
-  still work and behave identically, but every one of them has to come before the first
-  `write_batch` and says so only at runtime, with `INVALID_STATE`.
-- **Nulls are stored**, using Lance's definition-level layer, and stock Lance reads them back —
-  fixed-width (int, float, bool, temporal, decimal, `fixed_size_binary`) and variable-width
-  (`utf8`, `binary`) alike. A null **struct** is still refused with a clear message.
-- **Compression is off by default.** One switch (`set_compression`) picks the right Lance encoding per
-  column; see [AGENTS.md §3](AGENTS.md#3-enabling-the-compression-that-was-measured) for the per-type
-  table.
-- **To get small files, model external refs as plain `uri`/`position`/`size` columns**, *not* the packed
-  `lance.blob.v2` descriptor (~41 B/row vs ~3.4 B/row). See [AGENTS.md §4](AGENTS.md#4-data-model-how-to-actually-get-small-files-important).
-- **Memory while saving is bounded only if you bound it.** The writer holds every row until a commit,
-  so by default a whole session is resident. On a memory-constrained device set
-  `max_pending_bytes` (C options struct / `set_max_pending_bytes`, C++ `WriteOptions` and typed
-  `writer::options`, Python `LanceWriter(max_pending_bytes=...)`, CLI `--max-pending-bytes`):
-  `write_batch` then commits a fragment itself whenever the buffered data reaches the budget. Plan
-  for a peak of about 3-4x the budget plus one batch; a smaller budget means more, smaller fragments.
-- **The reader is hardened against untrusted files** — bounds/overflow-checked decode, allocation
-  budgets, ASan+UBSan CI, and continuous fuzzing. See [docs/SAFETY.md](docs/SAFETY.md) for the threat
-  model and reviewer checklist.
-
-### Type coverage
-
-Every Arrow type is in exactly one of two states: it round-trips correctly, or `write_batch` refuses
-it. Nothing writes a file nanolance (or stock Lance) cannot read back.
-
-| Arrow type | Status |
-|---|---|
-| `int8..64`, `uint8..64`, `float`, `double` | round-trips |
-| `bool` | round-trips (bit-packed on disk, 1 bit/value, same as stock Lance) |
-| `utf8`, `binary`, `fixed_size_binary(N)` | round-trips (high-cardinality strings FSST-compressed, as stock Lance does) |
-| `struct` (nested, arbitrarily deep) | round-trips |
-| `lance.blob.v2` external references | round-trips (the headline feature) |
-| `lance.blob.v2` as pylance writes it: inline, packed, dedicated, external, empty and null blobs | read (as descriptions, as bytes, or as file handles); nanolance writes external blobs only |
-| nulls in a fixed-width column (int, float, bool, temporal, decimal, `fixed_size_binary`) | round-trips |
-| nulls in a `utf8`/`binary` column | round-trips |
-| a null **struct** (as opposed to a null field inside one) | round-trips (written with its own definition level, as Lance does) |
-| `null` type | round-trips (Lance's all-null constant page) |
-| `float16`, `duration` | round-trips |
-| `fixed_size_list<T, N>` of a fixed-width `T` (embedding vectors) | round-trips, including null rows; a null *element* inside a valid row is refused |
-| `timestamp` (s/ms/us/ns, with or without an IANA timezone) | round-trips |
-| `date32`, `date64`, `time32` (s/ms), `time64` (us/ns) | round-trips |
-| `decimal128`, `decimal256` | round-trips |
-| `timestamp` with a **UTC-offset** timezone (`+05:30`) | **refused** — Lance supports IANA zone names only and panics on offsets, so pylance cannot write one either; use a named zone |
-| `list`, `large_list`, `map`, lists of structs, structs of lists | round-trips — null and empty lists, null items, any nesting depth, `fixed_size_list` items (bounding boxes, embeddings); a null element inside a valid `fixed_size_list` item is refused |
-| `large_utf8`, `large_binary` | round-trips — plain, nullable, dictionary-encoded, constant, and as list, struct or map items |
-| Arrow `dictionary<...>` columns | **refused** — cast to the value type; nanolance dictionary-encodes low-cardinality strings on disk by itself, so the file stays the same size |
-
-### What nanolance can read
-
-nanolance reads back **everything it writes**, and a growing subset of what the Rust `lance` crate
-writes. Measured against `pylance` 12.0.0 at 5 000 rows (20 000 for the FSST cases, which is where
-Lance's string compressor switches on):
-
-| stock-Lance column | nanolance reads it |
-|---|---|
-| `int64` and the other fixed-width integers | yes |
-| `float64`, `bool`, `fixed_size_binary` | yes |
-| `timestamp`, `date32/64`, `time32/64`, `decimal128/256` | yes |
-| nullable columns — scattered, all-null, and nulls in **runs** | yes |
-| `utf8`, `large_utf8`, `binary` — including FSST-compressed and nullable | yes |
-| strings or binaries with values of 256 bytes or more (Lance's FullZip layout) | yes |
-| a low-cardinality (categorical) string column, with or without nulls | yes — including its LZ4-compressed dictionary |
-| `struct`, including null structs | yes |
-| `fixed_size_list` vectors — nullable rows, null elements, any dimension | yes |
-| `list`, `large_list`, `list<list<…>>` of any type above, long values (FullZip) included — null lists, empty lists, null items | yes |
-| a list of structs, a struct holding lists — with nulls at any level | yes |
-| `map` | yes |
-| a list of `fixed_size_list` | yes (a null element inside a valid item is refused by name) |
-
-nanolance also reads Lance datasets pylance has **modified**: multiple versions, `append`,
-`overwrite`, `update`, `delete` (both the Arrow-IPC and roaring-bitmap deletion formats) and
-`add_columns` (a fragment whose columns span several data files).
-
-Anything in a "no" row is **refused by name**, not misread. What is left, and in what order, is
-[docs/ROADMAP.md](docs/ROADMAP.md); how list columns are decoded is
-[docs/NESTED_COLUMNS.md](docs/NESTED_COLUMNS.md).
-
-### Not yet supported / nanolance-only
-
-- **`bool` fixed-width columns are bit-packed on disk** (1 bit/value, LSB-first, same as stock Lance —
-  always on, not gated by `set_compression`). `float`/`double` columns *are* compressed when
-  `set_compression(true)` is set — via byte-stream-split + zstd, the same technique stock Lance uses.
-  Both are verified byte-for-byte readable by stock Lance. (Earlier docs said `bool` row fields were
-  unsupported and to use `uint8` instead; that was wrong — `bool` is one of the types nanolance
-  writes *faster* than rust-lance.)
-- **No transparent delta encoding** — store monotonic high-range integers as app-level deltas to stay
-  small (otherwise they bitpack as absolute values, where Parquet's delta encoding wins).
-- **Read throughput is the known gap** (currently ~2–3.5× `lance`, memory-bandwidth bound on column
-  materialization — see [bench/linux-ci-results.md](bench/linux-ci-results.md) for current numbers).
-- **`nano_lance_writer_set_blob_uri_dictionary` is nanolance-only** (dedups identical external URIs;
-  stock Lance cannot read that blob column; create-mode only).
-- **S3:** SSO / assume-role profiles aren't resolved — export credentials to the environment first
-  (`credential_process`, env, shared profiles, ECS/EKS, IMDSv2 *are* supported).
-
-For the full agent-oriented integration guide (API lifecycle, the measured per-column compression table,
-the data-model recipe, and interop verification), read **[AGENTS.md](AGENTS.md)**.
-
-## For AI agents
-
-**Use this library when** you want a Lance dataset — especially one where rows reference large payloads
-that live elsewhere (a file or `s3://`) instead of copying them in. It writes and reads back what it
-wrote; stock `lance` reads it too (unless you opt into a *nanolance-only* feature).
-
-**Pick a sibling instead when:** you want Parquet output (no external blobs) →
-[nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet) (the *same* Arrow batch feeds
-either). You need to *produce* the Arrow from packets/structs →
-[nanotins / soatins](https://github.com/yoavbendor/nanotins).
-
-**Minimal program** (`target_link_libraries(app PRIVATE nanolance)`; `nanolance_reader` if you only fetch):
-
-```c
-#include "nanolance/nano_lance_writer.h"
-#include <nanoarrow/nanoarrow.h>
-
-NanoLanceWriteOptions options = {0};
-options.compression_level = 3;
-options.compression = true;
+options.compression = true;                          // zstd for strings, byte-stream split for floats
 
 NanoLanceWriter w = {0};
 nano_lance_writer_open(&w, "out.lance", &options);
-nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // schema locks after batch #1
-nano_lance_writer_commit(&w, /*is_append=*/false);   // false = create, true = append fragment
+nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // repeatable; the schema is fixed by the first
+nano_lance_writer_commit(&w, /*is_append=*/false);   // false: create, true: append a fragment
 nano_lance_writer_close(&w);
-// non-zero return -> nano_lance_writer_last_error(&w)
+// A non-zero return: nano_lance_writer_last_error(&w).
 ```
 
-**Do**
-- Pass options to `nano_lance_writer_open` (or `nano_lance::Writer::open`); reuse one schema for all
-  batches. The `set_*` calls are still there and still work, but they must precede the first
-  `write_batch`.
-- Nulls are fine in fixed-width columns; fill or drop them in string columns.
-- For small files, model external refs as plain `uri` / `position` / `size` columns (not the packed
-  `lance.blob.v2` descriptor) — see [AGENTS.md §4](AGENTS.md#4-data-model-how-to-actually-get-small-files-important).
-- Use `bool` for flags (bit-packed on disk, and faster than rust-lance on the `bool_flags` bench) and
-  `fixed_size_binary` (`std::array<uint8,N>`) for MAC/IP-style fields.
-- For S3, export credentials to the environment if your profile uses SSO/assume-role.
-
-**Don't**
-- Don't pass Arrow dictionary columns to the writer — they are refused at `write_batch`
-  (see [Type coverage](#type-coverage)); cast to the value type. Timestamps are supported,
-  but their timezone must be an IANA name, not a UTC offset.
-- Don't change the schema between batches in one session.
-- Don't enable `nano_lance_writer_set_blob_uri_dictionary` if stock Lance must read that column
-  (nanolance-only, create-mode only).
-- Don't expect integers to delta-encode — store app-level deltas for monotonic high-range integers
-  (`float`/`bool` columns *are* compressed automatically).
-
-## Layout
-
-- **soatins** (namespace `soatins`, include prefix `soatins/`): reflection nucleus — `be<>`/`le<>` endian-aware fields, bitfield `bits<>`, `soa<T>` columnar store, Arrow `arrow_schema<T>()` / `to_arrow()`. Header-only, depends only on nanoarrow + boost. CMake target: `soatins::core`.
-- **nanotins** (namespace `nanotins`, include prefix `nanotins/`): pcap/pcapng scanner + L2/L3/L4 wire structs and decode, built on the **wire_spec** declarative spec system (one explicit-offset spec → host read + device-callable read + SoA + Arrow; see `protocol_specs.hpp`) + **spec_dag** DAG/FSM dispatcher. Also has scheduler-agnostic `bulk_for_each` (over stdexec). Header-only, depends on soatins + header-only stdexec. CMake targets: `nanotins::pcap`, `nanotins::protocols`, `nanotins` (umbrella). (A GPU/CUDA executor layer is developed separately and not vendored here for now.)
-- **nanolance** (namespace `nano_lance`, include prefix `nanolance/`): the Lance writer/reader. CMake targets: `nanolance_proto`, `nanolance_reader`, `nanolance` (writing); link `nanolance_reader` alone if you only fetch external blobs.
-- **CLI:** one `nanolance` binary with subcommands — `import` (Arrow IPC stream → Lance dataset),
-  `info` (fragments, rows, file sizes), `cat` (dataset → CSV/NDJSON, for validation), `stitch`
-  (several datasets → one). `nanolance --help` lists them; `--version` prints the library version.
-  Each is also still built under its original name (`arrowipc2lance`, `nlance_info`, `nlance2table`,
-  `nlance_stitch`) — same binary contents, same flags, since it is the same code compiled twice.
-
-## Standalone build
-
-Requires CMake 3.22+, C++20, network for first-time FetchContent (nanoarrow, zstd, CLI11).
-
-No GitHub access (a corporate GitLab mirror instead): set `NANOLANCE_GIT_BASE=https://gitlab.example.com/mirrors`
-(environment or `-D`) and every dependency is cloned from there; see
-[docs/BUILDING_BEHIND_A_FIREWALL.md](docs/BUILDING_BEHIND_A_FIREWALL.md) for what to mirror and the build and test commands.
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-# Full smoke needs Python with pyarrow for several arrowipc2lance scripts; otherwise use a venv:
-#   cmake -S . -B build -DNANO_LANCE_WRITER_PYTHON=/path/to/venv/bin/python
-ctest --test-dir build -L smoke --output-on-failure
-```
-
-Optional S3 external blobs — just turn the option on and nanolance reads `s3://` using
-[nanos3reader](https://github.com/yoavbendor/nanos3reader), a small read-only S3 range reader (libcurl +
-SigV4, no AWS SDK) that nanolance pulls in via CMake `FetchContent`:
-
-```bash
-cmake -S . -B build -DNANOLANCE_ENABLE_S3=ON
-```
-
-(Embedders with the legacy AWS-SDK seam can still set `NANOLANCE_S3_TARGET` to use that instead.)
-
-The reader resolves **credentials** the way the AWS tools do, trying in order: environment
-variables → the shared profile files (`~/.aws/credentials` and `~/.aws/config`, honoring `AWS_PROFILE`),
-including a profile's `credential_process` helper → ECS/EKS container credentials → the EC2 instance role
-(IMDSv2). Temporary credentials (session tokens) are supported and refreshed before they expire. When no
-credentials are found the error names each source it tried and why it failed. Other configuration:
-
-| Variable | Purpose |
-| --- | --- |
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Credentials via environment (highest precedence; session token optional). |
-| `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` | Profile to read from `~/.aws/credentials` + `~/.aws/config` (default `default`). `AWS_SHARED_CREDENTIALS_FILE` / `AWS_CONFIG_FILE` override the paths. |
-| `AWS_REGION` / `AWS_DEFAULT_REGION` | Region for virtual-hosted addressing; also read from the profile's `region`, else defaults to `us-east-1`. |
-| `AWS_ENDPOINT_URL` | Custom endpoint, e.g. `http://localhost:9000`; when set, requests use path-style addressing for S3-compatible stores (MinIO, etc.). |
-| `AWS_MAX_ATTEMPTS` | Total tries per range GET (default `3`); transient failures (timeouts, dropped connections, `429`/`500`/`502`/`503`/`504`) are retried with full-jitter exponential backoff. |
-
-The reader uses connect/stall timeouts (so an unreachable or hung endpoint fails fast instead of blocking),
-auto-corrects a wrong-region bucket once via the `x-amz-bucket-region` redirect hint, and reuses one
-keep-alive connection per object. `credential_process` profiles are run directly; SSO and assume-role
-profiles are not resolved — for those, export credentials into the environment (e.g. via your AWS tooling)
-before running.
-
-For deeper notes — credential resolution, the blob-fetch performance gap vs pylance, the swappable SigV4
-crypto backend, small static builds (mbedTLS), and the plan to spin the reader out as a standalone library
-— see [docs/s3_reader_notes.md](docs/s3_reader_notes.md).
-
-The SigV4 signer is unit-tested against AWS's published vectors (`nano_lance_s3_min_sigv4`, runs by default).
-A live round-trip test (`nano_lance_s3_min_integration`) is **gated** — it skips unless `NANOLANCE_S3_TEST_URI`
-(+ `AWS_*`) point at a bucket holding the pattern object it expects. To exercise it against a throwaway MinIO:
-
-```bash
-cmake --build build --target nano_lance_s3_min_integration_test
-tests/s3_minio_integration.sh build/nano_lance_s3_min_integration_test   # needs Docker; skips if absent
-```
-
-The script starts MinIO, uploads the object, runs ranged reads + multi-window stitching, and asserts a wrong
-secret is rejected (proving the endpoint really verifies the signature).
-
-To instead reuse an existing AWS-SDK-backed S3 helper from a parent project, point nanolance at it (this
-overrides the built-in):
-
-```bash
-cmake -S . -B build -DNANOLANCE_ENABLE_S3=ON \
-  -DNANOLANCE_S3_TARGET=your_s3_helper_target \
-  -DNANOLANCE_S3_INCLUDE_DIR=/path/to/headers
-```
-
-## Writing external references (C++)
-
-nanolance is write-centric and its headline feature is pointing rows at raw bytes that live
-elsewhere (a local file, or an object in S3) instead of copying them into the dataset. A row's
-`payload_ref` carries a `uri` + `position` + `size`; the bytes are never read at write time.
+### C++
 
 ```cpp
-#include "nanolance/blob_builder.hpp"   // build_epb_table_{schema,array}, BlobV2Row
-#include "nanolance/nano_lance_writer.h" // C writer API
-#include <nanoarrow/nanoarrow.h>
+#include "nanolance/writer.hpp"
+#include "nanolance/lance_table_reader.hpp"
 
-// Two packets whose payloads live in one S3 object at different offsets — no bytes copied.
-std::vector<std::uint64_t> packet_ids = {0, 1};
-std::vector<nano_lance::BlobV2Row> refs = {
-    {/*inline_data=*/std::nullopt, /*uri=*/"s3://bucket/capture.pcapng", /*position=*/2048, /*size=*/1500},
-    {/*inline_data=*/std::nullopt, /*uri=*/"s3://bucket/capture.pcapng", /*position=*/3548, /*size=*/512},
-};
+nano_lance::Writer writer;                           // owns the handle; the destructor closes it
+if (!writer.open("out.lance", {.compression = true}) || !writer.write_batch(&array, &schema) || !writer.commit()) {
+    return writer.error();
+}
 
-ArrowSchema schema{};
-ArrowArray batch{};
-std::string err;
-nano_lance::build_epb_table_schema(schema, err);
-nano_lance::build_epb_table_array(packet_ids, refs, batch, err);
-
-nano_lance::Writer writer;
-writer.open("capture.lance", {.compression_level = 3});
-writer.write_batch(&batch, &schema);
-writer.commit();   // ...and the destructor closes it
-// Read the referenced bytes back later with nano_lance_fetch_external_blob(uri, position, size, ...).
+nano_lance::LanceScanRequest request;                // columns, filter, range, version, row ids...
+const std::string filter = "id > 1";
+request.filter = &filter;                            // answered from the scalar indexes when they can
+ArrowSchema out_schema{};
+std::vector<ArrowArray> batches;
+std::string error;
+nano_lance::lance_dataset_scan("out.lance", request, out_schema, batches, error);
 ```
 
-Link `nanolance` (writer) for the build; `nanolance_reader` is enough if you only fetch blobs.
+## Building
 
-### Shrinking many refs to one object (URI dictionary, opt-in)
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build -L smoke               # or -L layer:table for one layer's tests
+```
 
-By default each row stores its URI inline, matching Lance's on-disk blob-v2 layout (verified against
-`pylance` 12.0.0: it stores the external URI per row and only generally compresses it — it does **not**
-dictionary-dedup). When many rows point at the *same* object (e.g. millions of packets in one
-`.pcapng`), call `nano_lance_writer_set_blob_uri_dictionary(&writer, true)` before writing. Each
-distinct URI is then stored once and referenced per row by index, so a reference costs a handful of
-bytes instead of the full URI.
+CMake 3.22+ and a C++20 compiler (GCC 12 or later, Clang, AppleClang); the first configure fetches nanoarrow, zstd,
+nanom and CLI11. Behind a firewall, `NANOLANCE_GIT_BASE` points every fetch at a mirror
+([docs/BUILDING_BEHIND_A_FIREWALL.md](docs/BUILDING_BEHIND_A_FIREWALL.md)).
 
-This is a **nanolance-only** layout — stock Lance/lance-c cannot read those blob columns — so it is
-off by default and create-mode only (not append). nanolance's own reader resolves the URIs
-transparently, so the data you read back is identical either way.
+| Option | Default | |
+|---|---|---|
+| `NANOLANCE_ENABLE_S3` | OFF | `s3://` reads and writes through nanos3reader (needs libcurl) |
+| `NANOLANCE_BUILD_TESTS` | ON standalone | the C++ tests, registered with ctest |
+| `NANOLANCE_BUILD_TOOLS` | ON | the `nanolance` command line (import, info, cat, stitch) |
+| `NANOLANCE_BUILD_LANCE_C` | ON | `liblance_c`, lance-c's C API |
+| `NANOLANCE_WITH_JIEBA` | ON | the jieba tokenizer for Chinese full-text search (embeds its model) |
+| `NANOLANCE_ENABLE_AVX2` | OFF | compile for Haswell and later (AVX2, BMI2, FMA) |
+| `NANOLANCE_WERROR` | OFF | warnings are errors on nanolance's own targets (CI turns it on) |
+| `NANOLANCE_SANITIZER` | | e.g. `address,undefined` |
+| `NANOLANCE_BUILD_FUZZERS` | OFF | libFuzzer harnesses over the decode path (Clang) |
+| `NANOLANCE_BUILD_EXAMPLES` | ON standalone | `examples/pcapng2lance` (needs the nanotins submodule: `git clone --recursive`) |
 
-## Threads
+**What a program links** is what it calls: the library is static and split by layer, so a writer of local
+datasets does not carry the index code or the S3 client. Measured, stripped, x86-64 Release: a local writer
+about 0.9 MB, a writer to S3 about 1.2 MB, everything about 3.6 MB. A reader that must not link the index code
+calls `lance_dataset_scan_core` instead of `lance_dataset_scan` ([src/scan](src/scan/README.md)).
 
-nanolance uses the machine's cores for reads and writes, with nothing to add: a ~200-line pool on
-`std::thread` (`src/base/parallel.cpp`), no runtime library.
+Embedding in another CMake project: `add_subdirectory` with `NANOLANCE_BUILD_TESTS` off, then link `nanolance`
+(`nanolance::nanolance`); `nanolance_reader` alone is enough to fetch external payloads.
 
-| | What runs side by side |
+## How the code is organized
+
+`src/` is eleven layers, each using only the ones below it (`tools/check_layers.py` checks every include in CI).
+Each layer's README says what it is for, how to use it, and what of the Lance specification it implements;
+its tests are in `tests/<layer>/` (`ctest -L layer:<layer>`).
+
+| Layer | What it is |
 |---|---|
-| Read | a fragment is cut into row ranges ("morsels"), each decoded -- every column of it -- on its own thread and returned as its own Arrow batch; fragments too. A list page with a repetition index and any MiniBlock page give up a row range without being decoded whole; a plan that would decode more than a quarter extra is not split. |
-| take | the columns of each fragment |
-| Write | the columns of a data file, encoded into memory and appended in order: the file is byte-for-byte what one thread writes |
+| [base](src/base/README.md) | threads, buffers, caches, Unicode, small utilities |
+| [io](src/io/README.md) | where bytes live: local files and object stores |
+| [arrow](src/arrow/README.md) | Arrow arrays and schemas, and how they map to Lance's types |
+| [encoding](src/encoding/README.md) | how one page of one column is laid out, both directions |
+| [file](src/file/README.md) | a `.lance` file: pages, column metadata, global buffers, footer |
+| [table](src/table/README.md) | what a version is: manifest, fragments, deletions, row ids, transactions, refs |
+| [expr](src/expr/README.md) | what a filter means |
+| [scan](src/scan/README.md) | reading rows of fragments, given a row selection |
+| [index](src/index/README.md) | each index kind: build, search, describe |
+| [dataset](src/dataset/README.md) | user operations: writes, updates, merge-insert, compaction, index lifecycle |
+| [api](src/api/README.md) | the C APIs and lance-c |
 
-- **Count**: `nanolance.set_threads(n)` / `nano_lance_set_threads(n)`, else `NANOLANCE_THREADS`, else the
-  CPUs the process may run on (its affinity mask: `taskset` and container limits count).
-- **One thread** is the single-threaded code path, not a pool of one: nothing is started, nothing split.
-- **A write memory budget** (`max_pending_bytes`) keeps columns streaming to the file one at a time.
-- **Batches**: with several threads a large fragment comes back as several record batches rather than one.
-- **Buffer pool**: released output buffers of 1 MiB and up are kept (at most `NANOLANCE_BUFFER_POOL_MB`,
-  default 128; 0 turns it off; two seconds idle and they go), so a repeated read does not page-fault
-  its output in again -- what Rust and pyarrow get from their pooling allocators.
-- A process forked after reading (a PyTorch DataLoader worker) starts a pool of its own.
+[src/README.md](src/README.md) has the rules between them. Public headers are in `include/nanolance/`.
 
-## Compression (Lance-compatible)
+## Spec coverage
 
-`nano_lance_writer_set_compression(&writer, true)` (CLI: `--compress`) turns on Lance-compatible
-compression, off by default. The output stays readable by stock `lance` (verified against `pylance`
-12.0.0); nanolance's own reader decodes it transparently.
+Every layer README ends with a table: one row per item of the [Lance format specification](https://lance.org/format/)
+(an encoding, a page layout, a manifest feature, a transaction and its conflict rules, an index's files), its
+status, where it is implemented, and the tests that prove it, marked *unit* (nanolance's own tests) or *interop*
+(compared against files pylance writes or reads). `tools/check_spec.py` checks in CI that every named function and
+test exists and that every module has a test of its own.
 
-- **String / binary columns → zstd.** Each chunk's value buffer is stored as `[uint64 LE
-  uncompressed size][zstd frame]` and the `PageLayout` advertises `General(ZSTD)`, exactly as the
-  Lance reference writer does. A 5000-row repetitive string column round-trips identically and is
-  ~2.7× smaller. The zstd level is the writer's `compression_level`.
-- **Integer columns (8/16/32/64-bit) → FastLanes bitpacking.** Values are packed in 1024-element
-  blocks at the minimum bit width, emitting `InlineBitpacking` (a faithful port of Lance's vendored
-  `spiraldb/fastlanes` kernel). A 5000-row int64 column with ~10-bit values is ~6.4× smaller and
-  reads back identically under stock `lance`.
+<!-- spec-summary:start -->
+<!-- spec-summary:end -->
 
-- **Float/double columns → byte-stream-split + zstd** (opt-in via `set_compression(true)`), and
-  **bool columns → 1-bit-per-value packing** (always on) — both match the technique stock Lance itself
-  uses for these types and round-trip byte-for-byte readable by it.
+What the tables mark missing is the roadmap's raw material ([docs/ROADMAP.md](docs/ROADMAP.md)).
 
-## Embedded in streamingtestapps
+## Types
 
-The parent project sets `NANOLANCE_SOURCE_DIR` and calls `add_subdirectory` with `NANOLANCE_ENABLE_S3`, `NANOLANCE_S3_TARGET`, and `NANOLANCE_BUILD_TESTS` so it reuses nanoarrow, zstd, and `stream_helper_s3` from the main tree.
+Every Arrow type either round-trips or is refused by `write_batch` with a message; nothing is written that
+nanolance or Lance cannot read back.
 
-## Repo size (why a zip looked huge)
+| Arrow type | |
+|---|---|
+| `int8`..`int64`, `uint8`..`uint64`, `float16`, `float`, `double`, `bool` | round-trips |
+| `utf8`, `large_utf8`, `binary`, `large_binary`, `fixed_size_binary(N)` | round-trips |
+| `timestamp` (with or without an IANA time zone), `date32/64`, `time32/64`, `duration`, `decimal128/256` | round-trips |
+| `struct` (any depth, null structs included), `list`, `large_list`, `map`, `fixed_size_list` | round-trips, with null and empty lists and null items at any level |
+| `null` | round-trips (Lance's all-null page) |
+| `lance.blob.v2` | external references written; inline, packed, dedicated and external blobs read |
+| Arrow `dictionary` | refused: cast to the value type (low-cardinality strings are dictionary-encoded on disk anyway) |
+| `timestamp` with a UTC-offset zone (`+05:30`) | refused: Lance supports IANA names only |
+| a null element inside a valid `fixed_size_list` row | refused |
 
-**The library sources are small** (on the order of 1–2 MB without `build/`). What explodes disk usage is the **CMake `build/` directory** after a standalone configure:
+Nulls are stored in every column kind.
 
-- FetchContent checkouts live under `build/_deps/` (nanoarrow, zstd, CLI11).
-- CMake clones those repos with **`.git` object packs`** (often tens of MB each) unless shallow clones are used.
-- Object files and static libs add more under `build/`.
+## Things to know
 
-**Nothing in `build/` is part of the “library” you distribute** — delete it before making a zip, or never add it to the archive:
+- **The schema is fixed by the first batch** of a write session.
+- **Compression:** structural encodings (bitpacking, constant pages, run-length, dictionary) are on by default
+  and cost nothing to read; `compression = true` adds zstd for high-cardinality strings and byte-stream split
+  + zstd for floats. Per-column measurements: [AGENTS.md §3](AGENTS.md#3-enabling-the-compression-that-was-measured).
+- **Small files of references:** model them as plain `uri` / `position` / `size` columns rather than the packed
+  `lance.blob.v2` descriptor (about 3 against 41 bytes a row): [AGENTS.md §4](AGENTS.md#4-data-model-how-to-actually-get-small-files-important).
+- **Memory while writing:** the writer holds rows until a commit; `max_pending_bytes` makes `write_batch` commit a
+  fragment whenever the buffered data reaches the budget (peak about 3-4x the budget).
+- **Threads:** reads, takes and writes use the machine's cores (`nanolance.set_threads(n)` /
+  `nano_lance_set_threads(n)` / `NANOLANCE_THREADS`); files do not depend on the thread count.
+- **nanolance-only features**, which pylance cannot read: the external-URI dictionary
+  (`nano_lance_writer_set_blob_uri_dictionary`), and full-text indexes built with the multi-script settings
+  (pylance refuses those by name rather than searching them wrongly).
+- **S3 credentials** are resolved as the AWS tools do (environment, profiles, `credential_process`, ECS/EKS,
+  IMDSv2); SSO and assume-role profiles are not: export their credentials first
+  ([docs/s3_reader_notes.md](docs/s3_reader_notes.md)).
 
-```bash
-rm -rf build
-du -sh .   # expect ~1–3MB for sources + .git + small fixtures
-```
+## Testing
 
-**Prefer a clean export** (no build, no deps):
+| What | Where |
+|---|---|
+| C++ unit tests, by layer | `tests/<layer>/`, `ctest -L layer:<layer>` |
+| cross-layer and smoke tests | `tests/integration/`, `tests/*.sh` |
+| Python, including every comparison with pylance | `bindings/python/tests` (`pytest`) |
+| pylance's own test suite against nanolance | [docs/PYLANCE_COMPAT.md](docs/PYLANCE_COMPAT.md) |
+| lance-c's tests against `liblance_c` | [docs/LANCE_C_COMPAT.md](docs/LANCE_C_COMPAT.md) |
+| Lance's Rust encoding tests, read back by nanolance | [docs/RUST_SUITE.md](docs/RUST_SUITE.md) |
+| datasets published on the Hugging Face Hub, read by both | [docs/REAL_DATASETS.md](docs/REAL_DATASETS.md) |
+| fuzzing and sanitizers | `tests/fuzz/`, `.github/workflows/memory-safety.yml` |
 
-```bash
-git archive --format=zip -o nanolance-src.zip HEAD
-```
+## Benchmarks
 
-Standalone configures use **`GIT_SHALLOW TRUE`** on FetchContent to keep *future* `build/_deps` smaller; an existing `build/` from before that change should still be removed or reconfigured from scratch to drop old full clones.
-
-## Benchmarking
-
-**Live results: [yoavbendor.github.io/nanolance/bench](https://yoavbendor.github.io/nanolance/bench/)**
--- updated by every benchmark run: the latest run in full, its raw JSON, and the history of runs
-(each run's branch, commit, gate result and link to its CI run). The table below is the latest run's
-summary; the image is served from the same site, so it updates with every run.
+**Live results: [yoavbendor.github.io/nanolance/bench](https://yoavbendor.github.io/nanolance/bench/)**, updated by
+every benchmark run. The table below is the latest run's summary.
 
 <!-- bench-summary:start -->
 
@@ -536,37 +256,23 @@ Latest run: 2026-10-19 08:56 UTC on `main` (`d67dfab`), [full results](https://y
 
 ![nanolance benchmark summary](https://yoavbendor.github.io/nanolance/bench/summary.svg)
 
-Speed is the reference's median time over nanolance's: above 1× nanolance is faster. Two suites, both
-sampled until 10 seconds of timed work per aspect:
+Speed is the reference's median time over nanolance's: above 1× nanolance is faster. The matrix covers 27 Arrow
+data types written and read by the C++ library and the Python binding, every read checked against its source;
+the index suites build and query scalar, vector and full-text indexes against the `lance` crate with no Python in
+the process, and the answers must agree before a time is reported. [docs/PERFORMANCE_GATE.md](docs/PERFORMANCE_GATE.md)
+is the gate that fails a CI run when nanolance loses ground; memory, file sizes, program sizes and the full-scale
+runs are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-- **Matrix, against pylance:** 27 Arrow data types (numbers, dates, strings, nulls, vectors, structs, lists,
-  maps and a mixed table), written and read by nanolance's C++ library and Python binding, on one core and on
-  all cores. Every read is checked against the source before it is timed.
-- **Indexes, against Rust Lance:** scalar, vector and full-text indexes, built and queried by nanolance's C++
-  library and by the `lance` crate (version 12.0.0) with no Python in the process. The answers must agree
-  before any time is reported. [docs/PERFORMANCE_GATE.md](docs/PERFORMANCE_GATE.md) describes the gate that
-  fails a run when nanolance loses ground on any of these.
+## Related projects
 
-Memory, file size, program size, COCO and Speech Commands, and the full-scale numbers are in
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md). Reproduce a run with `python tools/bench_matrix.py` (the matrix)
-and the three `tools/bench_{scalar_index,vector_index,fts}.py` scripts (the indexes); `tools/bench_publish.py` turns them into the
-page above. The Rust driver needs `cargo build --release` in `tools/lance_rs_bench`, the C++ one
-`cmake --build build --target nlbench_index`.
+- [nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet): the same Arrow batches to Parquet.
+- [nanotins / soatins](https://github.com/yoavbendor/nanotins): packets and structs to Arrow; used by
+  `examples/pcapng2lance`, a streaming pcapng to Lance converter.
+- [nanos3reader](https://github.com/yoavbendor/nanos3reader): the S3 client.
 
-Older, narrower benchmarks: pcap-style columns and native-reader profiles in
-[bench/linux-ci-results.md](bench/linux-ci-results.md) (CI-owned; local runs go to
-[bench/linux-local-results.md](bench/linux-local-results.md) via `bench/run-local-bench.sh`), external
-blob fetching in [bench/README_blob_fetch.md](bench/README_blob_fetch.md), per-column compression in
-[AGENTS.md](AGENTS.md#3-enabling-the-compression-that-was-measured).
+## Version and license
 
-## Version
-
-Version **0.2.0** — macros are generated into `build/include/nanolance/version.h`. Runtime string: `nanolance::library_version()` (declared in `include/nanolance/version.hpp`). `arrowipc2lance --version` includes this string.
-
-Standalone FetchContent pins **nanoarrow** to commit `ffe61d3cd2d02da9e60cfc405cd6c50c512f64b9` for reproducibility (align with a known-good streamingtestapps fetch).
-
-## License
-
-[Apache-2.0](LICENSE). See [NOTICE](NOTICE) and [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md) for attributions.
-
-nanolance is an independent C++ implementation of the **Lance** columnar format — it does not link the Rust `lance` crate, but its protobuf message definitions are derived from Lance's Apache-2.0 `.proto` schemas (pinned at `v7.0.0-rc.1`). Apache-2.0 is chosen to align with the Arrow/nanoarrow + Lance ecosystem (all Apache-2.0) and for its explicit patent grant. Build-time deps: nanoarrow (Apache-2.0), zstd (BSD-3-Clause), CLI11 (BSD-3-Clause).
+Version **0.2.0** (`nanolance::library_version()`, `include/nanolance/version.hpp`).
+[Apache-2.0](LICENSE); see [NOTICE](NOTICE) and [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md). nanolance is
+an independent implementation of the Lance format: it does not link the Rust `lance` crate; its protobuf message
+definitions are derived from Lance's Apache-2.0 `.proto` schemas.
