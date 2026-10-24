@@ -37,6 +37,7 @@ The modules so far:
 | `values/dictionary` | dictionary blocks of fixed and variable-width values, and their indices |
 | `values/scalar_value` | a constant page's one value |
 | `layout/miniblock` | mini-block chunk framing (header, levels, buffers, padding) and the metadata words that index the chunks |
+| `layout/full_zip` | full-zip rows (control word, value slot or length-prefixed value) and the repetition index |
 
 ## Its test
 

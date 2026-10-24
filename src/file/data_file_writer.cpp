@@ -11,6 +11,7 @@
 #include "encoding/values/rle.hpp"
 #include "encoding/values/scalar_value.hpp"
 #include "encoding/layout/miniblock.hpp"
+#include "encoding/layout/full_zip.hpp"
 #include "nanolance/parallel.hpp"
 #include "nanolance/work_stats.hpp"
 
@@ -1710,10 +1711,9 @@ bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& value
         for (auto r = first; r < end; ++r) {
             starts.push_back(data.size());
             const bool valid = validity_bit(values.validity, r);
-            if (nulls) {
-                data.push_back(valid ? 0U : 1U);  // the definition level: 1 = null item
-            }
+            const auto control = full_zip::control_bytes(0U, nulls ? 1U : 0U);
             if (!valid) {
+                full_zip::append_level(data, control, 1U, nullptr, 0U, length_bytes);  // definition 1: a null item
                 continue;
             }
             const auto begin = variable_offset(values, r);
@@ -1722,20 +1722,12 @@ bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& value
                 error = "a utf8/binary value over 4 GiB";
                 return false;
             }
-            const auto at = data.size();
-            data.resize(at + length_bytes + static_cast<std::size_t>(len));
-            std::memcpy(data.data() + at, &len, length_bytes);  // little-endian, low bytes first
-            if (len != 0U) {
-                std::memcpy(data.data() + at + length_bytes, values.variable.data.data() + begin,
-                            static_cast<std::size_t>(len));
-            }
+            static constexpr std::uint8_t kEmpty = 0U;
+            full_zip::append_level(data, control, 0U, len != 0U ? values.variable.data.data() + begin : &kEmpty,
+                                   static_cast<std::size_t>(len), length_bytes);
         }
         starts.push_back(data.size());
-        const std::size_t index_width = data.size() <= std::numeric_limits<std::uint32_t>::max() ? 4U : 8U;
-        std::vector<std::uint8_t> rep_index(starts.size() * index_width);
-        for (std::size_t k = 0; k < starts.size(); ++k) {
-            std::memcpy(rep_index.data() + k * index_width, &starts[k], index_width);
-        }
+        const auto rep_index = full_zip::repetition_index(starts);
 
         descriptor::FullZip layout;
         layout.bits_def = nulls ? 1U : 0U;
@@ -1795,8 +1787,7 @@ bool write_nested_blob_column(std::ostream& out, const LanceField& field, const 
     };
     const auto bits_def = ser.has_def ? bits_for(max_def) : 0U;
     const auto bits_rep = ser.has_rep ? bits_for(max_rep) : 0U;
-    const auto total_bits = bits_def + bits_rep;
-    const std::size_t control_bytes = total_bits == 0U ? 0U : total_bits <= 8U ? 1U : total_bits <= 16U ? 2U : 4U;
+    const std::size_t control_bytes = full_zip::control_bytes(bits_rep, bits_def);
     const auto levels = ser.has_rep || ser.has_def ? std::max(ser.rep.size(), ser.def.size())
                                                     : static_cast<std::size_t>(ser.items.size());
 
@@ -1817,11 +1808,7 @@ bool write_nested_blob_column(std::ostream& out, const LanceField& field, const 
             row_sizes.push_back(static_cast<std::uint32_t>(data.size() - row_start));  // a new row starts
             row_start = data.size();
         }
-        if (control_bytes != 0U) {
-            const std::uint32_t word = (rep << bits_def) | def;
-            const auto* p = reinterpret_cast<const std::uint8_t*>(&word);
-            data.insert(data.end(), p, p + control_bytes);  // little-endian
-        }
+        full_zip::append_level(data, control_bytes, (rep << bits_def) | def, nullptr, 0U, 0U);
         const bool has_slot = ser.is_slot.empty() || ser.is_slot[level] != 0U;
         if (!has_slot) {
             continue;  // an empty or null list

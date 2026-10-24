@@ -17,6 +17,7 @@
 #include "encoding/values/dictionary.hpp"
 #include "encoding/values/scalar_value.hpp"
 #include "encoding/layout/miniblock.hpp"
+#include "encoding/layout/full_zip.hpp"
 #include "nanolance/column_slice.hpp"
 #include <nanom/fastlanes.hpp>
 #include "nanolance/fsst.hpp"
@@ -854,6 +855,8 @@ struct FullZipPageParams {
     /// validity bits, then the items. `value_bytes` counts both.
     std::uint64_t items = 0;
     std::size_t item_validity_bytes = 0;
+
+    full_zip::RowShape shape() const { return {bits_rep, bits_def, max_visible_def, value_bytes, length_bytes}; }
 };
 
 /// Room for a FullZip page's variable-width values at once, given `encoded` bytes of them: growing
@@ -871,50 +874,7 @@ void reserve_full_zip_values(std::vector<std::uint8_t>& data, const FullZipPageP
 /// them carry a value -- what the page's layout states for the page as a whole.
 bool count_full_zip_levels(const std::vector<std::uint8_t>& data, const FullZipPageParams& params,
                            std::uint64_t& levels, std::uint64_t& visible, std::string& why) {
-    levels = 0;
-    visible = 0;
-    if (params.control_bytes == 0U) {
-        why = "a FullZip page window without control words";
-        return false;
-    }
-    const std::uint32_t def_mask = params.bits_def == 0U ? 0U : ((1U << params.bits_def) - 1U);
-    std::size_t at = 0;
-    while (at < data.size()) {
-        if (data.size() - at < params.control_bytes) {
-            why = "FullZip page window truncated in a control word";
-            return false;
-        }
-        std::uint32_t word = 0;
-        std::memcpy(&word, data.data() + at, params.control_bytes);  // little-endian
-        at += params.control_bytes;
-        ++levels;
-        const auto def = word & def_mask;
-        if (def > params.max_visible_def) {
-            continue;  // an empty or null list
-        }
-        ++visible;
-        if (params.length_bytes == 0U) {
-            if (data.size() - at < params.value_bytes) {
-                why = "FullZip page window truncated in a value";
-                return false;
-            }
-            at += params.value_bytes;
-        } else if (def == 0U) {
-            if (data.size() - at < params.length_bytes) {
-                why = "FullZip page window truncated in a length";
-                return false;
-            }
-            std::uint64_t length = 0;
-            std::memcpy(&length, data.data() + at, params.length_bytes);
-            at += params.length_bytes;
-            if (length > data.size() - at) {
-                why = "FullZip value runs past its page window";
-                return false;
-            }
-            at += static_cast<std::size_t>(length);
-        }
-    }
-    return true;
+    return full_zip::count_levels(data, params.shape(), levels, visible, why);
 }
 
 /// Set while a nested Blob v2 column is decoded (decode_nested_blob_column): its descriptor pages
@@ -978,8 +938,7 @@ bool full_zip_page_params(const page_layout::PageLayout& layout, std::uint64_t p
     out.visible = fz.num_visible_items;
     out.bits_rep = fz.bits_rep;
     out.bits_def = fz.bits_def;
-    const auto total_bits = fz.bits_rep + fz.bits_def;
-    out.control_bytes = total_bits == 0U ? 0U : total_bits <= 8U ? 1U : total_bits <= 16U ? 2U : 4U;
+    out.control_bytes = full_zip::control_bytes(fz.bits_rep, fz.bits_def);
 
     const auto* values = fz.value_compression.get();
     if (values == nullptr) {
@@ -2471,8 +2430,6 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
                 page_rep.resize(num_levels);
                 page_def.resize(num_levels);
             }
-            const std::uint32_t def_mask = params.bits_def == 0U ? 0U : ((1U << params.bits_def) - 1U);
-            const std::uint32_t rep_mask = params.bits_rep == 0U ? 0U : ((1U << params.bits_rep) - 1U);
             bool page_has_nulls = false;
             std::size_t at = 0;
             if (!variable) {
@@ -2496,24 +2453,22 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
                 reserve_full_zip_values(out.variable.data, params, data.size());
             }
             std::size_t r = 0;  // the next item
+            const auto shape = params.shape();
+            full_zip::Level lv;
             for (std::size_t level = 0; level < num_levels; ++level) {
-                std::uint32_t def = 0;
+                if (!full_zip::next_level(data, at, shape, lv, error)) {
+                    error = "column '" + on_disk_field.name + "': " + error;
+                    return false;
+                }
+                const auto def = lv.def;
+                if (params.bits_rep != 0U) {
+                    page_rep[level] = static_cast<std::uint16_t>(lv.rep);
+                    page_def[level] = static_cast<std::uint16_t>(def);
+                }
+                if (!lv.visible) {
+                    continue;  // an empty or null list: the control word is all there is
+                }
                 if (params.control_bytes != 0U) {
-                    if (data.size() - at < params.control_bytes) {
-                        error = "column '" + on_disk_field.name + "': FullZip page truncated in a control word";
-                        return false;
-                    }
-                    std::uint32_t word = 0;
-                    std::memcpy(&word, data.data() + at, params.control_bytes);  // little-endian
-                    at += params.control_bytes;
-                    def = word & def_mask;
-                    if (params.bits_rep != 0U) {
-                        page_rep[level] = static_cast<std::uint16_t>((word >> params.bits_def) & rep_mask);
-                        page_def[level] = static_cast<std::uint16_t>(def);
-                        if (def > params.max_visible_def) {
-                            continue;  // an empty or null list: the control word is all there is
-                        }
-                    }
                     if (r == rows) {
                         error = "column '" + on_disk_field.name + "': FullZip page has more values than the " +
                                 std::to_string(rows) + " it declares";
@@ -2523,50 +2478,34 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
                     page_has_nulls = page_has_nulls || def != 0U;
                 }
                 if (!variable) {
+                    const auto* slot = data.data() + lv.value_at;
                     const auto first_item = (rows_so_far + r) * params.items;
                     if (params.item_validity_bytes != 0U) {
-                        append_item_validity(out, data.data() + at, params.items, first_item);
+                        append_item_validity(out, slot, params.items, first_item);
                     } else if (params.items != 0U) {
                         append_item_validity(out, nullptr, params.items, first_item);
                     }
-                    at += params.item_validity_bytes;
-                    const auto item_bytes = params.value_bytes - params.item_validity_bytes;
-                    out.fixed.insert(out.fixed.end(), data.begin() + static_cast<std::ptrdiff_t>(at),
-                                     data.begin() + static_cast<std::ptrdiff_t>(at + item_bytes));
-                    at += item_bytes;
+                    out.fixed.insert(out.fixed.end(), slot + params.item_validity_bytes, slot + lv.value_size);
                     ++r;
                     continue;
                 }
-                if (def == 0U) {
-                    if (data.size() - at < params.length_bytes) {
-                        error = "column '" + on_disk_field.name + "': FullZip page truncated in a length";
-                        return false;
-                    }
-                    std::uint64_t length = 0;
-                    std::memcpy(&length, data.data() + at, params.length_bytes);
-                    at += params.length_bytes;
-                    if (length > data.size() - at) {
-                        error = "column '" + on_disk_field.name + "': FullZip value runs past the page";
-                        return false;
-                    }
+                if (lv.has_value) {
+                    const auto* value = data.data() + lv.value_at;
+                    const auto length = lv.value_size;
                     if (params.fsst) {
-                        if (!fsst::decompress_value(*params.fsst, data.data() + at, static_cast<std::size_t>(length),
-                                                    out.variable.data, error)) {
+                        if (!fsst::decompress_value(*params.fsst, value, length, out.variable.data, error)) {
                             return false;
                         }
                     } else if (params.value_scheme != page_layout::BufferScheme::kNone && length != 0U) {
-                        if (!decompress_full_zip_value(params.value_scheme, data.data() + at,
-                                                       static_cast<std::size_t>(length), out.variable.data, error)) {
+                        if (!decompress_full_zip_value(params.value_scheme, value, length, out.variable.data, error)) {
                             error = "column '" + on_disk_field.name + "': " + error;
                             return false;
                         }
                     } else if (params.value_scheme != page_layout::BufferScheme::kNone) {
                         // An empty compressed value is an empty value (Lance's decompressor skips it).
                     } else {
-                        out.variable.data.insert(out.variable.data.end(), data.begin() + static_cast<std::ptrdiff_t>(at),
-                                                 data.begin() + static_cast<std::ptrdiff_t>(at + length));
+                        out.variable.data.insert(out.variable.data.end(), value, value + length);
                     }
-                    at += static_cast<std::size_t>(length);
                     if (out.variable.data.size() > default_read_limits().max_uncompressed_bytes ||
                         (!out.variable.large &&
                          out.variable.data.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))) {
@@ -3657,14 +3596,9 @@ bool take_full_zip_rows(const EncodingsIo& io, const std::string& column, const 
         return take_full_zip_fixed_rows(io, column, page, params, rows, begin, end, page_first, out, out_row, error);
     }
     const auto index_size = page.buffer_sizes[1];
-    const auto entries = page.length + 1U;
-    if (index_size == 0U || index_size % entries != 0U) {
-        error = "column '" + column + "': FullZip repetition index does not have one entry per row";
-        return false;
-    }
-    const auto width = index_size / entries;
-    if (width != 1U && width != 2U && width != 4U && width != 8U) {
-        error = "column '" + column + "': FullZip repetition index entries are " + std::to_string(width) + " bytes";
+    const auto width = full_zip::repetition_index_width(index_size, page.length);
+    if (width == 0U) {
+        error = "column '" + column + "': FullZip repetition index does not have one 1, 2, 4 or 8-byte entry per row";
         return false;
     }
     thread_local std::vector<std::uint8_t> index;
@@ -3672,11 +3606,7 @@ bool take_full_zip_rows(const EncodingsIo& io, const std::string& column, const 
     if (!io.read(page.buffer_offsets[1], index_size, index, error)) {
         return false;
     }
-    const auto entry = [&](std::uint64_t k) {
-        std::uint64_t v = 0;
-        std::memcpy(&v, index.data() + k * width, static_cast<std::size_t>(width));
-        return v;
-    };
+    const auto entry = [&](std::uint64_t k) { return full_zip::repetition_index_entry(index, width, k); };
     const auto data_size = page.buffer_sizes[0];
     for (std::size_t i = begin; i < end;) {
         // Rows that sit next to each other in the page are one read.
