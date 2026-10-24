@@ -1502,7 +1502,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     request.fragment_ids = target != nullptr ? target->fragments : nullptr;
     OwnedSchema scanned;
     OwnedBatches batches;
-    if (!lance_dataset_scan(dataset_path, request, scanned.s, batches.v, error)) {
+    if (!lance_dataset_scan_core(dataset_path, request, scanned.s, batches.v, error)) {
         return false;
     }
     const ArrowSchema* type = scanned.s.children[0];

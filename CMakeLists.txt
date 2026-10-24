@@ -389,6 +389,7 @@ add_library(nanolance STATIC
     src/encoding/layout/miniblock.cpp
     src/encoding/layout/full_zip.cpp
     src/dataset/write_session.cpp
+    src/dataset/dataset_scan.cpp
     src/api/nano_lance_writer.cpp
     src/api/writer_cxx.cpp
 )

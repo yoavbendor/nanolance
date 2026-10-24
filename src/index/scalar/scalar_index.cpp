@@ -1579,7 +1579,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     OwnedSchema scanned;
     OwnedBatches batches;
     if (!index_build::stage(progress, "load_data", 0, "rows",
-                            [&] { return lance_dataset_scan(dataset_path, request, scanned.s, batches.v, error); })) {
+                            [&] { return lance_dataset_scan_core(dataset_path, request, scanned.s, batches.v, error); })) {
         return false;
     }
     const ArrowSchema* col_type = scanned.s.children[0];

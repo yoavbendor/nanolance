@@ -58,7 +58,7 @@ FILES = {
               "vector/vector_search.cpp", "vector/vector_index_build.cpp", "vector/hnsw_build.cpp",
               "vector/hnsw_build.hpp", "vector/rabitq_build.hpp", "vector/vector_segment.hpp"],
     "dataset": ["dataset.cpp", "dataset_ops.cpp", "dataset_stitcher.cpp", "index_optimize.cpp",
-                "index_segments.cpp", "write_session.cpp", "write_session.hpp"],
+                "index_segments.cpp", "write_session.cpp", "write_session.hpp", "dataset_scan.cpp"],
     "api": ["nano_lance_writer.cpp", "writer_cxx.cpp", "nano_lance_reader.cpp", "nano_lance_table_reader_c.cpp", "nano_lance_external_blob.cpp",
             "lance_c.cpp"],
 }

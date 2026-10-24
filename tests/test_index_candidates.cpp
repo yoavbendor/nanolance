@@ -13,6 +13,7 @@
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/nano_lance_writer.h"
 #include "nanolance/scalar_index.hpp"
+#include "nanolance/work_stats.hpp"
 
 #include "lance_minimal.pb.hpp"
 
@@ -222,8 +223,44 @@ int main() {
         require(!answer.exact, std::string(sql) + " is not exact");
     }
 
+    // The scans use them: lance_dataset_scan fills the request's selector in when it is null (the dataset
+    // layer's default); lance_dataset_scan_core consults only the one the request names; use_scalar_index
+    // false turns it off. The rows are the same every way.
+    {
+        const std::string sql = "id < 6";
+        const auto scan = [&](bool core, bool use_index, nano_lance::IndexCandidatesFn selector) {
+            nano_lance::LanceScanRequest request;
+            request.filter = &sql;
+            request.use_scalar_index = use_index;
+            request.index_candidates = selector;
+            ArrowSchema schema{};
+            std::vector<ArrowArray> batches;
+            nano_lance::work_stats::reset();
+            const bool ok = core ? nano_lance::lance_dataset_scan_core(path, request, schema, batches, error)
+                                 : nano_lance::lance_dataset_scan(path, request, schema, batches, error);
+            require(ok, "scan: " + error);
+            std::int64_t rows = 0;
+            for (auto& b : batches) {
+                rows += b.length;
+                b.release(&b);
+            }
+            schema.release(&schema);
+            return std::make_pair(rows, nano_lance::work_stats::counters().indexed_fragments.load());
+        };
+        const auto by_default = scan(false, true, nullptr);
+        require(by_default.first == 6, "the default scan finds the rows");
+        require(by_default.second > 0, "lance_dataset_scan uses the scalar index without being told to");
+        const auto core = scan(true, true, nullptr);
+        require(core.first == 6 && core.second == 0, "lance_dataset_scan_core with no selector reads every row");
+        const auto named = scan(true, true, nano_lance::index_candidates);
+        require(named.first == 6 && named.second > 0, "lance_dataset_scan_core uses a selector it is given");
+        const auto off = scan(false, false, nullptr);
+        require(off.first == 6 && off.second == 0, "use_scalar_index = false turns the index off");
+    }
+
     std::error_code ec;
     std::filesystem::remove_all(path, ec);
-    std::cout << "index_candidates: ok (BTREE and BITMAP answers for =, <, IN, AND, OR; unindexed filters)\n";
+    std::cout << "index_candidates: ok (BTREE and BITMAP answers for =, <, IN, AND, OR; unindexed filters; "
+                 "scans use them by default)\n";
     return 0;
 }

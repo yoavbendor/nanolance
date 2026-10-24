@@ -23,6 +23,14 @@ the format has one home here.
 | dataset | `src/dataset/` | user operations: write sessions, updates, merge_insert, compaction, index lifecycle, query planning |
 | api | `src/api/` | the C APIs and lance-c |
 
+A lower layer reaches a higher one only through something the higher one hands it. The scan layer, for
+one, does not know the indexes: a `LanceScanRequest` carries the index selector as a function pointer.
+`lance_dataset_scan` and `LanceTableStream::open_request` are defined in the dataset layer
+(`dataset/dataset_scan.cpp`) and fill it in, so filtered scans use the scalar indexes by default.
+`lance_dataset_scan_core` and `open_request_core` are the scan layer's own and consult only a selector the
+request names. A reader that calls only the `_core` entry points links no index code (about 1 MB less in a
+Release build).
+
 `python3 tools/check_layers.py` prints each layer's files and lines. About 18k of the index layer's lines are
 generated tables (`index/fts/*.inc`: Unicode and stop-word tables, the snowball stemmer, jieba's HMM model).
 

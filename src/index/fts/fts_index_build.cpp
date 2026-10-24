@@ -886,7 +886,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
             return false;
         }
     }
-    if (scan && !lance_dataset_scan(dataset_path, request, scanned.s, batches.v, error)) {
+    if (scan && !lance_dataset_scan_core(dataset_path, request, scanned.s, batches.v, error)) {
         return false;
     }
     report(2, "load_data", 0, "rows", 0);

@@ -1356,7 +1356,7 @@ bool row_addresses(const std::filesystem::path& path, const NearestQuery& q, con
     request.index_candidates = nano_lance::index_candidates;
     ArrowSchema schema{};
     std::vector<ArrowArray> batches;
-    if (!lance_dataset_scan(path, request, schema, batches, error)) {
+    if (!lance_dataset_scan_core(path, request, schema, batches, error)) {
         return false;
     }
     bool ok = true;
@@ -2756,7 +2756,7 @@ bool flat_search(const std::filesystem::path& path, const NearestQuery& q, Vecto
     request.index_candidates = nano_lance::index_candidates;
     ArrowSchema schema{};
     std::vector<ArrowArray> batches;
-    if (!lance_dataset_scan(path, request, schema, batches, error)) {
+    if (!lance_dataset_scan_core(path, request, schema, batches, error)) {
         return false;
     }
     const float q_norm = std::sqrt(dot(q.key.data(), q.key.data(), dim));

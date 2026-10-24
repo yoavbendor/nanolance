@@ -138,10 +138,10 @@ struct LanceScanRequest {
     /// With a filter: read only the rows the dataset's scalar indices say may pass (BTree, Bitmap,
     /// LabelList), as `index_candidates` answers them. The rows returned are the same either way.
     bool use_scalar_index = true;
-    /// How the filter is answered from indices: set it to nano_lance::index_candidates (index_search.hpp)
-    /// for `use_scalar_index` to have any effect. Null: no index is consulted and a filtered scan reads
-    /// every row -- the scan layer does not link the index code, so a reader built without indices stays
-    /// without them.
+    /// How the filter is answered from indices. Null: lance_dataset_scan and LanceTableStream::open_request
+    /// use the index layer's index_candidates (index_search.hpp); the *_core entry points consult no index
+    /// and a filtered scan reads every row. The scan layer does not link the index code, so a build without
+    /// indices (one that calls only the _core entry points) stays without it.
     IndexCandidatesFn index_candidates = nullptr;
     /// Row-address masks: only the rows the mask allows are read, before the filter, the range and any
     /// ranking. With a mask, `range` counts the rows that pass it (as with a filter). Null: no mask.
@@ -154,10 +154,18 @@ bool lance_fields_arrow_schema(const std::vector<pb::Field>& fields,
                                const std::map<std::string, std::vector<std::uint8_t>>& schema_metadata,
                                ArrowSchema& out_schema, std::string& error);
 
-/// A read as `request` describes it. See lance_table_read_dataset for the ownership rules.
+/// A read as `request` describes it, with the dataset's scalar indices answering a filter (unless the request
+/// names its own index_candidates, or use_scalar_index is false). See lance_table_read_dataset for the
+/// ownership rules. Defined by the dataset layer (src/dataset/dataset_scan.cpp), which links the index code.
 bool lance_dataset_scan(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
                         ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches, std::string& error,
                         bool trusted_input = false);
+
+/// The scan layer's read: as lance_dataset_scan, consulting only the index_candidates the request names (none
+/// when it is null). For builds without the index layer, and for code below it that names its own.
+bool lance_dataset_scan_core(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                             ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches, std::string& error,
+                             bool trusted_input = false);
 
 /// lance_table_take with the version, projection and row id columns of `request` (its range is ignored).
 bool lance_dataset_take(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
@@ -310,10 +318,16 @@ public:
                            ArrowSchema& out_schema, LanceTableStream& out, std::string& error,
                            bool trusted_input = false);
 
-    /// As `open`, for a whole scan request.
+    /// As `open`, for a whole scan request, with the dataset's scalar indices answering a filter (as
+    /// lance_dataset_scan). Defined by the dataset layer.
     static bool open_request(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
                              ArrowSchema& out_schema, LanceTableStream& out, std::string& error,
                              bool trusted_input = false);
+
+    /// The scan layer's open_request: only the index_candidates the request names (as lance_dataset_scan_core).
+    static bool open_request_core(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                                  ArrowSchema& out_schema, LanceTableStream& out, std::string& error,
+                                  bool trusted_input = false);
 
     /// Decode the next data file. Returns false on failure; on success with no data left,
     /// `out_batch.release` is null. The caller owns each batch it receives.

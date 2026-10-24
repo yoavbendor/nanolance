@@ -1343,7 +1343,7 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
     scan.index_candidates = nano_lance::index_candidates;
     ArrowSchema schema{};
     std::vector<ArrowArray> batches;
-    if (!lance_dataset_scan(path, scan, schema, batches, error)) {
+    if (!lance_dataset_scan_core(path, scan, schema, batches, error)) {
         return false;
     }
     const int tc = child_index(schema, parts.front());
@@ -2479,7 +2479,7 @@ bool row_addresses(const std::filesystem::path& path, const FtsSearchRequest& q,
     request.index_candidates = nano_lance::index_candidates;
     ArrowSchema schema{};
     std::vector<ArrowArray> batches;
-    if (!lance_dataset_scan(path, request, schema, batches, error)) {
+    if (!lance_dataset_scan_core(path, request, schema, batches, error)) {
         return false;
     }
     bool ok = true;

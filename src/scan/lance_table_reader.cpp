@@ -3412,9 +3412,9 @@ bool take_physical(const ReadPlan& plan, ArrowSchema& out_schema,
 
 }  // namespace
 
-bool lance_dataset_scan(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
-                        ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches, std::string& error,
-                        bool trusted_input) {
+bool lance_dataset_scan_core(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                             ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches, std::string& error,
+                             bool trusted_input) {
     return read_dataset_eager(dataset_path, request, out_schema, out_batches, error, trusted_input);
 }
 
@@ -3789,12 +3789,12 @@ bool LanceTableStream::open_range(const std::filesystem::path& dataset_path,
     LanceScanRequest request;
     request.columns = column_names;
     request.range = range;
-    return open_request(dataset_path, request, out_schema, out, error, trusted_input);
+    return open_request_core(dataset_path, request, out_schema, out, error, trusted_input);
 }
 
-bool LanceTableStream::open_request(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
-                                    ArrowSchema& out_schema, LanceTableStream& out, std::string& error,
-                                    bool trusted_input) {
+bool LanceTableStream::open_request_core(const std::filesystem::path& dataset_path,
+                                         const LanceScanRequest& request, ArrowSchema& out_schema,
+                                         LanceTableStream& out, std::string& error, bool trusted_input) {
     error.clear();
     ArrowSchemaInit(&out_schema);
 
