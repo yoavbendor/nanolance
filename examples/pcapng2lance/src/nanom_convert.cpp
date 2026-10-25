@@ -37,7 +37,11 @@
 #include "nanom_soa_lance_writer.hpp"  // generic nanom soa<Row> -> Lance table writer
 
 #include "nanolance/typed_writer.hpp"
+#include "nanolance/blob_v2_external.hpp"
+#include "nanolance/lance_table_reader.hpp"
+#include "nanolance/nano_lance_reader.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -45,6 +49,8 @@
 #include <span>
 #include <string>
 #include <vector>
+
+#include <nanoarrow/nanoarrow.h>
 
 namespace fs = std::filesystem;
 namespace nm = nanom;
@@ -298,6 +304,85 @@ std::string arrow_metadata(const std::vector<std::pair<std::string, std::string>
     return out;
 }
 
+// ---- --stage l2: the Ethernet and VLAN headers of a data folder's packet table -----------------------
+//
+// The staged path reads <datadir>/packets.lance, fetches the first bytes of each packet from the capture by its
+// external reference, decodes the link layer, and writes ethernet.lance, vlan.lance and remainder_after_l2.lance
+// beside it, with the rows and remainders the nanotins stage writes.
+
+constexpr std::size_t kPrefixCap = 256;                 // header bytes carved per packet (as the nanotins stage)
+constexpr std::size_t kReadTile = std::size_t{32} << 20;  // one fetch covers consecutive packets of one capture
+
+struct EnrichRow {
+    std::uint64_t pid = 0;
+    std::uint64_t disc = 0;  // link_type for the link layer
+    std::uint64_t off = 0;   // byte offset of the packet in the capture
+    std::uint64_t size = 0;  // captured length
+    std::string uri;
+};
+
+int child_index(const ArrowSchema& s, const char* name) {
+    for (std::int64_t i = 0; i < s.n_children; ++i) {
+        if (s.children[i]->name != nullptr && std::strcmp(s.children[i]->name, name) == 0) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+// Read packet_id, the discriminator column and the payload_ref of every row of a Lance table, in order.
+bool read_payload_rows(const fs::path& table, const char* disc_col, std::vector<EnrichRow>& out, std::string& error) {
+    ArrowSchema schema{};
+    std::vector<ArrowArray> batches;
+    if (!nano_lance::lance_table_read_dataset(table, schema, batches, error)) return false;
+    const auto release_all = [&] {
+        for (auto& b : batches) {
+            if (b.release) b.release(&b);
+        }
+        if (schema.release) schema.release(&schema);
+    };
+    const int pid_col = child_index(schema, "packet_id");
+    const int disc_at = child_index(schema, disc_col);
+    const int blob_col = child_index(schema, "payload_ref");
+    if (pid_col < 0 || disc_at < 0 || blob_col < 0) {
+        error = std::string("table missing packet_id / ") + disc_col + " / payload_ref";
+        release_all();
+        return false;
+    }
+    for (auto& batch : batches) {
+        ArrowArrayView view{};
+        ArrowError ae;
+        if (ArrowArrayViewInitFromSchema(&view, &schema, &ae) != NANOARROW_OK ||
+            ArrowArrayViewSetArray(&view, &batch, &ae) != NANOARROW_OK) {
+            error = "failed to view payload table batch";
+            ArrowArrayViewReset(&view);
+            release_all();
+            return false;
+        }
+        nano_lance::BlobV2ColumnView blob;
+        if (!blob.init(*schema.children[blob_col], *view.children[blob_col], error)) {
+            ArrowArrayViewReset(&view);
+            release_all();
+            return false;
+        }
+        for (std::int64_t i = 0; i < view.length; ++i) {
+            EnrichRow r;
+            r.pid = ArrowArrayViewGetUIntUnsafe(view.children[pid_col], i);
+            r.disc = ArrowArrayViewGetUIntUnsafe(view.children[disc_at], i);
+            r.off = blob.position(i);
+            r.size = blob.byte_size(i);
+            const char* data = nullptr;
+            std::int64_t n = 0;
+            blob.uri(i, &data, &n);
+            r.uri.assign(data, static_cast<std::size_t>(n));
+            out.push_back(std::move(r));
+        }
+        ArrowArrayViewReset(&view);
+    }
+    release_all();
+    return true;
+}
+
 // ---- the converter -------------------------------------------------------------------------------
 
 class Converter {
@@ -523,6 +608,90 @@ private:
         return 0;
     }
 
+public:
+    // --stage l2 <datadir>: decode the Ethernet and VLAN headers of each packet row of <datadir>/packets.lance and
+    // forward the payload after L2 (next_protocol = the inner EtherType). A row whose header is not fully resident,
+    // or whose link layer is not Ethernet, decodes nothing; a VLAN tag that cannot be read keeps the Ethernet row
+    // already decoded, as the nanotins decoder does.
+    int run_enrich_l2(const fs::path& datadir) {
+        std::vector<EnrichRow> in;
+        std::string err;
+        const fs::path table = datadir / "packets.lance";
+        if (!read_payload_rows(table, "link_type", in, err)) return fail("read " + table.string() + ": " + err);
+
+        std::vector<std::uint8_t> tile;
+        char ferr[512]{};
+        for (std::size_t i = 0; i < in.size();) {
+            const std::uint64_t base = in[i].off;
+            const std::string uri = in[i].uri;
+            std::size_t j = i;
+            std::uint64_t span_end = base;
+            for (; j < in.size() && in[j].uri == uri; ++j) {
+                const std::uint64_t need = in[j].off + std::min<std::uint64_t>(in[j].size, kPrefixCap);
+                if (j > i && need - base > kReadTile) break;
+                span_end = std::max(span_end, need);
+            }
+            const std::size_t span = static_cast<std::size_t>(span_end - base);
+            tile.resize(span);
+            std::size_t got = 0;
+            if (span > 0 && nano_lance_fetch_external_blob(uri.c_str(), base, span, tile.data(), tile.size(), &got,
+                                                           ferr, sizeof ferr) != NANO_LANCE_READER_OK) {
+                return fail(std::string("fetch_external_blob: ") + ferr);
+            }
+            for (std::size_t k = i; k < j; ++k) {
+                const EnrichRow& r = in[k];
+                const std::size_t local = static_cast<std::size_t>(r.off - base);
+                const std::size_t hdr = static_cast<std::size_t>(std::min<std::uint64_t>(r.size, kPrefixCap));
+                if (local + hdr > got || r.disc != nmproto::kLinkTypeEthernet) continue;
+                std::size_t consumed = 0;
+                std::uint16_t ethertype = 0;
+                if (decode_l2(r.pid, nm::bytes(reinterpret_cast<const std::byte*>(tile.data() + local), hdr),
+                              consumed, ethertype) &&
+                    consumed < r.size) {
+                    rem_pid_.push_back(r.pid);
+                    rem_next_.push_back(ethertype);
+                    rem_pay_.push_back(nt::blob_ref{r.uri, r.off + consumed, r.size - consumed});
+                }
+            }
+            i = j;
+        }
+
+        if (!p2l_nanom::write_soa_table((datadir / "ethernet.lance").string(), eth_, args_.compress, err)) {
+            return fail("write ethernet: " + err);
+        }
+        if (!p2l_nanom::write_soa_table((datadir / "vlan.lance").string(), vlan_, args_.compress, err)) {
+            return fail("write vlan: " + err);
+        }
+        if (const int rc = write_remainder_table((datadir / "remainder_after_l2.lance").string())) return rc;
+        std::fprintf(stderr, "pcapng2lance: stage l2 -> %zu input rows, %zu decoded forward\n", in.size(),
+                     rem_pid_.size());
+        return 0;
+    }
+
+    // The Ethernet header and VLAN tags at the start of `bytes`, as the nanotins decoder reads them.
+    bool decode_l2(std::uint64_t pid, nm::bytes bytes, std::size_t& consumed, std::uint16_t& next_ethertype) {
+        consumed = 0;
+        next_ethertype = 0;
+        auto eth = nm::strct<nmproto::Ethernet>()(nm::from(bytes));
+        if (!eth) return false;
+        eth_.push(p2l_nanom::make_eth(pid, eth->value));
+        std::uint16_t ethertype = eth->value.ethertype;
+        nm::input cur = eth->rest;
+        std::size_t off = nm::wire_size_v<nmproto::Ethernet>;
+        while (ethertype == nmproto::kEtherTypeVlan || ethertype == nmproto::kEtherTypeQinQ) {
+            auto tag = nm::strct<nmproto::VlanTag>()(cur);
+            if (!tag) return false;
+            vlan_.push(p2l_nanom::make_vlan(pid, tag->value));
+            ethertype = tag->value.inner_ethertype;
+            cur = tag->rest;
+            off += nm::wire_size_v<nmproto::VlanTag>;
+        }
+        consumed = off;
+        next_ethertype = ethertype;
+        return true;
+    }
+
+private:
     Args args_;
     fs::path output_;
     std::string kv_blob_;  // the SHB/IDB options as Arrow metadata, set before the packet table is written
@@ -553,6 +722,14 @@ int nanom_convert_main(int argc, char** argv) {
     Args args;
     std::string err;
     if (!parse_args(argc, argv, args, err)) return fail(err);
+    if (args.stage == "l2") {  // --stage l2 <datadir>
+        if (args.pos.empty()) {
+            std::fprintf(stderr, "usage: %s --stage l2 <datadir>\n", argv[0]);
+            return 2;
+        }
+        const fs::path datadir = args.pos[0];
+        return Converter(std::move(args), fs::path(), std::string()).run_enrich_l2(datadir);
+    }
     if (args.pos.size() < 2) {
         std::fprintf(stderr,
                      "usage: %s [--no-compress] [--no-write] [--decode-l2l3] <input.pcap|pcapng> "
