@@ -156,6 +156,7 @@ struct Args {
     bool compress = true;
     bool no_write = false;     // scan+parse only, skip the Lance write (isolates Phase A/B for benchmarking)
     bool decode_l2l3 = false;  // also decode L2/L3/L4 via nanom walk_packet -> per-PDU Lance tables
+    std::string stage;                      // --stage l1: the packet table into a data folder (see nanom_convert_main)
     std::uint64_t drop = 0;                 // -d: skip the first N packets (their packet_id is kept for the rest)
     std::uint64_t take = UINT64_MAX;        // -c: emit at most N packets after the drop (default: all)
     std::vector<std::string> pos;
@@ -177,6 +178,10 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
             a.no_write = true;
         } else if (s == "--decode-l2l3") {
             a.decode_l2l3 = true;
+        } else if (s == "--stage") {
+            const char* v = value(i);
+            if (!v) return false;
+            a.stage = v;
         } else if (s == "-d" || s == "--drop" || s == "-c" || s == "--count") {
             const char* v = value(i);
             if (!v) return false;
@@ -557,6 +562,14 @@ int nanom_convert_main(int argc, char** argv) {
     }
     const fs::path input = args.pos[0];
     fs::path output = args.pos[1];
+    if (args.stage == "l1") {  // --stage l1 <input> <datadir>: the packet table is <datadir>/packets.lance
+        std::error_code ec;
+        fs::create_directories(output, ec);
+        output = output / "packets.lance";
+        args.decode_l2l3 = false;  // the later stages decode each layer in their own run
+    } else if (!args.stage.empty()) {
+        return fail("--stage " + args.stage + " is not implemented by the nanom converter");
+    }
     std::string payload_uri = (args.pos.size() >= 3) ? args.pos[2] : to_file_uri(input);
     return Converter(std::move(args), std::move(output), std::move(payload_uri)).run(input);
 }
