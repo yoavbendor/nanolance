@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// pcapng2lance entry point. The packet table and the --decode-l2l3 protocol tables are written by the nanom
-// converter by default. The nanotins converter stays for the options nanom does not implement yet (staged
-// windowed streaming, threads, --gpu) and is chosen automatically when one of them is
-// given. --backend nanom|nanotins forces one.
+// pcapng2lance entry point. The nanom converter writes every table by default: the packet table, the staged
+// tables of --stage l1..l4 and the --decode-l2l3 protocol tables. The nanotins converter stays for the options that
+// change the layout or the cost of the output: --window-bytes (windowed streaming), --mem-bytes and
+// --read-tile-bytes (chunked enrichment), and --gpu, which is not built yet. It is chosen automatically when one of
+// them is given; --backend nanom|nanotins forces one.
 #include "nanom_convert.hpp"
 
 #include <cstdio>
@@ -16,8 +17,7 @@ namespace {
 
 // Options only the nanotins converter implements.
 bool nanotins_only(const std::string& s) {
-    static const char* const kOptions[] = {"--sequential", "--threads", "--window-bytes", "--mem-bytes",
-                                           "--read-tile-bytes", "--gpu"};
+    static const char* const kOptions[] = {"--window-bytes", "--mem-bytes", "--read-tile-bytes", "--gpu"};
     for (const char* o : kOptions) {
         if (s == o) return true;
     }

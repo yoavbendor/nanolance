@@ -188,6 +188,12 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
             const char* v = value(i);
             if (!v) return false;
             a.stage = v;
+        } else if (s == "--sequential") {
+            // Accepted for the nanotins converter's command line; this converter is sequential already.
+        } else if (s == "--threads") {
+            // The thread count only tunes how the nanotins converter runs; this one reads the capture on one
+            // thread and writes the same tables whatever it is set to.
+            if (!value(i)) return false;
         } else if (s == "-d" || s == "--drop" || s == "-c" || s == "--count") {
             const char* v = value(i);
             if (!v) return false;
