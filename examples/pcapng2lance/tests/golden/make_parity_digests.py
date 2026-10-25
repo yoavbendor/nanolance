@@ -3,6 +3,9 @@
 
   make_parity_digests.py <pcapng2lance> <dpar2lance_nanotins> <lldp2lance_nanotins> <repo-root> <nanom-testdata> <workdir>
 
+The nanotins converters are not in the current tree. They are built from the commit before ba5cb7d (the removal),
+with the nanotins submodule at d52a4e2 (examples/pcapng2lance/extern/nanotins); the goldens were generated that way.
+Those binaries are pcapng2lance (run with --backend nanotins), dpar2lance_nanotins and lldp2lance_nanotins.
 Needs pylance. Each digest is the SHA-256 of a table's columns, schema metadata and rows (in order)."""
 import hashlib, json, os, shutil, subprocess, sys
 

@@ -90,6 +90,24 @@ The packet table (`packets.lance`): `packet_id`, `interface_id`, `ts_raw`, `capl
 Section header and interface options are dataset metadata, on the first field, as `pcapng:shb<k>:<name>` and
 `pcapng:if<j>:<name>`.
 
+## Regenerating the golden digests
+
+`tests/golden/parity_digests.json` is the reference the converter is checked against. It was produced by the nanotins
+converters, which are no longer in the tree. To regenerate it (only needed if the reference itself changes):
+
+```
+git checkout 27f4ae7                # the last commit whose tree has the nanotins converters
+git submodule update --init --recursive
+cmake -S . -B build && cmake --build build --target pcapng2lance dpar2lance_nanotins lldp2lance_nanotins
+python3 examples/pcapng2lance/tests/golden/make_parity_digests.py \
+    build/examples/pcapng2lance/pcapng2lance \
+    build/examples/pcapng2lance/dpar2lance_nanotins build/examples/pcapng2lance/lldp2lance_nanotins \
+    . examples/pcapng2lance/extern/nanom/examples/nanotins_parity/testdata /tmp/golden-work
+```
+
+The nanotins submodule for that commit is `d52a4e2`. Copy the regenerated file back and check it into the
+current branch. Routine runs do not need any of this: the test compares against the committed file.
+
 ## Memory
 
 The converter reads the capture a window at a time (`--window-bytes`), and each stage reads its input table a batch at a

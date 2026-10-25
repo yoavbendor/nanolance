@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Guards the first command a new user runs. The README and docs/getting-started.md say the library
-# builds without the nanotins submodule; this job proves it by doing exactly what a new user does --
+# builds without the nanom submodule; this job proves it by doing exactly what a new user does --
 # a NON-RECURSIVE checkout followed by the documented cmake invocation, with no extra flags.
 #
 # It also covers the second quick-start trap: `pip install -e bindings/python` uses scikit-build-core
