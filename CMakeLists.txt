@@ -605,41 +605,29 @@ if(NANOLANCE_BUILD_TOOLS)
 endif()
 
 if(NANOLANCE_STANDALONE)
-    option(NANOLANCE_BUILD_EXAMPLES "Build examples (pcapng2lance + nanotins)" ON)
+    option(NANOLANCE_BUILD_EXAMPLES "Build examples (pcapng2lance and its nanom-based tools)" ON)
 else()
-    option(NANOLANCE_BUILD_EXAMPLES "Build examples (pcapng2lance + nanotins)" OFF)
+    option(NANOLANCE_BUILD_EXAMPLES "Build examples (pcapng2lance and its nanom-based tools)" OFF)
 endif()
-# The reflection/parsing stack (soatins + nanotins) is NOT a dependency of nanolance itself — nanolance
-# reads/writes Lance using only nanoarrow + zstd + local code. It is a consumer-side dependency of the
-# pcapng2lance example, which vendors it as a git submodule and adds it itself (see
-# examples/pcapng2lance/CMakeLists.txt). A plain nanolance build (library, tools, tests) needs no submodule.
-# Skip (don't fail) when the submodule is absent: a plain `git clone` without --recursive is the
-# documented way to build the library, and EXAMPLES defaults ON for standalone builds, so a hard
-# error here would break the quick start in README.md / docs/getting-started.md. Same graceful-skip
-# posture fuselance already takes when libfuse3 is missing.
+# The parser library nanom is NOT a dependency of nanolance itself: nanolance reads and writes Lance with nanoarrow,
+# zstd and local code only. It is a dependency of the pcapng2lance example, which vendors it as a git submodule and adds
+# it itself (examples/pcapng2lance/CMakeLists.txt). A plain nanolance build (library, tools, tests) needs no submodule.
+# Skip (don't fail) when the submodule is absent: a plain `git clone` without --recursive is the documented way to build
+# the library, and EXAMPLES defaults ON for standalone builds, so a hard error here would break the quick start in
+# README.md. Same graceful-skip posture fuselance already takes when libfuse3 is missing.
 if(NANOLANCE_BUILD_EXAMPLES)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/pcapng2lance/extern/nanotins/CMakeLists.txt")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/pcapng2lance/extern/nanom/CMakeLists.txt")
         add_subdirectory(examples/pcapng2lance)
     else()
         message(STATUS
-            "nanolance: skipping the pcapng2lance example -- its nanotins submodule is not checked "
-            "out. The library, tools and tests build fine without it. To build the example, run: "
+            "nanolance: skipping the pcapng2lance example -- its nanom submodule is not checked out. The library, "
+            "tools and tests build fine without it. To build the example, run: "
             "git submodule update --init --recursive")
     endif()
 endif()
 
-# pcapng2lance_nanom — the same L1 converter built on nanom instead of nanotins, for a head-to-head
-# benchmark. nanom is an OPTIONAL, non-mandatory dependency pulled in ONLY by this example (its own git
-# submodule under examples/pcapng2lance_nanom/extern/nanom), so this is its own opt-in toggle, OFF by
-# default and independent of NANOLANCE_BUILD_EXAMPLES: a normal build never needs the nanom submodule.
-option(NANOLANCE_BUILD_PCAPNG2LANCE_NANOM
-       "Build the nanom-based pcapng2lance example (needs the nanom submodule)" OFF)
-if(NANOLANCE_BUILD_PCAPNG2LANCE_NANOM)
-    add_subdirectory(examples/pcapng2lance_nanom)
-endif()
-
 # fuselance — mount a Lance blob.v2 table as a read-only FUSE filesystem. Independent of the
-# NANOLANCE_BUILD_EXAMPLES toggle above because that one pulls in pcapng2lance's nanotins submodule;
+# NANOLANCE_BUILD_EXAMPLES toggle above because that one pulls in pcapng2lance's nanom submodule;
 # fuselance needs only nanolance_reader + libfuse3, so it gets its own opt-in. Its CMakeLists skips
 # itself gracefully when libfuse3 is not installed.
 if(NANOLANCE_STANDALONE)

@@ -46,8 +46,8 @@ jobs:
 
       - name: Confirm the submodule really is absent
         run: |
-          if [ -f examples/pcapng2lance/extern/nanotins/CMakeLists.txt ]; then
-            echo "::error::nanotins submodule is checked out; this job must run without it"
+          if [ -f examples/pcapng2lance/extern/nanom/CMakeLists.txt ]; then
+            echo "::error::nanom submodule is checked out; this job must run without it"
             exit 1
           fi
 

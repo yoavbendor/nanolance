@@ -26,9 +26,8 @@ shallow mirror may not have them.
 The pins live in the `FetchContent_Declare` calls of `CMakeLists.txt` and
 `bindings/python/CMakeLists.txt` (see section 5 for checking them after an update).
 
-Not needed: the two git submodules (`examples/pcapng2lance/extern/nanotins`,
-`examples/pcapng2lance_nanom/extern/nanom`). They belong to two examples, and CMake skips those
-examples when the submodules are absent. To build them anyway, see the `insteadOf` note in section 6.
+Not needed: the git submodule `examples/pcapng2lance/extern/nanom`. It belongs to the pcapng2lance example, and
+CMake skips that example when the submodule is absent. To build it anyway, see the `insteadOf` note in section 6.
 
 ## 2. Point the build at the mirror
 

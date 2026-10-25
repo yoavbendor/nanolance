@@ -1,221 +1,99 @@
-# pcapng → Lance (nanotins reference converter)
+# pcapng → Lance
 
-A worked example that converts legacy **pcap** and **pcapng** captures into a Lance dataset — one row
-per packet, with packet **payloads kept external** (referenced by `uri` + offset + size, never
-copied). It demonstrates the full nanotins stack: the pcapng block scanner, the wire_spec declarative
-wire-parsing core + spec_dag DAG dispatcher, windowed streaming, staged enrichment (L1 → L2 → L3 → L4),
-and both CPU bulk (stdexec) and GPU paths.
+A converter from pcap / pcapng captures to Lance datasets, with the payloads kept **external**: one row per packet, and
+each packet's bytes stay in the capture, referenced by a `lance.blob.v2` `payload_ref` (`uri`, `position`, `size`). It is
+built on [nanom](https://github.com/yoavbendor/nanom), a header-only C++23 parser-combinator library, and on nanolance's
+writer. The DPAR and LLDP rule tools (`dpar2lance`, `lldp2lance`) are built on the same parser.
 
-See the docs/ folder for details: [`DESIGN.md`](docs/DESIGN.md) (architecture + parsing seam), 
-[`NANOTINS_REFLECTION.md`](docs/NANOTINS_REFLECTION.md) (struct → SoA → Arrow → Lance machinery), 
-and [`KICKOFF.md`](docs/KICKOFF.md) (build order + traps).
+## Build
 
-## At a glance
-
-- **Input:** classic pcap or pcapng (either endianness, multi-section). **Output:** a Lance dataset of
-  per-packet L1 rows, plus (with `--decode-l2l3`) one table per PDU — ethernet / vlan / ipv4 / ipv6 /
-  tcp / udp / ptp / IPv6 ext headers — joined by `packet_id`.
-- **Payloads stay external:** each row stores `(uri, offset, size)` into the *original* capture; bytes
-  are never copied (fetched on demand, including from `s3://`). The Parquet twin,
-  [`pcapng2parquet`](https://github.com/yoavbendor/nanoarrow2parquet/tree/main/examples/pcapng2parquet),
-  is parse-only because Parquet has no external blob store.
-- **Run:** `pcapng2lance [--decode-l2l3] [--no-compress] [--sequential|--threads N] [--window-bytes N]
-  <input> <output.lance> [payload_uri]`. Memory is bounded by `--window-bytes` regardless of capture size.
-- **Gotchas:** L4 (tcp/udp) rows are emitted only on the **first IPv4 fragment** (`frag_offset == 0`);
-  `bool` row fields are unsupported (use `uint8`); the original capture must stay reachable to fetch
-  payloads / run `--stage` enrichment. Cross-checked field-for-field against **tshark**.
-
-The rest of this document is the build history and the milestone/feature detail behind the above.
-
-## For AI agents
-
-**Use this example when** you want a Lance dataset from a capture **with packet payloads kept external**
-(referenced, never copied) and/or **staged, incremental enrichment** (decode one layer per run). It reads
-and writes through the full nanotins → soatins → nanolance stack.
-
-**Pick a sibling instead when:** you want Parquet and don't need payloads → the parse-only Parquet twin
-[`pcapng2parquet`](https://github.com/yoavbendor/nanoarrow2parquet/tree/main/examples/pcapng2parquet).
-You just want human-readable decoded packets →
-[`pcapng2json`](https://github.com/yoavbendor/nanotins/tree/main/examples/pcapng2json).
-
-**Run:** `build/examples/pcapng2lance/pcapng2lance --decode-l2l3 capture.pcapng out.lance` (add a
-`payload_uri` like `s3://…` as the last arg if the dataset will be read on another host).
-
-**Do**
-- Pass `--decode-l2l3` for the per-PDU tables; join each one to the L1 table on `packet_id`.
-- Keep the original capture reachable (`file://` or `s3://`) — payload fetches and every `--stage` run read
-  from it; pass an explicit `payload_uri` when the dataset moves hosts.
-- Bound RAM with `--window-bytes`; pick the CPU path with `--sequential` or `--threads N` — all produce
-  byte-identical tables.
-- Use `uint8` for flag fields and `fixed_size_binary` for MAC/IP fields.
-
-**Don't**
-- Don't use `bool` row fields — forbidden (Arrow 1-bit vs the byte-wide writer path).
-- Don't pass `--gpu` expecting a GPU run — it is a planned feature; the flag reports that and exits.
-- Don't expect a TCP/UDP row on continuation fragments (only `frag_offset == 0`) or cross-fragment payload
-  reassembly — neither is done.
-
-## What's built (M0 + M1 + M2 + M3/M6)
-
-- **M0 — `soatins` reflection core** (in the standalone [`soatins/`](extern/nanotins/soatins) library, vendored into this example as a submodule from the sister [nanotins](https://github.com/yoavbendor/nanotins) repo): `be<>`/`le<>` 
-  wire scalars, `bits<Word, field<…>…>` bitfields, `column_traits`, `columns_of<T>` (flattened column list),
-  `soa<T>`/`store`, `arrow_schema<T>()` + `to_arrow()`. One `BOOST_DESCRIBE_STRUCT` line per row type
-  drives SoA storage, an Arrow schema, and a Lance table. Proven bit-exact by `nanotins_roundtrip`.
-  
-- **M1 — the converter**: the parsing seam `nanotins/pcap_blocks.hpp` (Phase A scan → `BlockRef[]`) + the
-  driver `pcapng2lance_main.cpp`. Phase B (per-block parse → SoA) is now built on top of nanotins.
-
-- **M2 — windowed streaming + bulk** (for endless / S3-backed captures): the driver never reads the whole
-  file. It pulls bounded windows (`include/streaming_reader.hpp`), the seam's stateful `scan_window` walks
-  the complete blocks in each window, and the **scheduler-agnostic bulk parse** runs over resident bytes →
-  one Lance fragment per window, committed and freed before the next. Section/interface state and a global
-  `packet_id` carry across windows; stored payload offsets are absolute (fetchable from S3 regardless of
-  windowing). `--window-bytes` is the RAM budget (default 512 MiB; a small file is one window).
-  `--sequential` or `--threads N` selects the CPU path. (`--gpu` is a planned future feature.)
-  
-- **M3/M6 — L2/L3/L4 decode via wire_spec + spec_dag** (`--decode-l2l3`): The **wire_spec** declarative
-  core (nanotins `protocol_specs.hpp`) defines Ethernet / 802.1Q VLAN / IPv4 / IPv6 / TCP / UDP with explicit
-  byte offsets; the **spec_dag** DAG/FSM (`spec_dag.hpp`) chains them together (Ethernet → VLAN* → IPv4/IPv6
-  → TCP/UDP, honoring `ihl`/`data_offset`). One walk of the DAG (via `dag_decode.hpp`/`dag_bulk.hpp`) decodes
-  serially or as a CPU bulk pass (via `dag_decode_bulk`), bit-identically. Output: **one Lance table
-  per PDU type** (`<stem>_ethernet.lance`, `_vlan`, `_ipv4`, `_ipv6`, `_tcp`, `_udp`), each row = `packet_id`
-  + the reflected header fields. Also writes `<stem>_remainder_after_l4.lance` — the application payload after
-  L4 as external blob.v2 refs. **The DAG-emitted PDU tables are byte-identical to the older hand-written decode**
-  (verified by `test_pdu_table_interop`/`test_pdu_table_lance_interop`). Staged enrichment (`--stage l1→l2→l3→l4`)
-  decodes one layer per stage via the per-layer `protocols::` decode (not the all-layers DAG), and its
-  remainder is byte-identical to the one-shot path (guarded by `pcapng2lance_frag_harmony`).
-- **Scheduler-agnostic bulk** (`nanotins/include/nanotins/bulk.hpp`): `bulk_for_each(sched, num_tasks,
-  n, kernel)` is a partitioned stdexec `ex::schedule | ex::bulk` — the CPU path passes an
-  `exec::static_thread_pool` scheduler. The kernel is device-safe (POD captures, no allocation), so the same
-  call could drive a GPU executor layer later with only the scheduler swapped. 
-  
-  The **L1 Phase-B parse** runs through it: a device-safe kernel (POD captures, no alloc) calls the pure
-  `parse_epb` per `BlockRef` and scatters into the SoA columns. stdexec builds and runs on this MinGW
-  host (verified), so the CPU bulk is real stdexec, not a stand-in.
-  
-  The **L2/L3/L4 decode** (`--decode-l2l3`) runs through the DAG via `dag_decode_bulk` (CPU) / 
-  `dag_decode_gpu` (GPU), implementing the canonical variable-outputs-per-input pattern: two device-safe
-  bulk passes bracket a prefix-sum — pass 1 `count_packet` per packet → exclusive scan per PDU type →
-  size each output column exactly → pass 2 `scatter_packet` writes each PDU to its own prefix-summed slot
-  (disjoint writes, no `push_back`). Both passes walk the one shared DAG traversal (so count == scatter by
-  construction), and row order is packet order → byte-identical tables to the serial path
-  (`test_pdu_table_interop` verifies; `pcapng2lance_frag_harmony` verifies staged vs. one-shot). On a
-  CUDA host the scan becomes a `thrust::exclusive_scan` and the two kernels run on the GPU unchanged.
-  
-  **Sequential reference path** (`--sequential`): both the L1 parse and the L2/L3/L4 decode run through one
-  policy seam (`nanotins::bulk_for_each` vs `nanotins::serial_for_each`), so `--sequential` swaps the whole
-  Phase B to a plain in-thread loop — the readable/debuggable baseline and a byte-identical correctness
-  oracle for the bulk path. `--threads N` sets the ex::bulk pool size (default = `hardware_concurrency`),
-  for tuning on many-core hosts. Measured on this 8-core host (1.9 GB capture, single window): bulk and
-  sequential are within noise (L1 ~0.8 s both; L1+L2/L3/L4 ~0.71 vs 0.73 s), plateauing by ~2–8 threads —
-  the kernels are light and the pipeline is memory-bandwidth-bound, so CPU thread-parallelism barely
-  helps. Sweep it yourself with [`bench/decode_bench.sh`](../../bench/decode_bench.sh)
-  (`--threads 4,8,16,32,64,128,164`); pass `--no-write` (a driver flag that runs scan+parse+decode but
-  skips the Lance output) to isolate Phase B from the I/O+write cost. Confirmed even with `--no-write`,
-  Phase B is flat across thread counts — one thread already saturates memory-read bandwidth, so more
-  threads only contend for it. The bulk path's real payoff would be a **GPU** executor (swap the scheduler;
-  far higher memory bandwidth + latency hiding), not multicore CPU — a planned future addition.
-
-## Build & run
-
-Built as part of the standalone nanolance build (`NANOLANCE_BUILD_EXAMPLES`, ON by default). The only
-extra dependency is header-only `boost::describe`/`mp11`, fetched automatically.
+nanom is a git submodule, pinned under `extern/nanom`. Clone with it, or fetch it:
 
 ```
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target pcapng2lance
-build/examples/pcapng2lance/pcapng2lance capture.pcapng out.lance
+git submodule update --init --recursive
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release     # from the repository root
+cmake --build build --target pcapng2lance dpar2lance lldp2lance
 ```
 
-Usage: `pcapng2lance [--no-compress] [--decode-l2l3] [--sequential|--threads N] [--window-bytes N] <input.pcap|pcapng> <output.lance> [payload_uri]`.
+Without the submodule, the library and tools still build; this example is skipped with a message.
 
-- `--no-compress` — write uncompressed columns (default: compressed).
-- `--decode-l2l3` — also decode L2/L3/L4 via the wire_spec + spec_dag core; emits `<stem>_<pdu>.lance` tables (Ethernet captures only; non-Ethernet link types pass through as payload-only).
-- `--sequential` — run Phase B in-thread (reference/debug path); `--threads N` (default: hardware concurrency) selects the CPU thread-pool path.
-- `--window-bytes N` (default 512 MiB) — bounds the per-window RAM budget; the capture is streamed in windows and written as one fragment per window, so memory stays bounded regardless of capture size.
-- `--gpu` — **planned future feature.** GPU bulk decode (via the separately-developed gputins/CUDA layer) is not built into this example yet; the flag reports that and exits.
-- `--stage l1|l2|l3|l4` — staged enrichment (see "Staged / incremental parsing" below).
-- `--mem-bytes B`, `--read-tile-bytes B` — enrich-stage chunking (see "Staged / incremental parsing" below).
-
-### Staged / incremental parsing (`--stage`)
-
-Decode one layer at a time, enriching the same data folder across separate runs — demonstrating that
-parsing work can be done in parts and added to the dataset later, with the still-unparsed bytes kept as
-a blob.v2 external reference into the *original* capture (never copied):
+## Usage
 
 ```
-pcapng2lance --stage l1 capture.pcapng data/   # packets.lance + payload_ref (whole payload)
-pcapng2lance --stage l2 data/                  # ethernet/vlan tables + remainder_after_l2
-pcapng2lance --stage l3 data/                  # ipv4/ipv6 tables    + remainder_after_l3
-pcapng2lance --stage l4 data/                  # tcp/udp tables      + remainder_after_l4 (= app payload)
+pcapng2lance capture.pcapng out.lance                       # the packet table
+pcapng2lance --decode-l2l3 capture.pcapng out.lance         # plus the per-protocol tables
+pcapng2lance --stage l1 capture.pcapng data/                # staged: the packet table in data/
+pcapng2lance --stage l2 data/                               # then Ethernet / VLAN, l3 IPv4 / IPv6, l4 TCP / UDP
 ```
 
-Each enrich stage reads the previous stage's table, `nano_lance_fetch_external_blob`s each packet's
-current remainder, decodes exactly one more layer, writes that layer's PDU tables, and writes the
-advanced remainder (`packet_id` + next-layer discriminator + blob.v2 ref with `offset += header_len`).
-Everything is joined by `packet_id`; the original capture must remain present. The final
-`remainder_after_l4.lance` holds the application payloads as external references (packets fully consumed
-by L4 have no remainder row).
+- `--no-compress` writes uncompressed columns (default: compressed). `--no-write` parses without writing.
+- `--decode-l2l3` writes `<stem>_ethernet.lance`, `_vlan`, `_ipv4`, `_ipv4_option`, `_ipv6`, `_tcp`, `_udp`, the IPv6
+  extension-header tables, and `<stem>_remainder_after_l4.lance` (the application payload as external references).
+  Tables with no rows are not written.
+- `--window-bytes N` (default 512 MiB) commits the packet table in chunks of at most N captured bytes, one fragment each.
+- `--mem-bytes B` and `--read-tile-bytes B` size the staged stages' chunks and fetch tiles. Each chunk's rows are committed
+  as one fragment of each table.
+- `-d N` / `--drop N` and `-c N` / `--count N` write a slice: packets are numbered over the whole capture, and only those in
+  `[N, N+count)` are written, so slices stitch into the full dataset.
+- `--threads N` and `--sequential` are accepted; the converter reads the capture on one thread and its output does not depend
+  on them.
+- `--gpu` is a planned future feature and is reported as unsupported.
 
-The enrich stages are **memory-bounded and chunked, sized to the host they run on** (which may differ
-from the L1 chunker — so the original capture's `uri` must be reachable, e.g. `s3://`). No forward scan
-is needed: the table already gives each row's `(uri, off, size)`, so enrich is a pure random-access
-bulk. Per chunk it (1) sizes `N = mem_budget / per_row_cost` from `--mem-bytes` (default: detected free
-RAM × a fraction), (2) fetches the chunk's bytes in large contiguous tiles (`--read-tile-bytes`, default
-32 MiB — far faster on S3 than many tiny ranged GETs) and **carves** each row's header prefix (256 B)
-out of the resident tile, (3) bulk-decodes one layer, (4) appends a fragment to each table. Memory is
-bounded by `read-tile + N × small`, independent of total rows and payload sizes.
-The `payload_uri` defaults to a `file://` URI of the input; pass an explicit one (e.g. `s3://…`) when
-the Lance dataset will be read elsewhere.
+### Staged parsing
 
-## Columns
+`--stage l1` writes the packet table into a data folder. `--stage l2`, `l3` and `l4` each decode one more layer of that folder,
+reading the previous table and writing its own layer tables and `remainder_after_<stage>.lance`, the payload after that
+layer, as an external reference. The original capture must still be reachable at the `uri` of the packet rows. Each stage
+fetches each row's first 256 bytes from the capture in tiles, decodes what it needs, and commits each chunk as a fragment.
 
-Scalar columns flow through the `nanotins` reflection core from `PacketRow`
-(`interface_id`, `ts_raw`, `caplen`, `origlen`, `link_type`, `ts_resol`, `epb_flags`); the payload
-reference is a real `lance.blob.v2` external `payload_ref` struct (`data`=null, `uri`, `position`,
-`size`). SHB/IDB options ride as dataset KV metadata (on a field — see note below). `link_type` and
-`ts_resol` are denormalized per row so a row self-describes its time unit (≈free under ConstantLayout).
+## DPAR and LLDP tools
+
+`dpar2lance [--compress] <rules.txt> <input.pcap|pcapng> <outdir>` applies DPAR rules to a capture and writes one dataset per
+parser table at `<outdir>/<parser>.lance`. The rule grammar is `<node>.<field> <op> <value> [&& ...] => <parser> <region> "<label>"`,
+with the parsers `someip_tlv`, `raw_tlv`, `oddtlv` and `lldp`, and the regions `eth_payload`, `vlan_payload`, `udp_payload`,
+`tcp_payload` and `someip_payload`. Each row carries the `rule_id` of the rule that produced it.
+
+`lldp2lance` takes the same arguments and accepts the `lldp` parser only.
+
+The engine is nanom's DPAR parity example (`include/nanom_dpar.hpp`, from nanom's `examples/nanotins_parity/dpar_lite.cpp`).
 
 ## Tests
 
 | test | label | covers |
 |---|---|---|
-| `nanotins_reflect_smoke` | smoke | boost::describe → std adapter |
-| `nanotins_roundtrip` | smoke | struct → soa → arrow → Lance → read back (all-scalar, `be<>/le<>`, `bits<>`) |
-| `pcapng2lance_seam` | smoke | seam: pcap + pcapng (LE & byte-swapped), options, external offsets |
-| `nanotins_reader_parity` | smoke | nanolance reads back **every** fixed-width type it writes (incl. `fixed_size_binary`) with a blob column present |
-| `pcapng2lance_driver` | smoke | end-to-end run; manifest + KV metadata; `nano_lance_fetch_external_blob` premise |
-| `pcapng2lance_interop` | interop | stock **pylance** reads the dataset; stored offsets resolve to source bytes |
-| `pcapng2lance_realfile` | interop | converts a real committed capture (`tests/test_short.pcapng`, 274 pkts) and cross-checks every row against an independent Python pcapng walker |
-| `pcapng2lance_realfile_multisection` | interop | same, on `tests/test_framed.pcapng` — 12 concatenated SHB sections (per-section interface reset) |
-| `pcapng2lance_protocols` | smoke | L2/L3 wire structs overlay real bytes; bitfields + `columns_of` expansion |
-| `pcapng2lance_l2l3` | interop | `--decode-l2l3` on a crafted Ethernet capture; per-PDU tables verified via stock lance |
-| `pcapng2lance_staged` | interop | `--stage l1→l2→l3→l4` incremental enrichment; per-stage tables + final external remainder verified |
-| `pcapng2lance_streaming` / `_multisection` | interop | tiny `--window-bytes` (refill/straddle/grow/multi-fragment) gives byte-identical output to the whole-file path |
-| `pcapng2lance_enrich_chunking` | interop | tiny `--mem-bytes`/`--read-tile-bytes` (many chunks/fragments) enrich == single-chunk enrich for every PDU + remainder table |
-| `nlance2table_smoke` | interop | `nlance2table` (top-level tool) dumps PDU + L1 tables to CSV/NDJSON: header, row counts, `--limit`, `fixed_size_binary` hex, nested-struct flatten |
-| `nlance2table_tshark` | interop | per-PDU tables dumped via `nlance2table` match **tshark**'s dissection of the same pcapng field-for-field (eth/vlan/ipv4/ipv6/tcp/udp); skips if `tshark` absent |
-| `nlance2table_tshark_realfile` | interop | real fragmented capture (`tests/SRL_front_left_51_short.pcapng`, 224 frames): L4 gated to first fragments (udp on 7 only) + eth/vlan/ipv4 fields match `tshark` (reassembly off); skips if `tshark` absent |
-| `pcapng2lance_frag_harmony` | interop | one-shot (`--decode-l2l3`) and staged (`--stage l1→l4`) emit **identical** PDU tables **and `remainder_after_l4`** on the fragmented capture — the IPv4-fragmentation L4 gate + the L4 remainder match in both decode paths |
+| `pcapng2lance_interop` | interop | stock **pylance** reads the dataset; stored offsets resolve to the source bytes |
+| `pcapng2lance_realfile`, `_multisection` | interop | real captures (`tests/test_short.pcapng`, `tests/test_framed.pcapng`) cross-checked row by row against an independent Python pcapng walker |
+| `pcapng2lance_parity_golden` | interop | every stage, the one-shot tables and the DPAR / LLDP tables match the nanotins reference (below) |
+| `pcapng2lance_l2l3` | interop | `--decode-l2l3` on a crafted Ethernet capture, verified through pylance |
+| `pcapng2lance_staged` | interop | `--stage l1` → `l4` on a data folder, per-stage tables and final remainder verified |
+| `pcapng2lance_streaming`, `_multisection` | interop | tiny `--window-bytes` gives the same rows as the whole-file path, in several fragments |
+| `pcapng2lance_enrich_chunking` | interop | tiny `--mem-bytes` / `--read-tile-bytes` give the same tables as one chunk, in several fragments |
+| `pcapng2lance_frag_harmony` | interop | one-shot and staged PDU tables are identical on a fragmented capture |
+| `pcapng2lance_stitch_*` | interop | slices stitched with `nlance_stitch` equal the full dataset |
+| `nlance2table_*` | interop | `nlance2table` dumps match `tshark` field for field, where `tshark` is installed |
+| `dpar2lance` / `lldp2lance` | — | exercised by `pcapng2lance_parity_golden` |
+| `nano_lance_typed_writer`, `nano_lance_typed_blob_writer` | smoke | the nanolance writer facade the converter uses |
 
-## Notes / known limitations
+### Parity with the nanotins reference
 
-- The L1 packet row is **all-scalar** (payload external), so it needs no variable-width SoA or prefix-sum
-  — the simplest GPU-friendly path. Variable-width fields (comments, extracted PDU byte slices, protocol
-  payloads) remain future work. L2/L3/L4 protocol decoding is now built (via wire_spec + spec_dag),
-  but advanced features like inline comments or UDP-internal-PDU registries are still planned.
-- Write/read parity: nanolance now reads back every fixed-width type it writes — including narrow ints
-  and `fixed_size_binary` — even with a blob column present (`nanotins_reader_parity`). The per-column
-  value checks for the actual converter output still also run through stock pylance (`pcapng2lance_interop`).
-  Still open: `bool` row fields (Arrow's 1-bit storage vs the byte-wide writer path) are forbidden for
-  now, and stock-Lance interop of `fixed_size_binary` is unverified (nanolance round-trips it).
-- Dataset KV metadata is attached to a scalar **field**, not the root struct (the schema mapper treats
-  any root metadata as an extension marker, which breaks record-batch flattening).
-- **IPv4 fragmentation**: the L4 (TCP/UDP) header lives only in the first fragment, so the decode emits a
-  TCP/UDP row **only when `frag_offset == 0`** (verified against `tshark` with reassembly off on a real
-  fragmented capture). Continuation fragments still appear in the `ipv4` table (every fragment carries
-  `protocol`), so "how many packets belong to a UDP datagram" is the `ipv4.protocol==17` count, while the
-  `udp` table holds the real headers only. Payload **reassembly** across fragments is not done. **Both
-  decode paths apply this gate identically** — the one-shot `--decode-l2l3` walk and the staged
-  `--stage l4` enrich produce byte-identical PDU tables on a fragmented capture (guarded by
-  `pcapng2lance_frag_harmony`).
+The converter and tools were ported from nanotins, the parser library this example used before nanom. The reference they
+had to match is stored as digests: `tests/golden/parity_digests.json` has one SHA-256 per table, over its column names, schema
+metadata and rows in order, for the packet and staged tables of six captures, the one-shot tables of four, and the DPAR and
+LLDP tables. `tests/golden/make_parity_digests.py` regenerates it from a build that still has the nanotins tools.
+
+## Columns
+
+The packet table (`packets.lance`): `packet_id`, `interface_id`, `ts_raw`, `caplen`, `origlen`, `link_type`, `ts_resol`
+(the timestamp resolution, per row so a row is self-describing), `epb_flags`, and `payload_ref`, the external blob.
+Section header and interface options are dataset metadata, on the first field, as `pcapng:shb<k>:<name>` and
+`pcapng:if<j>:<name>`.
+
+## Limitations
+
+- The converter reads the whole capture into memory, and it holds all packet rows until the table is written. The
+  `--window-bytes` chunks bound the size of each commit, not the converter's own memory.
+- IPv4 fragments: the TCP or UDP header is in the first fragment only, so a TCP/UDP row is produced only when
+  `frag_offset == 0` (checked against `tshark` with reassembly off). Payload reassembly is not done.
+- IPv6 extension headers are walked for the one-shot tables; the staged `l3` stage reads the IPv6 base header only.
+- `oddtlv` is accepted by `dpar2lance`; the nanotins tool it was ported from rejected it, so it has no nanotins table to check
+  against, only nanom's own golden.

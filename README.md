@@ -132,7 +132,7 @@ nanom and CLI11. Behind a firewall, `NANOLANCE_GIT_BASE` points every fetch at a
 | `NANOLANCE_WERROR` | OFF | warnings are errors on nanolance's own targets (CI turns it on) |
 | `NANOLANCE_SANITIZER` | | e.g. `address,undefined` |
 | `NANOLANCE_BUILD_FUZZERS` | OFF | libFuzzer harnesses over the decode path (Clang) |
-| `NANOLANCE_BUILD_EXAMPLES` | ON standalone | `examples/pcapng2lance` (needs the nanotins submodule: `git clone --recursive`) |
+| `NANOLANCE_BUILD_EXAMPLES` | ON standalone | `examples/pcapng2lance` (needs the nanom submodule: `git clone --recursive`) |
 
 **What a program links** is what it calls: the library is static and split by layer, so a writer of local
 datasets does not carry the index code or the S3 client. Measured, stripped, x86-64 Release: a local writer
@@ -280,8 +280,8 @@ runs are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 ## Related projects
 
 - [nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet): the same Arrow batches to Parquet.
-- [nanotins / soatins](https://github.com/yoavbendor/nanotins): packets and structs to Arrow; used by
-  `examples/pcapng2lance`, a streaming pcapng to Lance converter.
+- [nanom](https://github.com/yoavbendor/nanom): the parser-combinator library behind `examples/pcapng2lance`, a
+  streaming pcapng to Lance converter, and its DPAR / LLDP tools.
 - [nanos3reader](https://github.com/yoavbendor/nanos3reader): the S3 client.
 
 ## Version and license

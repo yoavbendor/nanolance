@@ -92,8 +92,8 @@ Copyright The Lance Authors.
 | Zstandard (zstd) | column compression | BSD-3-Clause | https://github.com/facebook/zstd |
 | CLI11 | command-line parsing in the tools | BSD-3-Clause | https://github.com/CLIUtils/CLI11 |
 
-The `pcapng2lance` example additionally depends on the sister **nanotins** stack
-(soatins + nanotins), which is Apache-2.0; see its own `NOTICE` / `THIRD-PARTY-LICENSES.md`.
+The `pcapng2lance` example additionally depends on the sister **nanom** parser library, vendored as a git
+submodule under `examples/pcapng2lance/extern/nanom`; see its own `THIRD-PARTY.md`.
 
 ## Optional system libraries (built-in S3 reader)
 
