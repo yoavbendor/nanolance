@@ -385,11 +385,14 @@ public:
         return ok_;
     }
 
+    /// Commits the rows written since the last commit: the first commit creates the dataset (or appends to it
+    /// when options.append is set), each later one appends a fragment to the same writer session.
     bool commit() {
         if (!ok_) {
             return false;
         }
-        ok_ = nano_lance_writer_commit(&w_, opts_.append) == NANO_LANCE_OK;
+        ok_ = nano_lance_writer_commit(&w_, opts_.append || committed_) == NANO_LANCE_OK;
+        committed_ = committed_ || ok_;
         return ok_;
     }
 
@@ -569,6 +572,7 @@ private:
     NanoLanceWriter w_{};
     options opts_{};
     bool ok_ = false;
+    bool committed_ = false;  // a commit has created or appended the dataset in this session
     bool closed_ = false;
 };
 

@@ -163,6 +163,7 @@ struct Args {
     bool no_write = false;     // scan+parse only, skip the Lance write (isolates Phase A/B for benchmarking)
     bool decode_l2l3 = false;  // also decode L2/L3/L4 via nanom walk_packet -> per-PDU Lance tables
     std::string stage;                      // --stage l1: the packet table into a data folder (see nanom_convert_main)
+    std::size_t window_bytes = std::size_t{512} * 1024 * 1024;  // --window-bytes: packet table commits per this many captured bytes
     std::uint64_t drop = 0;                 // -d: skip the first N packets (their packet_id is kept for the rest)
     std::uint64_t take = UINT64_MAX;        // -c: emit at most N packets after the drop (default: all)
     std::vector<std::string> pos;
@@ -188,6 +189,11 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
             const char* v = value(i);
             if (!v) return false;
             a.stage = v;
+        } else if (s == "--window-bytes") {
+            const char* v = value(i);
+            if (!v) return false;
+            a.window_bytes = static_cast<std::size_t>(std::stoull(v));
+            if (a.window_bytes == 0) return (err = "--window-bytes must be > 0", false);
         } else if (s == "--sequential") {
             // Accepted for the nanotins converter's command line; this converter is sequential already.
         } else if (s == "--threads") {
@@ -455,7 +461,7 @@ public:
 
         // An empty slice (--drop past the last packet) writes nothing, as the nanotins converter does.
         if (!args_.no_write && !rows.empty()) {
-            if (const int rc = write_batch(rows, payload)) return rc;
+            if (const int rc = write_packet_table(rows, payload)) return rc;
             if (args_.decode_l2l3) {
                 if (const int rc = write_pdu_tables()) return rc;
             }
@@ -482,14 +488,41 @@ private:
     // same on-disk shape pcapng2lance's write_batch produces. The AoS PacketRow accumulator is
     // transposed into per-column buffers (one linear pass) and handed to the compile-time typed
     // writer; the blob_ref span carries the shared capture URI per row.
-    int write_batch(const std::vector<PacketRow>& rows, const std::vector<nt::blob_ref>& payload) {
-        const std::size_t n = rows.size();
+    // The packet table, committed in chunks of at most window_bytes captured bytes (a packet larger than the
+    // window is a chunk of its own). One writer session holds the dataset: each chunk is one fragment, so the table
+    // reads back identically whatever the window, as the nanotins converter's windows do.
+    int write_packet_table(const std::vector<PacketRow>& rows, const std::vector<nt::blob_ref>& payload) {
+        nt::writer<L1Schema>::options opts;
+        opts.compression_level = 3;
+        opts.compress = args_.compress;
+        opts.first_column_metadata = kv_blob_.c_str();
+        nt::writer<L1Schema> w(output_.string().c_str(), opts);
+        if (!w.ok()) return fail(std::string("writer init: ") + w.last_error());
+        std::size_t begin = 0;
+        while (begin < rows.size()) {
+            std::size_t end = begin;
+            std::uint64_t bytes = 0;
+            while (end < rows.size() && (end == begin || bytes + rows[end].caplen <= args_.window_bytes)) {
+                bytes += rows[end].caplen;
+                ++end;
+            }
+            if (const int rc = write_chunk(w, rows, payload, begin, end)) return rc;
+            begin = end;
+        }
+        w.close();
+        return 0;
+    }
+
+    // Rows [begin, end) of the packet table: one batch, committed as the next fragment of the session.
+    int write_chunk(nt::writer<L1Schema>& w, const std::vector<PacketRow>& rows,
+                    const std::vector<nt::blob_ref>& payload, std::size_t begin, std::size_t end) {
+        const std::size_t n = end - begin;
         std::vector<std::uint64_t> packet_id(n), ts_raw(n);
         std::vector<std::uint32_t> interface_id(n), caplen(n), origlen(n), epb(n);
         std::vector<std::uint16_t> link_type(n);
         std::vector<std::uint8_t> ts_resol(n);
         for (std::size_t i = 0; i < n; ++i) {
-            const PacketRow& r = rows[i];
+            const PacketRow& r = rows[begin + i];
             packet_id[i] = r.packet_id;
             interface_id[i] = r.interface_id;
             ts_raw[i] = r.ts_raw;
@@ -499,12 +532,6 @@ private:
             ts_resol[i] = r.ts_resol;
             epb[i] = r.epb_flags;
         }
-        nt::writer<L1Schema>::options opts;
-        opts.compression_level = 3;
-        opts.compress = args_.compress;
-        opts.first_column_metadata = kv_blob_.c_str();
-        nt::writer<L1Schema> w(output_.string().c_str(), opts);
-        if (!w.ok()) return fail(std::string("writer init: ") + w.last_error());
         if (!w.write_batch(std::span<const std::uint64_t>(packet_id),
                            std::span<const std::uint32_t>(interface_id),
                            std::span<const std::uint64_t>(ts_raw),
@@ -513,11 +540,10 @@ private:
                            std::span<const std::uint16_t>(link_type),
                            std::span<const std::uint8_t>(ts_resol),
                            std::span<const std::uint32_t>(epb),
-                           std::span<const nt::blob_ref>(payload))) {
+                           std::span<const nt::blob_ref>(payload).subspan(begin, n))) {
             return fail(std::string("write_batch: ") + w.last_error());
         }
         if (!w.commit()) return fail(std::string("commit: ") + w.last_error());
-        w.close();
         return 0;
     }
 
