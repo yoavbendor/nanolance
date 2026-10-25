@@ -1,0 +1,4 @@
+# The someip_tlv and raw_tlv rules of the nanom DPAR fixture (dpar_rules.txt): the two parsers the nanotins dpar2lance
+# tool accepts, so its tables are the reference for them.
+udp.src_port == 0 && udp.dst_port == 9999 => someip_tlv udp_payload "XYZtlv"
+udp.dst_port == 4000 => raw_tlv udp_payload "raw4000"

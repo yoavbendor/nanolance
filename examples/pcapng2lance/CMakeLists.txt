@@ -156,6 +156,16 @@ if(NANOLANCE_BUILD_TESTS)
                     $<TARGET_FILE:pcapng2lance> "${CMAKE_SOURCE_DIR}/tests/test_framed.pcapng")
         set_tests_properties(pcapng2lance_realfile_multisection PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
 
+        # Parity with the nanotins reference: every stage, one-shot and DPAR/LLDP table digests (golden/).
+        if(TARGET dpar2lance AND TARGET lldp2lance)
+            add_test(NAME pcapng2lance_parity_golden
+                COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_parity_golden.py"
+                        $<TARGET_FILE:pcapng2lance> $<TARGET_FILE:dpar2lance> $<TARGET_FILE:lldp2lance>
+                        "${CMAKE_SOURCE_DIR}" "${PCAPNG2LANCE_NANOM_DIR}/examples/nanotins_parity/testdata"
+                        "${CMAKE_CURRENT_BINARY_DIR}/parity_golden")
+            set_tests_properties(pcapng2lance_parity_golden PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+        endif()
+
         # M3: L2/L3 decode -> per-PDU Lance tables, verified via stock pylance.
         add_test(NAME pcapng2lance_l2l3
             COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pcapng2lance_l2l3.py"

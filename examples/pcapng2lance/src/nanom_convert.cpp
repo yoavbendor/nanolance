@@ -407,6 +407,36 @@ bool read_payload_rows(const fs::path& table, const char* disc_col, std::vector<
     return true;
 }
 
+// The IPv4 options of the header at `off` (IHL in 32-bit words): on_opt(type, on-wire length) for each, the walk of
+// the nanotins ipv4_option table. The option space is [off + 20, off + IHL*4) clamped to the packet; EOOL ends the
+// list; NOP is one byte; every other option's length octet counts the whole option, and an option that does not fit
+// ends the walk.
+template <class OnOpt>
+void ipv4_options(nm::bytes pkt, std::size_t off, std::uint8_t ihl, OnOpt on_opt) {
+    const std::size_t hdr = std::size_t(ihl) * 4;
+    if (hdr <= 20 || off > pkt.size()) return;
+    const std::size_t end = std::min<std::size_t>(off + hdr, pkt.size());
+    std::size_t p = off + 20;
+    const auto byte = [&](std::size_t i) { return static_cast<std::uint8_t>(pkt[i]); };
+    while (p < end) {
+        const std::uint8_t t = byte(p);
+        if (t == 0) {  // EOOL
+            on_opt(t, std::uint8_t{1});
+            return;
+        }
+        if (t == 1) {  // NOP
+            on_opt(t, std::uint8_t{1});
+            ++p;
+            continue;
+        }
+        if (p + 2 > end) return;
+        const std::uint8_t wlen = byte(p + 1);  // counts the whole option
+        if (wlen < 2 || p + wlen > end) return;
+        on_opt(t, wlen);
+        p += wlen;
+    }
+}
+
 // ---- writer sessions for a table written in chunks ----------------------------------------------------------
 //
 // The staged stages commit each chunk of rows as one fragment of its table. A session holds one writer for the
@@ -647,9 +677,22 @@ private:
     struct DecodeVisitor {
         Converter& c;
         std::uint64_t pid;
-        void on_eth(const nmproto::Ethernet& x) { c.eth_.push(p2l_nanom::make_eth(pid, x)); }
-        void on_vlan(const nmproto::VlanTag& x) { c.vlan_.push(p2l_nanom::make_vlan(pid, x)); }
-        void on_ipv4(const nmproto::Ipv4& x) { c.ipv4_.push(p2l_nanom::make_ipv4(pid, x)); }
+        nm::bytes pkt;               // the captured packet, for the IPv4 option bytes
+        std::size_t l3_off = 0;      // offset of the IPv4 header: after Ethernet and the VLAN tags seen so far
+        void on_eth(const nmproto::Ethernet& x) {
+            c.eth_.push(p2l_nanom::make_eth(pid, x));
+            l3_off = nm::wire_size_v<nmproto::Ethernet>;
+        }
+        void on_vlan(const nmproto::VlanTag& x) {
+            c.vlan_.push(p2l_nanom::make_vlan(pid, x));
+            l3_off += nm::wire_size_v<nmproto::VlanTag>;
+        }
+        void on_ipv4(const nmproto::Ipv4& x) {
+            c.ipv4_.push(p2l_nanom::make_ipv4(pid, x));
+            ipv4_options(pkt, l3_off, x.ihl, [&](std::uint8_t type, std::uint8_t len) {
+                c.ipv4opt_.push(p2l_nanom::Ipv4OptionRow{pid, type, len});
+            });
+        }
         void on_ipv6(const nmproto::Ipv6& x) { c.ipv6_.push(p2l_nanom::make_ipv6(pid, x)); }
         void on_tcp(const nmproto::Tcp& x) { c.tcp_.push(p2l_nanom::make_tcp(pid, x)); }
         void on_udp(const nmproto::Udp& x) { c.udp_.push(p2l_nanom::make_udp(pid, x)); }
@@ -672,7 +715,7 @@ private:
                        std::uint32_t caplen) {
         if (poff + caplen > file.size()) return;
         const nm::bytes pkt = file.subspan(static_cast<std::size_t>(poff), caplen);
-        DecodeVisitor visitor{*this, pid};
+        DecodeVisitor visitor{*this, pid, pkt};
         const auto wr = nmproto::walk_packet_ext(link, pkt, visitor);
         if (wr.reached_l4 && wr.l4_payload_offset < caplen) {
             rem_pid_.push_back(pid);
@@ -694,6 +737,7 @@ private:
             return true;
         };
         if (!(w("_ethernet.lance", eth_) & w("_vlan.lance", vlan_) & w("_ipv4.lance", ipv4_) &
+              w("_ipv4_option.lance", ipv4opt_) &
               w("_ipv6.lance", ipv6_) & w("_tcp.lance", tcp_) & w("_udp.lance", udp_) &
               w("_ipv6_hopbyhop.lance", hopbyhop_) & w("_ipv6_destopt.lance", destopt_) &
               w("_ipv6_routing.lance", routing_) & w("_ipv6_srh_segment.lance", srh_segment_) &
@@ -934,6 +978,7 @@ private:
     nm::soa<p2l_nanom::Ipv6RoutingRow> routing_{4096};
     nm::soa<p2l_nanom::Ipv6SrhSegmentRow> srh_segment_{4096};
     nm::soa<p2l_nanom::Ipv6OptionRow> ipv6_opt_{4096};
+    nm::soa<p2l_nanom::Ipv4OptionRow> ipv4opt_{4096};
     std::vector<std::uint64_t> rem_pid_, rem_next_;
     std::vector<nt::blob_ref> rem_pay_;
 };

@@ -88,6 +88,11 @@ struct Ipv6OptionRow {  // one row per IPv6/SRH TLV option
     u8 container_type, opt_type, opt_len;
 };
 
+struct Ipv4OptionRow {  // one row per IPv4 option (the nanotins ipv4_option table's columns)
+    u64 packet_id;
+    u8 opt_type, opt_len;
+};
+
 }  // namespace p2l_nanom
 
 NANOM_DESCRIBE(p2l_nanom::EthRow, packet_id, dst, src, ethertype);
@@ -104,6 +109,7 @@ NANOM_DESCRIBE(p2l_nanom::Ipv6RoutingRow, packet_id, next_header, hdr_ext_len, r
                last_entry, flags, tag);
 NANOM_DESCRIBE(p2l_nanom::Ipv6SrhSegmentRow, packet_id, srh_order, segment_index, address);
 NANOM_DESCRIBE(p2l_nanom::Ipv6OptionRow, packet_id, container_type, opt_type, opt_len);
+NANOM_DESCRIBE(p2l_nanom::Ipv4OptionRow, packet_id, opt_type, opt_len);
 
 namespace p2l_nanom {
 
