@@ -609,15 +609,21 @@ private:
     }
 
 public:
-    // --stage l2 <datadir>: decode the Ethernet and VLAN headers of each packet row of <datadir>/packets.lance and
-    // forward the payload after L2 (next_protocol = the inner EtherType). A row whose header is not fully resident,
-    // or whose link layer is not Ethernet, decodes nothing; a VLAN tag that cannot be read keeps the Ethernet row
-    // already decoded, as the nanotins decoder does.
-    int run_enrich_l2(const fs::path& datadir) {
+    // --stage l2|l3|l4 <datadir>: decode one layer of every row of the data folder's previous table, and forward
+    // the payload after it. l2 reads packets.lance (the link layer: Ethernet and VLAN), l3 reads
+    // remainder_after_l2.lance (IPv4 / IPv6) and l4 reads remainder_after_l3.lance (TCP / UDP). Each writes its
+    // PDU tables beside the input and its remainder as remainder_after_<stage>.lance, with the rows and remainders
+    // of the nanotins stage. A row whose header is not fully resident, or whose layer is not decoded, produces
+    // nothing; a row that fails partway keeps the header rows it already decoded, as the nanotins decoders do.
+    int run_enrich(const std::string& stage, const fs::path& datadir) {
+        const bool l2 = stage == "l2";
+        const bool l3 = stage == "l3";
+        const fs::path table = datadir / (l2 ? "packets.lance" : l3 ? "remainder_after_l2.lance" : "remainder_after_l3.lance");
         std::vector<EnrichRow> in;
         std::string err;
-        const fs::path table = datadir / "packets.lance";
-        if (!read_payload_rows(table, "link_type", in, err)) return fail("read " + table.string() + ": " + err);
+        if (!read_payload_rows(table, l2 ? "link_type" : "next_protocol", in, err)) {
+            return fail("read " + table.string() + ": " + err);
+        }
 
         std::vector<std::uint8_t> tile;
         char ferr[512]{};
@@ -642,30 +648,93 @@ public:
                 const EnrichRow& r = in[k];
                 const std::size_t local = static_cast<std::size_t>(r.off - base);
                 const std::size_t hdr = static_cast<std::size_t>(std::min<std::uint64_t>(r.size, kPrefixCap));
-                if (local + hdr > got || r.disc != nmproto::kLinkTypeEthernet) continue;
+                if (local + hdr > got) continue;
+                const nm::bytes bytes(reinterpret_cast<const std::byte*>(tile.data() + local), hdr);
                 std::size_t consumed = 0;
-                std::uint16_t ethertype = 0;
-                if (decode_l2(r.pid, nm::bytes(reinterpret_cast<const std::byte*>(tile.data() + local), hdr),
-                              consumed, ethertype) &&
-                    consumed < r.size) {
+                std::uint64_t next = 0;
+                bool ok = false;
+                if (l2) {
+                    std::uint16_t ethertype = 0;
+                    ok = r.disc == nmproto::kLinkTypeEthernet && decode_l2(r.pid, bytes, consumed, ethertype);
+                    next = ethertype;
+                } else if (l3) {
+                    ok = decode_l3(r.pid, static_cast<std::uint16_t>(r.disc), bytes, consumed, next);
+                } else {
+                    ok = decode_l4(r.pid, static_cast<std::uint8_t>(r.disc), bytes, consumed, next);
+                }
+                if (ok && consumed < r.size) {
                     rem_pid_.push_back(r.pid);
-                    rem_next_.push_back(ethertype);
+                    rem_next_.push_back(next);
                     rem_pay_.push_back(nt::blob_ref{r.uri, r.off + consumed, r.size - consumed});
                 }
             }
             i = j;
         }
 
-        if (!p2l_nanom::write_soa_table((datadir / "ethernet.lance").string(), eth_, args_.compress, err)) {
-            return fail("write ethernet: " + err);
+        const auto write = [&](const char* name, const auto& soa) {
+            return p2l_nanom::write_soa_table((datadir / name).string(), soa, args_.compress, err);
+        };
+        bool ok = l2 ? write("ethernet.lance", eth_) && write("vlan.lance", vlan_)
+                     : l3 ? write("ipv4.lance", ipv4_) && write("ipv6.lance", ipv6_)
+                          : write("tcp.lance", tcp_) && write("udp.lance", udp_);
+        if (!ok) return fail("write " + stage + " tables: " + err);
+        if (const int rc = write_remainder_table((datadir / ("remainder_after_" + stage + ".lance")).string())) {
+            return rc;
         }
-        if (!p2l_nanom::write_soa_table((datadir / "vlan.lance").string(), vlan_, args_.compress, err)) {
-            return fail("write vlan: " + err);
-        }
-        if (const int rc = write_remainder_table((datadir / "remainder_after_l2.lance").string())) return rc;
-        std::fprintf(stderr, "pcapng2lance: stage l2 -> %zu input rows, %zu decoded forward\n", in.size(),
-                     rem_pid_.size());
+        std::fprintf(stderr, "pcapng2lance: stage %s -> %zu input rows, %zu decoded forward\n", stage.c_str(),
+                     in.size(), rem_pid_.size());
         return 0;
+    }
+
+    // The IPv4 or IPv6 header of `bytes`, as the nanotins decoder reads it. A non-first IPv4 fragment has no
+    // next layer (0), like the L4 gate of the full walk.
+    bool decode_l3(std::uint64_t pid, std::uint16_t ethertype, nm::bytes bytes, std::size_t& consumed,
+                   std::uint64_t& next_proto) {
+        consumed = 0;
+        next_proto = 0;
+        if (ethertype == nmproto::kEtherTypeIpv4) {
+            auto ip = nm::strct<nmproto::Ipv4>()(nm::from(bytes));
+            if (!ip) return false;
+            ipv4_.push(p2l_nanom::make_ipv4(pid, ip->value));
+            const std::size_t hdr = std::size_t(ip->value.ihl) * 4;
+            consumed = hdr >= nm::wire_size_v<nmproto::Ipv4> ? hdr : nm::wire_size_v<nmproto::Ipv4>;
+            next_proto = ip->value.frag_offset == 0 ? ip->value.protocol : 0;
+            return true;
+        }
+        if (ethertype == nmproto::kEtherTypeIpv6) {
+            auto ip = nm::strct<nmproto::Ipv6>()(nm::from(bytes));
+            if (!ip) return false;
+            ipv6_.push(p2l_nanom::make_ipv6(pid, ip->value));
+            consumed = nm::wire_size_v<nmproto::Ipv6>;  // extension headers are not walked at this stage
+            next_proto = ip->value.next_header;
+            return true;
+        }
+        return false;
+    }
+
+    // The TCP or UDP header of `bytes`; next_proto is the packed src+dst ports (the L5 dispatch key).
+    bool decode_l4(std::uint64_t pid, std::uint8_t ip_proto, nm::bytes bytes, std::size_t& consumed,
+                   std::uint64_t& next_proto) {
+        consumed = 0;
+        next_proto = 0;
+        if (ip_proto == nmproto::kIpProtoTcp) {
+            auto tcp = nm::strct<nmproto::Tcp>()(nm::from(bytes));
+            if (!tcp) return false;
+            tcp_.push(p2l_nanom::make_tcp(pid, tcp->value));
+            const std::size_t hdr = std::size_t(tcp->value.data_offset) * 4;
+            consumed = hdr >= nm::wire_size_v<nmproto::Tcp> ? hdr : nm::wire_size_v<nmproto::Tcp>;
+            next_proto = (std::uint64_t(static_cast<std::uint16_t>(tcp->value.src_port)) << 16) | static_cast<std::uint16_t>(tcp->value.dst_port);
+            return true;
+        }
+        if (ip_proto == nmproto::kIpProtoUdp) {
+            auto udp = nm::strct<nmproto::Udp>()(nm::from(bytes));
+            if (!udp) return false;
+            udp_.push(p2l_nanom::make_udp(pid, udp->value));
+            consumed = nm::wire_size_v<nmproto::Udp>;
+            next_proto = (std::uint64_t(static_cast<std::uint16_t>(udp->value.src_port)) << 16) | static_cast<std::uint16_t>(udp->value.dst_port);
+            return true;
+        }
+        return false;
     }
 
     // The Ethernet header and VLAN tags at the start of `bytes`, as the nanotins decoder reads them.
@@ -722,13 +791,14 @@ int nanom_convert_main(int argc, char** argv) {
     Args args;
     std::string err;
     if (!parse_args(argc, argv, args, err)) return fail(err);
-    if (args.stage == "l2") {  // --stage l2 <datadir>
+    if (args.stage == "l2" || args.stage == "l3" || args.stage == "l4") {  // --stage l2|l3|l4 <datadir>
         if (args.pos.empty()) {
-            std::fprintf(stderr, "usage: %s --stage l2 <datadir>\n", argv[0]);
+            std::fprintf(stderr, "usage: %s --stage l2|l3|l4 <datadir>\n", argv[0]);
             return 2;
         }
+        const std::string stage = args.stage;
         const fs::path datadir = args.pos[0];
-        return Converter(std::move(args), fs::path(), std::string()).run_enrich_l2(datadir);
+        return Converter(std::move(args), fs::path(), std::string()).run_enrich(stage, datadir);
     }
     if (args.pos.size() < 2) {
         std::fprintf(stderr,
