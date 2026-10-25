@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # GitLab CI/CD for nanolance — the GitLab translation of .github/workflows/linux-bench.yml's build + test
 # phases (the benchmark/profile/commit-back steps stay GitHub-only). Builds the pcapng -> Lance stack
-# (vendoring nanotins via the recursive submodule, so the IPv4-options parser bumped in
-# examples/pcapng2lance/extern/nanotins is what gets built) and runs the C++ smoke + interop suites. The
+# (vendoring nanom via the recursive submodule, examples/pcapng2lance/extern/nanom) and runs the C++ smoke + interop suites. The
 # interop suite includes the IPv4-options tshark golden (nlance2table_tshark_ipv4_options), which skips
 # cleanly (ctest return code 77) when tshark is unavailable.
 

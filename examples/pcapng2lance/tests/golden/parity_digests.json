@@ -1,0 +1,81 @@
+{
+ "dpar": {
+  "raw_tlv": "e427ce54e22cbef9f69928eaa226696f2dce4797ff33f61d500c49289ccbd890",
+  "someip_tlv": "aae033b58f46c48ebbeb1152558eede914a5b106507ab9cfe299d96d95732e1d"
+ },
+ "lldp": {
+  "lldp": "9012009f745276b0759d56f45f51ba8e40f772d8064e3f425f10726d0e41f0d8"
+ },
+ "oneshot": {
+  "framed": {
+   "out": "327353cd62ab862ef486e9bdda4fec087b8e7b85429c5319495b452c9986ef8a"
+  },
+  "ipv4opt": {
+   "out": "a33ecaa20f8c63c78e97c04d3e1a71d802c9899dde970cf386f168c1e2bb227b",
+   "out_ethernet": "1145dcdec110ec19df786bad48f53a78f0b2fbce8be2392c4b29d0fe24f923a1",
+   "out_ipv4": "c4b965e93fd69f2334ee9c662a5e2a744b24311b998238d3483049f1fcf8eba1",
+   "out_ipv4_option": "dbcc9fc0022a92134fca0f7495c67573862e7178930734d9145accffb0208f24",
+   "out_tcp": "7665c8add0b4e13a8162731ed24624733f6742a5c3527f686bc680077d1e7e94",
+   "out_udp": "c57e55f99e62f91783223f0f40a1069b365856200647a13e3425eaf2777aba1d"
+  },
+  "srl": {
+   "out": "48db1b819490f815b343c6957a11f2b107fb8d7f5bc931a739fb64359c69a2bf",
+   "out_ethernet": "be7688ae3eeb97a2839a9f42960489aa047329cc039c69095fb85537f96cafae",
+   "out_ipv4": "5fae82a7415e5d99a1051a655ecfa82be68cc9bdf30e04c69bdbc3f8ac650e29",
+   "out_remainder_after_l4": "3693e72278cf27cb10c0eecc82fd1353df8ba0fa228731d3b665549447205cc3",
+   "out_udp": "3794b946f017232d126ea747badb03948aad3f34d01261d78b98ba4fb56be7f0",
+   "out_vlan": "3df07b6e09dc73933ddb3e64f125ef0bc6da0b11d163c54862178d01109e1560"
+  },
+  "srv6": {
+   "out": "c072ab8610d1cc62121ff127c32ed0cb6c60d2b046a671208297f2efb970a658",
+   "out_ethernet": "c578fe36f3e55662fdb2643680c77b4874b5f6fd0c4315747462e1b4df3b1aa8",
+   "out_ipv6": "196a2c4d0353d646a689d76cbc0fdf9929d27e115782a1abe2c4c06955c7d2cf",
+   "out_ipv6_destopt": "4c21706213184503b81be7e00a7c53b1ab22e285df1f76e2f9c393a800b3ef84",
+   "out_ipv6_hopbyhop": "13aee95eaf97f5982c1e26813ae3cda2eda9f6ea7e350f3ce3c2e3f2993d6281",
+   "out_ipv6_option": "36b96c4f18020c0f97e13a4b4b783694794d3f36e1fb8ea0e3647a96ff1fde6b",
+   "out_ipv6_routing": "cdefbe6b7a43e0deb7b90951d0b1751e4843a2b76bfffcd869c81f1a518d67d3",
+   "out_ipv6_srh_segment": "8d3efba81fe627d804893a7c0715bbdd90d07b9031b54a07e6f24be9bf332d97",
+   "out_tcp": "5b3a33fdf501177fdbd370d6eccb5d59fbe821e9df269984ebca6cd9f2fd5a2a",
+   "out_udp": "a09ab1d85618ce757495c5795298cdabb6d941c7f2bc6e191fff16dc09f84925"
+  }
+ },
+ "stages": {
+  "framed": {
+   "packets": "327353cd62ab862ef486e9bdda4fec087b8e7b85429c5319495b452c9986ef8a"
+  },
+  "ipv4opt": {
+   "ethernet": "1145dcdec110ec19df786bad48f53a78f0b2fbce8be2392c4b29d0fe24f923a1",
+   "ipv4": "c4b965e93fd69f2334ee9c662a5e2a744b24311b998238d3483049f1fcf8eba1",
+   "packets": "a33ecaa20f8c63c78e97c04d3e1a71d802c9899dde970cf386f168c1e2bb227b",
+   "remainder_after_l2": "5e8526e7799541620266f11843d9a1975dbd78cb4dd0de7fa463623ab515e26f",
+   "remainder_after_l3": "c7b2917a672795ec92605ef1f38d747d21a206e18ab2192bd85862b29d357ed2",
+   "tcp": "7665c8add0b4e13a8162731ed24624733f6742a5c3527f686bc680077d1e7e94",
+   "udp": "c57e55f99e62f91783223f0f40a1069b365856200647a13e3425eaf2777aba1d"
+  },
+  "ptp": {
+   "ethernet": "13d1e7d5c6bedb6d283265b7269a142d5da5b53a63ffa7854c2462faa0de0a05",
+   "packets": "f1e936aaf13f8e2e8af9627ab1dbb49e6f65c6c1b25fe644c20289bd422f2798",
+   "remainder_after_l2": "cb3bddb383152b36bcc844eb8500681a49b661bb97bd8104cb80af6a2021d46b"
+  },
+  "short": {
+   "packets": "542c0c4f758e5bebc2d49cc1372626ff12043ba80b0cd5b939f6cab1667e1ba2"
+  },
+  "srl": {
+   "ethernet": "be7688ae3eeb97a2839a9f42960489aa047329cc039c69095fb85537f96cafae",
+   "ipv4": "5fae82a7415e5d99a1051a655ecfa82be68cc9bdf30e04c69bdbc3f8ac650e29",
+   "packets": "48db1b819490f815b343c6957a11f2b107fb8d7f5bc931a739fb64359c69a2bf",
+   "remainder_after_l2": "e48ce69fe7478133f0710a12dba99406981cdb6965dcaa6baecdc773e1fa280d",
+   "remainder_after_l3": "5aec6f1261f9a1bbb6fe076a831b96741fc245f22c2c8119e0f133bad4a67bf5",
+   "remainder_after_l4": "3693e72278cf27cb10c0eecc82fd1353df8ba0fa228731d3b665549447205cc3",
+   "udp": "3794b946f017232d126ea747badb03948aad3f34d01261d78b98ba4fb56be7f0",
+   "vlan": "3df07b6e09dc73933ddb3e64f125ef0bc6da0b11d163c54862178d01109e1560"
+  },
+  "srv6": {
+   "ethernet": "c578fe36f3e55662fdb2643680c77b4874b5f6fd0c4315747462e1b4df3b1aa8",
+   "ipv6": "196a2c4d0353d646a689d76cbc0fdf9929d27e115782a1abe2c4c06955c7d2cf",
+   "packets": "c072ab8610d1cc62121ff127c32ed0cb6c60d2b046a671208297f2efb970a658",
+   "remainder_after_l2": "bc1e04b49ea2030c56095fe3ee1204e05a75d784a1d13f85acabadb8cb3e51f9",
+   "remainder_after_l3": "277f7e6c414cc55ee5b694f8df9fcd1bc2f7be352db1f958ff4f6c89efebb655"
+  }
+ }
+}

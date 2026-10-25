@@ -46,7 +46,7 @@ integration guide, and benchmarks, all as flat crawlable HTML — is at
 ## Examples
 
 - [arrowipc2lance](https://raw.githubusercontent.com/yoavbendor/nanolance/main/arrowipc2lance_main.cpp): Arrow IPC stream -> Lance dataset CLI tool
-- [pcapng2lance](https://github.com/yoavbendor/nanolance/tree/main/examples/pcapng2lance): streaming pcapng -> Lance converter built on the sister nanotins parsing stack, modeling external blobs as uri/position/size columns
+- [pcapng2lance](https://github.com/yoavbendor/nanolance/tree/main/examples/pcapng2lance): streaming pcapng -> Lance converter built on the sister nanom parser library, modeling external blobs as uri/position/size columns
 - [fuselance](https://github.com/yoavbendor/nanolance/tree/main/examples/fuselance): FUSE filesystem exposing a Lance dataset's external blobs as regular files
 
 ## Python bindings

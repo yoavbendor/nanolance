@@ -132,7 +132,7 @@ nanom and CLI11. Behind a firewall, `NANOLANCE_GIT_BASE` points every fetch at a
 | `NANOLANCE_WERROR` | OFF | warnings are errors on nanolance's own targets (CI turns it on) |
 | `NANOLANCE_SANITIZER` | | e.g. `address,undefined` |
 | `NANOLANCE_BUILD_FUZZERS` | OFF | libFuzzer harnesses over the decode path (Clang) |
-| `NANOLANCE_BUILD_EXAMPLES` | ON standalone | `examples/pcapng2lance` (needs the nanotins submodule: `git clone --recursive`) |
+| `NANOLANCE_BUILD_EXAMPLES` | ON standalone | `examples/pcapng2lance` (needs the nanom submodule: `git clone --recursive`) |
 
 **What a program links** is what it calls: the library is static and split by layer, so a writer of local
 datasets does not carry the index code or the S3 client. Measured, stripped, x86-64 Release: a local writer
@@ -249,22 +249,22 @@ every benchmark run. The table below is the latest run's summary.
 
 <!-- bench-summary:start -->
 
-Latest run: 2026-10-19 08:56 UTC on `main` (`d67dfab`), [full results](https://yoavbendor.github.io/nanolance/bench/).
+Latest run: 2026-10-25 14:05 UTC on `claude/nanolance-optimization-review-h3rxi7` (`9c1c79c`), [full results](https://yoavbendor.github.io/nanolance/bench/).
 
 | Benchmark | Reference | nanolance speed | Faster in |
 |---|---|---:|---:|
-| Read, C++ library, all cores | pylance | 2.81× | 24 of 27 |
-| Read, C++ library, 1 core | pylance | 3.49× | 27 of 27 |
-| Write, C++ library, all cores | pylance | 2.00× | 26 of 27 |
-| Write, C++ library, 1 core | pylance | 1.83× | 25 of 27 |
-| Read, Python binding, all cores | pylance | 2.74× | 27 of 27 |
-| Write, Python binding, all cores | pylance | 1.76× | 26 of 27 |
-| Scalar indexes, build | Rust Lance | not measured |  |
-| Scalar indexes, query | Rust Lance | not measured |  |
-| Vector indexes, build | Rust Lance | not measured |  |
-| Vector indexes, search | Rust Lance | not measured |  |
-| Full-text index, build | Rust Lance | not measured |  |
-| Full-text index, search | Rust Lance | not measured |  |
+| Read, C++ library, all cores | pylance | 2.99× | 27 of 27 |
+| Read, C++ library, 1 core | pylance | 3.87× | 27 of 27 |
+| Write, C++ library, all cores | pylance | 2.07× | 26 of 27 |
+| Write, C++ library, 1 core | pylance | 1.97× | 26 of 27 |
+| Read, Python binding, all cores | pylance | 2.86× | 27 of 27 |
+| Write, Python binding, all cores | pylance | 1.61× | 27 of 27 |
+| Scalar indexes, build | Rust Lance | 2.37× | 5 of 5 |
+| Scalar indexes, query | Rust Lance | 3.66× | 14 of 14 |
+| Vector indexes, build | Rust Lance | 1.13× | 1 of 3 |
+| Vector indexes, search | Rust Lance | 3.20× | 12 of 12 |
+| Full-text index, build | Rust Lance | 1.36× | 1 of 1 |
+| Full-text index, search | Rust Lance | 11.76× | 7 of 7 |
 
 <!-- bench-summary:end -->
 
@@ -275,13 +275,14 @@ data types written and read by the C++ library and the Python binding, every rea
 the index suites build and query scalar, vector and full-text indexes against the `lance` crate with no Python in
 the process, and the answers must agree before a time is reported. [docs/PERFORMANCE_GATE.md](docs/PERFORMANCE_GATE.md)
 is the gate that fails a CI run when nanolance loses ground; memory, file sizes, program sizes and the full-scale
-runs are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+runs are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Those full-scale numbers are dated 2026-10-17, from a local
+machine and an earlier commit; the table above is the latest CI run, and its full record is on the results page.
 
 ## Related projects
 
 - [nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet): the same Arrow batches to Parquet.
-- [nanotins / soatins](https://github.com/yoavbendor/nanotins): packets and structs to Arrow; used by
-  `examples/pcapng2lance`, a streaming pcapng to Lance converter.
+- [nanom](https://github.com/yoavbendor/nanom): the parser-combinator library behind `examples/pcapng2lance`, a
+  streaming pcapng to Lance converter, and its DPAR / LLDP tools.
 - [nanos3reader](https://github.com/yoavbendor/nanos3reader): the S3 client.
 
 ## Version and license

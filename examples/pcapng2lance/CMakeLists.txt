@@ -1,111 +1,43 @@
-# pcapng -> Lance example: a thin consumer of the standalone parsing stack. nanolance itself does NOT depend
-# on that stack (it reads/writes Lance with nanoarrow + local code only); the parsing stack is THIS example's
-# dependency, so the example owns it — vendored as a git submodule under extern/nanotins and added here. The
-# be<>/bits<>/SoA/arrow reflection lives in soatins; pcap/pcapng + L2/L3/L4 parsing in nanotins. This
-# directory owns the Lance-writing glue — the CLI driver, streaming windows, the per-PDU Lance table writer,
-# and the staged enrich pipeline.
+# pcapng -> Lance example. The converter (src/nanom_convert.cpp) and the DPAR/LLDP tools (src/dpar2lance_nanom_main.cpp)
+# are built on nanom, the parser-combinator library: a git submodule under extern/nanom, pinned, and added here.
+# nanolance's writer does the Lance output. Every table the converter and tools write is checked against the nanotins
+# reference the examples were ported from (tests/golden/parity_digests.json).
 #
-# CPU-only. (A GPU bulk path via the gputins/CUDA layer is a planned future feature; `--gpu` currently
-# reports that and exits.)
+# CPU-only. --gpu is a planned future feature; the converter reports that and exits.
 
-# Pull in the sister nanotins stack (soatins::core + nanotins). This is the only place the submodule is
-# referenced — a plain nanolance build never needs it.
-if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanotins/CMakeLists.txt")
-    message(FATAL_ERROR
-        "examples/pcapng2lance/extern/nanotins is empty — run: git submodule update --init --recursive")
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanom/CMakeLists.txt")
+    message(FATAL_ERROR "examples/pcapng2lance/extern/nanom is empty -- run: git submodule update --init --recursive")
 endif()
-# Build the nanotins/soatins unit tests alongside this example's tests when tests are on.
-if(NANOLANCE_BUILD_TESTS)
-    set(SOATINS_BUILD_TESTS ON CACHE BOOL "" FORCE)
-    set(NANOTINS_BUILD_TESTS ON CACHE BOOL "" FORCE)
+set(PCAPNG2LANCE_NANOM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanom")
+if(NOT TARGET nanom::nanom)
+    # nanom is header-only and built only here; its own tests and examples stay out of this build.
+    add_subdirectory("${PCAPNG2LANCE_NANOM_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/nanom" EXCLUDE_FROM_ALL)
 endif()
-add_subdirectory(extern/nanotins)
 
-# The pcapng -> Lance converter.
-add_executable(pcapng2lance src/pcapng2lance_main.cpp)
-target_sources(pcapng2lance PRIVATE src/phase_b_runner.cpp)
+# The converter, C++23 (nanom requires it).
+add_library(pcapng2lance_nanom_convert STATIC src/nanom_convert.cpp)
+target_compile_features(pcapng2lance_nanom_convert PRIVATE cxx_std_23)
+target_include_directories(pcapng2lance_nanom_convert PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include" "${PCAPNG2LANCE_NANOM_DIR}/examples/nanotins_parity")
+target_link_libraries(pcapng2lance_nanom_convert PRIVATE nanom::nanom nanolance)
+
+add_executable(pcapng2lance src/pcapng2lance.cpp)
 target_include_directories(pcapng2lance PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(pcapng2lance PRIVATE nanotins nanolance)
+target_link_libraries(pcapng2lance PRIVATE pcapng2lance_nanom_convert nanolance)
 
-# dpar2lance -> apply DPAR rules to a capture and write each matched rule table to its own Lance dataset
-# (the columnar counterpart to nanotins' NDJSON `dpar` example). Reuses this example's vendored nanotins
-# submodule + the nanolance writer.
-add_executable(dpar2lance src/dpar2lance_main.cpp)
-target_include_directories(dpar2lance PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(dpar2lance PRIVATE nanotins nanolance)
-
-# lldp2lance -> the same DPAR -> Lance sink, but driven by the USER-WRITTEN LldpPalette from the vendored
-# nanotins LLDP example (examples/lldp/lldp.hpp) instead of the built-in DefaultPalette. Demonstrates that
-# a downstream tool can add its own protocol parser and land its table in Lance for "free" — the generic
-# dpar_table_writer carries the example's fixed-binary value_head column unchanged. Needs the example's
-# header dir on the include path (it lives outside the nanotins include tree, as application code).
-add_executable(lldp2lance src/lldp2lance_main.cpp)
-target_include_directories(lldp2lance PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanotins/examples/lldp")
-target_link_libraries(lldp2lance PRIVATE nanotins nanolance)
+# dpar2lance and lldp2lance: the DPAR engine of nanom's parity example (include/nanom_dpar.hpp). lldp2lance is the
+# same source with NANOM_LLDP_ONLY, which accepts the lldp parser only.
+add_executable(dpar2lance src/dpar2lance_nanom_main.cpp)
+add_executable(lldp2lance src/dpar2lance_nanom_main.cpp)
+target_compile_definitions(lldp2lance PRIVATE NANOM_LLDP_ONLY)
+foreach(_nm_dpar_tool dpar2lance lldp2lance)
+    target_compile_features(${_nm_dpar_tool} PRIVATE cxx_std_23)
+    target_include_directories(${_nm_dpar_tool} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${PCAPNG2LANCE_NANOM_DIR}/examples/nanotins_parity")
+    target_link_libraries(${_nm_dpar_tool} PRIVATE nanom::nanom nanolance)
+endforeach()
 
 if(NANOLANCE_BUILD_TESTS)
-    # struct -> soa -> arrow -> Lance -> read-back (exercises nanotins reflection through the nanolance
-    # writer/reader; stays here because it depends on nanolance, not just nanotins).
-    add_executable(nanotins_roundtrip_test tests/test_reflect_roundtrip.cpp)
-    target_link_libraries(nanotins_roundtrip_test PRIVATE nanotins nanolance)
-    add_test(NAME nanotins_roundtrip COMMAND $<TARGET_FILE:nanotins_roundtrip_test>)
-    set_tests_properties(nanotins_roundtrip PROPERTIES LABELS "smoke")
-
-    # nanolance reads back every fixed-width type nanotins writes, even with a blob column present.
-    add_executable(nanotins_reader_parity_test tests/test_reader_parity.cpp)
-    target_link_libraries(nanotins_reader_parity_test PRIVATE nanotins nanolance)
-    add_test(NAME nanotins_reader_parity COMMAND $<TARGET_FILE:nanotins_reader_parity_test>)
-    set_tests_properties(nanotins_reader_parity PROPERTIES LABELS "smoke")
-
-    # DPAR rule table -> Arrow -> Lance write -> read-back roundtrip (the dpar2lance sink end to end).
-    add_executable(dpar2lance_roundtrip_test tests/test_dpar2lance_roundtrip.cpp)
-    target_include_directories(dpar2lance_roundtrip_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-    target_link_libraries(dpar2lance_roundtrip_test PRIVATE nanotins nanolance)
-    add_test(NAME dpar2lance_roundtrip COMMAND $<TARGET_FILE:dpar2lance_roundtrip_test>)
-    set_tests_properties(dpar2lance_roundtrip PROPERTIES LABELS "smoke")
-
-    # LldpPalette rule table -> Arrow -> Lance write -> read-back, including the example's decoded typed
-    # columns and the fixed-size-binary value_head (the lldp2lance sink end to end).
-    add_executable(lldp2lance_roundtrip_test tests/test_lldp2lance_roundtrip.cpp)
-    target_include_directories(lldp2lance_roundtrip_test PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanotins/examples/lldp")
-    target_link_libraries(lldp2lance_roundtrip_test PRIVATE nanotins nanolance)
-    add_test(NAME lldp2lance_roundtrip COMMAND $<TARGET_FILE:lldp2lance_roundtrip_test>)
-    set_tests_properties(lldp2lance_roundtrip PROPERTIES LABELS "smoke")
-
-    # M6: the DAG-driven PDU tables are byte-identical (schema + Arrow buffers) to the protocols:: tables,
-    # so the driver's decode path can move to the spec/DAG without changing the Lance output.
-    add_executable(pdu_table_interop_test tests/test_pdu_table_interop.cpp)
-    target_include_directories(pdu_table_interop_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-    target_link_libraries(pdu_table_interop_test PRIVATE nanotins nanolance)
-    add_test(NAME pdu_table_interop COMMAND $<TARGET_FILE:pdu_table_interop_test>)
-    set_tests_properties(pdu_table_interop PROPERTIES LABELS "smoke")
-
-    # M6 (full pipeline, no Python): write both PDU-table paths to real Lance, dump via nlance2table, diff
-    # the CSV. Proves the spec/DAG tables == protocols:: tables through Lance write/read, not just in-memory.
-    if(TARGET nlance2table)
-        add_executable(pdu_table_lance_interop_test tests/test_pdu_table_lance_interop.cpp)
-        target_include_directories(pdu_table_lance_interop_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-        target_link_libraries(pdu_table_lance_interop_test PRIVATE nanotins nanolance)
-        add_test(NAME pdu_table_lance_interop
-                 COMMAND $<TARGET_FILE:pdu_table_lance_interop_test> $<TARGET_FILE:nlance2table>)
-        set_tests_properties(pdu_table_lance_interop PROPERTIES LABELS "smoke")
-    endif()
-
-    # End-to-end driver self-check (manifest + KV metadata + external-blob premise). Uses the nanotins
-    # pcap scanner (linked via the umbrella target) and the shared pcap_fixtures.hpp from the vendored
-    # nanotins submodule's tests dir.
-    add_executable(pcapng2lance_driver_test tests/test_pcapng2lance_driver.cpp)
-    target_include_directories(pcapng2lance_driver_test PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanotins/nanotins/tests")
-    target_link_libraries(pcapng2lance_driver_test PRIVATE nanotins nanolance)
-    add_test(NAME pcapng2lance_driver COMMAND $<TARGET_FILE:pcapng2lance_driver_test> $<TARGET_FILE:pcapng2lance>)
-    set_tests_properties(pcapng2lance_driver PROPERTIES LABELS "smoke")
-
-    # (The GPU equivalence tests — wire_spec_gpu_smoke, dag_gpu_equiv_bench — moved out with the gputins
-    # layer; serial==bulk determinism is covered by the nanotins suite's test_dag_bulk.)
-
     # Stock-Lance (pylance) interop + on-disk offset verification. Skips (CTest 77) if pylance absent.
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
@@ -125,6 +57,16 @@ if(NANOLANCE_BUILD_TESTS)
             COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pcapng2lance_realfile.py"
                     $<TARGET_FILE:pcapng2lance> "${CMAKE_SOURCE_DIR}/tests/test_framed.pcapng")
         set_tests_properties(pcapng2lance_realfile_multisection PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+
+        # Parity with the nanotins reference: every stage, one-shot and DPAR/LLDP table digests (golden/).
+        if(TARGET dpar2lance AND TARGET lldp2lance)
+            add_test(NAME pcapng2lance_parity_golden
+                COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_parity_golden.py"
+                        $<TARGET_FILE:pcapng2lance> $<TARGET_FILE:dpar2lance> $<TARGET_FILE:lldp2lance>
+                        "${CMAKE_SOURCE_DIR}" "${PCAPNG2LANCE_NANOM_DIR}/examples/nanotins_parity/testdata"
+                        "${CMAKE_CURRENT_BINARY_DIR}/parity_golden")
+            set_tests_properties(pcapng2lance_parity_golden PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+        endif()
 
         # M3: L2/L3 decode -> per-PDU Lance tables, verified via stock pylance.
         add_test(NAME pcapng2lance_l2l3

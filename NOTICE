@@ -55,7 +55,8 @@ system libraries dynamically (not redistributed here):
   - OpenSSL (libcrypto)     - Apache License 2.0 (3.x)      - https://www.openssl.org
 
 See THIRD-PARTY-LICENSES.md for details. The pcapng2lance example additionally
-depends on the sister nanotins stack (Apache-2.0); see its own NOTICE.
+depends on the sister nanom parser library (Apache-2.0), vendored as a git submodule under
+examples/pcapng2lance/extern/nanom; see its own NOTICE.
 
 -------------------------------------------------------------------------------
 pylance Python modules

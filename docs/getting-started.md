@@ -14,7 +14,7 @@ ctest --test-dir build -L smoke --output-on-failure
 ```
 
 !!! note "Cloning"
-    Building the `pcapng2lance` example needs the `nanotins` git submodule — clone with
+    Building the `pcapng2lance` example needs the `nanom` git submodule — clone with
     `git clone --recursive`, or run `git submodule update --init --recursive`. Building nanolance
     itself (library, tools, tests) needs no submodule.
 

@@ -62,7 +62,7 @@ nlance2table -f csv -n 5 out.lance
 ### Validating L2/L3/L4 decode against Wireshark
 
 Because nlance2table emits plain text keyed by `packet_id`, the per-PDU tables from `--decode-l2l3` can be
-diffed field-for-field against `tshark` on the **same** capture — an independent check that the nanotins
+diffed field-for-field against `tshark` on the **same** capture — an independent check that the nanom
 decode matches an authoritative dissector:
 
 ```

@@ -42,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive  # vendored nanotins (examples/pcapng2lance/extern/nanotins) must be present
+          submodules: recursive  # vendored nanom (examples/pcapng2lance/extern/nanom) must be present
 
       - name: Install dependencies
         run: |
@@ -100,9 +100,8 @@ jobs:
           CC: clang-19
           CXX: clang++-19
         run: |
-          # NANOLANCE_BUILD_EXAMPLES=OFF: dpar/lldp2lance_main.cpp trigger clang ICEs on both
-          # clang-18 and clang-19; pcapng2lance also requires the nanotins submodule which CI
-          # does not need for core library tests.
+          # NANOLANCE_BUILD_EXAMPLES=OFF: the examples need the nanom submodule, which CI does not need
+          # for core library tests.
           # NANOLANCE_WERROR=ON: -Wall -Wextra -Werror on nanolance's own three library targets
           # (not on FetchContent'd deps, the tools or the tests -- see CMakeLists). The option
           # defaults OFF so a downstream build on an unknown compiler cannot be broken by a new
