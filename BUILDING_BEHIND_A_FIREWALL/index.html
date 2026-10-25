@@ -874,9 +874,8 @@ shallow mirror may not have them.</p>
 </table>
 <p>The pins live in the <code>FetchContent_Declare</code> calls of <code>CMakeLists.txt</code> and
 <code>bindings/python/CMakeLists.txt</code> (see section 5 for checking them after an update).</p>
-<p>Not needed: the two git submodules (<code>examples/pcapng2lance/extern/nanotins</code>,
-<code>examples/pcapng2lance_nanom/extern/nanom</code>). They belong to two examples, and CMake skips those
-examples when the submodules are absent. To build them anyway, see the <code>insteadOf</code> note in section 6.</p>
+<p>Not needed: the git submodule <code>examples/pcapng2lance/extern/nanom</code>. It belongs to the pcapng2lance example, and
+CMake skips that example when the submodule is absent. To build it anyway, see the <code>insteadOf</code> note in section 6.</p>
 <h2 id="2-point-the-build-at-the-mirror">2. Point the build at the mirror<a class="headerlink" href="#2-point-the-build-at-the-mirror" title="Permanent link">&para;</a></h2>
 <p>If the mirror keeps GitHub's <code>owner/repo</code> paths under one group (for example
 <code>https://gitlab.example.com/mirrors/apache/arrow-nanoarrow.git</code>), one setting does it:</p>
