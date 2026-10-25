@@ -17,7 +17,7 @@ namespace {
 
 // Options only the nanotins converter implements.
 bool nanotins_only(const std::string& s) {
-    static const char* const kOptions[] = {"--mem-bytes", "--read-tile-bytes", "--gpu"};
+    static const char* const kOptions[] = {"--gpu"};
     for (const char* o : kOptions) {
         if (s == o) return true;
     }

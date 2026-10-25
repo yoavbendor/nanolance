@@ -36,6 +36,7 @@
 #include "nanom_pdu_tables.hpp"        // per-PDU Lance row types + converters (--decode-l2l3)
 #include "nanom_soa_lance_writer.hpp"  // generic nanom soa<Row> -> Lance table writer
 
+#include "mem_budget.hpp"
 #include "nanolance/typed_writer.hpp"
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/lance_table_reader.hpp"
@@ -46,6 +47,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -164,6 +166,8 @@ struct Args {
     bool decode_l2l3 = false;  // also decode L2/L3/L4 via nanom walk_packet -> per-PDU Lance tables
     std::string stage;                      // --stage l1: the packet table into a data folder (see nanom_convert_main)
     std::size_t window_bytes = std::size_t{512} * 1024 * 1024;  // --window-bytes: packet table commits per this many captured bytes
+    std::uint64_t mem_bytes = 0;            // --mem-bytes: the enrich memory budget (0 = a share of free RAM)
+    std::size_t read_tile_bytes = std::size_t{32} * 1024 * 1024;  // --read-tile-bytes: one fetch of the enrich read
     std::uint64_t drop = 0;                 // -d: skip the first N packets (their packet_id is kept for the rest)
     std::uint64_t take = UINT64_MAX;        // -c: emit at most N packets after the drop (default: all)
     std::vector<std::string> pos;
@@ -196,6 +200,14 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
             if (a.window_bytes == 0) return (err = "--window-bytes must be > 0", false);
         } else if (s == "--sequential") {
             // Accepted for the nanotins converter's command line; this converter is sequential already.
+        } else if (s == "--mem-bytes") {
+            const char* v = value(i);
+            if (!v) return false;
+            a.mem_bytes = std::stoull(v);
+        } else if (s == "--read-tile-bytes") {
+            const char* v = value(i);
+            if (!v) return false;
+            a.read_tile_bytes = static_cast<std::size_t>(std::stoull(v));
         } else if (s == "--threads") {
             // The thread count only tunes how the nanotins converter runs; this one reads the capture on one
             // thread and writes the same tables whatever it is set to.
@@ -394,6 +406,86 @@ bool read_payload_rows(const fs::path& table, const char* disc_col, std::vector<
     release_all();
     return true;
 }
+
+// ---- writer sessions for a table written in chunks ----------------------------------------------------------
+//
+// The staged stages commit each chunk of rows as one fragment of its table. A session holds one writer for the
+// table, opened on the first rows it is given; flush() commits what it holds as the next fragment and clears it.
+// A table that never gets rows is never created, as the nanotins stage's per-table appenders.
+
+template <class Row>
+class SoaSession {
+public:
+    SoaSession(std::string path, bool compress) : path_(std::move(path)), compress_(compress) {}
+
+    bool flush(nm::soa<Row>& table, std::string& err) {
+        if (table.rows() == 0) return true;
+        if (!writer_) {
+            writer_ = std::make_unique<Writer>(path_.c_str(), typename Writer::options{.compression_level = 3,
+                                                                                    .compress = compress_});
+            if (!writer_->ok()) {
+                err = std::string("writer init: ") + writer_->last_error();
+                return false;
+            }
+        }
+        bool ok = true;
+        table.for_each_chunk([&](const auto& ch) {
+            ok = ok && p2l_nanom::detail::write_chunk<Row>(*writer_, ch,
+                                                            std::make_index_sequence<p2l_nanom::detail::field_count<Row>>{});
+        });
+        ok = ok && writer_->commit();
+        if (!ok) err = std::string("write ") + path_ + ": " + writer_->last_error();
+        table = nm::soa<Row>{4096};
+        return ok;
+    }
+
+    void close() {
+        if (writer_) writer_->close();
+        writer_.reset();
+    }
+
+private:
+    using Writer = nt::writer<p2l_nanom::detail::schema_for<Row>>;
+    std::string path_;
+    bool compress_;
+    std::unique_ptr<Writer> writer_;
+};
+
+class RemainderSession {
+public:
+    RemainderSession(std::string path, bool compress) : path_(std::move(path)), compress_(compress) {}
+
+    bool flush(std::vector<std::uint64_t>& pid, std::vector<std::uint64_t>& next, std::vector<nt::blob_ref>& pay,
+               std::string& err) {
+        if (pid.empty()) return true;
+        if (!writer_) {
+            writer_ = std::make_unique<nt::writer<RemainderSchema>>(path_.c_str(), nt::writer<RemainderSchema>::options{
+                                                                        .compression_level = 3, .compress = compress_});
+            if (!writer_->ok()) {
+                err = std::string("remainder writer init: ") + writer_->last_error();
+                return false;
+            }
+        }
+        const bool ok = writer_->write_batch(std::span<const std::uint64_t>(pid), std::span<const std::uint64_t>(next),
+                                             std::span<const nt::blob_ref>(pay)) &&
+                        writer_->commit();
+        if (!ok) err = std::string("remainder write: ") + writer_->last_error();
+        pid.clear();
+        next.clear();
+        pay.clear();
+        return ok;
+    }
+
+    void close() {
+        if (writer_) writer_->close();
+        writer_.reset();
+    }
+
+private:
+    std::string path_;
+    bool compress_;
+    std::unique_ptr<nt::writer<RemainderSchema>> writer_;
+};
 
 // ---- the converter -------------------------------------------------------------------------------
 
@@ -657,64 +749,93 @@ public:
             return fail("read " + table.string() + ": " + err);
         }
 
+        // Rows are decoded in chunks sized by the memory budget (--mem-bytes), and each chunk's PDU rows and
+        // remainder are committed to their tables as one fragment, so the chunk size shows in the fragment layout.
+        const std::size_t per_row = kPrefixCap + sizeof(nmproto::Ipv6) + sizeof(EnrichRow) + 64;
+        const std::size_t chunk_rows =
+            membudget::rows_per_chunk(membudget::resolve_budget(args_.mem_bytes), per_row);
+        const std::size_t read_tile = args_.read_tile_bytes;
+
+        // The tables this stage writes, each one writer session that starts on its first rows.
+        const auto dir = [&](const char* name) { return (datadir / name).string(); };
+        SoaSession<p2l_nanom::EthRow> eth_s(dir("ethernet.lance"), args_.compress);
+        SoaSession<p2l_nanom::VlanRow> vlan_s(dir("vlan.lance"), args_.compress);
+        SoaSession<p2l_nanom::Ipv4Row> ipv4_s(dir("ipv4.lance"), args_.compress);
+        SoaSession<p2l_nanom::Ipv6Row> ipv6_s(dir("ipv6.lance"), args_.compress);
+        SoaSession<p2l_nanom::TcpRow> tcp_s(dir("tcp.lance"), args_.compress);
+        SoaSession<p2l_nanom::UdpRow> udp_s(dir("udp.lance"), args_.compress);
+        RemainderSession rem_s((datadir / ("remainder_after_" + stage + ".lance")).string(), args_.compress);
+        const auto flush = [&]() -> bool {
+            if (l2) {
+                return eth_s.flush(eth_, err) && vlan_s.flush(vlan_, err) && rem_s.flush(rem_pid_, rem_next_, rem_pay_, err);
+            }
+            if (l3) {
+                return ipv4_s.flush(ipv4_, err) && ipv6_s.flush(ipv6_, err) &&
+                       rem_s.flush(rem_pid_, rem_next_, rem_pay_, err);
+            }
+            return tcp_s.flush(tcp_, err) && udp_s.flush(udp_, err) && rem_s.flush(rem_pid_, rem_next_, rem_pay_, err);
+        };
+
         std::vector<std::uint8_t> tile;
         char ferr[512]{};
-        for (std::size_t i = 0; i < in.size();) {
-            const std::uint64_t base = in[i].off;
-            const std::string uri = in[i].uri;
-            std::size_t j = i;
-            std::uint64_t span_end = base;
-            for (; j < in.size() && in[j].uri == uri; ++j) {
-                const std::uint64_t need = in[j].off + std::min<std::uint64_t>(in[j].size, kPrefixCap);
-                if (j > i && need - base > kReadTile) break;
-                span_end = std::max(span_end, need);
-            }
-            const std::size_t span = static_cast<std::size_t>(span_end - base);
-            tile.resize(span);
-            std::size_t got = 0;
-            if (span > 0 && nano_lance_fetch_external_blob(uri.c_str(), base, span, tile.data(), tile.size(), &got,
-                                                           ferr, sizeof ferr) != NANO_LANCE_READER_OK) {
-                return fail(std::string("fetch_external_blob: ") + ferr);
-            }
-            for (std::size_t k = i; k < j; ++k) {
-                const EnrichRow& r = in[k];
-                const std::size_t local = static_cast<std::size_t>(r.off - base);
-                const std::size_t hdr = static_cast<std::size_t>(std::min<std::uint64_t>(r.size, kPrefixCap));
-                if (local + hdr > got) continue;
-                const nm::bytes bytes(reinterpret_cast<const std::byte*>(tile.data() + local), hdr);
-                std::size_t consumed = 0;
-                std::uint64_t next = 0;
-                bool ok = false;
-                if (l2) {
-                    std::uint16_t ethertype = 0;
-                    ok = r.disc == nmproto::kLinkTypeEthernet && decode_l2(r.pid, bytes, consumed, ethertype);
-                    next = ethertype;
-                } else if (l3) {
-                    ok = decode_l3(r.pid, static_cast<std::uint16_t>(r.disc), bytes, consumed, next);
-                } else {
-                    ok = decode_l4(r.pid, static_cast<std::uint8_t>(r.disc), bytes, consumed, next);
+        std::size_t forwarded = 0;
+        for (std::size_t chunk = 0; chunk < in.size(); chunk += chunk_rows) {
+            const std::size_t chunk_end = std::min(chunk + chunk_rows, in.size());
+            for (std::size_t i = chunk; i < chunk_end;) {
+                const std::uint64_t base = in[i].off;
+                const std::string uri = in[i].uri;
+                std::size_t j = i;
+                std::uint64_t span_end = base;
+                for (; j < chunk_end && in[j].uri == uri; ++j) {
+                    const std::uint64_t need = in[j].off + std::min<std::uint64_t>(in[j].size, kPrefixCap);
+                    if (j > i && need - base > read_tile) break;
+                    span_end = std::max(span_end, need);
                 }
-                if (ok && consumed < r.size) {
-                    rem_pid_.push_back(r.pid);
-                    rem_next_.push_back(next);
-                    rem_pay_.push_back(nt::blob_ref{r.uri, r.off + consumed, r.size - consumed});
+                const std::size_t span = static_cast<std::size_t>(span_end - base);
+                tile.resize(span);
+                std::size_t got = 0;
+                if (span > 0 && nano_lance_fetch_external_blob(uri.c_str(), base, span, tile.data(), tile.size(),
+                                                               &got, ferr, sizeof ferr) != NANO_LANCE_READER_OK) {
+                    return fail(std::string("fetch_external_blob: ") + ferr);
                 }
+                for (std::size_t k = i; k < j; ++k) {
+                    const EnrichRow& r = in[k];
+                    const std::size_t local = static_cast<std::size_t>(r.off - base);
+                    const std::size_t hdr = static_cast<std::size_t>(std::min<std::uint64_t>(r.size, kPrefixCap));
+                    if (local + hdr > got) continue;
+                    const nm::bytes bytes(reinterpret_cast<const std::byte*>(tile.data() + local), hdr);
+                    std::size_t consumed = 0;
+                    std::uint64_t next = 0;
+                    bool ok = false;
+                    if (l2) {
+                        std::uint16_t ethertype = 0;
+                        ok = r.disc == nmproto::kLinkTypeEthernet && decode_l2(r.pid, bytes, consumed, ethertype);
+                        next = ethertype;
+                    } else if (l3) {
+                        ok = decode_l3(r.pid, static_cast<std::uint16_t>(r.disc), bytes, consumed, next);
+                    } else {
+                        ok = decode_l4(r.pid, static_cast<std::uint8_t>(r.disc), bytes, consumed, next);
+                    }
+                    if (ok && consumed < r.size) {
+                        rem_pid_.push_back(r.pid);
+                        rem_next_.push_back(next);
+                        rem_pay_.push_back(nt::blob_ref{r.uri, r.off + consumed, r.size - consumed});
+                    }
+                }
+                i = j;
             }
-            i = j;
+            forwarded += rem_pid_.size();
+            if (!flush()) return fail("write " + stage + " chunk: " + err);
         }
-
-        const auto write = [&](const char* name, const auto& soa) {
-            return p2l_nanom::write_soa_table((datadir / name).string(), soa, args_.compress, err);
-        };
-        bool ok = l2 ? write("ethernet.lance", eth_) && write("vlan.lance", vlan_)
-                     : l3 ? write("ipv4.lance", ipv4_) && write("ipv6.lance", ipv6_)
-                          : write("tcp.lance", tcp_) && write("udp.lance", udp_);
-        if (!ok) return fail("write " + stage + " tables: " + err);
-        if (const int rc = write_remainder_table((datadir / ("remainder_after_" + stage + ".lance")).string())) {
-            return rc;
-        }
-        std::fprintf(stderr, "pcapng2lance: stage %s -> %zu input rows, %zu decoded forward\n", stage.c_str(),
-                     in.size(), rem_pid_.size());
+        eth_s.close();
+        vlan_s.close();
+        ipv4_s.close();
+        ipv6_s.close();
+        tcp_s.close();
+        udp_s.close();
+        rem_s.close();
+        std::fprintf(stderr, "pcapng2lance: stage %s -> %zu input rows, %zu decoded forward (chunk=%zu rows, tile=%zu B)\n",
+                     stage.c_str(), in.size(), forwarded, chunk_rows, read_tile);
         return 0;
     }
 
