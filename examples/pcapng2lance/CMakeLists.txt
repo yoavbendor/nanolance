@@ -45,22 +45,34 @@ target_sources(pcapng2lance PRIVATE src/phase_b_runner.cpp)
 target_include_directories(pcapng2lance PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(pcapng2lance PRIVATE pcapng2lance_nanom_convert nanotins nanolance)
 
+# dpar2lance and lldp2lance on nanom: the DPAR engine of nanom's parity example (include/nanom_dpar.hpp), C++23.
+# lldp2lance is the same source with NANOM_LLDP_ONLY, which accepts the lldp parser only.
+add_executable(dpar2lance src/dpar2lance_nanom_main.cpp)
+add_executable(lldp2lance src/dpar2lance_nanom_main.cpp)
+target_compile_definitions(lldp2lance PRIVATE NANOM_LLDP_ONLY)
+foreach(_nm_dpar_tool dpar2lance lldp2lance)
+    target_compile_features(${_nm_dpar_tool} PRIVATE cxx_std_23)
+    target_include_directories(${_nm_dpar_tool} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${PCAPNG2LANCE_NANOM_DIR}/examples/nanotins_parity")
+    target_link_libraries(${_nm_dpar_tool} PRIVATE nanom::nanom nanolance)
+endforeach()
+
 # dpar2lance -> apply DPAR rules to a capture and write each matched rule table to its own Lance dataset
 # (the columnar counterpart to nanotins' NDJSON `dpar` example). Reuses this example's vendored nanotins
 # submodule + the nanolance writer.
-add_executable(dpar2lance src/dpar2lance_main.cpp)
-target_include_directories(dpar2lance PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(dpar2lance PRIVATE nanotins nanolance)
+add_executable(dpar2lance_nanotins src/dpar2lance_main.cpp)
+target_include_directories(dpar2lance_nanotins PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(dpar2lance_nanotins PRIVATE nanotins nanolance)
 
 # lldp2lance -> the same DPAR -> Lance sink, but driven by the USER-WRITTEN LldpPalette from the vendored
 # nanotins LLDP example (examples/lldp/lldp.hpp) instead of the built-in DefaultPalette. Demonstrates that
 # a downstream tool can add its own protocol parser and land its table in Lance for "free" — the generic
 # dpar_table_writer carries the example's fixed-binary value_head column unchanged. Needs the example's
 # header dir on the include path (it lives outside the nanotins include tree, as application code).
-add_executable(lldp2lance src/lldp2lance_main.cpp)
-target_include_directories(lldp2lance PRIVATE
+add_executable(lldp2lance_nanotins src/lldp2lance_main.cpp)
+target_include_directories(lldp2lance_nanotins PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanotins/examples/lldp")
-target_link_libraries(lldp2lance PRIVATE nanotins nanolance)
+target_link_libraries(lldp2lance_nanotins PRIVATE nanotins nanolance)
 
 if(NANOLANCE_BUILD_TESTS)
     # struct -> soa -> arrow -> Lance -> read-back (exercises nanotins reflection through the nanolance
