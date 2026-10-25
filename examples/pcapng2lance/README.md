@@ -30,7 +30,9 @@ pcapng2lance --stage l2 data/                               # then Ethernet / VL
 - `--decode-l2l3` writes `<stem>_ethernet.lance`, `_vlan`, `_ipv4`, `_ipv4_option`, `_ipv6`, `_tcp`, `_udp`, the IPv6
   extension-header tables, and `<stem>_remainder_after_l4.lance` (the application payload as external references).
   Tables with no rows are not written.
-- `--window-bytes N` (default 512 MiB) commits the packet table in chunks of at most N captured bytes, one fragment each.
+- `--window-bytes N` (default 16 MiB) is the window the capture is read and committed in: each window is a run of whole
+  blocks of at most N bytes, scanned and written on its own, one fragment of each table per window. Only one window is in
+  memory at a time, so the converter's memory is bounded by the window, not by the capture's size.
 - `--mem-bytes B` and `--read-tile-bytes B` size the staged stages' chunks and fetch tiles. Each chunk's rows are committed
   as one fragment of each table.
 - `-d N` / `--drop N` and `-c N` / `--count N` write a slice: packets are numbered over the whole capture, and only those in
@@ -88,10 +90,18 @@ The packet table (`packets.lance`): `packet_id`, `interface_id`, `ts_raw`, `capl
 Section header and interface options are dataset metadata, on the first field, as `pcapng:shb<k>:<name>` and
 `pcapng:if<j>:<name>`.
 
+## Memory
+
+The converter reads the capture a window at a time (`--window-bytes`), and each stage reads its input table a batch at a
+time (one data file of the dataset). Peak memory was measured on a 1M-packet classic pcap (200-byte packets, 205 MiB file):
+about 66 MiB for the packet table with a 16 MiB window, and about 70 MiB with `--decode-l2l3` at the same window. Doubling the
+capture size does not change the peak; the window does. A stage's batches are the table's fragments, which the window
+keeps small.
+
 ## Limitations
 
-- The converter reads the whole capture into memory, and it holds all packet rows until the table is written. The
-  `--window-bytes` chunks bound the size of each commit, not the converter's own memory.
+- The SHB and IDB options recorded as metadata are the first window's, as the nanotins converter records them: a capture
+  whose later sections begin after the first window does not get their options.
 - IPv4 fragments: the TCP or UDP header is in the first fragment only, so a TCP/UDP row is produced only when
   `frag_offset == 0` (checked against `tshark` with reassembly off). Payload reassembly is not done.
 - IPv6 extension headers are walked for the one-shot tables; the staged `l3` stage reads the IPv6 base header only.

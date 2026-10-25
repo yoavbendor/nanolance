@@ -153,7 +153,7 @@ struct Args {
     bool no_write = false;     // scan+parse only, skip the Lance write (isolates Phase A/B for benchmarking)
     bool decode_l2l3 = false;  // also decode L2/L3/L4 via nanom walk_packet -> per-PDU Lance tables
     std::string stage;                      // --stage l1: the packet table into a data folder (see nanom_convert_main)
-    std::size_t window_bytes = std::size_t{512} * 1024 * 1024;  // --window-bytes: packet table commits per this many captured bytes
+    std::size_t window_bytes = std::size_t{16} * 1024 * 1024;  // --window-bytes: the capture is read and committed this many bytes at a time
     std::uint64_t mem_bytes = 0;            // --mem-bytes: the enrich memory budget (0 = a share of free RAM)
     std::size_t read_tile_bytes = std::size_t{32} * 1024 * 1024;  // --read-tile-bytes: one fetch of the enrich read
     std::uint64_t drop = 0;                 // -d: skip the first N packets (their packet_id is kept for the rest)
@@ -216,9 +216,8 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
 // ---- the SHB/IDB options as dataset metadata ------------------------------------------------------
 //
 // pcapng2lance records the string options of each section header and interface block as key/value metadata
-// of the packet table's first field: "pcapng:shb<k>:<name>" and "pcapng:if<j>:<name>". The whole capture is walked
-// this while it scans; here the whole capture is walked once, which records the same entries for every capture
-// that its one-window scan also covers in full.
+// of the packet table's first field: "pcapng:shb<k>:<name>" and "pcapng:if<j>:<name>". They are read from the first
+// window's blocks, as the nanotins converter reads them from its first scan window.
 
 std::uint32_t read_u32(const std::vector<std::uint8_t>& b, std::size_t at, bool le) {
     const std::uint8_t* p = b.data() + at;
@@ -341,89 +340,6 @@ int child_index(const ArrowSchema& s, const char* name) {
     return -1;
 }
 
-// Read packet_id, the discriminator column and the payload_ref of every row of a Lance table, in order.
-bool read_payload_rows(const fs::path& table, const char* disc_col, std::vector<EnrichRow>& out, std::string& error) {
-    ArrowSchema schema{};
-    std::vector<ArrowArray> batches;
-    if (!nano_lance::lance_table_read_dataset(table, schema, batches, error)) return false;
-    const auto release_all = [&] {
-        for (auto& b : batches) {
-            if (b.release) b.release(&b);
-        }
-        if (schema.release) schema.release(&schema);
-    };
-    const int pid_col = child_index(schema, "packet_id");
-    const int disc_at = child_index(schema, disc_col);
-    const int blob_col = child_index(schema, "payload_ref");
-    if (pid_col < 0 || disc_at < 0 || blob_col < 0) {
-        error = std::string("table missing packet_id / ") + disc_col + " / payload_ref";
-        release_all();
-        return false;
-    }
-    for (auto& batch : batches) {
-        ArrowArrayView view{};
-        ArrowError ae;
-        if (ArrowArrayViewInitFromSchema(&view, &schema, &ae) != NANOARROW_OK ||
-            ArrowArrayViewSetArray(&view, &batch, &ae) != NANOARROW_OK) {
-            error = "failed to view payload table batch";
-            ArrowArrayViewReset(&view);
-            release_all();
-            return false;
-        }
-        nano_lance::BlobV2ColumnView blob;
-        if (!blob.init(*schema.children[blob_col], *view.children[blob_col], error)) {
-            ArrowArrayViewReset(&view);
-            release_all();
-            return false;
-        }
-        for (std::int64_t i = 0; i < view.length; ++i) {
-            EnrichRow r;
-            r.pid = ArrowArrayViewGetUIntUnsafe(view.children[pid_col], i);
-            r.disc = ArrowArrayViewGetUIntUnsafe(view.children[disc_at], i);
-            r.off = blob.position(i);
-            r.size = blob.byte_size(i);
-            const char* data = nullptr;
-            std::int64_t n = 0;
-            blob.uri(i, &data, &n);
-            r.uri.assign(data, static_cast<std::size_t>(n));
-            out.push_back(std::move(r));
-        }
-        ArrowArrayViewReset(&view);
-    }
-    release_all();
-    return true;
-}
-
-// The IPv4 options of the header at `off` (IHL in 32-bit words): on_opt(type, on-wire length) for each, the walk of
-// the ipv4_option table. The option space is [off + 20, off + IHL*4) clamped to the packet; EOOL ends the
-// list; NOP is one byte; every other option's length octet counts the whole option, and an option that does not fit
-// ends the walk.
-template <class OnOpt>
-void ipv4_options(nm::bytes pkt, std::size_t off, std::uint8_t ihl, OnOpt on_opt) {
-    const std::size_t hdr = std::size_t(ihl) * 4;
-    if (hdr <= 20 || off > pkt.size()) return;
-    const std::size_t end = std::min<std::size_t>(off + hdr, pkt.size());
-    std::size_t p = off + 20;
-    const auto byte = [&](std::size_t i) { return static_cast<std::uint8_t>(pkt[i]); };
-    while (p < end) {
-        const std::uint8_t t = byte(p);
-        if (t == 0) {  // EOOL
-            on_opt(t, std::uint8_t{1});
-            return;
-        }
-        if (t == 1) {  // NOP
-            on_opt(t, std::uint8_t{1});
-            ++p;
-            continue;
-        }
-        if (p + 2 > end) return;
-        const std::uint8_t wlen = byte(p + 1);  // counts the whole option
-        if (wlen < 2 || p + wlen > end) return;
-        on_opt(t, wlen);
-        p += wlen;
-    }
-}
-
 // ---- writer sessions for a table written in chunks ----------------------------------------------------------
 //
 // The staged stages commit each chunk of rows as one fragment of its table. A session holds one writer for the
@@ -506,125 +422,181 @@ private:
 
 // ---- the converter -------------------------------------------------------------------------------
 
-class Converter {
-public:
-    Converter(Args args, fs::path output, std::string payload_uri)
-        : args_(std::move(args)), output_(std::move(output)), payload_uri_(std::move(payload_uri)) {}
-
-    int run(const fs::path& input) {
-        std::vector<std::uint8_t> buf;
-        if (!read_file(input, buf)) return fail("cannot read input file: " + input.string());
-        const nm::bytes file(reinterpret_cast<const std::byte*>(buf.data()), buf.size());
-        kv_blob_ = arrow_metadata(pcapng_option_entries(buf));
-
-        // Phase A: scan block/record boundaries (nanom).
-        std::vector<nmpcap::BlockRef> refs;
-        std::string err;
-        if (!nmpcap::scan_blocks(file, refs, err)) return fail("scan: " + err);
-
-        // Phase B: classify + parse each packet, tabulate into the row buffers.
-        std::vector<PacketRow> rows;
-        std::vector<nt::blob_ref> payload;
-        std::vector<std::uint16_t> iface_link;  // link_type per interface, in the current section
-        std::vector<std::uint8_t> iface_res;    // ts_resol per interface, in the current section
-        for (const auto& ref : refs) {
-            switch (ref.kind) {
-                case nmpcap::Kind::Shb:
-                    iface_link.clear();
-                    iface_res.clear();
-                    ++shb_count_;
-                    break;
-                case nmpcap::Kind::Idb: {
-                    nmpcap::IdbView idb{};
-                    if (nmpcap::parse_idb(file, ref, idb)) {
-                        iface_link.push_back(idb.link_type);
-                        iface_res.push_back(idb_ts_resol(file, ref));
-                        ++idb_count_;
-                    }
-                    break;
-                }
-                case nmpcap::Kind::Epb:
-                case nmpcap::Kind::PcapRecord: {
-                    nmpcap::EpbView e{};
-                    if (!nmpcap::parse_epb(file, ref, e)) continue;
-                    const std::uint64_t seen = seen_;
-                    ++seen_;
-                    // --drop/--count: packets outside [drop, drop+take) are counted (so packet_id stays global,
-                    // so slices stitch into the full dataset) but not emitted; interface state is still applied.
-                    if (seen < args_.drop || seen - args_.drop >= args_.take) break;
-                    const std::uint16_t link =
-                        e.interface_id < iface_link.size() ? iface_link[e.interface_id] : std::uint16_t{0};
-                    const std::uint8_t res =
-                        e.interface_id < iface_res.size() ? iface_res[e.interface_id] : std::uint8_t{6};
-                    rows.push_back(PacketRow{seen, e.interface_id, e.ts_raw, e.caplen, e.origlen, link, res,
-                                             epb_flags(file, ref, e.caplen)});
-                    payload.push_back(nt::blob_ref{payload_uri_, e.payload_file_offset, e.caplen});
-                    if (args_.decode_l2l3) decode_packet(seen, link, file, e.payload_file_offset, e.caplen);
-                    break;
-                }
-                default:
-                    ++other_count_;
-                    break;
-            }
+// The IPv4 options of the header at `off` (IHL in 32-bit words): on_opt(type, on-wire length) for each, the walk of
+// the ipv4_option table. The option space is [off + 20, off + IHL*4) clamped to the packet; EOOL ends the
+// list; NOP is one byte; every other option's length octet counts the whole option, and an option that does not fit
+// ends the walk.
+template <class OnOpt>
+void ipv4_options(nm::bytes pkt, std::size_t off, std::uint8_t ihl, OnOpt on_opt) {
+    const std::size_t hdr = std::size_t(ihl) * 4;
+    if (hdr <= 20 || off > pkt.size()) return;
+    const std::size_t end = std::min<std::size_t>(off + hdr, pkt.size());
+    std::size_t p = off + 20;
+    const auto byte = [&](std::size_t i) { return static_cast<std::uint8_t>(pkt[i]); };
+    while (p < end) {
+        const std::uint8_t t = byte(p);
+        if (t == 0) {  // EOOL
+            on_opt(t, std::uint8_t{1});
+            return;
         }
-
-        // An empty slice (--drop past the last packet) writes nothing.
-        if (!args_.no_write && !rows.empty()) {
-            if (const int rc = write_packet_table(rows, payload)) return rc;
-            if (args_.decode_l2l3) {
-                if (const int rc = write_pdu_tables()) return rc;
-            }
+        if (t == 1) {  // NOP
+            on_opt(t, std::uint8_t{1});
+            ++p;
+            continue;
         }
-        std::fprintf(stderr,
-                     "pcapng2lance: %zu of %llu packets, %zu interface(s), %zu section(s), %zu other block(s)%s -> %s\n",
-                     rows.size(), static_cast<unsigned long long>(seen_), idb_count_, shb_count_, other_count_,
-                     args_.no_write ? " [--no-write]" : "", output_.string().c_str());
-        return 0;
+        if (p + 2 > end) return;
+        const std::uint8_t wlen = byte(p + 1);  // counts the whole option
+        if (wlen < 2 || p + wlen > end) return;
+        on_opt(t, wlen);
+        p += wlen;
     }
+}
 
-private:
-    static bool read_file(const fs::path& path, std::vector<std::uint8_t>& out) {
-        std::FILE* f = std::fopen(path.string().c_str(), "rb");
-        if (!f) return false;
-        std::uint8_t chunk[1 << 16];
-        std::size_t n = 0;
-        while ((n = std::fread(chunk, 1, sizeof chunk, f)) > 0) out.insert(out.end(), chunk, chunk + n);
-        std::fclose(f);
+// ---- the input, window by window ----------------------------------------------------------------------------------
+//
+// The capture is read as windows of whole blocks: a window is the next run of complete blocks, at most `budget` bytes
+// (a block larger than the budget is a window of its own). The first window starts at the file's first block. Every
+// later window starts with a copy of the file's first block (the section header of a pcapng, the global header of a pcap),
+// so nanom's scanner, which reads the byte order and link type from the start of the bytes it is given, reads each
+// window as it would the whole file. The converter keeps no more than one window of the capture in memory.
+
+class CaptureWindows {
+public:
+    bool open(const fs::path& path, std::size_t budget, std::string& err) {
+        f_.reset(std::fopen(path.string().c_str(), "rb"));
+        if (!f_) {
+            err = "cannot read input file: " + path.string();
+            return false;
+        }
+        budget_ = budget;
+        if (std::fseek(f_.get(), 0, SEEK_END) != 0) return (err = "cannot seek in " + path.string(), false);
+        size_ = static_cast<std::uint64_t>(std::ftell(f_.get()));
+        std::uint8_t magic_bytes[4]{};
+        if (size_ < 4 || !read_at(0, magic_bytes, 4)) return (err = "file too small", false);
+        const std::uint32_t magic = read_u32(magic_bytes, true);
+        if (magic == nmpcap::kShb) {
+            pcapng_ = true;
+            std::uint8_t bom[4]{};
+            if (!read_at(8, bom, 4)) return (err = "truncated section header", false);
+            le_ = read_u32(bom, true) == nmpcap::kByteOrderMagic;
+        } else if (magic == nmpcap::kMagicUsLE || magic == nmpcap::kMagicNsLE) {
+            pcapng_ = false;
+            le_ = true;
+        } else if (magic == nmpcap::kMagicUsBE || magic == nmpcap::kMagicNsBE) {
+            pcapng_ = false;
+            le_ = false;
+        } else {
+            return (err = "not a pcap or pcapng file (unknown magic)", false);
+        }
+        std::uint64_t first = 0;
+        if (!block_length(0, first, err)) return false;
+        prefix_.resize(static_cast<std::size_t>(first));
+        if (!read_at(0, prefix_.data(), prefix_.size())) return (err = "truncated first block", false);
         return true;
     }
 
-    // Write the L1 packet table (8 scalar columns + external payload_ref) as one Lance fragment — the
-    // same on-disk shape pcapng2lance's write_batch produces. The AoS PacketRow accumulator is
-    // transposed into per-column buffers (one linear pass) and handed to the compile-time typed
-    // writer; the blob_ref span carries the shared capture URI per row.
-    // The packet table, committed in chunks of at most window_bytes captured bytes (a packet larger than the
-    // window is a chunk of its own). One writer session holds the dataset: each chunk is one fragment, so the table
-    // reads back identically whatever the window.
-    int write_packet_table(const std::vector<PacketRow>& rows, const std::vector<nt::blob_ref>& payload) {
-        nt::writer<L1Schema>::options opts;
-        opts.compression_level = 3;
-        opts.compress = args_.compress;
-        opts.first_column_metadata = kv_blob_.c_str();
-        nt::writer<L1Schema> w(output_.string().c_str(), opts);
-        if (!w.ok()) return fail(std::string("writer init: ") + w.last_error());
-        std::size_t begin = 0;
-        while (begin < rows.size()) {
-            std::size_t end = begin;
-            std::uint64_t bytes = 0;
-            while (end < rows.size() && (end == begin || bytes + rows[end].caplen <= args_.window_bytes)) {
-                bytes += rows[end].caplen;
-                ++end;
-            }
-            if (const int rc = write_chunk(w, rows, payload, begin, end)) return rc;
-            begin = end;
+    // The next window: its bytes (the prefix copy, then the blocks) and where the window starts in the file, and how
+    // many leading bytes of the window are the prefix. False at the end of the file, or on error with `err` set.
+    bool next(std::vector<std::uint8_t>& out, std::uint64_t& start, std::size_t& prefix_len, std::string& err) {
+        if (pos_ >= size_) return false;
+        start = pos_;
+        std::uint64_t end = pos_;
+        while (end < size_) {
+            std::uint64_t total = 0;
+            if (!block_length(end, total, err)) return false;
+            if (end + total > size_) return (err = "truncated block at offset " + std::to_string(end), false);
+            if (end > pos_ && (end - pos_) + total > budget_) break;  // this block starts the next window
+            end += total;
         }
-        w.close();
-        return 0;
+        prefix_len = start == 0 ? 0 : prefix_.size();
+        out.resize(prefix_len + static_cast<std::size_t>(end - start));
+        if (prefix_len != 0) std::memcpy(out.data(), prefix_.data(), prefix_len);
+        if (!read_at(start, out.data() + prefix_len, static_cast<std::size_t>(end - start))) {
+            return (err = "cannot read the capture at offset " + std::to_string(start), false);
+        }
+        pos_ = end;
+        return true;
     }
 
-    // Rows [begin, end) of the packet table: one batch, committed as the next fragment of the session.
-    int write_chunk(nt::writer<L1Schema>& w, const std::vector<PacketRow>& rows,
-                    const std::vector<nt::blob_ref>& payload, std::size_t begin, std::size_t end) {
+private:
+    static std::uint32_t read_u32(const std::uint8_t* p, bool little) {
+        return little ? std::uint32_t(p[0]) | std::uint32_t(p[1]) << 8 | std::uint32_t(p[2]) << 16 | std::uint32_t(p[3]) << 24
+                      : std::uint32_t(p[3]) | std::uint32_t(p[2]) << 8 | std::uint32_t(p[1]) << 16 | std::uint32_t(p[0]) << 24;
+    }
+
+    bool read_at(std::uint64_t at, std::uint8_t* dst, std::size_t n) {
+        if (n == 0) return true;
+        if (std::fseek(f_.get(), static_cast<long>(at), SEEK_SET) != 0) return false;
+        return std::fread(dst, 1, n, f_.get()) == n;
+    }
+
+    // Total length of the block at `at` (a pcap's global header is 24 bytes, a pcap record 16 plus its caplen). A section
+    // header sets the byte order of the blocks that follow it.
+    bool block_length(std::uint64_t at, std::uint64_t& total, std::string& err) {
+        if (!pcapng_ && at == 0) {
+            total = 24;
+            return true;
+        }
+        std::uint8_t h[16]{};
+        const std::size_t need = pcapng_ ? 12 : 16;
+        if (at + need > size_ || !read_at(at, h, need)) {
+            return (err = "truncated block header at offset " + std::to_string(at), false);
+        }
+        if (pcapng_) {
+            if (read_u32(h, true) == nmpcap::kShb) le_ = read_u32(h + 8, true) == nmpcap::kByteOrderMagic;
+            const std::uint32_t len = read_u32(h + 4, le_);
+            if (len < 12 || len % 4 != 0) return (err = "bad block length at offset " + std::to_string(at), false);
+            total = len;
+        } else {
+            total = 16 + std::uint64_t(read_u32(h + 8, le_));
+        }
+        return true;
+    }
+
+    struct FileCloser {
+        void operator()(std::FILE* f) const {
+            if (f) std::fclose(f);
+        }
+    };
+    std::unique_ptr<std::FILE, FileCloser> f_;
+    std::size_t budget_ = 0;
+    std::uint64_t size_ = 0, pos_ = 0;
+    bool pcapng_ = false, le_ = true;
+    std::vector<std::uint8_t> prefix_;
+};
+
+// The packet table: one writer session, opened by its first rows with the capture's metadata, one fragment per window.
+class PacketTable {
+public:
+    PacketTable(std::string path, bool compress, std::string metadata)
+        : path_(std::move(path)), compress_(compress), metadata_(std::move(metadata)) {}
+
+    bool append(const std::vector<PacketRow>& rows, const std::vector<nt::blob_ref>& payload, std::string& err) {
+        if (rows.empty()) return true;
+        if (!writer_) {
+            nt::writer<L1Schema>::options opts;
+            opts.compression_level = 3;
+            opts.compress = compress_;
+            opts.first_column_metadata = metadata_.c_str();
+            writer_ = std::make_unique<nt::writer<L1Schema>>(path_.c_str(), opts);
+            if (!writer_->ok()) {
+                err = std::string("writer init: ") + writer_->last_error();
+                return false;
+            }
+        }
+        return write_packet_chunk(*writer_, rows, payload, 0, rows.size(), err);
+    }
+
+    void close() {
+        if (writer_) writer_->close();
+        writer_.reset();
+    }
+
+private:
+    // Rows [begin, end) as one batch, committed as the next fragment of the session.
+    static bool write_packet_chunk(nt::writer<L1Schema>& w, const std::vector<PacketRow>& rows,
+                                   const std::vector<nt::blob_ref>& payload, std::size_t begin, std::size_t end,
+                                   std::string& err) {
         const std::size_t n = end - begin;
         std::vector<std::uint64_t> packet_id(n), ts_raw(n);
         std::vector<std::uint32_t> interface_id(n), caplen(n), origlen(n), epb(n);
@@ -641,19 +613,250 @@ private:
             ts_resol[i] = r.ts_resol;
             epb[i] = r.epb_flags;
         }
-        if (!w.write_batch(std::span<const std::uint64_t>(packet_id),
-                           std::span<const std::uint32_t>(interface_id),
-                           std::span<const std::uint64_t>(ts_raw),
-                           std::span<const std::uint32_t>(caplen),
-                           std::span<const std::uint32_t>(origlen),
-                           std::span<const std::uint16_t>(link_type),
-                           std::span<const std::uint8_t>(ts_resol),
-                           std::span<const std::uint32_t>(epb),
+        if (!w.write_batch(std::span<const std::uint64_t>(packet_id), std::span<const std::uint32_t>(interface_id),
+                           std::span<const std::uint64_t>(ts_raw), std::span<const std::uint32_t>(caplen),
+                           std::span<const std::uint32_t>(origlen), std::span<const std::uint16_t>(link_type),
+                           std::span<const std::uint8_t>(ts_resol), std::span<const std::uint32_t>(epb),
                            std::span<const nt::blob_ref>(payload).subspan(begin, n))) {
-            return fail(std::string("write_batch: ") + w.last_error());
+            err = std::string("write_batch: ") + w.last_error();
+            return false;
         }
-        if (!w.commit()) return fail(std::string("commit: ") + w.last_error());
+        if (!w.commit()) {
+            err = std::string("commit: ") + w.last_error();
+            return false;
+        }
+        return true;
+    }
+
+    std::string path_;
+    bool compress_;
+    std::string metadata_;
+    std::unique_ptr<nt::writer<L1Schema>> writer_;
+};
+
+// The --decode-l2l3 tables: one session per table, named from the output's stem, fed one window at a time.
+struct PduSinks {
+    PduSinks(const std::string& stem, bool compress)
+        : eth(stem + "_ethernet.lance", compress), vlan(stem + "_vlan.lance", compress),
+          ipv4(stem + "_ipv4.lance", compress), ipv4_option(stem + "_ipv4_option.lance", compress),
+          ipv6(stem + "_ipv6.lance", compress), tcp(stem + "_tcp.lance", compress),
+          udp(stem + "_udp.lance", compress), hopbyhop(stem + "_ipv6_hopbyhop.lance", compress),
+          destopt(stem + "_ipv6_destopt.lance", compress), routing(stem + "_ipv6_routing.lance", compress),
+          srh_segment(stem + "_ipv6_srh_segment.lance", compress), ipv6_option(stem + "_ipv6_option.lance", compress),
+          remainder(stem + "_remainder_after_l4.lance", compress) {}
+
+    void close() {
+        eth.close();
+        vlan.close();
+        ipv4.close();
+        ipv4_option.close();
+        ipv6.close();
+        tcp.close();
+        udp.close();
+        hopbyhop.close();
+        destopt.close();
+        routing.close();
+        srh_segment.close();
+        ipv6_option.close();
+        remainder.close();
+    }
+
+    SoaSession<p2l_nanom::EthRow> eth;
+    SoaSession<p2l_nanom::VlanRow> vlan;
+    SoaSession<p2l_nanom::Ipv4Row> ipv4;
+    SoaSession<p2l_nanom::Ipv4OptionRow> ipv4_option;
+    SoaSession<p2l_nanom::Ipv6Row> ipv6;
+    SoaSession<p2l_nanom::TcpRow> tcp;
+    SoaSession<p2l_nanom::UdpRow> udp;
+    SoaSession<p2l_nanom::Ipv6ExtOptRow> hopbyhop;
+    SoaSession<p2l_nanom::Ipv6ExtOptRow> destopt;
+    SoaSession<p2l_nanom::Ipv6RoutingRow> routing;
+    SoaSession<p2l_nanom::Ipv6SrhSegmentRow> srh_segment;
+    SoaSession<p2l_nanom::Ipv6OptionRow> ipv6_option;
+    RemainderSession remainder;
+};
+
+// The payload-table columns a batch is read by.
+struct PayloadCols {
+    int pid = -1, disc = -1, blob = -1;
+};
+
+bool resolve_payload_cols(const ArrowSchema& schema, const char* disc_col, PayloadCols& c, std::string& error) {
+    c.pid = child_index(schema, "packet_id");
+    c.disc = child_index(schema, disc_col);
+    c.blob = child_index(schema, "payload_ref");
+    if (c.pid < 0 || c.disc < 0 || c.blob < 0) {
+        error = std::string("table missing packet_id / ") + disc_col + " / payload_ref";
+        return false;
+    }
+    return true;
+}
+
+// Append the rows of one batch of a payload table: packet_id, the discriminator, and the payload_ref's position and size.
+bool append_payload_rows(const ArrowSchema& schema, ArrowArray& batch, const PayloadCols& c,
+                         std::vector<EnrichRow>& out, std::string& error) {
+    ArrowArrayView view{};
+    ArrowError ae;
+    if (ArrowArrayViewInitFromSchema(&view, &schema, &ae) != NANOARROW_OK ||
+        ArrowArrayViewSetArray(&view, &batch, &ae) != NANOARROW_OK) {
+        error = "failed to view payload table batch";
+        ArrowArrayViewReset(&view);
+        return false;
+    }
+    nano_lance::BlobV2ColumnView blob;
+    if (!blob.init(*schema.children[c.blob], *view.children[c.blob], error)) {
+        ArrowArrayViewReset(&view);
+        return false;
+    }
+    for (std::int64_t i = 0; i < view.length; ++i) {
+        EnrichRow r;
+        r.pid = ArrowArrayViewGetUIntUnsafe(view.children[c.pid], i);
+        r.disc = ArrowArrayViewGetUIntUnsafe(view.children[c.disc], i);
+        r.off = blob.position(i);
+        r.size = blob.byte_size(i);
+        const char* data = nullptr;
+        std::int64_t n = 0;
+        blob.uri(i, &data, &n);
+        r.uri.assign(data, static_cast<std::size_t>(n));
+        out.push_back(std::move(r));
+    }
+    ArrowArrayViewReset(&view);
+    return true;
+}
+
+class Converter {
+public:
+    Converter(Args args, fs::path output, std::string payload_uri)
+        : args_(std::move(args)), output_(std::move(output)), payload_uri_(std::move(payload_uri)) {}
+
+    // The capture, window by window. Each window's packet rows are one fragment of the packet table, and its
+    // --decode-l2l3 rows one fragment of each protocol table, so only one window of the capture is in memory at a time.
+    int run(const fs::path& input) {
+        CaptureWindows windows;
+        std::string err;
+        if (!windows.open(input, args_.window_bytes, err)) return fail(err);
+        const std::string stem = (output_.parent_path() / output_.stem()).string();
+        if (!args_.no_write && args_.decode_l2l3) pdu_ = std::make_unique<PduSinks>(stem, args_.compress);
+
+        std::vector<std::uint8_t> bytes;
+        std::uint64_t start = 0;
+        std::size_t prefix = 0;
+        bool first = true;
+        while (windows.next(bytes, start, prefix, err)) {
+            if (first) {
+                // The metadata is the SHB and IDB options of the first window (as the nanotins converter records it),
+                // and the table is opened with it.
+                kv_blob_ = arrow_metadata(pcapng_option_entries(bytes));
+                if (!args_.no_write) packets_ = std::make_unique<PacketTable>(output_.string(), args_.compress, kv_blob_);
+                first = false;
+            }
+            if (const int rc = process_window(bytes, start, prefix)) return rc;
+        }
+        if (!err.empty()) return fail(err);
+        if (packets_) packets_->close();
+        if (pdu_) pdu_->close();
+        std::fprintf(stderr,
+                     "pcapng2lance: %llu of %llu packets, %zu interface(s), %zu section(s), %zu other block(s)%s -> %s\n",
+                     static_cast<unsigned long long>(rows_written_), static_cast<unsigned long long>(seen_), idb_count_,
+                     shb_count_, other_count_, args_.no_write ? " [--no-write]" : "", output_.string().c_str());
         return 0;
+    }
+
+private:
+    // One window of the capture: scan its blocks, tabulate its packets, and commit them and their protocol rows.
+    int process_window(const std::vector<std::uint8_t>& bytes, std::uint64_t start, std::size_t prefix) {
+        win_start_ = start;
+        prefix_len_ = prefix;
+        const nm::bytes file(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
+        std::vector<nmpcap::BlockRef> refs;
+        std::string err;
+        if (!nmpcap::scan_blocks(file, refs, err)) return fail("scan: " + err);
+
+        std::vector<PacketRow> rows;
+        std::vector<nt::blob_ref> payload;
+        for (const auto& ref : refs) {
+            if (ref.file_offset < prefix) continue;  // the copy of the first block, which the first window read
+            switch (ref.kind) {
+                case nmpcap::Kind::Shb:
+                    iface_link_.clear();
+                    iface_res_.clear();
+                    ++shb_count_;
+                    break;
+                case nmpcap::Kind::Idb: {
+                    nmpcap::IdbView idb{};
+                    if (nmpcap::parse_idb(file, ref, idb)) {
+                        iface_link_.push_back(idb.link_type);
+                        iface_res_.push_back(idb_ts_resol(file, ref));
+                        ++idb_count_;
+                    }
+                    break;
+                }
+                case nmpcap::Kind::Epb:
+                case nmpcap::Kind::PcapRecord: {
+                    nmpcap::EpbView e{};
+                    if (!nmpcap::parse_epb(file, ref, e)) continue;
+                    const std::uint64_t seen = seen_++;
+                    // --drop/--count: packets outside [drop, drop+take) are counted (so packet_id stays global, and
+                    // slices stitch into the full dataset) but not emitted; interface state is still applied.
+                    if (seen < args_.drop || seen - args_.drop >= args_.take) break;
+                    const std::uint16_t link =
+                        e.interface_id < iface_link_.size() ? iface_link_[e.interface_id] : std::uint16_t{0};
+                    const std::uint8_t res =
+                        e.interface_id < iface_res_.size() ? iface_res_[e.interface_id] : std::uint8_t{6};
+                    rows.push_back(PacketRow{seen, e.interface_id, e.ts_raw, e.caplen, e.origlen, link, res,
+                                             epb_flags(file, ref, e.caplen)});
+                    payload.push_back(nt::blob_ref{payload_uri_, to_file(e.payload_file_offset), e.caplen});
+                    if (args_.decode_l2l3) decode_packet(seen, link, file, e.payload_file_offset, e.caplen);
+                    break;
+                }
+                default:
+                    ++other_count_;
+                    break;
+            }
+        }
+
+        if (packets_ && !packets_->append(rows, payload, err)) return fail(err);
+        rows_written_ += rows.size();
+        if (args_.decode_l2l3) {
+            if (pdu_) {
+                if (!flush_pdu(err)) return fail("write protocol tables: " + err);
+            } else {
+                discard_pdu();
+            }
+        }
+        return 0;
+    }
+
+    // A window-relative offset as an offset into the capture file.
+    std::uint64_t to_file(std::uint64_t rel) const { return rel - prefix_len_ + win_start_; }
+
+    // Commit this window's protocol rows, one fragment per table; a table with no rows is not created.
+    bool flush_pdu(std::string& err) {
+        return pdu_->eth.flush(eth_, err) && pdu_->vlan.flush(vlan_, err) && pdu_->ipv4.flush(ipv4_, err) &&
+               pdu_->ipv4_option.flush(ipv4opt_, err) && pdu_->ipv6.flush(ipv6_, err) && pdu_->tcp.flush(tcp_, err) &&
+               pdu_->udp.flush(udp_, err) && pdu_->hopbyhop.flush(hopbyhop_, err) &&
+               pdu_->destopt.flush(destopt_, err) && pdu_->routing.flush(routing_, err) &&
+               pdu_->srh_segment.flush(srh_segment_, err) && pdu_->ipv6_option.flush(ipv6_opt_, err) &&
+               pdu_->remainder.flush(rem_pid_, rem_next_, rem_pay_, err);
+    }
+
+    // With no output, the protocol rows of a window are dropped once they are built.
+    void discard_pdu() {
+        eth_ = nm::soa<p2l_nanom::EthRow>{4096};
+        vlan_ = nm::soa<p2l_nanom::VlanRow>{4096};
+        ipv4_ = nm::soa<p2l_nanom::Ipv4Row>{4096};
+        ipv6_ = nm::soa<p2l_nanom::Ipv6Row>{4096};
+        tcp_ = nm::soa<p2l_nanom::TcpRow>{4096};
+        udp_ = nm::soa<p2l_nanom::UdpRow>{4096};
+        hopbyhop_ = nm::soa<p2l_nanom::Ipv6ExtOptRow>{4096};
+        destopt_ = nm::soa<p2l_nanom::Ipv6ExtOptRow>{4096};
+        routing_ = nm::soa<p2l_nanom::Ipv6RoutingRow>{4096};
+        srh_segment_ = nm::soa<p2l_nanom::Ipv6SrhSegmentRow>{4096};
+        ipv6_opt_ = nm::soa<p2l_nanom::Ipv6OptionRow>{4096};
+        ipv4opt_ = nm::soa<p2l_nanom::Ipv4OptionRow>{4096};
+        rem_pid_.clear();
+        rem_next_.clear();
+        rem_pay_.clear();
     }
 
     // ---- L2/L3/L4 decode (--decode-l2l3) ---------------------------------------------------------
@@ -696,98 +899,39 @@ private:
         }
     };
 
-    // One nanom walk_packet_ext traversal per packet; the L4 boundary yields a remainder row (the
-    // application payload after L4 as an external blob.v2 ref, never copied).
-    void decode_packet(std::uint64_t pid, std::uint16_t link, nm::bytes file, std::uint64_t poff,
-                       std::uint32_t caplen) {
-        if (poff + caplen > file.size()) return;
-        const nm::bytes pkt = file.subspan(static_cast<std::size_t>(poff), caplen);
-        DecodeVisitor visitor{*this, pid, pkt};
-        const auto wr = nmproto::walk_packet_ext(link, pkt, visitor);
-        if (wr.reached_l4 && wr.l4_payload_offset < caplen) {
-            rem_pid_.push_back(pid);
-            rem_next_.push_back(wr.l4_ports);
-            rem_pay_.push_back(nt::blob_ref{payload_uri_, poff + wr.l4_payload_offset,
-                                            caplen - wr.l4_payload_offset});
-        }
-    }
-
-    // Write one Lance table per PDU type (via the generic nanom-soa writer) + remainder_after_l4.
-    int write_pdu_tables() {
-        const std::string stem = (output_.parent_path() / output_.stem()).string();
-        std::string err;
-        const auto w = [&](const char* suffix, const auto& table) -> bool {
-            if (!p2l_nanom::write_soa_table(stem + suffix, table, args_.compress, err)) {
-                fail(std::string("write ") + suffix + ": " + err);
-                return false;
-            }
-            return true;
-        };
-        if (!(w("_ethernet.lance", eth_) & w("_vlan.lance", vlan_) & w("_ipv4.lance", ipv4_) &
-              w("_ipv4_option.lance", ipv4opt_) &
-              w("_ipv6.lance", ipv6_) & w("_tcp.lance", tcp_) & w("_udp.lance", udp_) &
-              w("_ipv6_hopbyhop.lance", hopbyhop_) & w("_ipv6_destopt.lance", destopt_) &
-              w("_ipv6_routing.lance", routing_) & w("_ipv6_srh_segment.lance", srh_segment_) &
-              w("_ipv6_option.lance", ipv6_opt_))) {
-            return 1;
-        }
-        if (const int rc = write_remainder_table(stem + "_remainder_after_l4.lance")) return rc;
-        std::fprintf(stderr,
-                     "pcapng2lance: decoded L2/L3/L4 -> eth %zu, vlan %zu, ipv4 %zu, ipv6 %zu, tcp %zu, "
-                     "udp %zu, remainder %zu\n",
-                     eth_.rows(), vlan_.rows(), ipv4_.rows(), ipv6_.rows(), tcp_.rows(), udp_.rows(),
-                     rem_pid_.size());
-        if (routing_.rows() || hopbyhop_.rows() || destopt_.rows()) {
-            std::fprintf(stderr,
-                         "pcapng2lance: IPv6 ext headers -> hopbyhop %zu, destopt %zu, routing %zu, "
-                         "srh_segment %zu, option %zu\n",
-                         hopbyhop_.rows(), destopt_.rows(), routing_.rows(), srh_segment_.rows(),
-                         ipv6_opt_.rows());
-        }
-        return 0;
-    }
-
-    // remainder_after_l4: packet_id + next_protocol (packed L4 ports) + the external payload_ref of the
-    // bytes past L4. Its own tiny typed schema (two scalars + the blob.v2 struct); skipped when empty.
-    int write_remainder_table(const std::string& path) {
-        if (rem_pid_.empty()) return 0;
-        nt::writer<RemainderSchema> w(path.c_str(), {.compression_level = 3, .compress = args_.compress});
-        if (!w.ok()) return fail(std::string("remainder writer init: ") + w.last_error());
-        if (!w.write_batch(std::span<const std::uint64_t>(rem_pid_),
-                           std::span<const std::uint64_t>(rem_next_),
-                           std::span<const nt::blob_ref>(rem_pay_)) ||
-            !w.commit()) {
-            return fail(std::string("remainder write: ") + w.last_error());
-        }
-        w.close();
-        return 0;
-    }
-
 public:
-    // --stage l2|l3|l4 <datadir>: decode one layer of every row of the data folder's previous table, and forward
-    // the payload after it. l2 reads packets.lance (the link layer: Ethernet and VLAN), l3 reads
-    // remainder_after_l2.lance (IPv4 / IPv6) and l4 reads remainder_after_l3.lance (TCP / UDP). Each writes its
-    // PDU tables beside the input and its remainder as remainder_after_<stage>.lance, with the rows and remainders
-    // of the nanotins stage. A row whose header is not fully resident, or whose layer is not decoded, produces
-    // nothing; a row that fails partway keeps the header rows it already decoded, as the nanotins decoders do.
+    // --stage l2|l3|l4 <datadir>: decode one layer of every row of the data folder's previous table, and forward the
+    // payload after it. l2 reads packets.lance (the link layer: Ethernet and VLAN), l3 reads remainder_after_l2.lance
+    // (IPv4 / IPv6) and l4 reads remainder_after_l3.lance (TCP / UDP). Each writes its PDU tables beside the input and
+    // its remainder as remainder_after_<stage>.lance. The input is read a batch at a time, and each batch is decoded in
+    // chunks sized from the memory budget (--mem-bytes); each chunk's rows are committed as one fragment of each table.
+    // A row whose header is not fully resident, or whose layer is not decoded, produces nothing; a row that fails
+    // partway keeps the header rows it already decoded.
     int run_enrich(const std::string& stage, const fs::path& datadir) {
         const bool l2 = stage == "l2";
         const bool l3 = stage == "l3";
         const fs::path table = datadir / (l2 ? "packets.lance" : l3 ? "remainder_after_l2.lance" : "remainder_after_l3.lance");
-        std::vector<EnrichRow> in;
+        const char* disc_col = l2 ? "link_type" : "next_protocol";
         std::string err;
-        if (!read_payload_rows(table, l2 ? "link_type" : "next_protocol", in, err)) {
+        ArrowSchema schema{};
+        struct SchemaGuard {
+            ArrowSchema& s;
+            ~SchemaGuard() {
+                if (s.release) s.release(&s);
+            }
+        } schema_guard{schema};
+        nano_lance::LanceTableStream stream;
+        if (!nano_lance::LanceTableStream::open(table, nullptr, schema, stream, err)) {
             return fail("read " + table.string() + ": " + err);
         }
+        PayloadCols cols;
+        if (!resolve_payload_cols(schema, disc_col, cols, err)) return fail("read " + table.string() + ": " + err);
 
-        // Rows are decoded in chunks sized by the memory budget (--mem-bytes), and each chunk's PDU rows and
-        // remainder are committed to their tables as one fragment, so the chunk size shows in the fragment layout.
+        // Rows per chunk from the memory budget of the host this stage runs on, and the fetch tile size.
         const std::size_t per_row = kPrefixCap + sizeof(nmproto::Ipv6) + sizeof(EnrichRow) + 64;
-        const std::size_t chunk_rows =
-            membudget::rows_per_chunk(membudget::resolve_budget(args_.mem_bytes), per_row);
+        const std::size_t chunk_rows = membudget::rows_per_chunk(membudget::resolve_budget(args_.mem_bytes), per_row);
         const std::size_t read_tile = args_.read_tile_bytes;
 
-        // The tables this stage writes, each one writer session that starts on its first rows.
         const auto dir = [&](const char* name) { return (datadir / name).string(); };
         SoaSession<p2l_nanom::EthRow> eth_s(dir("ethernet.lance"), args_.compress);
         SoaSession<p2l_nanom::VlanRow> vlan_s(dir("vlan.lance"), args_.compress);
@@ -801,62 +945,80 @@ public:
                 return eth_s.flush(eth_, err) && vlan_s.flush(vlan_, err) && rem_s.flush(rem_pid_, rem_next_, rem_pay_, err);
             }
             if (l3) {
-                return ipv4_s.flush(ipv4_, err) && ipv6_s.flush(ipv6_, err) &&
-                       rem_s.flush(rem_pid_, rem_next_, rem_pay_, err);
+                return ipv4_s.flush(ipv4_, err) && ipv6_s.flush(ipv6_, err) && rem_s.flush(rem_pid_, rem_next_, rem_pay_, err);
             }
             return tcp_s.flush(tcp_, err) && udp_s.flush(udp_, err) && rem_s.flush(rem_pid_, rem_next_, rem_pay_, err);
         };
 
         std::vector<std::uint8_t> tile;
         char ferr[512]{};
-        std::size_t forwarded = 0;
-        for (std::size_t chunk = 0; chunk < in.size(); chunk += chunk_rows) {
-            const std::size_t chunk_end = std::min(chunk + chunk_rows, in.size());
-            for (std::size_t i = chunk; i < chunk_end;) {
-                const std::uint64_t base = in[i].off;
-                const std::string uri = in[i].uri;
-                std::size_t j = i;
-                std::uint64_t span_end = base;
-                for (; j < chunk_end && in[j].uri == uri; ++j) {
-                    const std::uint64_t need = in[j].off + std::min<std::uint64_t>(in[j].size, kPrefixCap);
-                    if (j > i && need - base > read_tile) break;
-                    span_end = std::max(span_end, need);
-                }
-                const std::size_t span = static_cast<std::size_t>(span_end - base);
-                tile.resize(span);
-                std::size_t got = 0;
-                if (span > 0 && nano_lance_fetch_external_blob(uri.c_str(), base, span, tile.data(), tile.size(),
-                                                               &got, ferr, sizeof ferr) != NANO_LANCE_READER_OK) {
-                    return fail(std::string("fetch_external_blob: ") + ferr);
-                }
-                for (std::size_t k = i; k < j; ++k) {
-                    const EnrichRow& r = in[k];
-                    const std::size_t local = static_cast<std::size_t>(r.off - base);
-                    const std::size_t hdr = static_cast<std::size_t>(std::min<std::uint64_t>(r.size, kPrefixCap));
-                    if (local + hdr > got) continue;
-                    const nm::bytes bytes(reinterpret_cast<const std::byte*>(tile.data() + local), hdr);
-                    std::size_t consumed = 0;
-                    std::uint64_t next = 0;
-                    bool ok = false;
-                    if (l2) {
-                        std::uint16_t ethertype = 0;
-                        ok = r.disc == nmproto::kLinkTypeEthernet && decode_l2(r.pid, bytes, consumed, ethertype);
-                        next = ethertype;
-                    } else if (l3) {
-                        ok = decode_l3(r.pid, static_cast<std::uint16_t>(r.disc), bytes, consumed, next);
-                    } else {
-                        ok = decode_l4(r.pid, static_cast<std::uint8_t>(r.disc), bytes, consumed, next);
+        std::size_t forwarded = 0, read_rows = 0;
+        const auto process = [&](const std::vector<EnrichRow>& in) -> bool {
+            for (std::size_t chunk = 0; chunk < in.size(); chunk += chunk_rows) {
+                const std::size_t chunk_end = std::min(chunk + chunk_rows, in.size());
+                for (std::size_t i = chunk; i < chunk_end;) {
+                    const std::uint64_t base = in[i].off;
+                    const std::string uri = in[i].uri;
+                    std::size_t j = i;
+                    std::uint64_t span_end = base;
+                    for (; j < chunk_end && in[j].uri == uri; ++j) {
+                        const std::uint64_t need = in[j].off + std::min<std::uint64_t>(in[j].size, kPrefixCap);
+                        if (j > i && need - base > read_tile) break;
+                        span_end = std::max(span_end, need);
                     }
-                    if (ok && consumed < r.size) {
-                        rem_pid_.push_back(r.pid);
-                        rem_next_.push_back(next);
-                        rem_pay_.push_back(nt::blob_ref{r.uri, r.off + consumed, r.size - consumed});
+                    const std::size_t span = static_cast<std::size_t>(span_end - base);
+                    tile.resize(span);
+                    std::size_t got = 0;
+                    if (span > 0 && nano_lance_fetch_external_blob(uri.c_str(), base, span, tile.data(), tile.size(),
+                                                                   &got, ferr, sizeof ferr) != NANO_LANCE_READER_OK) {
+                        err = std::string("fetch_external_blob: ") + ferr;
+                        return false;
                     }
+                    for (std::size_t k = i; k < j; ++k) {
+                        const EnrichRow& r = in[k];
+                        const std::size_t local = static_cast<std::size_t>(r.off - base);
+                        const std::size_t hdr = static_cast<std::size_t>(std::min<std::uint64_t>(r.size, kPrefixCap));
+                        if (local + hdr > got) continue;
+                        const nm::bytes bytes(reinterpret_cast<const std::byte*>(tile.data() + local), hdr);
+                        std::size_t consumed = 0;
+                        std::uint64_t next = 0;
+                        bool ok = false;
+                        if (l2) {
+                            std::uint16_t ethertype = 0;
+                            ok = r.disc == nmproto::kLinkTypeEthernet && decode_l2(r.pid, bytes, consumed, ethertype);
+                            next = ethertype;
+                        } else if (l3) {
+                            ok = decode_l3(r.pid, static_cast<std::uint16_t>(r.disc), bytes, consumed, next);
+                        } else {
+                            ok = decode_l4(r.pid, static_cast<std::uint8_t>(r.disc), bytes, consumed, next);
+                        }
+                        if (ok && consumed < r.size) {
+                            rem_pid_.push_back(r.pid);
+                            rem_next_.push_back(next);
+                            rem_pay_.push_back(nt::blob_ref{r.uri, r.off + consumed, r.size - consumed});
+                        }
+                    }
+                    i = j;
                 }
-                i = j;
+                forwarded += rem_pid_.size();
+                if (!flush()) {
+                    err = "write " + stage + " chunk: " + err;
+                    return false;
+                }
             }
-            forwarded += rem_pid_.size();
-            if (!flush()) return fail("write " + stage + " chunk: " + err);
+            return true;
+        };
+
+        for (;;) {
+            ArrowArray batch{};
+            if (!stream.next(batch, err)) return fail("read " + table.string() + ": " + err);
+            if (batch.release == nullptr) break;  // no more data
+            std::vector<EnrichRow> in;
+            const bool read_ok = append_payload_rows(schema, batch, cols, in, err);
+            batch.release(&batch);
+            if (!read_ok) return fail("read " + table.string() + ": " + err);
+            read_rows += in.size();
+            if (!process(in)) return fail(err);
         }
         eth_s.close();
         vlan_s.close();
@@ -865,9 +1027,26 @@ public:
         tcp_s.close();
         udp_s.close();
         rem_s.close();
-        std::fprintf(stderr, "pcapng2lance: stage %s -> %zu input rows, %zu decoded forward (chunk=%zu rows, tile=%zu B)\n",
-                     stage.c_str(), in.size(), forwarded, chunk_rows, read_tile);
+        std::fprintf(stderr,
+                     "pcapng2lance: stage %s -> %zu input rows, %zu decoded forward (chunk=%zu rows, tile=%zu B)\n",
+                     stage.c_str(), read_rows, forwarded, chunk_rows, read_tile);
         return 0;
+    }
+
+    // One nanom walk_packet_ext traversal per packet; the L4 boundary yields a remainder row (the application payload
+    // after L4 as an external blob.v2 ref, never copied). `file` is the window the packet is in.
+    void decode_packet(std::uint64_t pid, std::uint16_t link, nm::bytes file, std::uint64_t poff,
+                       std::uint32_t caplen) {
+        if (poff + caplen > file.size()) return;
+        const nm::bytes pkt = file.subspan(static_cast<std::size_t>(poff), caplen);
+        DecodeVisitor visitor{*this, pid, pkt};
+        const auto wr = nmproto::walk_packet_ext(link, pkt, visitor);
+        if (wr.reached_l4 && wr.l4_payload_offset < caplen) {
+            rem_pid_.push_back(pid);
+            rem_next_.push_back(wr.l4_ports);
+            rem_pay_.push_back(nt::blob_ref{payload_uri_, to_file(poff + wr.l4_payload_offset),
+                                            caplen - wr.l4_payload_offset});
+        }
     }
 
     // The IPv4 or IPv6 header of `bytes`, as the nanotins decoder reads it. A non-first IPv4 fragment has no
@@ -945,13 +1124,6 @@ public:
     }
 
 private:
-    Args args_;
-    fs::path output_;
-    std::string kv_blob_;  // the SHB/IDB options as Arrow metadata, set before the packet table is written
-    std::string payload_uri_;
-    std::uint64_t seen_ = 0;  // packets seen, dropped or kept: the global packet index (packet_id)
-    std::size_t shb_count_ = 0, idb_count_ = 0, other_count_ = 0;
-
     // --decode-l2l3 accumulators: one nanom soa per PDU type + the remainder_after_l4 columns.
     nm::soa<p2l_nanom::EthRow> eth_{4096};
     nm::soa<p2l_nanom::VlanRow> vlan_{4096};
@@ -968,6 +1140,19 @@ private:
     nm::soa<p2l_nanom::Ipv4OptionRow> ipv4opt_{4096};
     std::vector<std::uint64_t> rem_pid_, rem_next_;
     std::vector<nt::blob_ref> rem_pay_;
+    Args args_;
+    fs::path output_;
+    std::string kv_blob_;  // the SHB and IDB options of the first window, as Arrow metadata
+    std::string payload_uri_;
+    std::uint64_t seen_ = 0;          // packets seen, dropped or kept: the global packet index (packet_id)
+    std::uint64_t rows_written_ = 0;  // packets written
+    std::size_t shb_count_ = 0, idb_count_ = 0, other_count_ = 0;
+    std::vector<std::uint16_t> iface_link_;  // link_type per interface, in the current section
+    std::vector<std::uint8_t> iface_res_;    // ts_resol per interface, in the current section
+    std::uint64_t win_start_ = 0;            // where the current window starts in the file
+    std::size_t prefix_len_ = 0;             // leading bytes of the window that are a copy of the first block
+    std::unique_ptr<PacketTable> packets_;
+    std::unique_ptr<PduSinks> pdu_;
 };
 
 }  // namespace

@@ -43,27 +43,36 @@ def main(argv):
     }
     prev = {"l2": "packets.lance", "l3": "remainder_after_l2.lance", "l4": "remainder_after_l3.lance"}
     got = {"stages": {}, "oneshot": {}, "dpar": {}, "lldp": {}}
+    # The default window, and a window of a few hundred bytes (many fragments, and the copy of the first block that
+    # each later window starts with): the tables must be the same either way.
+    windows = {"": [], "w300": ["--window-bytes", "300"]}
 
     def run(args):
         r = subprocess.run([str(a) for a in args], capture_output=True, text=True)
         if r.returncode != 0:
             raise SystemExit(f"failed: {args}\n{r.stderr}")
 
-    for name, cap in fixtures.items():
-        d = f"nm_{name}"
-        shutil.rmtree(d, ignore_errors=True)
-        os.makedirs(d)
-        run([pcap2lance, "--stage", "l1", cap, d])
-        for st in ["l2", "l3", "l4"]:
-            if os.path.exists(os.path.join(d, prev[st])):
-                run([pcap2lance, "--stage", st, d])
-        got["stages"][name] = tables_of(d)
-        if name in golden["oneshot"]:
-            od = f"os_{name}"
-            shutil.rmtree(od, ignore_errors=True)
-            os.makedirs(od)
-            run([pcap2lance, "--decode-l2l3", cap, os.path.join(od, "out.lance")])
-            got["oneshot"][name] = tables_of(od)
+    for wname, wargs in windows.items():
+        for name, cap in fixtures.items():
+            d = f"nm_{name}{wname}"
+            shutil.rmtree(d, ignore_errors=True)
+            os.makedirs(d)
+            run([pcap2lance, *wargs, "--stage", "l1", cap, d])
+            for st in ["l2", "l3", "l4"]:
+                if os.path.exists(os.path.join(d, prev[st])):
+                    run([pcap2lance, "--stage", st, d])
+            got["stages"].setdefault(name, {}).update(tables_of(d) if not wname else {})
+            if wname:
+                got.setdefault("stages_" + wname, {})[name] = tables_of(d)
+            if name in golden["oneshot"]:
+                od = f"os_{name}{wname}"
+                shutil.rmtree(od, ignore_errors=True)
+                os.makedirs(od)
+                run([pcap2lance, *wargs, "--decode-l2l3", cap, os.path.join(od, "out.lance")])
+                if wname:
+                    got.setdefault("oneshot_" + wname, {})[name] = tables_of(od)
+                else:
+                    got["oneshot"][name] = tables_of(od)
     subset = repo / "examples/pcapng2lance/tests/golden/dpar_rules_subset.txt"
     shutil.rmtree("dpar_nm", ignore_errors=True)
     run([dpar, subset, Path(testdata) / "dpar_sample.pcap", "dpar_nm"])
@@ -74,18 +83,20 @@ def main(argv):
 
     bad = []
     for section in ("stages", "oneshot"):
-        for fixture, want in golden[section].items():
-            have = got[section].get(fixture, {})
-            if have != want:
-                bad.append(f"{section}/{fixture}: {sorted(set(want) ^ set(have)) or 'digest differs'}")
+        for wname in windows:
+            key = section + ("_" + wname if wname else "")
+            for fixture, want in golden[section].items():
+                have = got.get(key, {}).get(fixture, {})
+                if have != want:
+                    bad.append(f"{key}/{fixture}: {sorted(set(want) ^ set(have)) or 'digest differs'}")
     for section in ("dpar", "lldp"):
         if got[section] != golden[section]:
             bad.append(f"{section}: {got[section]} != {golden[section]}")
     if bad:
         print("parity with the nanotins reference differs:\n  " + "\n  ".join(bad), file=sys.stderr)
         return 1
-    n = sum(len(v) for s in ("stages", "oneshot") for v in golden[s].values()) + len(golden["dpar"]) + len(golden["lldp"])
-    print(f"parity golden ok: {n} tables match the nanotins reference")
+    n = sum(len(v) for s in ("stages", "oneshot") for v in golden[s].values())
+    print(f"parity golden ok: {n} tables per window setting match the nanotins reference, with and without small windows")
     return 0
 
 
