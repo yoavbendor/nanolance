@@ -1,30 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
-// pcapng -> Lance converter, built on **nanom** instead of nanotins.
+// pcapng -> Lance converter, built on nanom (the parser-combinator library) and nanolance's writer.
 //
-// This is the nanom sibling of examples/pcapng2lance. It produces the same L1
-// output as `pcapng2lance` (one Lance row per packet: the eight scalar packet
-// columns + a `lance.blob.v2` external `payload_ref` that points at the packet
-// bytes in the source capture, never copied), but the whole parse side — the
-// pcap/pcapng block scanner and the per-EPB field decode — runs through nanom's
-// parser-combinator core (`nm::strct<T>(order)` over structs described with one
-// `NANOM_DESCRIBE`) rather than nanotins' hand-rolled readers + soatins
-// reflection. The Lance write side runs entirely on nanolance's compile-time
-// typed facade: the L1 and remainder tables declare their schema (including the
-// lance.blob.v2 payload_ref via blob_ref_column) as a type, and the per-PDU
-// tables derive theirs from each row struct's NANOM_DESCRIBE.
+// The whole parse side -- the pcap/pcapng block scanner and the per-EPB field decode -- runs through nanom's
+// parser-combinator core (`nm::strct<T>(order)` over structs described with one `NANOM_DESCRIBE`). The Lance write
+// side runs on nanolance's compile-time typed facade: the packet and remainder tables declare their schema (including
+// the lance.blob.v2 payload_ref via blob_ref_column) as a type, and the per-PDU tables derive theirs from each row
+// struct's NANOM_DESCRIBE.
 //
-// Scope: the L1 packet table (the `packets.lance` that `pcapng2lance` writes)
-// plus, under --decode-l2l3, the full L2/L3/L4 protocol walk (Ethernet -> VLAN*
-// -> IPv4/IPv6 -> TCP/UDP), INCLUDING the IPv6 extension-header chain / SRv6 SRH
-// (Hop-by-Hop, Routing/SRH, Fragment, Dest-Opts, AH), landed as one Lance table
-// per PDU type + the SRv6 segment / IPv6 option child tables + remainder_after_l4
-// — byte-for-byte identical to the nanotins converter's tables. Not ported: gPTP
-// / SOME/IP, staged enrichment (--stage), and windowed streaming; the capture is
-// read whole. This example exists so nanom's scan+parse+decode path can be
-// checked and benchmarked head-to-head against nanotins on the exact same output.
-// See README.md.
+// Scope: the packet table (the `packets.lance` a capture becomes), the staged layers (--stage l1..l4), the one-shot
+// L2/L3/L4 protocol walk under --decode-l2l3 (Ethernet -> VLAN* -> IPv4/IPv6 -> TCP/UDP, the IPv6 extension-header
+// chain and SRv6 SRH, and the IPv4 option table), slices (--drop/--count), windowed and chunked writes, and the SHB/IDB
+// options as metadata. See README.md, and tests/golden/ for the reference the tables are checked against.
 //
 // Pipeline: read file -> nm scan_blocks (Phase A) -> per-block classify ->
 //   nm parse_epb (Phase B) + option walk (ts_resol / epb_flags) -> soa<PacketRow>
@@ -90,7 +78,7 @@ using RemainderSchema = nt::schema<nt::column<std::uint64_t, "packet_id">,
                                    nt::blob_ref_column<"payload_ref">>;
 
 int fail(const std::string& msg) {
-    std::fprintf(stderr, "pcapng2lance_nanom: %s\n", msg.c_str());
+    std::fprintf(stderr, "pcapng2lance: %s\n", msg.c_str());
     return 1;
 }
 
@@ -199,7 +187,7 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
             a.window_bytes = static_cast<std::size_t>(std::stoull(v));
             if (a.window_bytes == 0) return (err = "--window-bytes must be > 0", false);
         } else if (s == "--sequential") {
-            // Accepted for the nanotins converter's command line; this converter is sequential already.
+            // This converter reads the capture on one thread; the flag is accepted for compatibility.
         } else if (s == "--mem-bytes") {
             const char* v = value(i);
             if (!v) return false;
@@ -209,8 +197,7 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
             if (!v) return false;
             a.read_tile_bytes = static_cast<std::size_t>(std::stoull(v));
         } else if (s == "--threads") {
-            // The thread count only tunes how the nanotins converter runs; this one reads the capture on one
-            // thread and writes the same tables whatever it is set to.
+            // This converter reads the capture on one thread and writes the same tables whatever the count.
             if (!value(i)) return false;
         } else if (s == "-d" || s == "--drop" || s == "-c" || s == "--count") {
             const char* v = value(i);
@@ -229,7 +216,7 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
 // ---- the SHB/IDB options as dataset metadata ------------------------------------------------------
 //
 // pcapng2lance records the string options of each section header and interface block as key/value metadata
-// of the packet table's first field: "pcapng:shb<k>:<name>" and "pcapng:if<j>:<name>". The nanotins converter does
+// of the packet table's first field: "pcapng:shb<k>:<name>" and "pcapng:if<j>:<name>". The whole capture is walked
 // this while it scans; here the whole capture is walked once, which records the same entries for every capture
 // that its one-window scan also covers in full.
 
@@ -332,9 +319,9 @@ std::string arrow_metadata(const std::vector<std::pair<std::string, std::string>
 //
 // The staged path reads <datadir>/packets.lance, fetches the first bytes of each packet from the capture by its
 // external reference, decodes the link layer, and writes ethernet.lance, vlan.lance and remainder_after_l2.lance
-// beside it, with the rows and remainders the nanotins stage writes.
+// beside it.
 
-constexpr std::size_t kPrefixCap = 256;                 // header bytes carved per packet (as the nanotins stage)
+constexpr std::size_t kPrefixCap = 256;                 // header bytes carved per packet
 constexpr std::size_t kReadTile = std::size_t{32} << 20;  // one fetch covers consecutive packets of one capture
 
 struct EnrichRow {
@@ -408,7 +395,7 @@ bool read_payload_rows(const fs::path& table, const char* disc_col, std::vector<
 }
 
 // The IPv4 options of the header at `off` (IHL in 32-bit words): on_opt(type, on-wire length) for each, the walk of
-// the nanotins ipv4_option table. The option space is [off + 20, off + IHL*4) clamped to the packet; EOOL ends the
+// the ipv4_option table. The option space is [off + 20, off + IHL*4) clamped to the packet; EOOL ends the
 // list; NOP is one byte; every other option's length octet counts the whole option, and an option that does not fit
 // ends the walk.
 template <class OnOpt>
@@ -441,7 +428,7 @@ void ipv4_options(nm::bytes pkt, std::size_t off, std::uint8_t ihl, OnOpt on_opt
 //
 // The staged stages commit each chunk of rows as one fragment of its table. A session holds one writer for the
 // table, opened on the first rows it is given; flush() commits what it holds as the next fragment and clears it.
-// A table that never gets rows is never created, as the nanotins stage's per-table appenders.
+// A table that never gets rows is never created.
 
 template <class Row>
 class SoaSession {
@@ -563,7 +550,7 @@ public:
                     const std::uint64_t seen = seen_;
                     ++seen_;
                     // --drop/--count: packets outside [drop, drop+take) are counted (so packet_id stays global,
-                    // as the nanotins converter's slices do) but not emitted; interface state is still applied.
+                    // so slices stitch into the full dataset) but not emitted; interface state is still applied.
                     if (seen < args_.drop || seen - args_.drop >= args_.take) break;
                     const std::uint16_t link =
                         e.interface_id < iface_link.size() ? iface_link[e.interface_id] : std::uint16_t{0};
@@ -581,7 +568,7 @@ public:
             }
         }
 
-        // An empty slice (--drop past the last packet) writes nothing, as the nanotins converter does.
+        // An empty slice (--drop past the last packet) writes nothing.
         if (!args_.no_write && !rows.empty()) {
             if (const int rc = write_packet_table(rows, payload)) return rc;
             if (args_.decode_l2l3) {
@@ -612,7 +599,7 @@ private:
     // writer; the blob_ref span carries the shared capture URI per row.
     // The packet table, committed in chunks of at most window_bytes captured bytes (a packet larger than the
     // window is a chunk of its own). One writer session holds the dataset: each chunk is one fragment, so the table
-    // reads back identically whatever the window, as the nanotins converter's windows do.
+    // reads back identically whatever the window.
     int write_packet_table(const std::vector<PacketRow>& rows, const std::vector<nt::blob_ref>& payload) {
         nt::writer<L1Schema>::options opts;
         opts.compression_level = 3;
@@ -746,13 +733,13 @@ private:
         }
         if (const int rc = write_remainder_table(stem + "_remainder_after_l4.lance")) return rc;
         std::fprintf(stderr,
-                     "pcapng2lance_nanom: decoded L2/L3/L4 -> eth %zu, vlan %zu, ipv4 %zu, ipv6 %zu, tcp %zu, "
+                     "pcapng2lance: decoded L2/L3/L4 -> eth %zu, vlan %zu, ipv4 %zu, ipv6 %zu, tcp %zu, "
                      "udp %zu, remainder %zu\n",
                      eth_.rows(), vlan_.rows(), ipv4_.rows(), ipv6_.rows(), tcp_.rows(), udp_.rows(),
                      rem_pid_.size());
         if (routing_.rows() || hopbyhop_.rows() || destopt_.rows()) {
             std::fprintf(stderr,
-                         "pcapng2lance_nanom: IPv6 ext headers -> hopbyhop %zu, destopt %zu, routing %zu, "
+                         "pcapng2lance: IPv6 ext headers -> hopbyhop %zu, destopt %zu, routing %zu, "
                          "srh_segment %zu, option %zu\n",
                          hopbyhop_.rows(), destopt_.rows(), routing_.rows(), srh_segment_.rows(),
                          ipv6_opt_.rows());
