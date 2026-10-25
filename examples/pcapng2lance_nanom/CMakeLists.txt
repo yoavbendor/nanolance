@@ -13,7 +13,9 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanom/CMakeLists.txt")
 endif()
 # Pull in the nanom::nanom interface target. It builds its own tests/examples only when it is the top-level
 # project, so add_subdirectory here contributes just the header target.
-add_subdirectory(extern/nanom EXCLUDE_FROM_ALL)
+if(NOT TARGET nanom::nanom)  # pcapng2lance adds the same checkout when it is built
+    add_subdirectory(extern/nanom EXCLUDE_FROM_ALL)
+endif()
 
 add_executable(pcapng2lance_nanom src/pcapng2lance_nanom_main.cpp)
 target_compile_features(pcapng2lance_nanom PRIVATE cxx_std_23)  # nanom requires C++23

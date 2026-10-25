@@ -315,6 +315,9 @@ public:
         /// itself when the buffered data reaches it -- for devices that must keep their resident set
         /// small. Borrowed spans count toward it and are released at each such flush.
         std::uint64_t max_pending_bytes = 0;
+        /// Arrow binary metadata (the ArrowSchema.metadata encoding) recorded on the first column, which keeps
+        /// its own metadata when it has one (a blob column). Must outlive the writer's write_batch calls.
+        const char* first_column_metadata = nullptr;
     };
 
     explicit writer(const char* dataset_path, options opts = {}) : opts_(opts) {
@@ -356,6 +359,9 @@ public:
         BatchStorage storage;
         std::size_t index = 0;
         (fill_column<Columns>(cols, storage, index), ...);
+        if (storage.child_schemas[0].metadata == nullptr) {
+            storage.child_schemas[0].metadata = opts_.first_column_metadata;
+        }
         for (std::size_t i = 0; i < kColumns; ++i) {
             storage.schema_children[i] = &storage.child_schemas[i];
             storage.array_children[i] = &storage.child_arrays[i];

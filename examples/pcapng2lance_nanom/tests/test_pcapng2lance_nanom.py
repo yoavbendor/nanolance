@@ -165,7 +165,7 @@ def decode_and_check(nm_exe, nt_exe, tmp_path: Path) -> None:
 
     if nt_exe:
         nt_out = tmp_path / "mix_nt.lance"
-        run(nt_exe, fixture, nt_out, "--decode-l2l3")
+        run(nt_exe, fixture, nt_out, "--backend", "nanotins", "--decode-l2l3")
         nt = tables(nt_out)
         for t in PDU_TABLES:
             assert (nm[t] is None) == (nt[t] is None), f"decode {t}: table presence differs"
@@ -222,7 +222,7 @@ def decode_srv6_check(nm_exe, nt_exe, srv6_pcap: str, nlance2table, tmp_path: Pa
     if not nt_exe:
         return
     nt_out = tmp_path / "srv6_nt.lance"
-    run(nt_exe, fixture, nt_out, "--decode-l2l3")
+    run(nt_exe, fixture, nt_out, "--backend", "nanotins", "--decode-l2l3")
 
     # pylance can read these fine; assert byte-identical to nanotins.
     plain = ["ethernet", "ipv6", "ipv6_hopbyhop", "ipv6_destopt", "ipv6_routing", "ipv6_option", "tcp", "udp"]
@@ -290,7 +290,7 @@ def main(argv: list[str]) -> int:
                 check_dataset(nm_ds, fixture, payloads)
             if nt_exe:
                 nt_ds = tmp_path / f"{name}_nt.lance"
-                run(nt_exe, fixture, nt_ds)
+                run(nt_exe, fixture, nt_ds, "--backend", "nanotins")
                 assert_identical(nm_ds, nt_ds, name)
 
         # L2/L3/L4 decode: the full protocol walk lands in per-PDU Lance tables (parity with nanotins).

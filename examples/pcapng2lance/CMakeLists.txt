@@ -21,11 +21,29 @@ if(NANOLANCE_BUILD_TESTS)
 endif()
 add_subdirectory(extern/nanotins)
 
-# The pcapng -> Lance converter.
-add_executable(pcapng2lance src/pcapng2lance_main.cpp)
+# The nanom converter (src/nanom_convert.cpp) is the default; nanom is the same checkout pcapng2lance_nanom
+# builds from (extern/nanom at 5213d5), added once for both. A later commit removes the nanotins converter.
+set(PCAPNG2LANCE_NANOM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../pcapng2lance_nanom/extern/nanom")
+if(NOT EXISTS "${PCAPNG2LANCE_NANOM_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "examples/pcapng2lance_nanom/extern/nanom is empty -- run: git submodule update --init --recursive")
+endif()
+if(NOT TARGET nanom::nanom)
+    add_subdirectory("${PCAPNG2LANCE_NANOM_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/nanom" EXCLUDE_FROM_ALL)
+endif()
+
+# The nanom converter, C++23 (nanom requires it); only this translation unit sees nanom.
+add_library(pcapng2lance_nanom_convert STATIC src/nanom_convert.cpp)
+target_compile_features(pcapng2lance_nanom_convert PRIVATE cxx_std_23)
+target_include_directories(pcapng2lance_nanom_convert PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include" "${PCAPNG2LANCE_NANOM_DIR}/examples/nanotins_parity")
+target_link_libraries(pcapng2lance_nanom_convert PRIVATE nanom::nanom nanolance)
+
+# The pcapng -> Lance converter: the dispatcher, the nanom converter by default, and the nanotins converter.
+add_executable(pcapng2lance src/pcapng2lance.cpp src/pcapng2lance_main.cpp)
 target_sources(pcapng2lance PRIVATE src/phase_b_runner.cpp)
 target_include_directories(pcapng2lance PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(pcapng2lance PRIVATE nanotins nanolance)
+target_link_libraries(pcapng2lance PRIVATE pcapng2lance_nanom_convert nanotins nanolance)
 
 # dpar2lance -> apply DPAR rules to a capture and write each matched rule table to its own Lance dataset
 # (the columnar counterpart to nanotins' NDJSON `dpar` example). Reuses this example's vendored nanotins

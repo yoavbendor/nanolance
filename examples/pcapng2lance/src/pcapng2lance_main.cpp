@@ -799,7 +799,7 @@ private:
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int nanotins_convert_main(int argc, char** argv) {
     Args args;
     std::string err;
     if (!parse_args(argc, argv, args, err)) return fail(err);
