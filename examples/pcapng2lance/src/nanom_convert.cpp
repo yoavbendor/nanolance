@@ -156,10 +156,19 @@ struct Args {
     bool compress = true;
     bool no_write = false;     // scan+parse only, skip the Lance write (isolates Phase A/B for benchmarking)
     bool decode_l2l3 = false;  // also decode L2/L3/L4 via nanom walk_packet -> per-PDU Lance tables
+    std::uint64_t drop = 0;                 // -d: skip the first N packets (their packet_id is kept for the rest)
+    std::uint64_t take = UINT64_MAX;        // -c: emit at most N packets after the drop (default: all)
     std::vector<std::string> pos;
 };
 
 bool parse_args(int argc, char** argv, Args& a, std::string& err) {
+    auto value = [&](int& i) -> const char* {
+        if (i + 1 >= argc) {
+            err = std::string(argv[i]) + " requires a value";
+            return nullptr;
+        }
+        return argv[++i];
+    };
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];
         if (s == "--no-compress") {
@@ -168,6 +177,10 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
             a.no_write = true;
         } else if (s == "--decode-l2l3") {
             a.decode_l2l3 = true;
+        } else if (s == "-d" || s == "--drop" || s == "-c" || s == "--count") {
+            const char* v = value(i);
+            if (!v) return false;
+            (s == "-d" || s == "--drop" ? a.drop : a.take) = std::stoull(v);
         } else if (!s.empty() && s[0] == '-') {
             err = "unknown option '" + s + "'";
             return false;
@@ -323,15 +336,19 @@ public:
                 case nmpcap::Kind::PcapRecord: {
                     nmpcap::EpbView e{};
                     if (!nmpcap::parse_epb(file, ref, e)) continue;
+                    const std::uint64_t seen = seen_;
+                    ++seen_;
+                    // --drop/--count: packets outside [drop, drop+take) are counted (so packet_id stays global,
+                    // as the nanotins converter's slices do) but not emitted; interface state is still applied.
+                    if (seen < args_.drop || seen - args_.drop >= args_.take) break;
                     const std::uint16_t link =
                         e.interface_id < iface_link.size() ? iface_link[e.interface_id] : std::uint16_t{0};
                     const std::uint8_t res =
                         e.interface_id < iface_res.size() ? iface_res[e.interface_id] : std::uint8_t{6};
-                    rows.push_back(PacketRow{pid_, e.interface_id, e.ts_raw, e.caplen, e.origlen, link, res,
+                    rows.push_back(PacketRow{seen, e.interface_id, e.ts_raw, e.caplen, e.origlen, link, res,
                                              epb_flags(file, ref, e.caplen)});
                     payload.push_back(nt::blob_ref{payload_uri_, e.payload_file_offset, e.caplen});
-                    if (args_.decode_l2l3) decode_packet(pid_, link, file, e.payload_file_offset, e.caplen);
-                    ++pid_;
+                    if (args_.decode_l2l3) decode_packet(seen, link, file, e.payload_file_offset, e.caplen);
                     break;
                 }
                 default:
@@ -340,15 +357,16 @@ public:
             }
         }
 
-        if (!args_.no_write) {
+        // An empty slice (--drop past the last packet) writes nothing, as the nanotins converter does.
+        if (!args_.no_write && !rows.empty()) {
             if (const int rc = write_batch(rows, payload)) return rc;
             if (args_.decode_l2l3) {
                 if (const int rc = write_pdu_tables()) return rc;
             }
         }
         std::fprintf(stderr,
-                     "pcapng2lance_nanom: %llu packets, %zu interface(s), %zu section(s), %zu other block(s)%s -> %s\n",
-                     static_cast<unsigned long long>(pid_), idb_count_, shb_count_, other_count_,
+                     "pcapng2lance: %zu of %llu packets, %zu interface(s), %zu section(s), %zu other block(s)%s -> %s\n",
+                     rows.size(), static_cast<unsigned long long>(seen_), idb_count_, shb_count_, other_count_,
                      args_.no_write ? " [--no-write]" : "", output_.string().c_str());
         return 0;
     }
@@ -504,7 +522,7 @@ private:
     fs::path output_;
     std::string kv_blob_;  // the SHB/IDB options as Arrow metadata, set before the packet table is written
     std::string payload_uri_;
-    std::uint64_t pid_ = 0;
+    std::uint64_t seen_ = 0;  // packets seen, dropped or kept: the global packet index (packet_id)
     std::size_t shb_count_ = 0, idb_count_ = 0, other_count_ = 0;
 
     // --decode-l2l3 accumulators: one nanom soa per PDU type + the remainder_after_l4 columns.
