@@ -3158,6 +3158,454 @@ struct NestedPageWindow {
     std::uint64_t rows = 0;                  // out: rows (fragments included) the window decoded to
 };
 
+/// The state one decode_nested_column call carries from page to page: the column's shape, the
+/// pooled scratch buffers its pages are read into, and the output layers and item validity so far.
+struct NestedDecodeState {
+    const EncodingsIo& io;
+    const pb::Field& on_disk_field;
+    bool variable;
+    std::size_t value_bytes;
+    std::vector<std::uint8_t>& control;
+    std::vector<std::uint8_t>& payload;
+    std::vector<miniblock::ChunkView>& chunks;
+    std::vector<std::uint16_t>& rep;
+    std::vector<std::uint16_t>& def;
+    std::vector<ColumnValues::NestedLayer> layers{};  // outermost first
+    std::vector<std::uint8_t> item_validity{};
+    std::uint64_t item_nulls = 0;
+    std::uint64_t items_total = 0;
+    std::vector<bool> shape{};  // per layer, innermost first: is it a list? Must agree across pages
+};
+
+/// One page of a nested column while decode_nested_column decodes it: its levels, then its items.
+struct NestedPageState {
+    bool has_rep = false;
+    bool has_def = false;
+    std::uint64_t num_items = repdef::kInferItems;
+    const std::vector<std::uint8_t>* layer_kinds = nullptr;
+    std::vector<std::uint64_t> items;
+    std::uint64_t page_rows = 0;
+    ColumnValues full_zip_values;
+    ColumnValues page_values;
+};
+
+/// Decodes the repetition and definition levels of a mini-block page's chunks into the column's rep
+/// and def buffers. One step of decode_nested_column, for the MiniBlock layout.
+bool decode_nested_chunk_levels(NestedDecodeState& st, const miniblock::ChunkShape& chunk_shape, bool has_rep,
+                                const page_layout::PageLayout& layout, const std::string& where,
+                                std::string& error) {
+    const auto& chunks = st.chunks;
+    auto& rep = st.rep;
+    auto& def = st.def;
+    const auto& mb = layout.mini_block;
+    std::size_t page_levels = 0;
+    for (const auto& chunk : chunks) {
+        page_levels += chunk.num_levels;
+    }
+    if (has_rep) {
+        rep.reserve(page_levels);
+    }
+    if (chunk_shape.has_definition) {
+        def.reserve(page_levels);
+    }
+    for (const auto& chunk : chunks) {
+        const auto n = chunk.num_levels;
+        if (n == 0U) {
+            continue;
+        }
+        if ((has_rep && chunk.rep.empty() && !zero_width_levels(*mb.rep_compression)) ||
+            (chunk_shape.has_definition && chunk.repdef.empty() && !zero_width_levels(*mb.repdef_compression))) {
+            error = where + "a chunk declares " + std::to_string(n) + " levels but carries no " +
+                    (has_rep && chunk.rep.empty() ? "repetition (" + page_layout::describe_encoding(*mb.rep_compression)
+                                                  : "definition (" +
+                                                        page_layout::describe_encoding(*mb.repdef_compression)) +
+                    ") level buffer";
+            return false;
+        }
+        if (has_rep) {
+            rep.resize(rep.size() + n);
+            if (!decode_levels(chunk.rep, *mb.rep_compression, n, rep.data() + rep.size() - n, error)) {
+                error = where + "repetition levels: " + error;
+                return false;
+            }
+        }
+        if (chunk_shape.has_definition) {
+            def.resize(def.size() + n);
+            if (!decode_levels(chunk.repdef, *mb.repdef_compression, n, def.data() + def.size() - n, error)) {
+                error = where + "definition levels: " + error;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Decodes the levels of a mini-block page: its chunks' items and levels, cut down to the window when
+/// the caller reads one. One step of decode_nested_column, for the MiniBlock layout.
+bool decode_nested_mini_block_levels(NestedDecodeState& st, const pb::ColumnPage& page,
+                                     const page_layout::PageLayout& layout, const std::string& where,
+                                     NestedPageWindow* window, NestedPageState& page_state, std::string& error) {
+    const EncodingsIo& io = st.io;
+    auto& control = st.control;
+    auto& payload = st.payload;
+    auto& chunks = st.chunks;
+    auto& rep = st.rep;
+    bool& has_rep = page_state.has_rep;
+    bool& has_def = page_state.has_def;
+    std::uint64_t& num_items = page_state.num_items;
+    const std::vector<std::uint8_t>*& layer_kinds = page_state.layer_kinds;
+    std::vector<std::uint64_t>& items = page_state.items;
+    std::uint64_t& page_rows = page_state.page_rows;
+    const auto& mb = layout.mini_block;
+    has_rep = mb.has_repetition;
+    if (has_rep && mb.rep_compression == nullptr) {
+        error = where + "a page declares repetition levels but no encoding for them";
+        return false;
+    }
+    miniblock::ChunkShape chunk_shape;
+    chunk_shape.has_repetition = has_rep;
+    chunk_shape.has_definition = mb.repdef_compression != nullptr;
+    chunk_shape.large_buffer_sizes = mb.has_large_chunk;
+    chunk_shape.num_buffers = mb.num_buffers != 0U ? mb.num_buffers : 2U;
+    if (!read_page_buffers(io, page, false, control, payload, error) ||
+        !miniblock::split_payload(payload, chunk_shape, chunks, error) ||
+        (window == nullptr &&
+         !miniblock::decode_chunk_items(control, mb.has_large_chunk, mb.num_items, items, error))) {
+        error = where + error;
+        return false;
+    }
+    if (window != nullptr) {
+        items = window->chunk_items;
+    }
+    if (items.size() != chunks.size()) {
+        error = where + std::to_string(chunks.size()) + " chunks but " + std::to_string(items.size()) +
+                " metadata words";
+        return false;
+    }
+        if (!decode_nested_chunk_levels(st, chunk_shape, has_rep, layout, where, error)) {
+            return false;
+        }
+    has_def = chunk_shape.has_definition;
+    num_items = mb.num_items;
+    layer_kinds = &mb.layers;
+    if (window != nullptr) {
+        num_items = 0;
+        for (const auto n : items) {
+            num_items += n;
+        }
+        // A window starting mid-row: its leading levels become a row of their own (dropped
+        // by the caller). Whatever list they continue, the layers outside it are valid, so
+        // promoting the first level to a row start keeps the levels well formed.
+        std::uint16_t max_rep = 0;
+        for (const auto kind : mb.layers) {
+            max_rep = static_cast<std::uint16_t>(max_rep + (repdef::is_list_layer(kind) ? 1U : 0U));
+        }
+        if (!has_rep) {
+            // No list (a nullable struct's child): one value slot per row, so a window of
+            // chunks is whole rows.
+            page_rows = num_items;
+        } else {
+            if (rep.empty()) {
+                error = where + "a page window holds no repetition levels";
+                return false;
+            }
+            rep[0] = max_rep;
+            page_rows = static_cast<std::uint64_t>(std::count(rep.begin(), rep.end(), max_rep));
+        }
+        window->rows = page_rows;
+    }
+    return true;
+}
+
+/// Decodes the levels of a constant page: its repetition and definition level buffers, and the layers
+/// they describe. One step of decode_nested_column, for the Constant layout.
+bool decode_nested_constant_levels(NestedDecodeState& st, const pb::ColumnPage& page,
+                                   const page_layout::PageLayout& layout, const std::string& where,
+                                   NestedPageState& page_state, std::string& error) {
+    const EncodingsIo& io = st.io;
+    auto& control = st.control;
+    auto& payload = st.payload;
+    auto& rep = st.rep;
+    auto& def = st.def;
+    bool& has_rep = page_state.has_rep;
+    bool& has_def = page_state.has_def;
+    const std::vector<std::uint8_t>*& layer_kinds = page_state.layer_kinds;
+    // Buffers: [rep, def] after the value when the value is not inline; no value at all when
+    // every item is null or there are none.
+    const auto& c = layout.constant;
+    const std::size_t buffers = page.buffer_offsets.size();
+    if (page.buffer_sizes.size() != buffers || (buffers != 2U && buffers != 3U) ||
+        (c.inline_value.has_value() && buffers != 2U)) {
+        error = where + "a constant list page has " + std::to_string(buffers) + " buffers";
+        return false;
+    }
+    const std::size_t rep_at = buffers == 3U ? 1U : 0U;
+    if (!io.read(page.buffer_offsets[rep_at], page.buffer_sizes[rep_at],
+                                    control, error) ||
+        !io.read(page.buffer_offsets[rep_at + 1U],
+                                    page.buffer_sizes[rep_at + 1U], payload, error) ||
+        !decode_level_buffer(control, c.rep_compression.get(), c.num_rep_values, rep, error) ||
+        !decode_level_buffer(payload, c.def_compression.get(), c.num_def_values, def, error)) {
+        error = where + error;
+        return false;
+    }
+    // A constant under a nullable struct but in no list stores an empty repetition buffer; one
+    // under lists whose every layer is all-valid (a map's constant key, say) stores an empty
+    // definition buffer -- there is nothing to define. With both empty the page has no levels
+    // to infer its items from, and the definition path reports that.
+    has_rep = !rep.empty();
+    has_def = !def.empty() || rep.empty();
+    layer_kinds = &c.layers;
+    return true;
+}
+
+/// Decodes the values of a FullZip page, which come first because they are what yields its levels. One
+/// step of decode_nested_column, for the FullZip layout.
+bool decode_nested_full_zip_values(NestedDecodeState& st, const pb::ColumnPage& page, NestedPageWindow* window,
+                                   const std::string& where, NestedPageState& page_state, std::string& error) {
+    const EncodingsIo& io = st.io;
+    const pb::Field& on_disk_field = st.on_disk_field;
+    auto& rep = st.rep;
+    auto& def = st.def;
+    bool& has_rep = page_state.has_rep;
+    bool& has_def = page_state.has_def;
+    std::uint64_t& num_items = page_state.num_items;
+    std::uint64_t& page_rows = page_state.page_rows;
+    ColumnValues& full_zip_values = page_state.full_zip_values;
+    pb::ColumnMetadata one_page;
+    one_page.pages.push_back(page);
+    auto view = std::make_shared<ItemView>();
+    view->full_zip_window = window != nullptr;
+    if (!decode_column_impl(io, on_disk_field, one_page, full_zip_values, error, view)) {
+        return false;
+    }
+    if (window != nullptr) {
+        // Whole rows of a list page: the values counted from its bytes; rows as the caller cut.
+        if (!has_rep) {
+            error = where + "a FullZip page window without lists";
+            return false;
+        }
+        num_items = view->full_zip_visible;
+        window->rows = page_rows;
+    }
+    if (has_def) {
+        def = std::move(view->full_zip_levels);
+    }
+    if (has_rep) {
+        rep = std::move(view->full_zip_rep);
+    }
+    return true;
+}
+
+/// Unravels a page's repetition and definition levels into its layers. One step of decode_nested_column,
+/// after the page's levels are decoded.
+bool decode_nested_unravel_page(NestedDecodeState& st, NestedPageState& page_state, const std::string& where,
+                                std::vector<repdef::UnraveledLayer>& unraveled, std::string& error) {
+    auto& rep = st.rep;
+    auto& def = st.def;
+    bool& has_rep = page_state.has_rep;
+    bool& has_def = page_state.has_def;
+    const std::vector<std::uint8_t>* layer_kinds = page_state.layer_kinds;
+    std::uint64_t& num_items = page_state.num_items;
+    std::uint64_t& page_rows = page_state.page_rows;
+    if (!repdef::unravel(rep, has_rep, def, has_def, *layer_kinds, num_items, unraveled, error)) {
+        error = where + error;
+        return false;
+    }
+    if (unraveled.back().length != page_rows) {
+        error = where + "levels describe " + std::to_string(unraveled.back().length) + " rows, the page " +
+                std::to_string(page_rows);
+        return false;
+    }
+    return true;
+}
+
+/// Checks that a page's list layers agree with the column's first page, and takes the column's shape
+/// from the first page. One step of decode_nested_column.
+bool decode_nested_page_shape(NestedDecodeState& st, const std::vector<repdef::UnraveledLayer>& unraveled,
+                              std::size_t page_index, const std::string& where, std::string& error) {
+    std::vector<bool>& shape = st.shape;
+    std::vector<ColumnValues::NestedLayer>& layers = st.layers;
+    std::vector<bool> page_shape;
+    for (const auto& layer : unraveled) {
+        page_shape.push_back(repdef::is_list_layer(layer.kind));
+    }
+    if (page_index == 0U) {
+        shape = page_shape;
+        layers.resize(shape.size() - 1U);
+        for (std::size_t k = 1; k < shape.size(); ++k) {
+            auto& layer = layers[layers.size() - k];
+            layer.is_list = shape[k];
+            if (layer.is_list) {
+                layer.offsets.push_back(0);
+            }
+        }
+    } else if (page_shape != shape) {
+        error = where + "its list layers differ from the column's first page";
+        return false;
+    }
+    return true;
+}
+
+/// Decodes the items of a constant page: one value repeated for every item, or every item null. One
+/// step of decode_nested_column, for a page whose items are not read from its buffers.
+bool decode_nested_constant_items(NestedDecodeState& st, const pb::ColumnPage& page,
+                                  const page_layout::PageLayout& layout,
+                                  const std::vector<repdef::UnraveledLayer>& unraveled, const std::string& where,
+                                  const ColumnValues& out, ColumnValues& page_values, std::string& error) {
+    const EncodingsIo& io = st.io;
+    auto& control = st.control;
+    const bool variable = st.variable;
+    const std::size_t value_bytes = st.value_bytes;
+    const auto page_items = unraveled[0].length;
+    // One value repeated for every item -- or, with no value stored, every item null.
+    const auto& c = layout.constant;
+    std::vector<std::uint8_t> value;
+    if (page.buffer_offsets.size() == 3U) {  // [value, rep, def]
+        if (!io.read(page.buffer_offsets[0], page.buffer_sizes[0], control,
+                                        error)) {
+            return false;
+        }
+        if (variable) {
+            if (!scalar_value::decode_variable(control, value, error)) {
+                error = where + error;
+                return false;
+            }
+        } else {
+            value = control;
+        }
+    } else if (c.inline_value.has_value()) {
+        value = *c.inline_value;
+    } else if (unraveled[0].null_count != page_items) {
+        error = where + "a constant list page stores no value but has valid items";
+        return false;
+    } else if (!variable) {
+        value.assign(value_bytes, 0U);
+    }
+    if (!variable && value.size() != value_bytes) {
+        error = where + "constant item is " + std::to_string(value.size()) + " bytes, the type " +
+                std::to_string(value_bytes);
+        return false;
+    }
+    std::uint64_t total = 0;
+    if (!checked_mul(page_items, static_cast<std::uint64_t>(std::max<std::size_t>(value.size(), 1U)), total) ||
+        total > default_read_limits().max_uncompressed_bytes) {
+        error = where + "constant list page expands past the decoded-size limit";
+        return false;
+    }
+    page_values.kind = out.kind;
+    page_values.variable.large = out.variable.large;
+    // The expanded size is known: reserve it, rather than letting a page of large repeated values
+    // (300 KB x 1,009 rows) reallocate and copy its way up to hundreds of megabytes.
+    if (variable) {
+        page_values.variable.data.reserve(static_cast<std::size_t>(total));
+        page_values.variable.offsets.reserve(static_cast<std::size_t>(page_items + 1U) *
+                                             (out.variable.large ? 8U : 4U));
+        append_list_offset(page_values.variable.offsets, 0, out.variable.large);
+    } else {
+        page_values.fixed.reserve(static_cast<std::size_t>(total));
+    }
+    for (std::uint64_t i = 0; i < page_items; ++i) {
+        if (variable) {
+            page_values.variable.data.insert(page_values.variable.data.end(), value.begin(), value.end());
+            append_list_offset(page_values.variable.offsets,
+                               static_cast<std::int64_t>(page_values.variable.data.size()), out.variable.large);
+        } else {
+            page_values.fixed.insert(page_values.fixed.end(), value.begin(), value.end());
+        }
+    }
+    return true;
+}
+
+/// Decodes a page's items into page_state.page_values, from the page's layout. One step of
+/// decode_nested_column.
+bool decode_nested_page_values(NestedDecodeState& st, const pb::ColumnPage& page,
+                               const page_layout::PageLayout& layout, NestedPageState& page_state,
+                               const std::vector<repdef::UnraveledLayer>& unraveled, const ColumnValues& out,
+                               const std::string& where, std::string& error) {
+    const EncodingsIo& io = st.io;
+    const pb::Field& on_disk_field = st.on_disk_field;
+    const auto page_items = unraveled[0].length;
+    ColumnValues& full_zip_values = page_state.full_zip_values;
+    ColumnValues& page_values = page_state.page_values;
+    std::vector<std::uint64_t>& items = page_state.items;
+    // The page's items.
+    if (layout.kind == page_layout::LayoutKind::kFullZip) {
+        page_values = std::move(full_zip_values);
+    } else if (layout.kind == page_layout::LayoutKind::kMiniBlock) {
+        pb::ColumnMetadata one_page;
+        one_page.pages.push_back(page);
+        one_page.pages.back().length = page_items;
+        auto view = std::make_shared<ItemView>();
+        view->page_chunk_items.push_back(std::move(items));
+        if (!decode_column_impl(io, on_disk_field, one_page, page_values, error, view)) {
+            return false;
+        }
+    } else if (page_items != 0U) {
+        if (!decode_nested_constant_items(st, page, layout, unraveled, where, out, page_values, error)) {
+            return false;
+        }
+    } else {
+        page_values.kind = out.kind;
+        page_values.variable.large = out.variable.large;
+    }
+    return true;
+}
+
+/// Checks and drops the element validity of a fixed_size_list page's items. One step of
+/// decode_nested_column.
+bool decode_nested_fixed_list_validity(ColumnValues& page_values,
+                                       const std::vector<repdef::UnraveledLayer>& unraveled,
+                                       std::uint64_t page_items, const std::string& where, std::string& error) {
+    // fixed_size_list items (bounding boxes, embeddings): Lance marks every element of a null item
+    // null as well. Those element bits say nothing the item's own validity does not, so they are
+    // dropped; a null element inside a VALID item is not something this reader can carry.
+    if (!page_values.item_validity.empty()) {
+        const auto per_item = page_values.items_per_row;
+        const auto& item_bits = unraveled[0].validity;
+        for (std::uint64_t k = 0; k < page_items && per_item != 0U; ++k) {
+            if (!item_bits.empty() && ((item_bits[static_cast<std::size_t>(k >> 3U)] >> (k & 7U)) & 1U) == 0U) {
+                continue;
+            }
+            for (std::uint64_t e = k * per_item; e < (k + 1U) * per_item; ++e) {
+                if (static_cast<std::size_t>(e >> 3U) < page_values.item_validity.size() &&
+                    ((page_values.item_validity[static_cast<std::size_t>(e >> 3U)] >> (e & 7U)) & 1U) == 0U) {
+                    error = where + "a null element inside a fixed_size_list item is not read yet";
+                    return false;
+                }
+            }
+        }
+        page_values.item_validity.clear();
+        page_values.item_null_count = 0;
+    }
+    return true;
+}
+
+/// Appends a page's validity and layers to the column's. One step of decode_nested_column.
+void append_nested_page_layers(NestedDecodeState& st, const std::vector<repdef::UnraveledLayer>& unraveled,
+                               std::uint64_t page_items) {
+    auto& item_validity = st.item_validity;
+    auto& item_nulls = st.item_nulls;
+    auto& items_total = st.items_total;
+    auto& layers = st.layers;
+    // The page's layers: layer k (innermost first, k >= 1) lands in layers[size - k].
+    append_validity_bits(item_validity, item_nulls, items_total, unraveled[0].validity, unraveled[0].null_count,
+                         page_items);
+    items_total += page_items;
+    for (std::size_t k = 1; k < unraveled.size(); ++k) {
+        auto& dst = layers[layers.size() - k];
+        const auto& src = unraveled[k];
+        if (dst.is_list) {
+            const auto base = dst.offsets.back();
+            for (std::size_t i = 1; i < src.offsets.size(); ++i) {
+                dst.offsets.push_back(base + src.offsets[i]);
+            }
+        }
+        append_validity_bits(dst.validity, dst.null_count, dst.length, src.validity, src.null_count, src.length);
+        dst.length += src.length;
+    }
+}
+
 bool decode_nested_column(const EncodingsIo& io, const pb::Field& on_disk_field,
                         const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
                         std::vector<NestedPageWindow>* windows = nullptr) {
@@ -3176,12 +3624,6 @@ bool decode_nested_column(const EncodingsIo& io, const pb::Field& on_disk_field,
         return false;
     }
 
-    std::vector<ColumnValues::NestedLayer> layers;  // outermost first
-    std::vector<std::uint8_t> item_validity;
-    std::uint64_t item_nulls = 0;
-    std::uint64_t items_total = 0;
-    std::vector<bool> shape;  // per layer, innermost first: is it a list? Must agree across pages.
-
     // Pooled per thread: a large list column is decoded window by window, and fresh buffers each time
     // made glibc grow and trim its heap around every window (a nanolance-written list<int64> read 45%
     // slower than with a retaining malloc).
@@ -3195,6 +3637,7 @@ bool decode_nested_column(const EncodingsIo& io, const pb::Field& on_disk_field,
     Scratch<std::vector<std::uint16_t>> def_scratch;
     auto& rep = rep_scratch.get();
     auto& def = def_scratch.get();
+    NestedDecodeState st{io, on_disk_field, variable, value_bytes, control, payload, chunks, rep, def};
     std::uint64_t rows_total = 0;
     for (const auto& page : column_metadata.pages) {
         rows_total += page.length;  // only guides reserve_projected; overflow would just skip it
@@ -3205,7 +3648,8 @@ bool decode_nested_column(const EncodingsIo& io, const pb::Field& on_disk_field,
         const auto where = "column '" + on_disk_field.name + "' page " + std::to_string(page_index) + ": ";
         NestedPageWindow* window =
             windows != nullptr && (*windows)[page_index].active ? &(*windows)[page_index] : nullptr;
-        std::uint64_t page_rows = page.length;
+        NestedPageState page_state;
+        page_state.page_rows = page.length;
         page_layout::PageLayout layout;
         std::string why;
         if (!page_layout::decode_page_layout(page.encoding, layout, why)) {
@@ -3214,335 +3658,71 @@ bool decode_nested_column(const EncodingsIo& io, const pb::Field& on_disk_field,
         }
         rep.clear();
         def.clear();
-        bool has_def = false;
-        std::uint64_t num_items = repdef::kInferItems;
-        const std::vector<std::uint8_t>* layer_kinds = nullptr;
-        std::vector<std::uint64_t> items;
-
-        bool has_rep = false;
         if (layout.kind == page_layout::LayoutKind::kMiniBlock) {
-            const auto& mb = layout.mini_block;
-            has_rep = mb.has_repetition;
-            if (has_rep && mb.rep_compression == nullptr) {
-                error = where + "a page declares repetition levels but no encoding for them";
+            if (!decode_nested_mini_block_levels(st, page, layout, where, window, page_state, error)) {
                 return false;
-            }
-            miniblock::ChunkShape chunk_shape;
-            chunk_shape.has_repetition = has_rep;
-            chunk_shape.has_definition = mb.repdef_compression != nullptr;
-            chunk_shape.large_buffer_sizes = mb.has_large_chunk;
-            chunk_shape.num_buffers = mb.num_buffers != 0U ? mb.num_buffers : 2U;
-            if (!read_page_buffers(io, page, false, control, payload, error) ||
-                !miniblock::split_payload(payload, chunk_shape, chunks, error) ||
-                (window == nullptr &&
-                 !miniblock::decode_chunk_items(control, mb.has_large_chunk, mb.num_items, items, error))) {
-                error = where + error;
-                return false;
-            }
-            if (window != nullptr) {
-                items = window->chunk_items;
-            }
-            if (items.size() != chunks.size()) {
-                error = where + std::to_string(chunks.size()) + " chunks but " + std::to_string(items.size()) +
-                        " metadata words";
-                return false;
-            }
-            std::size_t page_levels = 0;
-            for (const auto& chunk : chunks) {
-                page_levels += chunk.num_levels;
-            }
-            if (has_rep) {
-                rep.reserve(page_levels);
-            }
-            if (chunk_shape.has_definition) {
-                def.reserve(page_levels);
-            }
-            for (const auto& chunk : chunks) {
-                const auto n = chunk.num_levels;
-                if (n == 0U) {
-                    continue;
-                }
-                if ((has_rep && chunk.rep.empty() && !zero_width_levels(*mb.rep_compression)) ||
-                    (chunk_shape.has_definition && chunk.repdef.empty() && !zero_width_levels(*mb.repdef_compression))) {
-                    error = where + "a chunk declares " + std::to_string(n) + " levels but carries no " +
-                            (has_rep && chunk.rep.empty() ? "repetition (" + page_layout::describe_encoding(*mb.rep_compression)
-                                                          : "definition (" + page_layout::describe_encoding(*mb.repdef_compression)) +
-                            ") level buffer";
-                    return false;
-                }
-                if (has_rep) {
-                    rep.resize(rep.size() + n);
-                    if (!decode_levels(chunk.rep, *mb.rep_compression, n, rep.data() + rep.size() - n, error)) {
-                        error = where + "repetition levels: " + error;
-                        return false;
-                    }
-                }
-                if (chunk_shape.has_definition) {
-                    def.resize(def.size() + n);
-                    if (!decode_levels(chunk.repdef, *mb.repdef_compression, n, def.data() + def.size() - n, error)) {
-                        error = where + "definition levels: " + error;
-                        return false;
-                    }
-                }
-            }
-            has_def = chunk_shape.has_definition;
-            num_items = mb.num_items;
-            layer_kinds = &mb.layers;
-            if (window != nullptr) {
-                num_items = 0;
-                for (const auto n : items) {
-                    num_items += n;
-                }
-                // A window starting mid-row: its leading levels become a row of their own (dropped
-                // by the caller). Whatever list they continue, the layers outside it are valid, so
-                // promoting the first level to a row start keeps the levels well formed.
-                std::uint16_t max_rep = 0;
-                for (const auto kind : mb.layers) {
-                    max_rep = static_cast<std::uint16_t>(max_rep + (repdef::is_list_layer(kind) ? 1U : 0U));
-                }
-                if (!has_rep) {
-                    // No list (a nullable struct's child): one value slot per row, so a window of
-                    // chunks is whole rows.
-                    page_rows = num_items;
-                } else {
-                    if (rep.empty()) {
-                        error = where + "a page window holds no repetition levels";
-                        return false;
-                    }
-                    rep[0] = max_rep;
-                    page_rows = static_cast<std::uint64_t>(std::count(rep.begin(), rep.end(), max_rep));
-                }
-                window->rows = page_rows;
             }
         } else if (layout.kind == page_layout::LayoutKind::kConstant) {
-            // Buffers: [rep, def] after the value when the value is not inline; no value at all when
-            // every item is null or there are none.
-            const auto& c = layout.constant;
-            const std::size_t buffers = page.buffer_offsets.size();
-            if (page.buffer_sizes.size() != buffers || (buffers != 2U && buffers != 3U) ||
-                (c.inline_value.has_value() && buffers != 2U)) {
-                error = where + "a constant list page has " + std::to_string(buffers) + " buffers";
+            if (!decode_nested_constant_levels(st, page, layout, where, page_state, error)) {
                 return false;
             }
-            const std::size_t rep_at = buffers == 3U ? 1U : 0U;
-            if (!io.read(page.buffer_offsets[rep_at], page.buffer_sizes[rep_at],
-                                            control, error) ||
-                !io.read(page.buffer_offsets[rep_at + 1U],
-                                            page.buffer_sizes[rep_at + 1U], payload, error) ||
-                !decode_level_buffer(control, c.rep_compression.get(), c.num_rep_values, rep, error) ||
-                !decode_level_buffer(payload, c.def_compression.get(), c.num_def_values, def, error)) {
-                error = where + error;
-                return false;
-            }
-            // A constant under a nullable struct but in no list stores an empty repetition buffer; one
-            // under lists whose every layer is all-valid (a map's constant key, say) stores an empty
-            // definition buffer -- there is nothing to define. With both empty the page has no levels
-            // to infer its items from, and the definition path reports that.
-            has_rep = !rep.empty();
-            has_def = !def.empty() || rep.empty();
-            layer_kinds = &c.layers;
         } else if (layout.kind == page_layout::LayoutKind::kFullZip) {
             // Long values under lists or null structs: the levels are in each value's control word,
             // which the FullZip value pass reads anyway and hands back.
-            has_rep = layout.full_zip.bits_rep != 0U;
-            has_def = layout.full_zip.bits_def != 0U;
-            num_items = has_rep ? layout.full_zip.num_visible_items : page.length;
-            layer_kinds = &layout.full_zip.layers;
+            page_state.has_rep = layout.full_zip.bits_rep != 0U;
+            page_state.has_def = layout.full_zip.bits_def != 0U;
+            page_state.num_items = page_state.has_rep ? layout.full_zip.num_visible_items : page.length;
+            page_state.layer_kinds = &layout.full_zip.layers;
         } else {
             error = where + "unsupported page layout in a nested column: " + page_layout::describe(layout);
             return false;
         }
 
         // FullZip: the values come first, because they are what yields the levels.
-        ColumnValues full_zip_values;
         if (layout.kind == page_layout::LayoutKind::kFullZip) {
-            pb::ColumnMetadata one_page;
-            one_page.pages.push_back(page);
-            auto view = std::make_shared<ItemView>();
-            view->full_zip_window = window != nullptr;
-            if (!decode_column_impl(io, on_disk_field, one_page, full_zip_values, error, view)) {
+            if (!decode_nested_full_zip_values(st, page, window, where, page_state, error)) {
                 return false;
-            }
-            if (window != nullptr) {
-                // Whole rows of a list page: the values counted from its bytes; rows as the caller cut.
-                if (!has_rep) {
-                    error = where + "a FullZip page window without lists";
-                    return false;
-                }
-                num_items = view->full_zip_visible;
-                window->rows = page_rows;
-            }
-            if (has_def) {
-                def = std::move(view->full_zip_levels);
-            }
-            if (has_rep) {
-                rep = std::move(view->full_zip_rep);
             }
         }
 
         std::vector<repdef::UnraveledLayer> unraveled;
-        if (!repdef::unravel(rep, has_rep, def, has_def, *layer_kinds, num_items, unraveled, error)) {
-            error = where + error;
-            return false;
-        }
-        if (unraveled.back().length != page_rows) {
-            error = where + "levels describe " + std::to_string(unraveled.back().length) + " rows, the page " +
-                    std::to_string(page_rows);
+        if (!decode_nested_unravel_page(st, page_state, where, unraveled, error)) {
             return false;
         }
         const auto page_items = unraveled[0].length;
-        std::vector<bool> page_shape;
-        for (const auto& layer : unraveled) {
-            page_shape.push_back(repdef::is_list_layer(layer.kind));
-        }
-        if (page_index == 0U) {
-            shape = page_shape;
-            layers.resize(shape.size() - 1U);
-            for (std::size_t k = 1; k < shape.size(); ++k) {
-                auto& layer = layers[layers.size() - k];
-                layer.is_list = shape[k];
-                if (layer.is_list) {
-                    layer.offsets.push_back(0);
-                }
-            }
-        } else if (page_shape != shape) {
-            error = where + "its list layers differ from the column's first page";
+        if (!decode_nested_page_shape(st, unraveled, page_index, where, error)) {
             return false;
         }
 
-        // The page's items.
-        ColumnValues page_values;
-        if (layout.kind == page_layout::LayoutKind::kFullZip) {
-            page_values = std::move(full_zip_values);
-        } else if (layout.kind == page_layout::LayoutKind::kMiniBlock) {
-            pb::ColumnMetadata one_page;
-            one_page.pages.push_back(page);
-            one_page.pages.back().length = page_items;
-            auto view = std::make_shared<ItemView>();
-            view->page_chunk_items.push_back(std::move(items));
-            if (!decode_column_impl(io, on_disk_field, one_page, page_values, error, view)) {
-                return false;
-            }
-        } else if (page_items != 0U) {
-            // One value repeated for every item -- or, with no value stored, every item null.
-            const auto& c = layout.constant;
-            std::vector<std::uint8_t> value;
-            if (page.buffer_offsets.size() == 3U) {  // [value, rep, def]
-                if (!io.read(page.buffer_offsets[0], page.buffer_sizes[0], control,
-                                                error)) {
-                    return false;
-                }
-                if (variable) {
-                    if (!scalar_value::decode_variable(control, value, error)) {
-                        error = where + error;
-                        return false;
-                    }
-                } else {
-                    value = control;
-                }
-            } else if (c.inline_value.has_value()) {
-                value = *c.inline_value;
-            } else if (unraveled[0].null_count != page_items) {
-                error = where + "a constant list page stores no value but has valid items";
-                return false;
-            } else if (!variable) {
-                value.assign(value_bytes, 0U);
-            }
-            if (!variable && value.size() != value_bytes) {
-                error = where + "constant item is " + std::to_string(value.size()) + " bytes, the type " +
-                        std::to_string(value_bytes);
-                return false;
-            }
-            std::uint64_t total = 0;
-            if (!checked_mul(page_items, static_cast<std::uint64_t>(std::max<std::size_t>(value.size(), 1U)), total) ||
-                total > default_read_limits().max_uncompressed_bytes) {
-                error = where + "constant list page expands past the decoded-size limit";
-                return false;
-            }
-            page_values.kind = out.kind;
-            page_values.variable.large = out.variable.large;
-            // The expanded size is known: reserve it, rather than letting a page of large repeated values
-            // (300 KB x 1,009 rows) reallocate and copy its way up to hundreds of megabytes.
-            if (variable) {
-                page_values.variable.data.reserve(static_cast<std::size_t>(total));
-                page_values.variable.offsets.reserve(static_cast<std::size_t>(page_items + 1U) *
-                                                     (out.variable.large ? 8U : 4U));
-                append_list_offset(page_values.variable.offsets, 0, out.variable.large);
-            } else {
-                page_values.fixed.reserve(static_cast<std::size_t>(total));
-            }
-            for (std::uint64_t i = 0; i < page_items; ++i) {
-                if (variable) {
-                    page_values.variable.data.insert(page_values.variable.data.end(), value.begin(), value.end());
-                    append_list_offset(page_values.variable.offsets,
-                                       static_cast<std::int64_t>(page_values.variable.data.size()), out.variable.large);
-                } else {
-                    page_values.fixed.insert(page_values.fixed.end(), value.begin(), value.end());
-                }
-            }
-        } else {
-            page_values.kind = out.kind;
-            page_values.variable.large = out.variable.large;
+        if (!decode_nested_page_values(st, page, layout, page_state, unraveled, out, where, error)) {
+            return false;
         }
-        // fixed_size_list items (bounding boxes, embeddings): Lance marks every element of a null item
-        // null as well. Those element bits say nothing the item's own validity does not, so they are
-        // dropped; a null element inside a VALID item is not something this reader can carry.
-        if (!page_values.item_validity.empty()) {
-            const auto per_item = page_values.items_per_row;
-            const auto& item_bits = unraveled[0].validity;
-            for (std::uint64_t k = 0; k < page_items && per_item != 0U; ++k) {
-                if (!item_bits.empty() && ((item_bits[static_cast<std::size_t>(k >> 3U)] >> (k & 7U)) & 1U) == 0U) {
-                    continue;
-                }
-                for (std::uint64_t e = k * per_item; e < (k + 1U) * per_item; ++e) {
-                    if (static_cast<std::size_t>(e >> 3U) < page_values.item_validity.size() &&
-                        ((page_values.item_validity[static_cast<std::size_t>(e >> 3U)] >> (e & 7U)) & 1U) == 0U) {
-                        error = where + "a null element inside a fixed_size_list item is not read yet";
-                        return false;
-                    }
-                }
-            }
-            page_values.item_validity.clear();
-            page_values.item_null_count = 0;
+        if (!decode_nested_fixed_list_validity(page_state.page_values, unraveled, page_items, where, error)) {
+            return false;
         }
-        if (!append_leaf_values(out, page_values, error)) {
+        if (!append_leaf_values(out, page_state.page_values, error)) {
             error = where + error;
             return false;
         }
-        rows_done += page_rows;
+        rows_done += page_state.page_rows;
         reserve_projected(out.fixed, rows_done, rows_total);
         reserve_projected(out.variable.data, rows_done, rows_total);
         reserve_projected(out.variable.offsets, rows_done, rows_total);
 
-        // The page's layers: layer k (innermost first, k >= 1) lands in layers[size - k].
-        append_validity_bits(item_validity, item_nulls, items_total, unraveled[0].validity, unraveled[0].null_count,
-                             page_items);
-        items_total += page_items;
-        for (std::size_t k = 1; k < unraveled.size(); ++k) {
-            auto& dst = layers[layers.size() - k];
-            const auto& src = unraveled[k];
-            if (dst.is_list) {
-                const auto base = dst.offsets.back();
-                for (std::size_t i = 1; i < src.offsets.size(); ++i) {
-                    dst.offsets.push_back(base + src.offsets[i]);
-                }
-            }
-            append_validity_bits(dst.validity, dst.null_count, dst.length, src.validity, src.null_count, src.length);
-            dst.length += src.length;
-        }
+        append_nested_page_layers(st, unraveled, page_items);
     }
     if (column_metadata.pages.empty()) {
         error = "column '" + on_disk_field.name + "' has no pages";
         return false;
     }
-    if (!variable && out.fixed.size() != items_total * value_bytes) {
+    if (!variable && out.fixed.size() != st.items_total * value_bytes) {
         error = "column '" + on_disk_field.name + "' decoded " + std::to_string(out.fixed.size()) +
-                " bytes for " + std::to_string(items_total) + " items";
+                " bytes for " + std::to_string(st.items_total) + " items";
         return false;
     }
-    out.validity = std::move(item_validity);
-    out.null_count = item_nulls;
-    out.layers = std::move(layers);
+    out.validity = std::move(st.item_validity);
+    out.null_count = st.item_nulls;
+    out.layers = std::move(st.layers);
     return true;
 }
 
