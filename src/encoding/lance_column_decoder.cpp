@@ -1725,8 +1725,6 @@ bool decode_legacy_blob_column(const EncodingsIo& io, const pb::Field& field,
 
 namespace {
 
-namespace {
-
 /// Decodes a blob-v2 column (packed blob descriptions, payloads stored elsewhere).
 /// One branch of decode_column_impl, which has already bounded the row count.
 bool decode_blob_v2_column(const EncodingsIo& io, const pb::Field& on_disk_field,
@@ -2905,8 +2903,6 @@ bool decode_fixed_width_column(const EncodingsIo& io, const pb::Field& on_disk_f
     }
     return true;
 }
-
-}  // namespace
 
 /// The whole decoder for one physical column. `item_view` is set only for a list column's second
 /// pass (decode_list_column), which reads the leaf values as a flat column of items.
