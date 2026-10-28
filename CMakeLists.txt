@@ -1419,20 +1419,31 @@ foreach(_nl_layer_dir IN ITEMS base io arrow encoding file table expr scan index
 endforeach()
 # One example per layer (examples/layers/): built and run as tests, labelled example and layer:<layer>.
 include("${CMAKE_CURRENT_SOURCE_DIR}/examples/layers/examples.cmake")
+# Layer benchmarks (bench/<layer>/): built, and run with --quick as tests labelled bench and bench:<layer>.
+include("${CMAKE_CURRENT_SOURCE_DIR}/bench/layers.cmake")
 
 # Each test's layer: the folder of its source under tests/ (tests/<layer>/, src/README.md), or for an example the
-# file name under examples/layers/, as the label layer:<layer>, so `ctest -L layer:table` runs one layer's tests. A
-# test whose target is not built from one (the smoke scripts, the app checks) is a cross-layer test, layer:integration.
+# file name under examples/layers/, or for a benchmark the folder under bench/ (bench/<layer>/), as the label
+# layer:<layer>, so `ctest -L layer:table` runs one layer's tests. A test whose target is not built from one (the smoke
+# scripts, the app checks) is a cross-layer test, layer:integration. A benchmark test names its program in the
+# NL_BENCH_TARGET property (bench/layers.cmake), since its test name does not name the target.
 get_property(_nl_tests DIRECTORY PROPERTY TESTS)
 foreach(_nl_test IN LISTS _nl_tests)
     set(_nl_layer integration)
-    foreach(_nl_target IN ITEMS ${_nl_test}_test ${_nl_test})
+    get_property(_nl_bench_target TEST ${_nl_test} PROPERTY NL_BENCH_TARGET)
+    set(_nl_candidates ${_nl_test}_test ${_nl_test})
+    if(_nl_bench_target)
+        list(APPEND _nl_candidates ${_nl_bench_target})
+    endif()
+    foreach(_nl_target IN LISTS _nl_candidates)
         if(TARGET ${_nl_target})
             get_target_property(_nl_sources ${_nl_target} SOURCES)
             list(GET _nl_sources 0 _nl_first)
             if(_nl_first MATCHES "^tests/([a-z_]+)/")
                 set(_nl_layer ${CMAKE_MATCH_1})
             elseif(_nl_first MATCHES "^examples/layers/([a-z_]+)\\.cpp")
+                set(_nl_layer ${CMAKE_MATCH_1})
+            elseif(_nl_first MATCHES "^bench/([a-z_]+)/")
                 set(_nl_layer ${CMAKE_MATCH_1})
             endif()
             break()

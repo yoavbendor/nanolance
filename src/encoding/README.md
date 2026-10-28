@@ -156,3 +156,40 @@ separate rows where nanolance does only one.
   included), and most `lance-encoding:*` field options ignored. Every choice made is one Lance reads;
   the cost is size or random-access speed against pylance on some shapes, not correctness.
 - **Format 2.0** is read, not written (nanolance writes 2.2, and appends 2.2 files to older datasets).
+
+## Performance
+
+Measured by [bench/encoding/decode_bench.cpp](../../bench/encoding/decode_bench.cpp) (`nl_bench_encoding`). It writes one
+`.lance` file with one column per kind of encoding this layer decodes. The writer picks each column's kind from its field
+tag (`nanolance:packing`). The benchmark reads each column's page layout to name its kind, checks the values read back, and
+times `decode_lance_physical_column` on each column: the median of 7 runs after one warm-up, with the file in the OS cache.
+Decoded bytes are the values of a fixed-width column, or the offsets and text of a variable-width one. The timing includes
+allocating the decoded buffers. The full-zip column holds 4200-byte strings, since the writer lays a column out as FullZip
+only when its values average 4096 bytes or more.
+
+```
+cmake --build build --target nl_bench_encoding
+./build/nl_bench_encoding --json out.json
+python3 tools/compare_bench.py bench/results/layers/encoding.json out.json
+```
+
+`--rows N` sets the rows per column (default 20000), `--runs N` the timed runs, and `--quick` a small run. ctest runs the
+quick mode as `nano_lance_bench_encoding_quick`.
+
+Baseline from one full run, saved as [bench/results/layers/encoding.json](../../bench/results/layers/encoding.json). It was
+built from commit 7330b61 with the benchmark code uncommitted; the library sources are unchanged. The numbers come from a
+4-core cloud sandbox with a Release build (gcc 13.3.0), so they are for comparison on the same machine, not absolute.
+
+| column | kind | rows | decoded bytes | median ms | rows/s | MB/s |
+|---|---|---:|---:|---:|---:|---:|
+| int64_seq | bitpack | 20,000 | 160,000 | 0.028 | 725,268,349 | 5,802 |
+| int64_random | flat | 20,000 | 160,000 | 0.025 | 814,398,567 | 6,515 |
+| int64_constant | constant | 20,000 | 160,000 | 0.009 | 2,176,041,780 | 17,408 |
+| int64_runs | rle | 20,000 | 160,000 | 0.015 | 1,327,668,614 | 10,621 |
+| float64_random | byte-stream-split+zstd | 20,000 | 160,000 | 0.040 | 495,970,242 | 3,968 |
+| bool | bool-packed | 20,000 | 20,000 | 0.008 | 2,421,307,506 | 2,421 |
+| str_few_values | dict | 20,000 | 280,004 | 0.130 | 154,248,386 | 2,160 |
+| str_runs | dict-rle | 20,000 | 180,004 | 0.046 | 433,924,193 | 3,905 |
+| str_unique | variable | 20,000 | 228,894 | 0.057 | 352,032,105 | 4,029 |
+| str_320_bytes | variable | 20,000 | 6,480,004 | 1.882 | 10,626,388 | 3,443 |
+| str_4200_bytes | full-zip | 20,000 | 84,080,004 | 139.458 | 143,413 | 603 |

@@ -1,0 +1,26 @@
+{
+  "header": {
+    "program": "nl_bench_encoding",
+    "git_commit": "7330b61fba580087ec04321cd17a986bc0b0cb0f",
+    "git_dirty": true,
+    "compiler": "gcc 13.3.0",
+    "build_type": "Release",
+    "cores": 4,
+    "quick": false,
+    "rows": 20000,
+    "runs": 7
+  },
+  "results": [
+    {"name": "decode/int64_seq", "rows": 20000, "bytes": 160000, "median_ns": 27576, "rows_per_s": 725268349.3, "mb_per_s": 5802.147},
+    {"name": "decode/int64_random", "rows": 20000, "bytes": 160000, "median_ns": 24558, "rows_per_s": 814398566.7, "mb_per_s": 6515.189},
+    {"name": "decode/int64_constant", "rows": 20000, "bytes": 160000, "median_ns": 9191, "rows_per_s": 2176041780.0, "mb_per_s": 17408.334},
+    {"name": "decode/int64_runs", "rows": 20000, "bytes": 160000, "median_ns": 15064, "rows_per_s": 1327668613.9, "mb_per_s": 10621.349},
+    {"name": "decode/float64_random", "rows": 20000, "bytes": 160000, "median_ns": 40325, "rows_per_s": 495970241.8, "mb_per_s": 3967.762},
+    {"name": "decode/bool", "rows": 20000, "bytes": 20000, "median_ns": 8260, "rows_per_s": 2421307506.1, "mb_per_s": 2421.308},
+    {"name": "decode/str_few_values", "rows": 20000, "bytes": 280004, "median_ns": 129661, "rows_per_s": 154248386.2, "mb_per_s": 2159.508},
+    {"name": "decode/str_runs", "rows": 20000, "bytes": 180004, "median_ns": 46091, "rows_per_s": 433924193.4, "mb_per_s": 3905.405},
+    {"name": "decode/str_unique", "rows": 20000, "bytes": 228894, "median_ns": 56813, "rows_per_s": 352032105.3, "mb_per_s": 4028.902},
+    {"name": "decode/str_320_bytes", "rows": 20000, "bytes": 6480004, "median_ns": 1882107, "rows_per_s": 10626388.4, "mb_per_s": 3442.952},
+    {"name": "decode/str_4200_bytes", "rows": 20000, "bytes": 84080004, "median_ns": 139457727, "rows_per_s": 143412.6, "mb_per_s": 602.907}
+  ]
+}
