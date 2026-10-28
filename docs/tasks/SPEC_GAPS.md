@@ -46,3 +46,17 @@ These stay as they are until a user asks, or the Lance pin moves:
 
 Waves 2 to 7 cover table, expr, scan, index, dataset and api, in that order. They are briefed when wave 1 is
 reviewed, from the rows the README tables list at that point.
+
+## Measured for W1e (unenforced primary key)
+
+- Lance 12 `Field` proto: `bool unenforced_primary_key = 12`; `uint32 unenforced_primary_key_position = 13`
+  (1-based; 0 means the field is part of the key and orders by field id); `bool unenforced_clustering_key = 14`
+  (reserved); `uint32 unenforced_clustering_key_position = 15` (1-based; 0 is not in the key).
+- Arrow metadata (`rust/lance-core/src/datatypes/field.rs`): `lance-schema:unenforced-primary-key:position`
+  parsed as u32 first; otherwise `lance-schema:unenforced-primary-key` truthy gives position 0;
+  `lance-schema:unenforced-clustering-key:position` as u32. pylance keeps the metadata on the Arrow field
+  as given.
+- pylance 12 write checks: a nullable key column is refused with `LanceError(Schema): Primary key column and all
+  its ancestors must not be nullable: Field(id=0, name=id, type=int64)`. A list column is refused with
+  `Primary key column must be a leaf: Field(id=0, name=l, type=list, children=[Field(id=1, name=item,
+  type=int32), ])`. A non-null leaf inside a non-null struct is accepted.
