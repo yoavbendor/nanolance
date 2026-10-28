@@ -1417,10 +1417,12 @@ endif()
 foreach(_nl_layer_dir IN ITEMS base io arrow encoding file table expr scan index dataset api integration)
     include("${CMAKE_CURRENT_SOURCE_DIR}/tests/${_nl_layer_dir}/tests.cmake")
 endforeach()
+# One example per layer (examples/layers/): built and run as tests, labelled example and layer:<layer>.
+include("${CMAKE_CURRENT_SOURCE_DIR}/examples/layers/examples.cmake")
 
-# Each test's layer: the folder of its source under tests/ (tests/<layer>/, src/README.md), as the label
-# layer:<layer>, so `ctest -L layer:table` runs one layer's tests. A test whose target is not built from one
-# (the smoke scripts, the app checks) is a cross-layer test, layer:integration.
+# Each test's layer: the folder of its source under tests/ (tests/<layer>/, src/README.md), or for an example the
+# file name under examples/layers/, as the label layer:<layer>, so `ctest -L layer:table` runs one layer's tests. A
+# test whose target is not built from one (the smoke scripts, the app checks) is a cross-layer test, layer:integration.
 get_property(_nl_tests DIRECTORY PROPERTY TESTS)
 foreach(_nl_test IN LISTS _nl_tests)
     set(_nl_layer integration)
@@ -1429,6 +1431,8 @@ foreach(_nl_test IN LISTS _nl_tests)
             get_target_property(_nl_sources ${_nl_target} SOURCES)
             list(GET _nl_sources 0 _nl_first)
             if(_nl_first MATCHES "^tests/([a-z_]+)/")
+                set(_nl_layer ${CMAKE_MATCH_1})
+            elseif(_nl_first MATCHES "^examples/layers/([a-z_]+)\\.cpp")
                 set(_nl_layer ${CMAKE_MATCH_1})
             endif()
             break()

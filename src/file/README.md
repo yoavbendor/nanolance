@@ -3,6 +3,7 @@
 <!-- layer-deps:start -->
 Layer 5 of 11 (1 is the bottom, 11 the top). Uses: [base](../base/README.md), [io](../io/README.md), [arrow](../arrow/README.md), [encoding](../encoding/README.md). Used by: [table](../table/README.md), [scan](../scan/README.md), [index](../index/README.md), [dataset](../dataset/README.md), [api](../api/README.md). See [docs/LAYERS.md](../../docs/LAYERS.md).
 <!-- layer-deps:end -->
+Example: [examples/layers/file.cpp](../../examples/layers/file.cpp) (run with ctest -R nano_lance_example_file).
 
 This layer reads and writes the container a Lance data file is: data pages, column metadata, the column
 metadata and global buffer offset tables, global buffers (the schema in buffer 0) and the 40-byte footer, plus

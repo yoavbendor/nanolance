@@ -3,6 +3,7 @@
 <!-- layer-deps:start -->
 Layer 1 of 11 (1 is the bottom, 11 the top). Uses: none. Used by: [io](../io/README.md), [arrow](../arrow/README.md), [encoding](../encoding/README.md), [file](../file/README.md), [table](../table/README.md), [expr](../expr/README.md), [scan](../scan/README.md), [index](../index/README.md), [api](../api/README.md). See [docs/LAYERS.md](../../docs/LAYERS.md).
 <!-- layer-deps:end -->
+Example: [examples/layers/base.cpp](../../examples/layers/base.cpp) (run with ctest -R nano_lance_example_base).
 
 The lowest layer: what every other layer relies on and nothing in it knows about Lance files. It holds the
 thread pool, the read-safety limits and overflow-checked arithmetic of the read path, the work counters

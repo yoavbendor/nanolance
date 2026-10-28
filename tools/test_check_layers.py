@@ -170,3 +170,34 @@ def test_write_allowlist_round_trip(tmp_path):
 
 def test_usage_error_exits_2(tmp_path):
     assert check(tmp_path / "missing").returncode == 2
+
+
+def write_example(root, name, text):
+    """An example program: examples/layers/<name>, read by the examples pass of the check."""
+    path = root / "examples" / "layers" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def test_example_may_include_its_own_layer_and_below(tmp_path):
+    root = make_tree(tmp_path, CLEAN)
+    write_example(root, "mid.cpp", '#include <base.hpp>\n#include "mid.cpp"\n')
+    r = check(root)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "examples/layers: 1 file(s), 2 include(s)" in r.stdout
+
+
+def test_example_include_of_a_higher_layer_fails(tmp_path):
+    root = make_tree(tmp_path, CLEAN)
+    write_example(root, "low.cpp", '#include <base.hpp>\n#include <top.hpp>\n')
+    r = check(root)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "example low includes top (high)  [examples/layers/low.cpp:2]" in r.stdout
+
+
+def test_example_named_for_no_layer_fails(tmp_path):
+    root = make_tree(tmp_path, CLEAN)
+    write_example(root, "stray.cpp", '#include "base.hpp"\n')
+    r = check(root)
+    assert r.returncode == 1
+    assert "'stray' is not a layer in tools/layout.py" in r.stdout
