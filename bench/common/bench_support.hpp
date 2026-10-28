@@ -260,6 +260,7 @@ inline bool median_nanoseconds(int runs, const std::function<bool(std::string&)>
 /// Command-line options every benchmark takes.
 struct Options {
     std::uint64_t rows = 0;  // --rows: the main scale; 0 means the program's default for the mode
+    double mb = 0;           // --mb: decoded MiB per column, where a program sizes its columns; 0 means its default
     int runs = 0;            // --runs: timed runs per case; 0 means 2 with --quick, 7 otherwise
     bool quick = false;      // --quick: small sizes, for a test that only checks the program runs
     std::string json_path;   // --json: where to write the results; empty for none
@@ -267,12 +268,19 @@ struct Options {
 
 /// Reads the command line into `options`. Returns -1 to run the benchmark, or the exit code to return now.
 inline int parse_options(int argc, char** argv, const char* program, Options& options) {
-    const std::string usage = std::string("usage: ") + program + " [--rows N] [--runs N] [--quick] [--json PATH]";
+    const std::string usage =
+        std::string("usage: ") + program + " [--mb N] [--rows N] [--runs N] [--quick] [--json PATH]";
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         const bool has_value = i + 1 < argc;
         if (arg == "--quick") {
             options.quick = true;
+        } else if (arg == "--mb" && has_value) {
+            options.mb = std::strtod(argv[++i], nullptr);
+            if (!(options.mb > 0)) {
+                std::cerr << usage << "\n--mb needs a positive number\n";
+                return 2;
+            }
         } else if ((arg == "--rows" || arg == "--runs") && has_value) {
             const auto value = std::strtoull(argv[++i], nullptr, 10);
             if (value == 0) {
@@ -353,6 +361,7 @@ struct RunInfo {
     unsigned cores = 0;
     bool quick = false;
     std::uint64_t rows = 0;
+    std::string scale;  // what sized the cases in words, when rows does not say it (empty: rows is the scale)
     int runs = 0;
 };
 
@@ -399,7 +408,8 @@ struct Result {
 };
 
 inline void print_run_info(const RunInfo& info) {
-    std::cout << info.program << ": " << (info.quick ? "quick, " : "") << info.rows << " rows, " << info.runs
+    std::cout << info.program << ": " << (info.quick ? "quick, " : "")
+              << (info.scale.empty() ? std::to_string(info.rows) + " rows" : info.scale) << ", " << info.runs
               << " timed runs after 1 warm-up, " << info.build_type << " build with " << info.compiler << ", "
               << info.cores << " cores, commit " << info.git_commit << (info.git_dirty ? " (uncommitted changes)" : "")
               << "\n";
@@ -459,6 +469,7 @@ inline bool write_json(const std::string& path, const RunInfo& info, const std::
         << "    \"cores\": " << info.cores << ",\n"
         << "    \"quick\": " << (info.quick ? "true" : "false") << ",\n"
         << "    \"rows\": " << info.rows << ",\n"
+        << (info.scale.empty() ? std::string() : "    \"scale\": " + json_string(info.scale) + ",\n")
         << "    \"runs\": " << info.runs << "\n  },\n  \"results\": [\n";
     for (std::size_t i = 0; i < results.size(); ++i) {
         const auto& r = results[i];

@@ -160,12 +160,14 @@ separate rows where nanolance does only one.
 ## Performance
 
 Measured by [bench/encoding/decode_bench.cpp](../../bench/encoding/decode_bench.cpp) (`nl_bench_encoding`). It writes one
-`.lance` file with one column per kind of encoding this layer decodes. The writer picks each column's kind from its field
-tag (`nanolance:packing`). The benchmark reads each column's page layout to name its kind, checks the values read back, and
-times `decode_lance_physical_column` on each column: the median of 7 runs after one warm-up, with the file in the OS cache.
-Decoded bytes are the values of a fixed-width column, or the offsets and text of a variable-width one. The timing includes
-allocating the decoded buffers. The full-zip column holds 4200-byte strings, since the writer lays a column out as FullZip
-only when its values average 4096 bytes or more.
+`.lance` file per column, one column per kind of encoding this layer decodes. The writer picks each column's kind from its
+field tag (`nanolance:packing`). The benchmark reads each column's page layout to name its kind, checks the values read
+back, and times `decode_lance_physical_column` on each column: the median of 7 runs after one warm-up, with the file in the
+OS cache. Each column is sized to the same decoded bytes, 16 MiB, so the cases take milliseconds and compare by bytes per
+second. A column gets the rows that fill 16 MiB (at least 1000), so the int64 columns hold about 2 million rows and the
+4200-byte strings about 4000. Decoded bytes are the values of a fixed-width column, or the offsets and text of a
+variable-width one. The timing includes allocating the decoded buffers. The full-zip column holds 4200-byte strings, since
+the writer lays a column out as FullZip only when its values average 4096 bytes or more.
 
 ```
 cmake --build build --target nl_bench_encoding
@@ -173,23 +175,24 @@ cmake --build build --target nl_bench_encoding
 python3 tools/compare_bench.py bench/results/layers/encoding.json out.json
 ```
 
-`--rows N` sets the rows per column (default 20000), `--runs N` the timed runs, and `--quick` a small run. ctest runs the
+`--mb N` sets the decoded MiB per column (default 16). `--rows N` forces one row count for every column instead, which
+overrides `--mb`. `--runs N` sets the timed runs, and `--quick` a small run (0.5 MiB per column, 2 runs). ctest runs the
 quick mode as `nano_lance_bench_encoding_quick`.
 
-Baseline from one full run, saved as [bench/results/layers/encoding.json](../../bench/results/layers/encoding.json). It was
-built from commit 7330b61 with the benchmark code uncommitted; the library sources are unchanged. The numbers come from a
-4-core cloud sandbox with a Release build (gcc 13.3.0), so they are for comparison on the same machine, not absolute.
+Baseline from one full run, saved as [bench/results/layers/encoding.json](../../bench/results/layers/encoding.json). The
+library sources are unchanged since commit 7330b61, and the benchmark code was uncommitted when it ran. The numbers come from
+a 4-core cloud sandbox with a Release build (gcc 13.3.0), so they are for comparison on the same machine, not absolute.
 
 | column | kind | rows | decoded bytes | median ms | rows/s | MB/s |
 |---|---|---:|---:|---:|---:|---:|
-| int64_seq | bitpack | 20,000 | 160,000 | 0.028 | 725,268,349 | 5,802 |
-| int64_random | flat | 20,000 | 160,000 | 0.025 | 814,398,567 | 6,515 |
-| int64_constant | constant | 20,000 | 160,000 | 0.009 | 2,176,041,780 | 17,408 |
-| int64_runs | rle | 20,000 | 160,000 | 0.015 | 1,327,668,614 | 10,621 |
-| float64_random | byte-stream-split+zstd | 20,000 | 160,000 | 0.040 | 495,970,242 | 3,968 |
-| bool | bool-packed | 20,000 | 20,000 | 0.008 | 2,421,307,506 | 2,421 |
-| str_few_values | dict | 20,000 | 280,004 | 0.130 | 154,248,386 | 2,160 |
-| str_runs | dict-rle | 20,000 | 180,004 | 0.046 | 433,924,193 | 3,905 |
-| str_unique | variable | 20,000 | 228,894 | 0.057 | 352,032,105 | 4,029 |
-| str_320_bytes | variable | 20,000 | 6,480,004 | 1.882 | 10,626,388 | 3,443 |
-| str_4200_bytes | full-zip | 20,000 | 84,080,004 | 139.458 | 143,413 | 603 |
+| int64_seq | bitpack | 2,097,152 | 16,777,216 | 5.670 | 369,890,584 | 2,959 |
+| int64_random | flat | 2,097,152 | 16,777,216 | 4.880 | 429,719,342 | 3,438 |
+| int64_constant | constant | 2,097,152 | 16,777,216 | 1.860 | 1,127,684,172 | 9,021 |
+| int64_runs | rle | 2,097,152 | 16,777,216 | 1.146 | 1,830,628,907 | 14,645 |
+| float64_random | byte-stream-split+zstd | 2,097,152 | 16,777,216 | 6.259 | 335,048,770 | 2,680 |
+| bool | bool-packed | 16,777,216 | 16,777,216 | 2.912 | 5,760,644,970 | 5,761 |
+| str_few_values | dict | 1,198,373 | 16,777,226 | 8.466 | 141,550,863 | 1,982 |
+| str_runs | dict-rle | 1,864,136 | 16,777,228 | 3.367 | 553,605,538 | 4,982 |
+| str_unique | variable | 1,277,738 | 16,777,226 | 12.889 | 99,131,321 | 1,302 |
+| str_320_bytes | variable | 51,782 | 16,777,372 | 5.046 | 10,262,010 | 3,325 |
+| str_4200_bytes | full-zip | 3,991 | 16,778,168 | 5.048 | 790,630 | 3,324 |
