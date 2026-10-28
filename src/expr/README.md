@@ -1,5 +1,9 @@
 # expr: what a filter means (no storage)
 
+<!-- layer-deps:start -->
+Layer 7 of 11 (1 is the bottom, 11 the top). Uses: [base](../base/README.md), [arrow](../arrow/README.md). Used by: [scan](../scan/README.md), [index](../index/README.md), [dataset](../dataset/README.md), [api](../api/README.md). See [docs/LAYERS.md](../../docs/LAYERS.md).
+<!-- layer-deps:end -->
+
 The expr layer parses and evaluates SQL expressions over Arrow record batches: the filters of a scan, count,
 delete or update (`id > 100 AND name LIKE 'a%'`), and the values an update or an added column writes
 (`price * 2`). It follows DataFusion's SQL as pylance runs it, coercions and errors included, and refuses

@@ -1,5 +1,9 @@
 # dataset: the operations a user calls on a dataset, each committed as one version
 
+<!-- layer-deps:start -->
+Layer 10 of 11 (1 is the bottom, 11 the top). Uses: [io](../io/README.md), [arrow](../arrow/README.md), [encoding](../encoding/README.md), [file](../file/README.md), [table](../table/README.md), [expr](../expr/README.md), [scan](../scan/README.md), [index](../index/README.md). Used by: [api](../api/README.md). See [docs/LAYERS.md](../../docs/LAYERS.md).
+<!-- layer-deps:end -->
+
 The dataset layer is where a user's request becomes a new version: write sessions (create, append, overwrite),
 delete, update, merge_insert, adding, altering and dropping columns, compaction, keeping indexes up to date and
 committing index segments, restore, config and metadata changes, and the version inspection the pylance- and

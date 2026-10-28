@@ -1,5 +1,9 @@
 # encoding: how one page of one column is laid out, in both directions
 
+<!-- layer-deps:start -->
+Layer 4 of 11 (1 is the bottom, 11 the top). Uses: [base](../base/README.md), [arrow](../arrow/README.md). Used by: [file](../file/README.md), [scan](../scan/README.md), [dataset](../dataset/README.md). See [docs/LAYERS.md](../../docs/LAYERS.md).
+<!-- layer-deps:end -->
+
 This layer turns a page's bytes into a column's values and back: the value encodings (bitpacking, run-length,
 dictionary, FSST, general zstd / LZ4 compression, byte-stream split), the page layouts around them (mini-block,
 full-zip, constant and all-null, the legacy blob layout), repetition and definition levels, and the format 2.0

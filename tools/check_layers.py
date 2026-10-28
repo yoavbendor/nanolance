@@ -109,10 +109,12 @@ def strongly_connected(nodes, adj):
     return sorted(out)
 
 
-def run(root, write):
+def collect(root):
+    """Read the layout and every file the check scans. Returns (layout, layer_of, errors, per_layer, modules,
+    edges), where edges are (includer module, included module, file, line) for each include between known
+    modules. tools/gen_layer_docs.py reads the same edges."""
     layout = load_layout(root)
     layer_of = layout.module_layer()
-    rank = layout.rank()
     layer_dir = {name: d for name, d, _ in layout.LAYERS}
     errors = []
     per_layer = {name: [0, 0] for name, _, _ in layout.LAYERS}  # files, lines
@@ -149,6 +151,13 @@ def run(root, write):
             if target == module or target not in layer_of:
                 continue  # self-edge, or third-party / system header
             edges.append((module, target, rel, n))
+
+    return layout, layer_of, errors, per_layer, modules, edges
+
+
+def run(root, write):
+    layout, layer_of, errors, per_layer, modules, edges = collect(root)
+    rank = layout.rank()
 
     occurrences = [(a, b, rel, n) for a, b, rel, n in edges if rank[layer_of[b]] > rank[layer_of[a]]]
     pairs = sorted({(a, b) for a, b, _, _ in occurrences})

@@ -1,5 +1,9 @@
 # table: what a version is -- manifest, fragments, deletions, row ids, transactions, refs, index metadata
 
+<!-- layer-deps:start -->
+Layer 6 of 11 (1 is the bottom, 11 the top). Uses: [base](../base/README.md), [io](../io/README.md), [arrow](../arrow/README.md), [file](../file/README.md). Used by: [scan](../scan/README.md), [index](../index/README.md), [dataset](../dataset/README.md), [api](../api/README.md). See [docs/LAYERS.md](../../docs/LAYERS.md).
+<!-- layer-deps:end -->
+
 This layer reads and writes the Lance table format around the data files: the manifest of each version
 (`_versions/`), its fragments and their data and deletion files, base paths, row id and row version
 sequences, data overlays, the transaction of each commit (`_transactions/`) and the conflict verdicts

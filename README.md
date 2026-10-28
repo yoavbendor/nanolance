@@ -148,19 +148,22 @@ Embedding in another CMake project: `add_subdirectory` with `NANOLANCE_BUILD_TES
 Each layer's README says what it is for, how to use it, and what of the Lance specification it implements;
 its tests are in `tests/<layer>/` (`ctest -L layer:<layer>`).
 
-| Layer | What it is |
-|---|---|
-| [base](src/base/README.md) | threads, buffers, caches, Unicode, small utilities |
-| [io](src/io/README.md) | where bytes live: local files and object stores |
-| [arrow](src/arrow/README.md) | Arrow arrays and schemas, and how they map to Lance's types |
-| [encoding](src/encoding/README.md) | how one page of one column is laid out, both directions |
-| [file](src/file/README.md) | a `.lance` file: pages, column metadata, global buffers, footer |
-| [table](src/table/README.md) | what a version is: manifest, fragments, deletions, row ids, transactions, refs |
-| [expr](src/expr/README.md) | what a filter means |
-| [scan](src/scan/README.md) | reading rows of fragments, given a row selection |
-| [index](src/index/README.md) | each index kind: build, search, describe |
-| [dataset](src/dataset/README.md) | user operations: writes, updates, merge-insert, compaction, index lifecycle |
-| [api](src/api/README.md) | the C APIs and lance-c |
+The table runs from the bottom layer (1, base) to the top layer (11, api). [docs/LAYERS.md](docs/LAYERS.md) has
+the diagram and each layer's direct dependencies.
+
+| Number | Layer | What it is |
+|---|---|---|
+| 1 | [base](src/base/README.md) | threads, buffers, caches, Unicode, small utilities |
+| 2 | [io](src/io/README.md) | where bytes live: local files and object stores |
+| 3 | [arrow](src/arrow/README.md) | Arrow arrays and schemas, and how they map to Lance's types |
+| 4 | [encoding](src/encoding/README.md) | how one page of one column is laid out, both directions |
+| 5 | [file](src/file/README.md) | a `.lance` file: pages, column metadata, global buffers, footer |
+| 6 | [table](src/table/README.md) | what a version is: manifest, fragments, deletions, row ids, transactions, refs |
+| 7 | [expr](src/expr/README.md) | what a filter means |
+| 8 | [scan](src/scan/README.md) | reading rows of fragments, given a row selection |
+| 9 | [index](src/index/README.md) | each index kind: build, search, describe |
+| 10 | [dataset](src/dataset/README.md) | user operations: writes, updates, merge-insert, compaction, index lifecycle |
+| 11 | [api](src/api/README.md) | the C APIs and lance-c |
 
 [src/README.md](src/README.md) has the rules between them. Public headers are in `include/nanolance/`.
 
