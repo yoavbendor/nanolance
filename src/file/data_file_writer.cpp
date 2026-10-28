@@ -1851,921 +1851,1069 @@ bool write_nested_blob_column(std::ostream& out, const LanceField& field, const 
     return true;
 }
 
-bool write_lance_data_file(const std::filesystem::path& dataset_path,
-                           const std::string& file_name,
-                           const LanceSchemaMapping& mapping,
-                           const std::vector<ColumnValues>& column_values,
-                           std::uint64_t rows,
-                           int compression_level,
-                           bool compress,
-                           DataFileResult& result,
-                           std::string& error,
-                           bool parallel_columns,
-                           const LanceFileExtras* extras) {
-    error.clear();
-    if (mapping.fields.empty()) {
-        error = "cannot write Lance data file without mapped fields";
-        return false;
-    }
-    const auto physical_fields = lance_physical_fields(mapping);
-    if (column_values.size() != physical_fields.size()) {
-        error = "column value count does not match physical schema field count";
-        return false;
-    }
+namespace {
 
-    const auto relative_path =
-        extras != nullptr && !extras->path.empty() ? extras->path : std::filesystem::path("data") / file_name;
-    const auto full_path = extras != nullptr && !extras->path.empty() ? extras->path : dataset_path / relative_path;
-    work_stats::WrittenFileTally tally(full_path);
-    // A local file (its directory created), or an object uploaded on commit() (io::open_output).
-    auto output = io::open_output(full_path.string(), error);
-    if (!output) {
-        return false;
-    }
-    std::ostream& out = *output;
-
-    // Lance's blob preprocessing, now that the file's name is known: blobs given as bytes are placed --
-    // inline ones here at the head of the file, before any column (their descriptors hold absolute
-    // positions, which a column buffered on its own thread could not), packed and dedicated ones in
-    // sidecar files beside it.
-    std::vector<const ColumnValues*> column_source(physical_fields.size());
+/// The state the steps of write_lance_data_file share: the physical fields, each column's values and the
+/// values it is written from (a blob column's placed copy), and the row count and compression options.
+struct FileWriteState {
+    const std::vector<const LanceField*>& physical_fields;
+    const std::vector<ColumnValues>& column_values;
+    std::vector<const ColumnValues*> column_source;
     std::vector<ColumnValues> placed_blobs;
-    {
-        BlobV2Placer placer(full_path, extras != nullptr ? extras->blob_pack_file_size : 0U);
-        std::size_t blob_columns = 0;
-        for (const auto& v : column_values) {
-            blob_columns += v.kind == ColumnValues::Kind::BlobV2External ? 1U : 0U;
-        }
-        placed_blobs.reserve(blob_columns);
-        for (std::size_t i = 0; i < physical_fields.size(); ++i) {
-            column_source[i] = &column_values[i];
-            if (column_values[i].kind != ColumnValues::Kind::BlobV2External ||
-                !blob_v2_has_pending(column_values[i])) {
-                continue;  // external references (or nulls) only: stored as they are
-            }
-            BlobV2Thresholds thresholds;
-            if (!blob_v2_thresholds(*physical_fields[i], thresholds, error)) {
-                return false;
-            }
-            placed_blobs.emplace_back();
-            if (!placer.place(column_values[i], thresholds, out, placed_blobs.back(), error)) {
-                return false;
-            }
-            column_source[i] = &placed_blobs.back();
-        }
-        if (!placer.finish(error)) {
-            return false;
-        }
-    }
+    std::uint64_t rows;
+    int compression_level;
+    bool compress;
+};
 
-    // One column's pages, written to `out` (the file, or with several threads a buffer of its own).
-    const auto encode_column = [&](std::size_t field_index, std::ostream& out,
-                                   std::vector<pb::ColumnMetadata>& columns, std::string& error) -> bool {
-        const auto& field = *physical_fields[field_index];
-        const auto& values = *column_source[field_index];
-        // `lance-encoding:compression=zstd` on one column (pylance's per-column option) zstd-compresses that
-        // column alone, as the writer-wide `compress` flag does for every string column. Such a column
-        // skips FSST, which would otherwise be chosen where it pays.
-        const auto zstd_option = field.metadata.find("lance-encoding:compression");
-        const bool zstd_requested = zstd_option != field.metadata.end() && zstd_option->second == "zstd";
-        const bool compress_column = compress || zstd_requested;
+/// One column's inputs for the per-encoding writers below: its field and values, the row count, what
+/// encode_column has already decided about it (its compression and its nulls), and its nanolance:packing tag.
+struct ColumnEncodeContext {
+    const LanceField& field;
+    const ColumnValues& values;
+    std::uint64_t rows;
+    int compression_level;
+    bool compress;
+    bool zstd_requested;
+    bool compress_column;
+    bool column_has_nulls;
+    decltype(LanceField::metadata)::const_iterator packing_it;
+};
 
-        // Nulls are encodable only on the paths that have been taught the definition-level layer.
-        // Everything else must refuse rather than drop them: ingest no longer rejects a null batch,
-        // so this is the backstop that keeps a column with nulls from being written as if it had
-        // none -- which is exactly the silent [10, null, 30] -> [10, 0, 30] corruption this whole
-        // area is here to prevent.
-        const bool column_has_nulls = values.null_count != 0U;
-        if (column_has_nulls) {
-            if (values.validity.empty()) {
-                error = "column '" + field.name + "' reports " + std::to_string(values.null_count) +
-                        " nulls but carries no validity bitmap";
-                return false;
-            }
-        }
+/// The fixed-width encoding picked for a column: bit-packed, bool, byte-stream-split + zstd, or flat.
+struct FixedWidthChoice {
+    bool bitpack;
+    bool bool_pack;
+    bool bss_zstd;
+    std::size_t bytes_per_value;
+};
 
-        if (values.kind == ColumnValues::Kind::BlobV2External && !values.layers.empty()) {
-            pb::ColumnMetadata column;
-            if (!write_nested_blob_column(out, field, values, rows, column, error)) {
-                return false;
-            }
-            columns.push_back(std::move(column));
-            return true;
-        }
-        if (values.kind == ColumnValues::Kind::BlobV2External) {
-            const auto& blob = values.blob_v2;
-            if (blob.row_packed_sizes.size() != static_cast<std::size_t>(rows)) {
-                error = "blob v2 row count does not match fragment row count for ";
-                error += field.name;
-                return false;
-            }
-            // With nulls, each row starts with its definition level (1: null), a null row being that
-            // byte alone -- Lance's FullZip with one definition layer.
-            const bool nullable = column_has_nulls;
-            std::vector<std::uint8_t> with_levels;
-            std::vector<std::uint32_t> level_sizes;
-            if (nullable) {
-                with_levels.reserve(blob.packed_payload.size() + blob.row_packed_sizes.size());
-                level_sizes.reserve(blob.row_packed_sizes.size());
-                std::size_t at = 0;
-                for (std::size_t r = 0; r < blob.row_packed_sizes.size(); ++r) {
-                    const bool valid = validity_bit(values.validity, r);
-                    const auto n = blob.row_packed_sizes[r];
-                    with_levels.push_back(valid ? 0U : 1U);
-                    if (valid) {
-                        with_levels.insert(with_levels.end(), blob.packed_payload.begin() + static_cast<std::ptrdiff_t>(at),
-                                           blob.packed_payload.begin() + static_cast<std::ptrdiff_t>(at + n));
-                    }
-                    at += n;
-                    level_sizes.push_back(valid ? n + 1U : 1U);
-                }
-            }
-            const auto& payload = nullable ? with_levels : blob.packed_payload;
-            const auto control = blob_v2_build_control_buffer(nullable ? level_sizes : blob.row_packed_sizes);
+/// Writes a blob-v2 column: a nested blob column with its layers, or packed blob descriptions.
+/// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
+bool write_blob_v2_column(const ColumnEncodeContext& ctx, std::ostream& out, std::vector<pb::ColumnMetadata>& columns,
+                          std::string& error) {
+    const auto& field = ctx.field;
+    const auto& values = ctx.values;
+    const auto rows = ctx.rows;
+    const bool column_has_nulls = ctx.column_has_nulls;
 
-            align64(out);
-            const auto values_offset = pos(out);
-            out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
-
-            align64(out);
-            const auto control_offset = pos(out);
-            out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
-
-            pb::ColumnMetadata column;
-            column.encoding = column_encoding_bytes();
-            pb::ColumnPage page;
-            page.buffer_offsets.push_back(values_offset);
-            page.buffer_offsets.push_back(control_offset);
-            page.buffer_sizes.push_back(payload.size());
-            page.buffer_sizes.push_back(control.size());
-            page.length = rows;
-            page.priority = 0;
-            page.encoding = blob_v2_descriptor_page_encoding(rows, nullable);
-            column.pages.push_back(std::move(page));
-            columns.push_back(std::move(column));
-            return true;
-        }
-
-        if (values.needs_nested_pages()) {
-            pb::ColumnMetadata column;
-            if (!write_nested_column(out, field, values, rows, column, error)) {
-                return false;
-            }
-            columns.push_back(std::move(column));
-            return true;
-        }
-
-        // Arrow's null type: every row is null and there is no value to store at all. An empty struct
-        // (a physical "struct" column) is written the same way, as Lance writes it: the page says
-        // nothing a reader needs, the type says every row is a valid empty struct.
-        if (field.logical_type == "null" || field.logical_type == "struct") {
-            pb::ColumnMetadata column;
-            column.encoding = column_encoding_bytes();
-            pb::ColumnPage page;
-            page.length = rows;
-            page.priority = 0;
-            page.encoding = all_null_constant_layout_message();
-            column.pages.push_back(std::move(page));
-            columns.push_back(std::move(column));
-            return true;
-        }
-
-        // An Arrow dictionary column: Lance's dictionary page -- the indices, at the index type's
-        // width, in mini-block chunks, and the dictionary it was given (unused entries and order
-        // kept) as the page's third buffer.
-        if (!field.dictionary_index_format.empty()) {
-            const bool variable = values.kind == ColumnValues::Kind::VariableWidth;
-            const bool large = values.variable.large;
-            const auto& format = field.dictionary_index_format;
-            const std::size_t iw = format == "c" || format == "C" ? 1U : format == "s" || format == "S" ? 2U
-                                   : format == "i" || format == "I"                                  ? 4U
-                                                                                                     : 8U;
-            const std::size_t width = variable ? 0U : lance_logical_type_value_bytes(field.logical_type);
-            const auto value_at = [&](std::uint64_t r) -> std::string_view {
-                if (!variable) {
-                    return {reinterpret_cast<const char*>(values.fixed_data() + r * width), width};
-                }
-                std::uint64_t s = 0;
-                std::uint64_t e = 0;
-                if (large) {
-                    std::memcpy(&s, values.variable.offsets.data() + r * 8U, 8U);
-                    std::memcpy(&e, values.variable.offsets.data() + (r + 1U) * 8U, 8U);
-                } else {
-                    std::uint32_t s32 = 0;
-                    std::uint32_t e32 = 0;
-                    std::memcpy(&s32, values.variable.offsets.data() + r * 4U, 4U);
-                    std::memcpy(&e32, values.variable.offsets.data() + (r + 1U) * 4U, 4U);
-                    s = s32;
-                    e = e32;
-                }
-                return {reinterpret_cast<const char*>(values.variable.data.data() + s), static_cast<std::size_t>(e - s)};
-            };
-            std::vector<std::string> entries;
-            if (values.dictionary != nullptr) {
-                entries = *values.dictionary;
-            }
-            std::unordered_map<std::string_view, std::uint64_t> lookup;
-            for (std::size_t k = 0; k < entries.size(); ++k) {
-                lookup.emplace(std::string_view(entries[k]), k);
-            }
-            std::deque<std::string> extra;  // values the dictionary lacks (none, from an Arrow dictionary)
-            std::vector<std::uint8_t> indices(static_cast<std::size_t>(rows) * iw, 0U);
-            for (std::uint64_t r = 0; r < rows; ++r) {
-                if (!values.validity.empty() && ((values.validity[r >> 3U] >> (r & 7U)) & 1U) == 0U) {
-                    continue;
-                }
-                const auto v = value_at(r);
-                auto it = lookup.find(v);
-                if (it == lookup.end()) {
-                    extra.emplace_back(v);
-                    it = lookup.emplace(std::string_view(extra.back()), entries.size() + extra.size() - 1U).first;
-                }
-                std::memcpy(indices.data() + r * iw, &it->second, iw);
-            }
-            // (A deque: `lookup` holds views into its strings, which must not move.)
-            for (auto& e : extra) {
-                entries.push_back(e);
-            }
-            std::vector<std::uint8_t> dict_block;
-            std::vector<std::uint8_t> dict_encoding;
-            if (variable) {
-                std::vector<std::string_view> views(entries.begin(), entries.end());
-                dict_block = dictionary::encode_variable(views, large);
-                dict_encoding = descriptor::variable(descriptor::flat(offset_bits_token(large)));
-            } else {
-                dict_block = dictionary::encode_fixed(entries);
-                dict_encoding = descriptor::flat(static_cast<std::uint32_t>(width * 8U));
-            }
-            const auto by_bytes = max_values_per_uncompressed_chunk(iw);
-            const auto multi = multichunk_values(column_has_nulls ? std::min<std::size_t>(1024U, by_bytes) : by_bytes);
-            const auto max_chunk = multi != 0U ? multi : std::size_t{1};
-            pb::ColumnMetadata column;
-            column.encoding = column_encoding_bytes();
-            MiniblockPageWriter page_writer(out);
-            for (std::size_t off = 0; off < rows;) {
-                const auto count = std::min<std::size_t>(max_chunk, rows - off);
-                const auto def = column_has_nulls ? pack_definition_levels(values.validity, off, count)
-                                                  : std::vector<std::uint8_t>{};
-                page_writer.begin_chunk();
-                const auto footprint = stream_miniblock_chunk(out, count, def, {{indices.data() + off * iw, count * iw}});
-                page_writer.end_chunk(footprint, count);
-                off += count;
-            }
-            pb::ColumnPage page;
-            if (rows > 0U) {
-                page_writer.finish(page);
-            } else {
-                page.length = 0;
-            }
-            align64(out);
-            page.buffer_offsets.push_back(pos(out));
-            page.buffer_sizes.push_back(dict_block.size());
-            out.write(reinterpret_cast<const char*>(dict_block.data()), static_cast<std::streamsize>(dict_block.size()));
-            descriptor::MiniBlock m;
-            m.value_compression = descriptor::flat(static_cast<std::uint32_t>(iw * 8U));
-            m.dictionary = dict_encoding;
-            m.num_dictionary_items = entries.size();
-            if (column_has_nulls) {
-                m.def_compression = repdef_encoding_bytes();
-            }
-            mini_block_tail(m, rows, 1U, column_has_nulls);
-            page.encoding = descriptor::page_encoding(m);
-            column.pages.push_back(std::move(page));
-            columns.push_back(std::move(column));
-            return true;
-        }
-
-        // A fixed_size_list with null elements inside valid rows: Lance's mini-block chunks of two
-        // buffers, the elements' validity bits then the values, under FixedSizeList{has_validity}.
-        if (!values.item_validity.empty()) {
-            std::string element;
-            std::uint64_t items = 0;
-            if (!lance_fixed_size_list_parts(field.logical_type, element, items) || items == 0U) {
-                error = "element validity on a column that is not a fixed_size_list: " + field.name;
-                return false;
-            }
-            const auto element_bytes = lance_logical_type_value_bytes(element);
-            const auto row_bytes = element_bytes * items;
-            const auto total = values.fixed_size() / row_bytes;
-            const auto by_bytes = max_values_per_uncompressed_chunk(row_bytes + (items + 7U) / 8U + 1U);
-            const auto multi = multichunk_values(column_has_nulls ? std::min<std::size_t>(1024U, by_bytes) : by_bytes);
-            const auto max_chunk_rows = multi != 0U ? multi : std::size_t{1};
-            pb::ColumnMetadata column;
-            column.encoding = column_encoding_bytes();
-            MiniblockPageWriter page_writer(out);
-            std::vector<std::uint8_t> bits;
-            for (std::size_t off = 0; off < total;) {
-                const auto count = std::min<std::size_t>(max_chunk_rows, static_cast<std::size_t>(total - off));
-                const auto first = static_cast<std::uint64_t>(off) * items;
-                const auto n = static_cast<std::uint64_t>(count) * items;
-                bits.assign(static_cast<std::size_t>((n + 7U) / 8U), 0U);
-                for (std::uint64_t k = 0; k < n; ++k) {
-                    const auto at = first + k;
-                    if ((values.item_validity[at >> 3U] >> (at & 7U)) & 1U) {
-                        bits[k >> 3U] |= static_cast<std::uint8_t>(1U << (k & 7U));
-                    }
-                }
-                const auto def = column_has_nulls ? pack_definition_levels(values.validity, off, count)
-                                                  : std::vector<std::uint8_t>{};
-                page_writer.begin_chunk();
-                const auto footprint = stream_miniblock_chunk(
-                    out, count, def, {{bits.data(), bits.size()}, {values.fixed_data() + off * row_bytes, count * row_bytes}});
-                page_writer.end_chunk(footprint, count);
-                off += count;
-                if (off < total && multi != 0U && page_writer.payload_bytes() < kTargetMiniblockPageBytes) {
-                    continue;
-                }
-                pb::ColumnPage page;
-                const auto page_rows = page_writer.rows();
-                page_writer.finish(page);
-                descriptor::MiniBlock m;
-                m.value_compression =
-                    descriptor::fixed_size_list(items, descriptor::flat(static_cast<std::uint32_t>(element_bytes * 8U)), true);
-                if (column_has_nulls) {
-                    m.def_compression = repdef_encoding_bytes();
-                }
-                mini_block_tail(m, page_rows, 2U, column_has_nulls);
-                page.encoding = descriptor::page_encoding(m);
-                column.pages.push_back(std::move(page));
-            }
-            columns.push_back(std::move(column));
-            return true;
-        }
-
-        // Constant column (tagged by the writer): ConstantLayout. The single value comes from the
-        // field metadata. Fixed-width stores it inline (zero data buffers); variable-width stores it
-        // in one data buffer.
-        const auto packing_it = field.metadata.find("nanolance:packing");
-// Skipped for a column with nulls: these encodings rewrite the value sequence (a constant column
-        // stores one value, RLE stores runs, a dictionary stores indices) and the definition-level layer is
-        // positional -- one level per value, in row order. Pairing them needs the levels to be encoded
-        // against the rewritten sequence, which is not done yet, so a nullable column takes the flat or
-        // bit-packed path instead. It costs size, never correctness.
-        // A fixed-width constant is inlined in the descriptor, which Lance caps at 32 bytes. Wider
-        // ones fall through to the flat path -- this used to write the inline value's length as ONE
-        // byte, so any value of 128 bytes or more produced a descriptor neither nanolance nor pylance
-        // could parse: a corrupt file, from a constant fixed_size_binary(200) column.
-        const bool constant_fits =
-            lance_field_is_variable_width(field.logical_type) ||
-            lance_logical_type_value_bytes(field.logical_type) <= kMaxInlineConstantBytes;
-        if (!column_has_nulls && constant_fits && packing_it != field.metadata.end() &&
-            packing_it->second == "constant") {
-            const auto value_it = field.metadata.find("nanolance:const-value");
-            if (value_it == field.metadata.end()) {
-                error = "constant column missing nanolance:const-value for ";
-                error += field.name;
-                return false;
-            }
-            const std::vector<std::uint8_t> value(value_it->second.begin(), value_it->second.end());
-            pb::ColumnMetadata column;
-            column.encoding = column_encoding_bytes();
-            pb::ColumnPage page;
-            page.length = rows;
-            page.priority = 0;
-            if (lance_field_is_variable_width(field.logical_type)) {
-                const bool large =
-                    lance_logical_type_has_large_offsets(field.logical_type);
-                const auto scalar_buffer = scalar_value::encode_variable(value, large);
-                align64(out);
-                const auto value_offset = pos(out);
-                out.write(reinterpret_cast<const char*>(scalar_buffer.data()),
-                          static_cast<std::streamsize>(scalar_buffer.size()));
-                page.buffer_offsets.push_back(value_offset);
-                page.buffer_sizes.push_back(scalar_buffer.size());
-                page.encoding = constant_layout_message(nullptr);  // value is in the data buffer
-            } else {
-                page.encoding = constant_layout_message(&value);  // inline, no data buffers
-            }
-            column.pages.push_back(std::move(page));
-            columns.push_back(std::move(column));
-            return true;
-        }
-
-        // Run-length encoded fixed-width column (tagged by the writer): one chunk with two buffers
-        // (run values + run lengths) -> Rle PageLayout.
-        if (!column_has_nulls && packing_it != field.metadata.end() && packing_it->second == "rle" &&
-            values.kind == ColumnValues::Kind::FixedWidth) {
-            const auto bpv = value_width_bytes(field);
-            const std::size_t n = values.fixed_size() / bpv;
-            std::vector<std::uint8_t> run_values;
-            std::vector<std::uint8_t> run_lengths;  // Lance requires 8-bit run lengths
-            auto emit_run = [&](std::size_t row, std::uint64_t run) {
-                rle::append_run(std::span<const std::uint8_t>(values.fixed_data() + row * bpv, bpv), run, run_values,
-                                run_lengths);
-            };
-            if (values.fixed_rle_plan.computed) {
-                // The write-side "is RLE beneficial?" heuristic already detected every run while
-                // deciding -- reuse it verbatim instead of re-running the same memcmp-based scan.
-                for (const auto& [row, run] : values.fixed_rle_plan.runs) {
-                    emit_run(row, run);
-                }
-            } else {
-                std::size_t i = 0;
-                while (i < n) {
-                    std::size_t run = 1;
-                    while (i + run < n && std::memcmp(values.fixed_data() + (i + run) * bpv,
-                                                      values.fixed_data() + i * bpv, bpv) == 0) {
-                        ++run;
-                    }
-                    emit_run(i, run);
-                    i += run;
-                }
-            }
-            const std::size_t length_bytes = 1U;
-            std::vector<std::uint8_t> chunk_bytes;
-            const std::span<const std::uint8_t> run_buffers[2] = {run_values, run_lengths};
-            miniblock::append_chunk(chunk_bytes, 0U, {}, run_buffers);
-            const miniblock::ChunkMeta meta[1] = {{chunk_bytes.size(), n}};
-            const auto control = miniblock::control_buffer(meta);
-
-            align64(out);
-            const auto control_offset = pos(out);
-            out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
-            align64(out);
-            const auto data_offset = pos(out);
-            out.write(reinterpret_cast<const char*>(chunk_bytes.data()), static_cast<std::streamsize>(chunk_bytes.size()));
-
-            pb::ColumnMetadata column;
-            column.encoding = column_encoding_bytes();
-            pb::ColumnPage page;
-            page.buffer_offsets.push_back(control_offset);
-            page.buffer_offsets.push_back(data_offset);
-            page.buffer_sizes.push_back(control.size());
-            page.buffer_sizes.push_back(chunk_bytes.size());
-            page.length = rows;
-            page.priority = 0;
-            page.encoding = page_layout_bytes_rle(static_cast<std::uint8_t>(bpv * 8U),
-                                                  static_cast<std::uint8_t>(length_bytes * 8U), rows);
-            column.pages.push_back(std::move(page));
-            columns.push_back(std::move(column));
-            return true;
-        }
-
-        // Dictionary + RLE for a low-cardinality variable-width column: distinct values in buffer[2],
-        // per-row u32 indices RLE'd in buffer[1].
-        if (!column_has_nulls && packing_it != field.metadata.end() && packing_it->second == "dict-rle" &&
-            values.kind == ColumnValues::Kind::VariableWidth) {
-            const bool large =
-                lance_logical_type_has_large_offsets(field.logical_type);
-            const std::size_t ow = large ? 8U : 4U;
-            const std::size_t num_rows = values.variable.offsets.size() / ow - 1U;
-            auto read_offset = [&](std::size_t idx) -> std::int64_t {
-                const auto* p = values.variable.offsets.data() + idx * ow;
-                if (large) {
-                    std::int64_t v = 0;
-                    std::memcpy(&v, p, 8);
-                    return v;
-                }
-                std::int32_t v = 0;
-                std::memcpy(&v, p, 4);
-                return v;
-            };
-            std::vector<std::string_view> distinct;
-            std::vector<std::uint8_t> run_values;
-            std::vector<std::uint8_t> run_lengths;
-            const bool have_rle_plan = values.structural_dict_rle_plan.computed;
-            if (have_rle_plan) {
-                // The write-side "is dict-RLE beneficial?" heuristic already detected every run and
-                // built the (run-keyed, not row-keyed) dictionary while deciding -- reuse it verbatim
-                // instead of re-scanning row-by-row and re-running RLE detection from scratch.
-                distinct = values.structural_dict_rle_plan.distinct;
-                for (const auto& [index, run_length] : values.structural_dict_rle_plan.runs) {
-                    rle::append_index_run(index, run_length, run_values, run_lengths);
-                }
-            } else {
-                // Dictionary keyed by string_view into the stable column data buffer: no per-row heap
-                // string allocation and hash lookups instead of full-string red-black-tree comparisons.
-                std::unordered_map<std::string_view, std::uint32_t> dict;
-                dict.reserve(num_rows / 4U + 1U);
-                std::vector<std::uint32_t> indices;
-                indices.reserve(num_rows);
-                for (std::size_t r = 0; r < num_rows; ++r) {
-                    const auto s = read_offset(r);
-                    const auto e = read_offset(r + 1);
-                    const std::string_view val(reinterpret_cast<const char*>(values.variable.data.data() + s),
-                                               static_cast<std::size_t>(e - s));
-                    const auto id = static_cast<std::uint32_t>(distinct.size());
-                    const auto [it, inserted] = dict.try_emplace(val, id);
-                    if (inserted) {
-                        distinct.push_back(val);
-                    }
-                    indices.push_back(it->second);
-                }
-                // RLE the u32 indices (8-bit sub-runs).
-                for (std::size_t r = 0; r < indices.size();) {
-                    std::size_t run = 1;
-                    while (r + run < indices.size() && indices[r + run] == indices[r]) {
-                        ++run;
-                    }
-                    rle::append_index_run(indices[r], run, run_values, run_lengths);
-                    r += run;
-                }
-            }
-            std::vector<std::uint8_t> chunk_bytes;
-            const std::span<const std::uint8_t> run_buffers[2] = {run_values, run_lengths};
-            miniblock::append_chunk(chunk_bytes, 0U, {}, run_buffers);
-            const miniblock::ChunkMeta meta[1] = {{chunk_bytes.size(), static_cast<std::size_t>(rows)}};
-            const auto control = miniblock::control_buffer(meta);
-            std::vector<std::uint8_t> dict_frame;
-            if (!general::zstd_frame(dictionary::encode_variable(distinct, values.variable.large), compression_level,
-                                   dict_frame, error)) {
-                return false;
-            }
-
-            align64(out);
-            const auto control_offset = pos(out);
-            out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
-            align64(out);
-            const auto data_offset = pos(out);
-            out.write(reinterpret_cast<const char*>(chunk_bytes.data()), static_cast<std::streamsize>(chunk_bytes.size()));
-            align64(out);
-            const auto dict_offset = pos(out);
-            out.write(reinterpret_cast<const char*>(dict_frame.data()), static_cast<std::streamsize>(dict_frame.size()));
-
-            pb::ColumnMetadata column;
-            column.encoding = column_encoding_bytes();
-            pb::ColumnPage page;
-            page.buffer_offsets.push_back(control_offset);
-            page.buffer_offsets.push_back(data_offset);
-            page.buffer_offsets.push_back(dict_offset);
-            page.buffer_sizes.push_back(control.size());
-            page.buffer_sizes.push_back(chunk_bytes.size());
-            page.buffer_sizes.push_back(dict_frame.size());
-            page.length = rows;
-            page.priority = 0;
-            page.encoding =
-                page_layout_bytes_dict_rle(static_cast<std::uint32_t>(distinct.size()), rows, values.variable.large);
-            column.pages.push_back(std::move(page));
-            columns.push_back(std::move(column));
-            return true;
-        }
-
-        // Structural dictionary for scattered low-cardinality strings: flat bitpacked u32 indices in
-        // buffer[1], uncompressed dictionary variable block in buffer[2].
-        if (!column_has_nulls && packing_it != field.metadata.end() && packing_it->second == "dict" &&
-            values.kind == ColumnValues::Kind::VariableWidth) {
-            const bool large =
-                lance_logical_type_has_large_offsets(field.logical_type);
-            const std::size_t ow = large ? 8U : 4U;
-            const std::size_t num_rows = values.variable.offsets.size() / ow - 1U;
-            auto read_offset = [&](std::size_t idx) -> std::int64_t {
-                const auto* p = values.variable.offsets.data() + idx * ow;
-                if (large) {
-                    std::int64_t v = 0;
-                    std::memcpy(&v, p, 8);
-                    return v;
-                }
-                std::int32_t v = 0;
-                std::memcpy(&v, p, 4);
-                return v;
-            };
-            // Reuse the dictionary the write-side heuristic already built for this column when it is
-            // available (the common path via the public writer): the (dedup + per-row index) scan is
-            // identical, so recomputing it here would double the hashing/comparison work for exactly
-            // the columns this encoding targets. Fall back to building it for direct callers of
-            // write_lance_data_file that never ran the heuristic (e.g. some tests).
-            std::unordered_map<std::string_view, std::uint32_t> dict;  // only used on the fallback path
-            std::vector<std::string_view> local_distinct;
-            std::vector<std::uint32_t> local_indices;
-            const bool have_plan = values.structural_dict_plan.computed;
-            if (!have_plan) {
-                dict.reserve(num_rows / 4U + 1U);
-                local_indices.reserve(num_rows);
-                for (std::size_t r = 0; r < num_rows; ++r) {
-                    const auto s = read_offset(r);
-                    const auto e = read_offset(r + 1);
-                    const std::string_view val(reinterpret_cast<const char*>(values.variable.data.data() + s),
-                                               static_cast<std::size_t>(e - s));
-                    const auto id = static_cast<std::uint32_t>(local_distinct.size());
-                    const auto [it, inserted] = dict.try_emplace(val, id);
-                    if (inserted) {
-                        local_distinct.push_back(val);
-                    }
-                    local_indices.push_back(it->second);
-                }
-            }
-            const std::vector<std::string_view>& distinct =
-                have_plan ? values.structural_dict_plan.distinct : local_distinct;
-            const std::vector<std::uint32_t>& indices =
-                have_plan ? values.structural_dict_plan.indices : local_indices;
-            std::vector<MiniblockChunk> index_chunks;
-            for (std::size_t off = 0; off < indices.size(); off += 1024U) {
-                const auto count = std::min<std::size_t>(1024U, indices.size() - off);
-                MiniblockChunk chunk;
-                chunk.value_count = count;
-                bitpack::encode_block(reinterpret_cast<const std::uint8_t*>(indices.data() + off), count, 4U,
-                                      chunk.bytes);
-                index_chunks.push_back(std::move(chunk));
-            }
-            const auto payload = miniblock_payload(index_chunks);
-            const auto control = control_buffer_for(index_chunks);
-            const auto dict_block = dictionary::encode_variable(distinct, values.variable.large);
-
-            align64(out);
-            const auto control_offset = pos(out);
-            out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
-            align64(out);
-            const auto data_offset = pos(out);
-            out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
-            align64(out);
-            const auto dict_offset = pos(out);
-            out.write(reinterpret_cast<const char*>(dict_block.data()), static_cast<std::streamsize>(dict_block.size()));
-
-            pb::ColumnMetadata column;
-            column.encoding = column_encoding_bytes();
-            pb::ColumnPage page;
-            page.buffer_offsets.push_back(control_offset);
-            page.buffer_offsets.push_back(data_offset);
-            page.buffer_offsets.push_back(dict_offset);
-            page.buffer_sizes.push_back(control.size());
-            page.buffer_sizes.push_back(payload.size());
-            page.buffer_sizes.push_back(dict_block.size());
-            page.length = rows;
-            page.priority = 0;
-            page.encoding =
-                page_layout_bytes_dict(static_cast<std::uint32_t>(distinct.size()), rows, values.variable.large);
-            column.pages.push_back(std::move(page));
-            columns.push_back(std::move(column));
-            return true;
-        }
-
-        std::vector<MiniblockChunk> chunks;
-        const bool is_variable = values.kind == ColumnValues::Kind::VariableWidth;
-        // Bitpacking is a structural encoding, signalled by the writer's packing tag (independent of the
-        // zstd `compress` flag, which now gates only the variable-width zstd path below).
-        const bool bitpack = !is_variable && packing_it != field.metadata.end() &&
-                             packing_it->second == "bitpack" &&
-                             lance_logical_type_is_bitpackable_integer(field.logical_type);
-        // Byte-stream-split + zstd: float/double, tagged when set_compression(true) (writer.cpp).
-        const bool bss_zstd = !is_variable && packing_it != field.metadata.end() &&
-                              packing_it->second == "bss-zstd";
-        // bool is always stored bit-packed (1 bit/value, LSB-first) on disk, matching stock Lance's own
-        // Flat{bits_per_value:1} representation (verified empirically) -- not gated by any opt-in flag.
-        const bool bool_pack = !is_variable && field.logical_type == "bool";
-        const auto fixed_bytes_per_value = value_width_bytes(field);
-        if (!is_variable) {
-            if (values.fixed_size() % fixed_bytes_per_value != 0U) {
-                error = "column value buffer size is not aligned to field width for ";
-                error += field.name;
-                return false;
-            }
-            if (values.fixed_size() / fixed_bytes_per_value != static_cast<std::size_t>(rows)) {
-                error = "column value count does not match row count for ";
-                error += field.name;
-                return false;
-            }
-        }
-
-        // Flat (uncompressed) fixed-width column: stream each miniblock chunk directly from the value
-        // buffer -- the chunk bytes are just a slice of values.fixed, so building a MiniblockChunk
-        // first would only copy them. Chunks are gathered into pages of ~kTargetMiniblockPageBytes
-        // (MiniblockPageWriter); a value too wide for two to share a chunk gets a page per chunk.
-        if (!is_variable && !bitpack && !bss_zstd && !bool_pack) {
-            pb::ColumnMetadata column;
-            column.encoding = column_encoding_bytes();
-            const auto total = values.fixed_size() / fixed_bytes_per_value;
-            std::uint64_t fsl_items = 0;
-            {
-                std::string element;
-                (void)lance_fixed_size_list_parts(field.logical_type, element, fsl_items);
-            }
-            // A chunk that carries definition levels is limited to one FastLanes block (1024
-            // values); without nulls the chunk is sized by its byte budget, rounded down to the
-            // power of two a non-final chunk needs.
-            const auto by_bytes = max_values_per_uncompressed_chunk(fixed_bytes_per_value);
-            const auto multi = multichunk_values(column_has_nulls ? std::min<std::size_t>(1024U, by_bytes) : by_bytes);
-            const auto max_chunk_values = multi != 0U ? multi : std::size_t{1};
-            // Every full page produces IDENTICAL page-encoding bytes: build them once per row count.
-            std::uint64_t cached_rows = 0;
-            std::vector<std::uint8_t> cached_encoding;
-            MiniblockPageWriter page_writer(out);
-            for (std::size_t off = 0; off < total;) {
-                const auto count = std::min(max_chunk_values, total - off);
-                const auto chunk_bytes = count * fixed_bytes_per_value;
-                const auto chunk_repdef =
-                    column_has_nulls ? pack_definition_levels(values.validity, off, count)
-                                     : std::vector<std::uint8_t>{};
-                page_writer.begin_chunk();
-                const auto footprint =
-                    stream_miniblock_chunk(out, count, chunk_repdef,
-                                           values.fixed_data() + off * fixed_bytes_per_value, chunk_bytes);
-                page_writer.end_chunk(footprint, count);
-                off += count;
-                if (off < total && multi != 0U && page_writer.payload_bytes() < kTargetMiniblockPageBytes) {
-                    continue;
-                }
-                pb::ColumnPage page;
-                const auto page_rows = page_writer.rows();
-                page_writer.finish(page);
-                if (page_rows != cached_rows || cached_encoding.empty()) {
-                    cached_rows = page_rows;
-                    cached_encoding =
-                        page_layout_bytes_flat(flat_bits_per_value(field), page_rows, column_has_nulls, fsl_items);
-                }
-                page.encoding = cached_encoding;
-                column.pages.push_back(std::move(page));
-            }
-            columns.push_back(std::move(column));
-            return true;
-        }
-
-        // Bitpack / bool / byte-stream-split+zstd fixed-width columns: STREAM one chunk at a time
-        // through hoisted, loop-reused scratch buffers (build chunk -> write it -> reuse); after the
-        // first chunk resize() touches nothing, since chunks are equal-sized. Pages gather chunks as
-        // the flat path above does.
-        if (bitpack || bool_pack || bss_zstd) {
-            pb::ColumnMetadata column;
-            column.encoding = column_encoding_bytes();
-            const auto total = bool_pack ? values.fixed_size() : values.fixed_size() / fixed_bytes_per_value;
-            std::size_t step = bitpack      ? 1024U  // one FastLanes block per chunk
-                               : bool_pack ? kMaxBoolValuesPerChunk
-                                           : max_values_per_uncompressed_chunk(fixed_bytes_per_value);
-            if (column_has_nulls) {
-                step = std::min<std::size_t>(step, 1024U);  // see pack_definition_levels
-            }
-            // A power of two for every non-final chunk. For byte-stream-split it also keeps the raw
-            // chunk at half the 32 KiB cap, leaving room for a zstd frame that does not shrink.
-            const auto multi = multichunk_values(step);
-            step = multi != 0U ? multi : std::size_t{1};
-            std::vector<std::uint8_t> scratch;  // built chunk bytes, reused across chunks
-            std::vector<std::uint8_t> framed;   // zstd frame (bss-zstd only), reused across chunks
-            auto build_page_encoding = [&](std::uint64_t count) {
-                if (bitpack) {
-                    return page_layout_bytes_inline_bitpacking(
-                        static_cast<std::uint8_t>(fixed_bytes_per_value * 8U), count, column_has_nulls);
-                }
-                if (bool_pack) {
-                    // Plain Flat{bits_per_value:1} -- no CompressiveEncoding wrapper, matching stock Lance.
-                    return page_layout_bytes_flat(flat_bits_per_value(field), count, column_has_nulls);
-                }
-                // byte-stream-split is restricted to 32/64-bit values, so the cast is safe.
-                return page_layout_bytes_bss_zstd(static_cast<std::uint8_t>(flat_bits_per_value(field)), count,
-                                                  column_has_nulls);
-            };
-            std::uint64_t cached_rows = 0;
-            std::vector<std::uint8_t> cached_encoding;
-            MiniblockPageWriter page_writer(out);
-            for (std::size_t off = 0; off < total;) {
-                const auto count = std::min(step, total - off);
-                if (bitpack) {
-                    // Each chunk buffer = [bit_width][FastLanes packed 1024 values].
-                    bitpack::encode_block(values.fixed_data() + off * fixed_bytes_per_value, count,
-                                          fixed_bytes_per_value, scratch);
-                } else if (bool_pack) {
-                    // Bit-pack LSB-first, ceil(count/8) bytes; no zstd on top (stock Lance doesn't
-                    // compress 1-bit-packed bool either). values.fixed is one byte per value here.
-                    boolpack::pack_lsb_first(values.fixed_data() + off, count, scratch);
-                } else {
-                    // Byte-transpose (mantissa/exponent bytes grouped) so the zstd frame compresses
-                    // meaningfully, then frame it: bytes become [u64 raw size][zstd].
-                    scratch.resize(fixed_bytes_per_value * count);
-                    (void)byte_stream_split::encode(
-                        std::as_bytes(std::span(values.fixed_data() + off * fixed_bytes_per_value,
-                                                fixed_bytes_per_value * count)),
-                        fixed_bytes_per_value, std::as_writable_bytes(std::span(scratch)));
-                    if (!general::zstd_frame(scratch, compression_level, framed, error)) {
-                        return false;
-                    }
-                }
-                const auto& chunk_bytes = bss_zstd ? framed : scratch;
-                const auto chunk_repdef =
-                    column_has_nulls ? pack_definition_levels(values.validity, off, count)
-                                     : std::vector<std::uint8_t>{};
-                page_writer.begin_chunk();
-                const auto footprint =
-                    stream_miniblock_chunk(out, count, chunk_repdef, chunk_bytes.data(), chunk_bytes.size());
-                page_writer.end_chunk(footprint, count);
-                off += count;
-                if (off < total && multi != 0U && page_writer.payload_bytes() < kTargetMiniblockPageBytes) {
-                    continue;
-                }
-                pb::ColumnPage page;
-                const auto page_rows = page_writer.rows();
-                page_writer.finish(page);
-                if (page_rows != cached_rows || cached_encoding.empty()) {
-                    cached_rows = page_rows;
-                    cached_encoding = build_page_encoding(page_rows);
-                }
-                page.encoding = cached_encoding;
-                column.pages.push_back(std::move(page));
-            }
-            columns.push_back(std::move(column));
-            return true;
-        }
-
-        // A string column FSST can compress (roadmap F2) goes to the multi-chunk page writer: one
-        // symbol table per page, over 1024-value chunks. The single-chunk pages below would pay the
-        // 2,312-byte table every 32 KiB. build_nested_page still declines FSST page by page when it
-        // does not pay, writing plain Variable chunks instead.
-        // Only when the writer's structural detection tagged the column: FSST is one of those
-        // encodings, and set_structural_encoding(false) must still write plain pages.
-        fsst::Encoder fsst_encoder;
-        if (packing_it != field.metadata.end() && packing_it->second == "fsst" &&
-            train_column_fsst(field, values, fsst_encoder) &&
-            !zstd_requested && (!compress || fsst_pays_on_first_page(fsst_encoder, values, rows))) {
-            pb::ColumnMetadata column;
-            if (!write_nested_column(out, field, values, rows, column, error, &fsst_encoder)) {
-                return false;
-            }
-            columns.push_back(std::move(column));
-            return true;
-        }
-
-        // Every other string or binary column goes to the multi-chunk page writer too, in its plain
-        // mode (Variable chunks, no dictionary, no FSST). The single-chunk pages below describe a
-        // chunk's value bytes in a u16, so one value over ~32 KB -- a JPEG, an audio clip -- wrote a
-        // file Rust Lance could not read, and over 64 KB one nanolance could not read either; they
-        // also cost Rust a page set-up per 32 KB. The multi-chunk writer's chunks carry u32 sizes.
-        // What stays below is zstd (compress), which only these pages carry, and only while every
-        // value fits a chunk.
-        bool value_too_big_for_a_chunk = false;
-        {
-            const auto width = values.variable.large ? 8U : 4U;
-            const auto entries = values.variable.offsets.size() / width;
-            for (std::size_t i = 0; i + 1U < entries && !value_too_big_for_a_chunk; ++i) {
-                value_too_big_for_a_chunk =
-                    variable_offset(values, i + 1U) - variable_offset(values, i) > kMaxVariableMiniblockBytes / 2U;
-            }
-        }
-        if (!compress_column || value_too_big_for_a_chunk) {
-            pb::ColumnMetadata column;
-            // Large values get FullZip pages (row-addressable, as Lance writes them); the rest
-            // MiniBlock chunks.
-            std::uint64_t valid_rows = 0;
-            for (std::uint64_t r = 0; r < rows; ++r) {
-                valid_rows += validity_bit(values.validity, r) ? 1U : 0U;
-            }
-            const auto total_bytes = static_cast<std::uint64_t>(variable_offset(values, rows) - variable_offset(values, 0));
-            const bool full_zip = valid_rows != 0U && total_bytes / valid_rows >= kFullZipMinAverageValueBytes;
-            if (full_zip ? !write_full_zip_variable_column(out, values, rows, column, error)
-                         : !write_nested_column(out, field, values, rows, column, error, nullptr, /*plain=*/true)) {
-                return false;
-            }
-            columns.push_back(std::move(column));
-            return true;
-        }
-
-        // zstd variable-width columns keep the two-phase build (chunks are unequal-sized, driven by
-        // the offsets math in build_variable_chunks_for_column). A nullable column additionally caps
-        // each chunk at one FastLanes block, since that is what a definition-level buffer covers.
-        if (!build_variable_chunks_for_column(values.variable, chunks, error,
-                                              column_has_nulls ? 1024U : 0U)) {
-            return false;
-        }
-        if (column_has_nulls) {
-            std::uint64_t row = 0;
-            for (auto& chunk : chunks) {
-                chunk.repdef = pack_definition_levels(values.validity, row, chunk.value_count);
-                row += chunk.value_count;
-            }
-        }
-
-        const bool zstd_variable = compress_column;
+    if (values.kind == ColumnValues::Kind::BlobV2External && !values.layers.empty()) {
         pb::ColumnMetadata column;
-        column.encoding = column_encoding_bytes();
-        // Hoisted out of the loop (not freshly declared per chunk): general::zstd_frame's resize() only
-        // avoids re-zeroing already-there bytes when the buffer is reused across calls of similar size,
-        // which requires swap (not move) below so `framed`'s capacity survives being handed off.
-        std::vector<std::uint8_t> framed;
-        for (auto& chunk : chunks) {
-            if (zstd_variable) {
-                if (!general::zstd_frame(chunk.bytes, compression_level, framed, error)) {
-                    return false;
-                }
-                std::swap(chunk.bytes, framed);  // value_count unchanged; bytes are now [u64][zstd]
-            }
-            const auto control = control_buffer_for({&chunk, 1});
-            const auto payload = miniblock_payload({&chunk, 1});
-
-            align64(out);
-            const auto control_offset = pos(out);
-            out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
-
-            align64(out);
-            const auto payload_offset = pos(out);
-            out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
-
-            pb::ColumnPage page;
-            page.buffer_offsets.push_back(control_offset);
-            page.buffer_offsets.push_back(payload_offset);
-            page.buffer_sizes.push_back(control.size());
-            page.buffer_sizes.push_back(payload.size());
-            page.length = chunk.value_count;
-            page.priority = 0;
-            const auto bits_token =
-                values.variable.large ? static_cast<std::uint8_t>(0x40U) : static_cast<std::uint8_t>(0x20U);
-            page.encoding = zstd_variable
-                                ? page_layout_bytes_variable_zstd(bits_token, chunk.value_count,
-                                                                  column_has_nulls)
-                                : page_layout_bytes(bits_token, chunk.value_count, true, column_has_nulls);
-            column.pages.push_back(std::move(page));
+        if (!write_nested_blob_column(out, field, values, rows, column, error)) {
+            return false;
         }
         columns.push_back(std::move(column));
         return true;
-    };
+    }
+    const auto& blob = values.blob_v2;
+    if (blob.row_packed_sizes.size() != static_cast<std::size_t>(rows)) {
+        error = "blob v2 row count does not match fragment row count for ";
+        error += field.name;
+        return false;
+    }
+    // With nulls, each row starts with its definition level (1: null), a null row being that
+    // byte alone -- Lance's FullZip with one definition layer.
+    const bool nullable = column_has_nulls;
+    std::vector<std::uint8_t> with_levels;
+    std::vector<std::uint32_t> level_sizes;
+    if (nullable) {
+        with_levels.reserve(blob.packed_payload.size() + blob.row_packed_sizes.size());
+        level_sizes.reserve(blob.row_packed_sizes.size());
+        std::size_t at = 0;
+        for (std::size_t r = 0; r < blob.row_packed_sizes.size(); ++r) {
+            const bool valid = validity_bit(values.validity, r);
+            const auto n = blob.row_packed_sizes[r];
+            with_levels.push_back(valid ? 0U : 1U);
+            if (valid) {
+                with_levels.insert(with_levels.end(), blob.packed_payload.begin() + static_cast<std::ptrdiff_t>(at),
+                                   blob.packed_payload.begin() + static_cast<std::ptrdiff_t>(at + n));
+            }
+            at += n;
+            level_sizes.push_back(valid ? n + 1U : 1U);
+        }
+    }
+    const auto& payload = nullable ? with_levels : blob.packed_payload;
+    const auto control = blob_v2_build_control_buffer(nullable ? level_sizes : blob.row_packed_sizes);
 
-    std::vector<pb::ColumnMetadata> columns;
-    columns.reserve(physical_fields.size());
+    align64(out);
+    const auto values_offset = pos(out);
+    out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+
+    align64(out);
+    const auto control_offset = pos(out);
+    out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
+
+    pb::ColumnMetadata column;
+    column.encoding = column_encoding_bytes();
+    pb::ColumnPage page;
+    page.buffer_offsets.push_back(values_offset);
+    page.buffer_offsets.push_back(control_offset);
+    page.buffer_sizes.push_back(payload.size());
+    page.buffer_sizes.push_back(control.size());
+    page.length = rows;
+    page.priority = 0;
+    page.encoding = blob_v2_descriptor_page_encoding(rows, nullable);
+    column.pages.push_back(std::move(page));
+    columns.push_back(std::move(column));
+    return true;
+}
+
+/// Writes an Arrow null column, or an empty struct: every row is null and no value is stored.
+/// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
+bool write_all_null_column(const ColumnEncodeContext& ctx, std::vector<pb::ColumnMetadata>& columns) {
+    const auto rows = ctx.rows;
+
+    pb::ColumnMetadata column;
+    column.encoding = column_encoding_bytes();
+    pb::ColumnPage page;
+    page.length = rows;
+    page.priority = 0;
+    page.encoding = all_null_constant_layout_message();
+    column.pages.push_back(std::move(page));
+    columns.push_back(std::move(column));
+    return true;
+}
+
+/// Writes an Arrow dictionary column as Lance's dictionary page: the indices, and the dictionary.
+/// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
+bool write_dictionary_column(const ColumnEncodeContext& ctx, std::ostream& out,
+                             std::vector<pb::ColumnMetadata>& columns) {
+    const auto& field = ctx.field;
+    const auto& values = ctx.values;
+    const auto rows = ctx.rows;
+    const bool column_has_nulls = ctx.column_has_nulls;
+
+    const bool variable = values.kind == ColumnValues::Kind::VariableWidth;
+    const bool large = values.variable.large;
+    const auto& format = field.dictionary_index_format;
+    const std::size_t iw = format == "c" || format == "C" ? 1U : format == "s" || format == "S" ? 2U
+                           : format == "i" || format == "I"                                  ? 4U
+                                                                                             : 8U;
+    const std::size_t width = variable ? 0U : lance_logical_type_value_bytes(field.logical_type);
+    const auto value_at = [&](std::uint64_t r) -> std::string_view {
+        if (!variable) {
+            return {reinterpret_cast<const char*>(values.fixed_data() + r * width), width};
+        }
+        std::uint64_t s = 0;
+        std::uint64_t e = 0;
+        if (large) {
+            std::memcpy(&s, values.variable.offsets.data() + r * 8U, 8U);
+            std::memcpy(&e, values.variable.offsets.data() + (r + 1U) * 8U, 8U);
+        } else {
+            std::uint32_t s32 = 0;
+            std::uint32_t e32 = 0;
+            std::memcpy(&s32, values.variable.offsets.data() + r * 4U, 4U);
+            std::memcpy(&e32, values.variable.offsets.data() + (r + 1U) * 4U, 4U);
+            s = s32;
+            e = e32;
+        }
+        return {reinterpret_cast<const char*>(values.variable.data.data() + s), static_cast<std::size_t>(e - s)};
+    };
+    std::vector<std::string> entries;
+    if (values.dictionary != nullptr) {
+        entries = *values.dictionary;
+    }
+    std::unordered_map<std::string_view, std::uint64_t> lookup;
+    for (std::size_t k = 0; k < entries.size(); ++k) {
+        lookup.emplace(std::string_view(entries[k]), k);
+    }
+    std::deque<std::string> extra;  // values the dictionary lacks (none, from an Arrow dictionary)
+    std::vector<std::uint8_t> indices(static_cast<std::size_t>(rows) * iw, 0U);
+    for (std::uint64_t r = 0; r < rows; ++r) {
+        if (!values.validity.empty() && ((values.validity[r >> 3U] >> (r & 7U)) & 1U) == 0U) {
+            continue;
+        }
+        const auto v = value_at(r);
+        auto it = lookup.find(v);
+        if (it == lookup.end()) {
+            extra.emplace_back(v);
+            it = lookup.emplace(std::string_view(extra.back()), entries.size() + extra.size() - 1U).first;
+        }
+        std::memcpy(indices.data() + r * iw, &it->second, iw);
+    }
+    // (A deque: `lookup` holds views into its strings, which must not move.)
+    for (auto& e : extra) {
+        entries.push_back(e);
+    }
+    std::vector<std::uint8_t> dict_block;
+    std::vector<std::uint8_t> dict_encoding;
+    if (variable) {
+        std::vector<std::string_view> views(entries.begin(), entries.end());
+        dict_block = dictionary::encode_variable(views, large);
+        dict_encoding = descriptor::variable(descriptor::flat(offset_bits_token(large)));
+    } else {
+        dict_block = dictionary::encode_fixed(entries);
+        dict_encoding = descriptor::flat(static_cast<std::uint32_t>(width * 8U));
+    }
+    const auto by_bytes = max_values_per_uncompressed_chunk(iw);
+    const auto multi = multichunk_values(column_has_nulls ? std::min<std::size_t>(1024U, by_bytes) : by_bytes);
+    const auto max_chunk = multi != 0U ? multi : std::size_t{1};
+    pb::ColumnMetadata column;
+    column.encoding = column_encoding_bytes();
+    MiniblockPageWriter page_writer(out);
+    for (std::size_t off = 0; off < rows;) {
+        const auto count = std::min<std::size_t>(max_chunk, rows - off);
+        const auto def = column_has_nulls ? pack_definition_levels(values.validity, off, count)
+                                          : std::vector<std::uint8_t>{};
+        page_writer.begin_chunk();
+        const auto footprint = stream_miniblock_chunk(out, count, def, {{indices.data() + off * iw, count * iw}});
+        page_writer.end_chunk(footprint, count);
+        off += count;
+    }
+    pb::ColumnPage page;
+    if (rows > 0U) {
+        page_writer.finish(page);
+    } else {
+        page.length = 0;
+    }
+    align64(out);
+    page.buffer_offsets.push_back(pos(out));
+    page.buffer_sizes.push_back(dict_block.size());
+    out.write(reinterpret_cast<const char*>(dict_block.data()), static_cast<std::streamsize>(dict_block.size()));
+    descriptor::MiniBlock m;
+    m.value_compression = descriptor::flat(static_cast<std::uint32_t>(iw * 8U));
+    m.dictionary = dict_encoding;
+    m.num_dictionary_items = entries.size();
+    if (column_has_nulls) {
+        m.def_compression = repdef_encoding_bytes();
+    }
+    mini_block_tail(m, rows, 1U, column_has_nulls);
+    page.encoding = descriptor::page_encoding(m);
+    column.pages.push_back(std::move(page));
+    columns.push_back(std::move(column));
+    return true;
+}
+
+/// Writes a fixed_size_list column with null elements: validity bits, then the values.
+/// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
+bool write_fixed_size_list_column(const ColumnEncodeContext& ctx, std::ostream& out,
+                                  std::vector<pb::ColumnMetadata>& columns, std::string& error) {
+    const auto& field = ctx.field;
+    const auto& values = ctx.values;
+    const bool column_has_nulls = ctx.column_has_nulls;
+
+    std::string element;
+    std::uint64_t items = 0;
+    if (!lance_fixed_size_list_parts(field.logical_type, element, items) || items == 0U) {
+        error = "element validity on a column that is not a fixed_size_list: " + field.name;
+        return false;
+    }
+    const auto element_bytes = lance_logical_type_value_bytes(element);
+    const auto row_bytes = element_bytes * items;
+    const auto total = values.fixed_size() / row_bytes;
+    const auto by_bytes = max_values_per_uncompressed_chunk(row_bytes + (items + 7U) / 8U + 1U);
+    const auto multi = multichunk_values(column_has_nulls ? std::min<std::size_t>(1024U, by_bytes) : by_bytes);
+    const auto max_chunk_rows = multi != 0U ? multi : std::size_t{1};
+    pb::ColumnMetadata column;
+    column.encoding = column_encoding_bytes();
+    MiniblockPageWriter page_writer(out);
+    std::vector<std::uint8_t> bits;
+    for (std::size_t off = 0; off < total;) {
+        const auto count = std::min<std::size_t>(max_chunk_rows, static_cast<std::size_t>(total - off));
+        const auto first = static_cast<std::uint64_t>(off) * items;
+        const auto n = static_cast<std::uint64_t>(count) * items;
+        bits.assign(static_cast<std::size_t>((n + 7U) / 8U), 0U);
+        for (std::uint64_t k = 0; k < n; ++k) {
+            const auto at = first + k;
+            if ((values.item_validity[at >> 3U] >> (at & 7U)) & 1U) {
+                bits[k >> 3U] |= static_cast<std::uint8_t>(1U << (k & 7U));
+            }
+        }
+        const auto def = column_has_nulls ? pack_definition_levels(values.validity, off, count)
+                                          : std::vector<std::uint8_t>{};
+        page_writer.begin_chunk();
+        const auto footprint = stream_miniblock_chunk(
+            out, count, def, {{bits.data(), bits.size()}, {values.fixed_data() + off * row_bytes, count * row_bytes}});
+        page_writer.end_chunk(footprint, count);
+        off += count;
+        if (off < total && multi != 0U && page_writer.payload_bytes() < kTargetMiniblockPageBytes) {
+            continue;
+        }
+        pb::ColumnPage page;
+        const auto page_rows = page_writer.rows();
+        page_writer.finish(page);
+        descriptor::MiniBlock m;
+        m.value_compression =
+            descriptor::fixed_size_list(items, descriptor::flat(static_cast<std::uint32_t>(element_bytes * 8U)), true);
+        if (column_has_nulls) {
+            m.def_compression = repdef_encoding_bytes();
+        }
+        mini_block_tail(m, page_rows, 2U, column_has_nulls);
+        page.encoding = descriptor::page_encoding(m);
+        column.pages.push_back(std::move(page));
+    }
+    columns.push_back(std::move(column));
+    return true;
+}
+
+/// Writes a constant column: the single value stored once, inline or in one data buffer.
+/// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
+bool write_constant_column(const ColumnEncodeContext& ctx, std::ostream& out, std::vector<pb::ColumnMetadata>& columns,
+                           std::string& error) {
+    const auto& field = ctx.field;
+    const auto rows = ctx.rows;
+
+    const auto value_it = field.metadata.find("nanolance:const-value");
+    if (value_it == field.metadata.end()) {
+        error = "constant column missing nanolance:const-value for ";
+        error += field.name;
+        return false;
+    }
+    const std::vector<std::uint8_t> value(value_it->second.begin(), value_it->second.end());
+    pb::ColumnMetadata column;
+    column.encoding = column_encoding_bytes();
+    pb::ColumnPage page;
+    page.length = rows;
+    page.priority = 0;
+    if (lance_field_is_variable_width(field.logical_type)) {
+        const bool large =
+            lance_logical_type_has_large_offsets(field.logical_type);
+        const auto scalar_buffer = scalar_value::encode_variable(value, large);
+        align64(out);
+        const auto value_offset = pos(out);
+        out.write(reinterpret_cast<const char*>(scalar_buffer.data()),
+                  static_cast<std::streamsize>(scalar_buffer.size()));
+        page.buffer_offsets.push_back(value_offset);
+        page.buffer_sizes.push_back(scalar_buffer.size());
+        page.encoding = constant_layout_message(nullptr);  // value is in the data buffer
+    } else {
+        page.encoding = constant_layout_message(&value);  // inline, no data buffers
+    }
+    column.pages.push_back(std::move(page));
+    columns.push_back(std::move(column));
+    return true;
+}
+
+/// Writes a run-length encoded fixed-width column: one chunk of run values and run lengths.
+/// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
+bool write_rle_column(const ColumnEncodeContext& ctx, std::ostream& out, std::vector<pb::ColumnMetadata>& columns) {
+    const auto& field = ctx.field;
+    const auto& values = ctx.values;
+    const auto rows = ctx.rows;
+
+    const auto bpv = value_width_bytes(field);
+    const std::size_t n = values.fixed_size() / bpv;
+    std::vector<std::uint8_t> run_values;
+    std::vector<std::uint8_t> run_lengths;  // Lance requires 8-bit run lengths
+    auto emit_run = [&](std::size_t row, std::uint64_t run) {
+        rle::append_run(std::span<const std::uint8_t>(values.fixed_data() + row * bpv, bpv), run, run_values,
+                        run_lengths);
+    };
+    if (values.fixed_rle_plan.computed) {
+        // The write-side "is RLE beneficial?" heuristic already detected every run while
+        // deciding -- reuse it verbatim instead of re-running the same memcmp-based scan.
+        for (const auto& [row, run] : values.fixed_rle_plan.runs) {
+            emit_run(row, run);
+        }
+    } else {
+        std::size_t i = 0;
+        while (i < n) {
+            std::size_t run = 1;
+            while (i + run < n && std::memcmp(values.fixed_data() + (i + run) * bpv,
+                                              values.fixed_data() + i * bpv, bpv) == 0) {
+                ++run;
+            }
+            emit_run(i, run);
+            i += run;
+        }
+    }
+    const std::size_t length_bytes = 1U;
+    std::vector<std::uint8_t> chunk_bytes;
+    const std::span<const std::uint8_t> run_buffers[2] = {run_values, run_lengths};
+    miniblock::append_chunk(chunk_bytes, 0U, {}, run_buffers);
+    const miniblock::ChunkMeta meta[1] = {{chunk_bytes.size(), n}};
+    const auto control = miniblock::control_buffer(meta);
+
+    align64(out);
+    const auto control_offset = pos(out);
+    out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
+    align64(out);
+    const auto data_offset = pos(out);
+    out.write(reinterpret_cast<const char*>(chunk_bytes.data()), static_cast<std::streamsize>(chunk_bytes.size()));
+
+    pb::ColumnMetadata column;
+    column.encoding = column_encoding_bytes();
+    pb::ColumnPage page;
+    page.buffer_offsets.push_back(control_offset);
+    page.buffer_offsets.push_back(data_offset);
+    page.buffer_sizes.push_back(control.size());
+    page.buffer_sizes.push_back(chunk_bytes.size());
+    page.length = rows;
+    page.priority = 0;
+    page.encoding = page_layout_bytes_rle(static_cast<std::uint8_t>(bpv * 8U),
+                                          static_cast<std::uint8_t>(length_bytes * 8U), rows);
+    column.pages.push_back(std::move(page));
+    columns.push_back(std::move(column));
+    return true;
+}
+
+/// Writes a dictionary + RLE variable-width column: the distinct values, and RLE'd indices.
+/// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
+bool write_dict_rle_column(const ColumnEncodeContext& ctx, std::ostream& out, std::vector<pb::ColumnMetadata>& columns,
+                           std::string& error) {
+    const auto& field = ctx.field;
+    const auto& values = ctx.values;
+    const auto rows = ctx.rows;
+    const auto compression_level = ctx.compression_level;
+
+    const bool large =
+        lance_logical_type_has_large_offsets(field.logical_type);
+    const std::size_t ow = large ? 8U : 4U;
+    const std::size_t num_rows = values.variable.offsets.size() / ow - 1U;
+    auto read_offset = [&](std::size_t idx) -> std::int64_t {
+        const auto* p = values.variable.offsets.data() + idx * ow;
+        if (large) {
+            std::int64_t v = 0;
+            std::memcpy(&v, p, 8);
+            return v;
+        }
+        std::int32_t v = 0;
+        std::memcpy(&v, p, 4);
+        return v;
+    };
+    std::vector<std::string_view> distinct;
+    std::vector<std::uint8_t> run_values;
+    std::vector<std::uint8_t> run_lengths;
+    const bool have_rle_plan = values.structural_dict_rle_plan.computed;
+    if (have_rle_plan) {
+        // The write-side "is dict-RLE beneficial?" heuristic already detected every run and
+        // built the (run-keyed, not row-keyed) dictionary while deciding -- reuse it verbatim
+        // instead of re-scanning row-by-row and re-running RLE detection from scratch.
+        distinct = values.structural_dict_rle_plan.distinct;
+        for (const auto& [index, run_length] : values.structural_dict_rle_plan.runs) {
+            rle::append_index_run(index, run_length, run_values, run_lengths);
+        }
+    } else {
+        // Dictionary keyed by string_view into the stable column data buffer: no per-row heap
+        // string allocation and hash lookups instead of full-string red-black-tree comparisons.
+        std::unordered_map<std::string_view, std::uint32_t> dict;
+        dict.reserve(num_rows / 4U + 1U);
+        std::vector<std::uint32_t> indices;
+        indices.reserve(num_rows);
+        for (std::size_t r = 0; r < num_rows; ++r) {
+            const auto s = read_offset(r);
+            const auto e = read_offset(r + 1);
+            const std::string_view val(reinterpret_cast<const char*>(values.variable.data.data() + s),
+                                       static_cast<std::size_t>(e - s));
+            const auto id = static_cast<std::uint32_t>(distinct.size());
+            const auto [it, inserted] = dict.try_emplace(val, id);
+            if (inserted) {
+                distinct.push_back(val);
+            }
+            indices.push_back(it->second);
+        }
+        // RLE the u32 indices (8-bit sub-runs).
+        for (std::size_t r = 0; r < indices.size();) {
+            std::size_t run = 1;
+            while (r + run < indices.size() && indices[r + run] == indices[r]) {
+                ++run;
+            }
+            rle::append_index_run(indices[r], run, run_values, run_lengths);
+            r += run;
+        }
+    }
+    std::vector<std::uint8_t> chunk_bytes;
+    const std::span<const std::uint8_t> run_buffers[2] = {run_values, run_lengths};
+    miniblock::append_chunk(chunk_bytes, 0U, {}, run_buffers);
+    const miniblock::ChunkMeta meta[1] = {{chunk_bytes.size(), static_cast<std::size_t>(rows)}};
+    const auto control = miniblock::control_buffer(meta);
+    std::vector<std::uint8_t> dict_frame;
+    if (!general::zstd_frame(dictionary::encode_variable(distinct, values.variable.large), compression_level,
+                           dict_frame, error)) {
+        return false;
+    }
+
+    align64(out);
+    const auto control_offset = pos(out);
+    out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
+    align64(out);
+    const auto data_offset = pos(out);
+    out.write(reinterpret_cast<const char*>(chunk_bytes.data()), static_cast<std::streamsize>(chunk_bytes.size()));
+    align64(out);
+    const auto dict_offset = pos(out);
+    out.write(reinterpret_cast<const char*>(dict_frame.data()), static_cast<std::streamsize>(dict_frame.size()));
+
+    pb::ColumnMetadata column;
+    column.encoding = column_encoding_bytes();
+    pb::ColumnPage page;
+    page.buffer_offsets.push_back(control_offset);
+    page.buffer_offsets.push_back(data_offset);
+    page.buffer_offsets.push_back(dict_offset);
+    page.buffer_sizes.push_back(control.size());
+    page.buffer_sizes.push_back(chunk_bytes.size());
+    page.buffer_sizes.push_back(dict_frame.size());
+    page.length = rows;
+    page.priority = 0;
+    page.encoding =
+        page_layout_bytes_dict_rle(static_cast<std::uint32_t>(distinct.size()), rows, values.variable.large);
+    column.pages.push_back(std::move(page));
+    columns.push_back(std::move(column));
+    return true;
+}
+
+/// Writes a structural dictionary column: bitpacked indices, and an uncompressed dictionary block.
+/// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
+bool write_dict_column(const ColumnEncodeContext& ctx, std::ostream& out, std::vector<pb::ColumnMetadata>& columns) {
+    const auto& field = ctx.field;
+    const auto& values = ctx.values;
+    const auto rows = ctx.rows;
+
+    const bool large =
+        lance_logical_type_has_large_offsets(field.logical_type);
+    const std::size_t ow = large ? 8U : 4U;
+    const std::size_t num_rows = values.variable.offsets.size() / ow - 1U;
+    auto read_offset = [&](std::size_t idx) -> std::int64_t {
+        const auto* p = values.variable.offsets.data() + idx * ow;
+        if (large) {
+            std::int64_t v = 0;
+            std::memcpy(&v, p, 8);
+            return v;
+        }
+        std::int32_t v = 0;
+        std::memcpy(&v, p, 4);
+        return v;
+    };
+    // Reuse the dictionary the write-side heuristic already built for this column when it is
+    // available (the common path via the public writer): the (dedup + per-row index) scan is
+    // identical, so recomputing it here would double the hashing/comparison work for exactly
+    // the columns this encoding targets. Fall back to building it for direct callers of
+    // write_lance_data_file that never ran the heuristic (e.g. some tests).
+    std::unordered_map<std::string_view, std::uint32_t> dict;  // only used on the fallback path
+    std::vector<std::string_view> local_distinct;
+    std::vector<std::uint32_t> local_indices;
+    const bool have_plan = values.structural_dict_plan.computed;
+    if (!have_plan) {
+        dict.reserve(num_rows / 4U + 1U);
+        local_indices.reserve(num_rows);
+        for (std::size_t r = 0; r < num_rows; ++r) {
+            const auto s = read_offset(r);
+            const auto e = read_offset(r + 1);
+            const std::string_view val(reinterpret_cast<const char*>(values.variable.data.data() + s),
+                                       static_cast<std::size_t>(e - s));
+            const auto id = static_cast<std::uint32_t>(local_distinct.size());
+            const auto [it, inserted] = dict.try_emplace(val, id);
+            if (inserted) {
+                local_distinct.push_back(val);
+            }
+            local_indices.push_back(it->second);
+        }
+    }
+    const std::vector<std::string_view>& distinct =
+        have_plan ? values.structural_dict_plan.distinct : local_distinct;
+    const std::vector<std::uint32_t>& indices =
+        have_plan ? values.structural_dict_plan.indices : local_indices;
+    std::vector<MiniblockChunk> index_chunks;
+    for (std::size_t off = 0; off < indices.size(); off += 1024U) {
+        const auto count = std::min<std::size_t>(1024U, indices.size() - off);
+        MiniblockChunk chunk;
+        chunk.value_count = count;
+        bitpack::encode_block(reinterpret_cast<const std::uint8_t*>(indices.data() + off), count, 4U,
+                              chunk.bytes);
+        index_chunks.push_back(std::move(chunk));
+    }
+    const auto payload = miniblock_payload(index_chunks);
+    const auto control = control_buffer_for(index_chunks);
+    const auto dict_block = dictionary::encode_variable(distinct, values.variable.large);
+
+    align64(out);
+    const auto control_offset = pos(out);
+    out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
+    align64(out);
+    const auto data_offset = pos(out);
+    out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+    align64(out);
+    const auto dict_offset = pos(out);
+    out.write(reinterpret_cast<const char*>(dict_block.data()), static_cast<std::streamsize>(dict_block.size()));
+
+    pb::ColumnMetadata column;
+    column.encoding = column_encoding_bytes();
+    pb::ColumnPage page;
+    page.buffer_offsets.push_back(control_offset);
+    page.buffer_offsets.push_back(data_offset);
+    page.buffer_offsets.push_back(dict_offset);
+    page.buffer_sizes.push_back(control.size());
+    page.buffer_sizes.push_back(payload.size());
+    page.buffer_sizes.push_back(dict_block.size());
+    page.length = rows;
+    page.priority = 0;
+    page.encoding =
+        page_layout_bytes_dict(static_cast<std::uint32_t>(distinct.size()), rows, values.variable.large);
+    column.pages.push_back(std::move(page));
+    columns.push_back(std::move(column));
+    return true;
+}
+
+/// Writes a flat (uncompressed) fixed-width column, streaming each miniblock chunk from the values.
+/// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
+bool write_flat_fixed_column(const ColumnEncodeContext& ctx, const FixedWidthChoice& fixed, std::ostream& out,
+                             std::vector<pb::ColumnMetadata>& columns) {
+    const auto& field = ctx.field;
+    const auto& values = ctx.values;
+    const bool column_has_nulls = ctx.column_has_nulls;
+    const auto fixed_bytes_per_value = fixed.bytes_per_value;
+
+    pb::ColumnMetadata column;
+    column.encoding = column_encoding_bytes();
+    const auto total = values.fixed_size() / fixed_bytes_per_value;
+    std::uint64_t fsl_items = 0;
+    {
+        std::string element;
+        (void)lance_fixed_size_list_parts(field.logical_type, element, fsl_items);
+    }
+    // A chunk that carries definition levels is limited to one FastLanes block (1024
+    // values); without nulls the chunk is sized by its byte budget, rounded down to the
+    // power of two a non-final chunk needs.
+    const auto by_bytes = max_values_per_uncompressed_chunk(fixed_bytes_per_value);
+    const auto multi = multichunk_values(column_has_nulls ? std::min<std::size_t>(1024U, by_bytes) : by_bytes);
+    const auto max_chunk_values = multi != 0U ? multi : std::size_t{1};
+    // Every full page produces IDENTICAL page-encoding bytes: build them once per row count.
+    std::uint64_t cached_rows = 0;
+    std::vector<std::uint8_t> cached_encoding;
+    MiniblockPageWriter page_writer(out);
+    for (std::size_t off = 0; off < total;) {
+        const auto count = std::min(max_chunk_values, total - off);
+        const auto chunk_bytes = count * fixed_bytes_per_value;
+        const auto chunk_repdef =
+            column_has_nulls ? pack_definition_levels(values.validity, off, count)
+                             : std::vector<std::uint8_t>{};
+        page_writer.begin_chunk();
+        const auto footprint =
+            stream_miniblock_chunk(out, count, chunk_repdef,
+                                   values.fixed_data() + off * fixed_bytes_per_value, chunk_bytes);
+        page_writer.end_chunk(footprint, count);
+        off += count;
+        if (off < total && multi != 0U && page_writer.payload_bytes() < kTargetMiniblockPageBytes) {
+            continue;
+        }
+        pb::ColumnPage page;
+        const auto page_rows = page_writer.rows();
+        page_writer.finish(page);
+        if (page_rows != cached_rows || cached_encoding.empty()) {
+            cached_rows = page_rows;
+            cached_encoding =
+                page_layout_bytes_flat(flat_bits_per_value(field), page_rows, column_has_nulls, fsl_items);
+        }
+        page.encoding = cached_encoding;
+        column.pages.push_back(std::move(page));
+    }
+    columns.push_back(std::move(column));
+    return true;
+}
+
+/// Writes a bitpacked, bool or byte-stream-split + zstd fixed-width column, one chunk at a time.
+/// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
+bool write_packed_fixed_column(const ColumnEncodeContext& ctx, const FixedWidthChoice& fixed, std::ostream& out,
+                               std::vector<pb::ColumnMetadata>& columns, std::string& error) {
+    const auto& field = ctx.field;
+    const auto& values = ctx.values;
+    const auto compression_level = ctx.compression_level;
+    const bool column_has_nulls = ctx.column_has_nulls;
+    const bool bitpack = fixed.bitpack;
+    const bool bool_pack = fixed.bool_pack;
+    const bool bss_zstd = fixed.bss_zstd;
+    const auto fixed_bytes_per_value = fixed.bytes_per_value;
+
+    pb::ColumnMetadata column;
+    column.encoding = column_encoding_bytes();
+    const auto total = bool_pack ? values.fixed_size() : values.fixed_size() / fixed_bytes_per_value;
+    std::size_t step = bitpack      ? 1024U  // one FastLanes block per chunk
+                       : bool_pack ? kMaxBoolValuesPerChunk
+                                   : max_values_per_uncompressed_chunk(fixed_bytes_per_value);
+    if (column_has_nulls) {
+        step = std::min<std::size_t>(step, 1024U);  // see pack_definition_levels
+    }
+    // A power of two for every non-final chunk. For byte-stream-split it also keeps the raw
+    // chunk at half the 32 KiB cap, leaving room for a zstd frame that does not shrink.
+    const auto multi = multichunk_values(step);
+    step = multi != 0U ? multi : std::size_t{1};
+    std::vector<std::uint8_t> scratch;  // built chunk bytes, reused across chunks
+    std::vector<std::uint8_t> framed;   // zstd frame (bss-zstd only), reused across chunks
+    auto build_page_encoding = [&](std::uint64_t count) {
+        if (bitpack) {
+            return page_layout_bytes_inline_bitpacking(
+                static_cast<std::uint8_t>(fixed_bytes_per_value * 8U), count, column_has_nulls);
+        }
+        if (bool_pack) {
+            // Plain Flat{bits_per_value:1} -- no CompressiveEncoding wrapper, matching stock Lance.
+            return page_layout_bytes_flat(flat_bits_per_value(field), count, column_has_nulls);
+        }
+        // byte-stream-split is restricted to 32/64-bit values, so the cast is safe.
+        return page_layout_bytes_bss_zstd(static_cast<std::uint8_t>(flat_bits_per_value(field)), count,
+                                          column_has_nulls);
+    };
+    std::uint64_t cached_rows = 0;
+    std::vector<std::uint8_t> cached_encoding;
+    MiniblockPageWriter page_writer(out);
+    for (std::size_t off = 0; off < total;) {
+        const auto count = std::min(step, total - off);
+        if (bitpack) {
+            // Each chunk buffer = [bit_width][FastLanes packed 1024 values].
+            bitpack::encode_block(values.fixed_data() + off * fixed_bytes_per_value, count,
+                                  fixed_bytes_per_value, scratch);
+        } else if (bool_pack) {
+            // Bit-pack LSB-first, ceil(count/8) bytes; no zstd on top (stock Lance doesn't
+            // compress 1-bit-packed bool either). values.fixed is one byte per value here.
+            boolpack::pack_lsb_first(values.fixed_data() + off, count, scratch);
+        } else {
+            // Byte-transpose (mantissa/exponent bytes grouped) so the zstd frame compresses
+            // meaningfully, then frame it: bytes become [u64 raw size][zstd].
+            scratch.resize(fixed_bytes_per_value * count);
+            (void)byte_stream_split::encode(
+                std::as_bytes(std::span(values.fixed_data() + off * fixed_bytes_per_value,
+                                        fixed_bytes_per_value * count)),
+                fixed_bytes_per_value, std::as_writable_bytes(std::span(scratch)));
+            if (!general::zstd_frame(scratch, compression_level, framed, error)) {
+                return false;
+            }
+        }
+        const auto& chunk_bytes = bss_zstd ? framed : scratch;
+        const auto chunk_repdef =
+            column_has_nulls ? pack_definition_levels(values.validity, off, count)
+                             : std::vector<std::uint8_t>{};
+        page_writer.begin_chunk();
+        const auto footprint =
+            stream_miniblock_chunk(out, count, chunk_repdef, chunk_bytes.data(), chunk_bytes.size());
+        page_writer.end_chunk(footprint, count);
+        off += count;
+        if (off < total && multi != 0U && page_writer.payload_bytes() < kTargetMiniblockPageBytes) {
+            continue;
+        }
+        pb::ColumnPage page;
+        const auto page_rows = page_writer.rows();
+        page_writer.finish(page);
+        if (page_rows != cached_rows || cached_encoding.empty()) {
+            cached_rows = page_rows;
+            cached_encoding = build_page_encoding(page_rows);
+        }
+        page.encoding = cached_encoding;
+        column.pages.push_back(std::move(page));
+    }
+    columns.push_back(std::move(column));
+    return true;
+}
+
+/// Writes a plain variable-width column: FullZip pages for large values, MiniBlock chunks otherwise.
+/// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
+bool write_plain_variable_column(const ColumnEncodeContext& ctx, std::ostream& out,
+                                 std::vector<pb::ColumnMetadata>& columns, std::string& error) {
+    const auto& field = ctx.field;
+    const auto& values = ctx.values;
+    const auto rows = ctx.rows;
+
+    pb::ColumnMetadata column;
+    // Large values get FullZip pages (row-addressable, as Lance writes them); the rest
+    // MiniBlock chunks.
+    std::uint64_t valid_rows = 0;
+    for (std::uint64_t r = 0; r < rows; ++r) {
+        valid_rows += validity_bit(values.validity, r) ? 1U : 0U;
+    }
+    const auto total_bytes = static_cast<std::uint64_t>(variable_offset(values, rows) - variable_offset(values, 0));
+    const bool full_zip = valid_rows != 0U && total_bytes / valid_rows >= kFullZipMinAverageValueBytes;
+    if (full_zip ? !write_full_zip_variable_column(out, values, rows, column, error)
+                 : !write_nested_column(out, field, values, rows, column, error, nullptr, /*plain=*/true)) {
+        return false;
+    }
+    columns.push_back(std::move(column));
+    return true;
+}
+
+/// Writes a variable-width column as MiniBlock chunks, each zstd-compressed when the column is compressed.
+/// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
+bool write_zstd_variable_column(const ColumnEncodeContext& ctx, std::ostream& out,
+                                std::vector<pb::ColumnMetadata>& columns, std::string& error) {
+    const auto& values = ctx.values;
+    const auto compression_level = ctx.compression_level;
+    const bool compress_column = ctx.compress_column;
+    const bool column_has_nulls = ctx.column_has_nulls;
+
+    std::vector<MiniblockChunk> chunks;
+
+    // zstd variable-width columns keep the two-phase build (chunks are unequal-sized, driven by
+    // the offsets math in build_variable_chunks_for_column). A nullable column additionally caps
+    // each chunk at one FastLanes block, since that is what a definition-level buffer covers.
+    if (!build_variable_chunks_for_column(values.variable, chunks, error,
+                                          column_has_nulls ? 1024U : 0U)) {
+        return false;
+    }
+    if (column_has_nulls) {
+        std::uint64_t row = 0;
+        for (auto& chunk : chunks) {
+            chunk.repdef = pack_definition_levels(values.validity, row, chunk.value_count);
+            row += chunk.value_count;
+        }
+    }
+
+    const bool zstd_variable = compress_column;
+    pb::ColumnMetadata column;
+    column.encoding = column_encoding_bytes();
+    // Hoisted out of the loop (not freshly declared per chunk): general::zstd_frame's resize() only
+    // avoids re-zeroing already-there bytes when the buffer is reused across calls of similar size,
+    // which requires swap (not move) below so `framed`'s capacity survives being handed off.
+    std::vector<std::uint8_t> framed;
+    for (auto& chunk : chunks) {
+        if (zstd_variable) {
+            if (!general::zstd_frame(chunk.bytes, compression_level, framed, error)) {
+                return false;
+            }
+            std::swap(chunk.bytes, framed);  // value_count unchanged; bytes are now [u64][zstd]
+        }
+        const auto control = control_buffer_for({&chunk, 1});
+        const auto payload = miniblock_payload({&chunk, 1});
+
+        align64(out);
+        const auto control_offset = pos(out);
+        out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
+
+        align64(out);
+        const auto payload_offset = pos(out);
+        out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+
+        pb::ColumnPage page;
+        page.buffer_offsets.push_back(control_offset);
+        page.buffer_offsets.push_back(payload_offset);
+        page.buffer_sizes.push_back(control.size());
+        page.buffer_sizes.push_back(payload.size());
+        page.length = chunk.value_count;
+        page.priority = 0;
+        const auto bits_token =
+            values.variable.large ? static_cast<std::uint8_t>(0x40U) : static_cast<std::uint8_t>(0x20U);
+        page.encoding = zstd_variable
+                            ? page_layout_bytes_variable_zstd(bits_token, chunk.value_count,
+                                                              column_has_nulls)
+                            : page_layout_bytes(bits_token, chunk.value_count, true, column_has_nulls);
+        column.pages.push_back(std::move(page));
+    }
+    columns.push_back(std::move(column));
+    return true;
+}
+
+/// Writes a fixed-width column: flat, or bitpacked / bool / byte-stream-split + zstd, after its value-size checks.
+/// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
+bool write_fixed_width_column(const ColumnEncodeContext& ctx, std::ostream& out,
+                              std::vector<pb::ColumnMetadata>& columns, std::string& error) {
+    const auto& field = ctx.field;
+    const auto& values = ctx.values;
+    const auto rows = ctx.rows;
+    const auto packing_it = ctx.packing_it;
+
+    const bool is_variable = values.kind == ColumnValues::Kind::VariableWidth;
+    // Bitpacking is a structural encoding, signalled by the writer's packing tag (independent of the
+    // zstd `compress` flag, which now gates only the variable-width zstd path below).
+    const bool bitpack = !is_variable && packing_it != field.metadata.end() &&
+                         packing_it->second == "bitpack" &&
+                         lance_logical_type_is_bitpackable_integer(field.logical_type);
+    // Byte-stream-split + zstd: float/double, tagged when set_compression(true) (writer.cpp).
+    const bool bss_zstd = !is_variable && packing_it != field.metadata.end() &&
+                          packing_it->second == "bss-zstd";
+    // bool is always stored bit-packed (1 bit/value, LSB-first) on disk, matching stock Lance's own
+    // Flat{bits_per_value:1} representation (verified empirically) -- not gated by any opt-in flag.
+    const bool bool_pack = !is_variable && field.logical_type == "bool";
+    const auto fixed_bytes_per_value = value_width_bytes(field);
+    const FixedWidthChoice fixed{bitpack, bool_pack, bss_zstd, fixed_bytes_per_value};
+
+    if (!is_variable) {
+        if (values.fixed_size() % fixed_bytes_per_value != 0U) {
+            error = "column value buffer size is not aligned to field width for ";
+            error += field.name;
+            return false;
+        }
+        if (values.fixed_size() / fixed_bytes_per_value != static_cast<std::size_t>(rows)) {
+            error = "column value count does not match row count for ";
+            error += field.name;
+            return false;
+        }
+    }
+
+    // Flat (uncompressed) fixed-width column: stream each miniblock chunk directly from the value
+    // buffer -- the chunk bytes are just a slice of values.fixed, so building a MiniblockChunk
+    // first would only copy them. Chunks are gathered into pages of ~kTargetMiniblockPageBytes
+    // (MiniblockPageWriter); a value too wide for two to share a chunk gets a page per chunk.
+    if (!is_variable && !bitpack && !bss_zstd && !bool_pack) {
+        return write_flat_fixed_column(ctx, fixed, out, columns);
+    }
+
+    // Bitpack / bool / byte-stream-split+zstd fixed-width columns: STREAM one chunk at a time
+    // through hoisted, loop-reused scratch buffers (build chunk -> write it -> reuse); after the
+    // first chunk resize() touches nothing, since chunks are equal-sized. Pages gather chunks as
+    // the flat path above does.
+    return write_packed_fixed_column(ctx, fixed, out, columns, error);
+}
+
+/// Writes a variable-width column: an FSST page, plain pages, or zstd-compressed chunks.
+/// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
+bool write_variable_column(const ColumnEncodeContext& ctx, std::ostream& out,
+                           std::vector<pb::ColumnMetadata>& columns, std::string& error) {
+    const auto& field = ctx.field;
+    const auto& values = ctx.values;
+    const auto rows = ctx.rows;
+    const auto packing_it = ctx.packing_it;
+    const bool zstd_requested = ctx.zstd_requested;
+    const bool compress = ctx.compress;
+    const bool compress_column = ctx.compress_column;
+
+    // A string column FSST can compress (roadmap F2) goes to the multi-chunk page writer: one
+    // symbol table per page, over 1024-value chunks. The single-chunk pages below would pay the
+    // 2,312-byte table every 32 KiB. build_nested_page still declines FSST page by page when it
+    // does not pay, writing plain Variable chunks instead.
+    // Only when the writer's structural detection tagged the column: FSST is one of those
+    // encodings, and set_structural_encoding(false) must still write plain pages.
+    fsst::Encoder fsst_encoder;
+    if (packing_it != field.metadata.end() && packing_it->second == "fsst" &&
+        train_column_fsst(field, values, fsst_encoder) &&
+        !zstd_requested && (!compress || fsst_pays_on_first_page(fsst_encoder, values, rows))) {
+        pb::ColumnMetadata column;
+        if (!write_nested_column(out, field, values, rows, column, error, &fsst_encoder)) {
+            return false;
+        }
+        columns.push_back(std::move(column));
+        return true;
+    }
+
+    // Every other string or binary column goes to the multi-chunk page writer too, in its plain
+    // mode (Variable chunks, no dictionary, no FSST). The single-chunk pages below describe a
+    // chunk's value bytes in a u16, so one value over ~32 KB -- a JPEG, an audio clip -- wrote a
+    // file Rust Lance could not read, and over 64 KB one nanolance could not read either; they
+    // also cost Rust a page set-up per 32 KB. The multi-chunk writer's chunks carry u32 sizes.
+    // What stays below is zstd (compress), which only these pages carry, and only while every
+    // value fits a chunk.
+    bool value_too_big_for_a_chunk = false;
+    {
+        const auto width = values.variable.large ? 8U : 4U;
+        const auto entries = values.variable.offsets.size() / width;
+        for (std::size_t i = 0; i + 1U < entries && !value_too_big_for_a_chunk; ++i) {
+            value_too_big_for_a_chunk =
+                variable_offset(values, i + 1U) - variable_offset(values, i) > kMaxVariableMiniblockBytes / 2U;
+        }
+    }
+
+    if (!compress_column || value_too_big_for_a_chunk) {
+        return write_plain_variable_column(ctx, out, columns, error);
+    }
+    return write_zstd_variable_column(ctx, out, columns, error);
+}
+
+/// Writes one column's pages to `out` and its metadata to `columns`, choosing its encoding.
+/// Step 2 of write_lance_data_file, per column: called by encode_columns.
+bool encode_column(const FileWriteState& state, std::size_t field_index, std::ostream& out,
+                   std::vector<pb::ColumnMetadata>& columns, std::string& error) {
+    const auto& field = *state.physical_fields[field_index];
+    const auto& values = *state.column_source[field_index];
+    const auto rows = state.rows;
+    const auto compression_level = state.compression_level;
+    const bool compress = state.compress;
+
+    // `lance-encoding:compression=zstd` on one column (pylance's per-column option) zstd-compresses that
+    // column alone, as the writer-wide `compress` flag does for every string column. Such a column
+    // skips FSST, which would otherwise be chosen where it pays.
+    const auto zstd_option = field.metadata.find("lance-encoding:compression");
+    const bool zstd_requested = zstd_option != field.metadata.end() && zstd_option->second == "zstd";
+    const bool compress_column = compress || zstd_requested;
+
+    // Nulls are encodable only on the paths that have been taught the definition-level layer.
+    // Everything else must refuse rather than drop them: ingest no longer rejects a null batch,
+    // so this is the backstop that keeps a column with nulls from being written as if it had
+    // none -- which is exactly the silent [10, null, 30] -> [10, 0, 30] corruption this whole
+    // area is here to prevent.
+    const bool column_has_nulls = values.null_count != 0U;
+    if (column_has_nulls) {
+        if (values.validity.empty()) {
+            error = "column '" + field.name + "' reports " + std::to_string(values.null_count) +
+                    " nulls but carries no validity bitmap";
+            return false;
+        }
+    }
+
+    const auto packing_it = field.metadata.find("nanolance:packing");
+    const ColumnEncodeContext ctx{field, values, rows, compression_level, compress, zstd_requested, compress_column,
+                                  column_has_nulls, packing_it};
+
+    if (values.kind == ColumnValues::Kind::BlobV2External) {
+        return write_blob_v2_column(ctx, out, columns, error);
+    }
+
+    if (values.needs_nested_pages()) {
+        pb::ColumnMetadata column;
+        if (!write_nested_column(out, field, values, rows, column, error)) {
+            return false;
+        }
+        columns.push_back(std::move(column));
+        return true;
+    }
+
+    // Arrow's null type: every row is null and there is no value to store at all. An empty struct
+    // (a physical "struct" column) is written the same way, as Lance writes it: the page says
+    // nothing a reader needs, the type says every row is a valid empty struct.
+    if (field.logical_type == "null" || field.logical_type == "struct") {
+        return write_all_null_column(ctx, columns);
+    }
+
+    // An Arrow dictionary column: Lance's dictionary page -- the indices, at the index type's
+    // width, in mini-block chunks, and the dictionary it was given (unused entries and order
+    // kept) as the page's third buffer.
+    if (!field.dictionary_index_format.empty()) {
+        return write_dictionary_column(ctx, out, columns);
+    }
+
+    // A fixed_size_list with null elements inside valid rows: Lance's mini-block chunks of two
+    // buffers, the elements' validity bits then the values, under FixedSizeList{has_validity}.
+    if (!values.item_validity.empty()) {
+        return write_fixed_size_list_column(ctx, out, columns, error);
+    }
+
+    // Constant column (tagged by the writer): ConstantLayout. The single value comes from the
+    // field metadata. Fixed-width stores it inline (zero data buffers); variable-width stores it
+    // in one data buffer.
+    // Skipped for a column with nulls: these encodings rewrite the value sequence (a constant column
+    // stores one value, RLE stores runs, a dictionary stores indices) and the definition-level layer is
+    // positional -- one level per value, in row order. Pairing them needs the levels to be encoded
+    // against the rewritten sequence, which is not done yet, so a nullable column takes the flat or
+    // bit-packed path instead. It costs size, never correctness.
+    // A fixed-width constant is inlined in the descriptor, which Lance caps at 32 bytes. Wider
+    // ones fall through to the flat path -- this used to write the inline value's length as ONE
+    // byte, so any value of 128 bytes or more produced a descriptor neither nanolance nor pylance
+    // could parse: a corrupt file, from a constant fixed_size_binary(200) column.
+    const bool constant_fits =
+        lance_field_is_variable_width(field.logical_type) ||
+        lance_logical_type_value_bytes(field.logical_type) <= kMaxInlineConstantBytes;
+    if (!column_has_nulls && constant_fits && packing_it != field.metadata.end() &&
+        packing_it->second == "constant") {
+        return write_constant_column(ctx, out, columns, error);
+    }
+
+    // Run-length encoded fixed-width column (tagged by the writer): one chunk with two buffers
+    // (run values + run lengths) -> Rle PageLayout.
+    if (!column_has_nulls && packing_it != field.metadata.end() && packing_it->second == "rle" &&
+        values.kind == ColumnValues::Kind::FixedWidth) {
+        return write_rle_column(ctx, out, columns);
+    }
+
+    // Dictionary + RLE for a low-cardinality variable-width column: distinct values in buffer[2],
+    // per-row u32 indices RLE'd in buffer[1].
+    if (!column_has_nulls && packing_it != field.metadata.end() && packing_it->second == "dict-rle" &&
+        values.kind == ColumnValues::Kind::VariableWidth) {
+        return write_dict_rle_column(ctx, out, columns, error);
+    }
+
+    // Structural dictionary for scattered low-cardinality strings: flat bitpacked u32 indices in
+    // buffer[1], uncompressed dictionary variable block in buffer[2].
+    if (!column_has_nulls && packing_it != field.metadata.end() && packing_it->second == "dict" &&
+        values.kind == ColumnValues::Kind::VariableWidth) {
+        return write_dict_column(ctx, out, columns);
+    }
+
+    const bool is_variable = values.kind == ColumnValues::Kind::VariableWidth;
+    if (!is_variable) {
+        return write_fixed_width_column(ctx, out, columns, error);
+    }
+    return write_variable_column(ctx, out, columns, error);
+}
+
+/// Encodes every column in order: straight into `out`, or with several threads each column into a buffer
+/// that is appended in order. Step 2 of write_lance_data_file.
+bool encode_columns(const FileWriteState& state, bool parallel_columns, std::ostream& out,
+                    std::vector<pb::ColumnMetadata>& columns, std::string& error) {
+    const auto& physical_fields = state.physical_fields;
+    const auto& column_values = state.column_values;
+
     // Columns side by side only when no one column is most of the data: a column encoded into
     // memory is copied again into the file, and for the column that dominates (COCO's images, 800 of
     // 828 MB; Speech Commands' waveforms) that costs more than the others' encoding saves -- measured
@@ -2784,7 +2932,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
     const bool one_column_dominates = largest_raw * 2U > total_raw;
     if (!parallel_columns || parallel::threads() <= 1U || physical_fields.size() <= 1U || one_column_dominates) {
         for (std::size_t field_index = 0; field_index < physical_fields.size(); ++field_index) {
-            if (!encode_column(field_index, out, columns, error)) {
+            if (!encode_column(state, field_index, out, columns, error)) {
                 return false;
             }
         }
@@ -2803,7 +2951,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             auto& e = encoded[field_index];
             e.bytes.reserve(static_cast<std::size_t>(raw_bytes(field_index) + (raw_bytes(field_index) >> 4U) + 4096U));
             std::ostream sink(&e.bytes);
-            e.ok = encode_column(field_index, sink, e.columns, e.error) && sink.good();
+            e.ok = encode_column(state, field_index, sink, e.columns, e.error) && sink.good();
             if (!e.ok && e.error.empty()) {
                 e.error = "failed to buffer column '" + physical_fields[field_index]->name + "'";
             }
@@ -2833,6 +2981,51 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         }
     }
 
+    return true;
+}
+
+/// Places the blobs given as bytes: inline ones at the head of the file, packed and dedicated ones in sidecar
+/// files beside it. Step 1 of write_lance_data_file.
+bool place_inline_blobs(FileWriteState& state, const std::filesystem::path& full_path,
+                        const LanceFileExtras* extras, std::ostream& out, std::string& error) {
+    const auto& physical_fields = state.physical_fields;
+    const auto& column_values = state.column_values;
+    auto& column_source = state.column_source;
+    auto& placed_blobs = state.placed_blobs;
+
+    BlobV2Placer placer(full_path, extras != nullptr ? extras->blob_pack_file_size : 0U);
+    std::size_t blob_columns = 0;
+    for (const auto& v : column_values) {
+        blob_columns += v.kind == ColumnValues::Kind::BlobV2External ? 1U : 0U;
+    }
+    placed_blobs.reserve(blob_columns);
+    for (std::size_t i = 0; i < physical_fields.size(); ++i) {
+        column_source[i] = &column_values[i];
+        if (column_values[i].kind != ColumnValues::Kind::BlobV2External ||
+            !blob_v2_has_pending(column_values[i])) {
+            continue;  // external references (or nulls) only: stored as they are
+        }
+        BlobV2Thresholds thresholds;
+        if (!blob_v2_thresholds(*physical_fields[i], thresholds, error)) {
+            return false;
+        }
+        placed_blobs.emplace_back();
+        if (!placer.place(column_values[i], thresholds, out, placed_blobs.back(), error)) {
+            return false;
+        }
+        column_source[i] = &placed_blobs.back();
+    }
+    if (!placer.finish(error)) {
+        return false;
+    }
+
+    return true;
+}
+
+/// Builds the file's schema descriptor from the mapping: a Blob v2 field as Lance stores it. Step 3 of
+/// write_lance_data_file.
+pb::FileDescriptor build_file_descriptor(const LanceSchemaMapping& mapping, std::uint64_t rows,
+                                         const LanceFileExtras* extras) {
     pb::FileDescriptor descriptor;
     descriptor.length = rows;
     // A Blob v2 field is stored as Lance stores it: the file's schema has the descriptor struct --
@@ -2861,7 +3054,8 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             parent.metadata["lance-encoding:packed"] = {'t', 'r', 'u', 'e'};
             descriptor.fields.push_back(std::move(parent));
             const std::pair<const char*, const char*> children[] = {
-                {"kind", "uint8"}, {"position", "uint64"}, {"size", "uint64"}, {"blob_id", "uint32"}, {"blob_uri", "string"}};
+                {"kind", "uint8"}, {"position", "uint64"}, {"size", "uint64"}, {"blob_id", "uint32"},
+                {"blob_uri", "string"}};
             for (const auto& [name, type] : children) {
                 pb::Field child;
                 child.name = name;
@@ -2882,7 +3076,8 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         field.parent_id = mapped_field.parent_id;
         field.type = 2;
         field.nullable = mapped_field.nullable;
-        field.encoding = mapped_field.dictionary_index_format.empty() ? lance_on_disk_field_encoding(mapped_field.logical_type) : 3;
+        field.encoding = mapped_field.dictionary_index_format.empty() ? lance_on_disk_field_encoding(mapped_field.logical_type)
+                                                                      : 3;
         for (const auto& kv : mapped_field.metadata) {
             field.metadata[kv.first] = std::vector<std::uint8_t>(kv.second.begin(), kv.second.end());
         }
@@ -2891,20 +3086,16 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
     if (extras != nullptr) {
         descriptor.schema_metadata = extras->schema_metadata;
     }
-    // Global buffers past the schema's: written before it, listed after it.
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> extra_buffers;
-    if (extras != nullptr) {
-        for (const auto& buffer : extras->global_buffers) {
-            align64(out);
-            extra_buffers.emplace_back(pos(out), buffer.size());
-            out.write(reinterpret_cast<const char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
-        }
-    }
-    const auto descriptor_bytes = pb::encode_file_descriptor(descriptor);
-    align64(out);
-    const auto global_buffer_offset = pos(out);
-    out.write(reinterpret_cast<const char*>(descriptor_bytes.data()), static_cast<std::streamsize>(descriptor_bytes.size()));
 
+    return descriptor;
+}
+
+/// Writes the column metadata, the offset tables and the footer, then flushes the file. Step 5 of
+/// write_lance_data_file.
+bool write_footer(std::ostream& out, const std::vector<pb::ColumnMetadata>& columns,
+                  const std::vector<std::pair<std::uint64_t, std::uint64_t>>& extra_buffers,
+                  std::uint64_t global_buffer_offset, const std::vector<std::uint8_t>& descriptor_bytes,
+                  std::string& error) {
     align64(out);
     const auto column_metadata_start = pos(out);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> column_metadata_offsets;
@@ -2941,6 +3132,84 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
     out.flush();
     if (!out) {
         error = "failed to write Lance data file";
+        return false;
+    }
+
+    return true;
+}
+
+}  // namespace
+
+bool write_lance_data_file(const std::filesystem::path& dataset_path,
+                           const std::string& file_name,
+                           const LanceSchemaMapping& mapping,
+                           const std::vector<ColumnValues>& column_values,
+                           std::uint64_t rows,
+                           int compression_level,
+                           bool compress,
+                           DataFileResult& result,
+                           std::string& error,
+                           bool parallel_columns,
+                           const LanceFileExtras* extras) {
+    error.clear();
+    if (mapping.fields.empty()) {
+        error = "cannot write Lance data file without mapped fields";
+        return false;
+    }
+    const auto physical_fields = lance_physical_fields(mapping);
+    if (column_values.size() != physical_fields.size()) {
+        error = "column value count does not match physical schema field count";
+        return false;
+    }
+
+    const auto relative_path =
+        extras != nullptr && !extras->path.empty() ? extras->path : std::filesystem::path("data") / file_name;
+    const auto full_path = extras != nullptr && !extras->path.empty() ? extras->path : dataset_path / relative_path;
+    work_stats::WrittenFileTally tally(full_path);
+    // A local file (its directory created), or an object uploaded on commit() (io::open_output).
+    auto output = io::open_output(full_path.string(), error);
+    if (!output) {
+        return false;
+    }
+    std::ostream& out = *output;
+
+    FileWriteState state{physical_fields, column_values,
+                         std::vector<const ColumnValues*>(physical_fields.size()), {}, rows, compression_level,
+                         compress};
+
+    // Lance's blob preprocessing, now that the file's name is known: blobs given as bytes are placed --
+    // inline ones here at the head of the file, before any column (their descriptors hold absolute
+    // positions, which a column buffered on its own thread could not), packed and dedicated ones in
+    // sidecar files beside it.
+    if (!place_inline_blobs(state, full_path, extras, out, error)) {
+        return false;
+    }
+
+    std::vector<pb::ColumnMetadata> columns;
+    columns.reserve(physical_fields.size());
+    if (!encode_columns(state, parallel_columns, out, columns, error)) {
+        return false;
+    }
+
+    pb::FileDescriptor descriptor = build_file_descriptor(mapping, rows, extras);
+
+    // Global buffers past the schema's: written before it, listed after it.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> extra_buffers;
+    if (extras != nullptr) {
+        for (const auto& buffer : extras->global_buffers) {
+            align64(out);
+            extra_buffers.emplace_back(pos(out), buffer.size());
+            out.write(reinterpret_cast<const char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        }
+    }
+
+    const auto descriptor_bytes = pb::encode_file_descriptor(descriptor);
+    align64(out);
+    const auto global_buffer_offset = pos(out);
+    out.write(reinterpret_cast<const char*>(descriptor_bytes.data()),
+              static_cast<std::streamsize>(descriptor_bytes.size()));
+
+    if (!write_footer(out, columns, extra_buffers, global_buffer_offset, descriptor_bytes, error)) {
         return false;
     }
     const auto file_size = pos(out);
