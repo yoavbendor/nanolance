@@ -29,7 +29,7 @@ FILES = {
     "io": ["byte_source.cpp", "byte_sink.cpp", "external_blob.cpp", "external_blob.hpp", "s3_byte_source.cpp", "s3_byte_source.hpp", "s3_byte_sink.cpp",
            "s3_byte_sink.hpp"],
     "arrow": ["schema_mapper.cpp", "array_accessor.cpp", "arrow_slice.cpp", "blob_builder.cpp", "jsonb.cpp",
-              "arrow_owned.hpp", "arrow_owned.cpp"],
+              "arrow_owned.hpp", "arrow_owned.cpp", "arrow_views.hpp", "arrow_views.cpp"],
     "encoding": ["fsst.cpp", "lz4_block.cpp", "repdef.cpp", "page_layout.cpp", "column_slice.cpp",
                  "lance_descriptors.hpp", "lance_column_decoder.cpp", "lance_v20_decoder.cpp",
                  "encoding_choice.cpp", "encoding_choice.hpp", "blob_v2_layout.cpp",

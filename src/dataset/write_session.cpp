@@ -13,6 +13,7 @@
 #include "nanolance/manifest_writer.hpp"
 #include "nanolance/schema_mapper.hpp"
 #include "encoding/encoding_choice.hpp"
+#include "arrow/arrow_views.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -375,8 +376,19 @@ WriteStatus WriteSession::write_batch(struct ArrowArray* batch, struct ArrowSche
         return fail(WriteStatus::InvalidArgument, "batch length must not be negative");
     }
 
-    LanceSchemaMapping batch_mapping;
+    // Utf8View and BinaryView columns are written as string and binary, as pylance writes them. A batch without a
+    // view column is not touched.
     std::string error;
+    arrow_views::ViewlessBatch viewless;
+    if (arrow_views::has_view_types(*schema)) {
+        if (!viewless.convert(*schema, *batch, error)) {
+            return fail(WriteStatus::Unsupported, error);
+        }
+        batch = viewless.array();
+        schema = viewless.schema();
+    }
+
+    LanceSchemaMapping batch_mapping;
     if (!map_arrow_schema(*schema, batch_mapping, error, state->ignore_nullability)) {
         return fail(WriteStatus::Unsupported, error);
     }
