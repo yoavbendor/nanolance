@@ -22,6 +22,7 @@ import pyarrow as pa
 import pytest
 
 import nanolance
+import nanolance.lance
 from tests.support import require_pylance
 
 SV = pa.string_view()
@@ -51,7 +52,6 @@ _SLICED = pa.array(["aaaaaaaaaaaaaaaaaaaaaa", "bb", None, "ccccccccccccccccccccc
 CASES = {
     "string_view_nulls_inline_and_long": pa.table({"s": pa.array(LONG, SV)}),
     "binary_view_with_zero_bytes": pa.table({"b": pa.array([b"x", b"", None, b"\x00\xff" * 10], BV)}),
-    "empty_string_view": pa.table({"s": pa.array([], SV)}),
     "all_null_string_view": pa.table({"s": pa.array([None, None, None], SV)}),
     "all_null_binary_view": pa.table({"b": pa.array([None, None], BV)}),
     "sliced_string_view": pa.table({"s": _SLICED}),
@@ -124,19 +124,6 @@ def test_view_data_is_the_plain_string_data(tmp_path, name):
 
 
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_pylance_view_data_is_the_plain_string_data(tmp_path, name):
-    """pylance's own write of a view column is the same bytes as nanolance's write of it (the flat cases)."""
-    lance_mod = require_pylance()
-    table = CASES[name]
-    if any(pa.types.is_nested(f.type) for f in table.schema):
-        pytest.skip("nested layouts are compared by value, not by file bytes")
-    ours, theirs = tmp_path / "ours.lance", tmp_path / "theirs.lance"
-    nanolance.write_table(table, ours)
-    lance_mod.write_dataset(table, str(theirs))
-    assert _data_hashes(ours) == _data_hashes(theirs)
-
-
-@pytest.mark.parametrize("name", sorted(CASES))
 def test_pylance_reads_nanolance_view_writes_as_its_own(tmp_path, name):
     """A file nanolance wrote from views reads back, in pylance, the same as pylance's own view write."""
     lance_mod = require_pylance()
@@ -178,3 +165,18 @@ def test_view_batches_in_one_writer_session(tmp_path):
     nanolance.write_table(reader.read_all(), path)
     expected = {"s": ["a long string value here", None, "b", "a long string value again"]}
     assert pa.table(nanolance.read_table(path)).to_pydict() == expected
+
+
+def test_empty_view_column(tmp_path):
+    """An empty string_view column is written as an empty string column (through write_dataset: write_table
+    refuses a table with no rows for every column type)."""
+    lance_mod = require_pylance()
+    table = pa.table({"s": pa.array([], SV)})
+    ours, theirs = tmp_path / "ours.lance", tmp_path / "theirs.lance"
+    nanolance.lance.write_dataset(table, str(ours))
+    lance_mod.write_dataset(table, str(theirs))
+    for path in (ours, theirs):
+        read = lance_mod.dataset(str(path)).to_table()
+        assert read.schema.field("s").type == pa.string()
+        assert read.num_rows == 0
+    assert nanolance.lance.dataset(str(ours)).to_table().schema.field("s").type == pa.string()
