@@ -117,8 +117,11 @@ jobs:
       # (docs/PYLANCE_COMPAT.md). Fails when a test listed in tests/pylance_suite/expected_pass.txt
       # stops passing.
       - name: pylance's test suite against nanolance.lance
+        # pytest below 9.2: 9.2 keeps a test's id in Node._id, and pytest-xdist 3.8 still renames
+        # Node._nodeid for --dist loadgroup, so the lindera tests' xdist_group is lost and their
+        # shared dictionary folder is unzipped and deleted by several workers at once.
         run: |
-          python3 -m pip install pytest-xdist pytest-timeout pandas polars duckdb tqdm ml_dtypes pydantic "pylance==12.0.0"
+          python3 -m pip install "pytest<9.2" pytest-xdist pytest-timeout pandas polars duckdb tqdm ml_dtypes pydantic "pylance==12.0.0"
           python3 tools/pylance_suite.py --report pylance-suite.json
 
       # lance-c's own C and C++ tests, at the lance-c commit whose header compat/lance-c vendors,
