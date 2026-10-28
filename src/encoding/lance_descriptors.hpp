@@ -74,6 +74,29 @@ Bytes compressive(Member wire::CompressiveEncoding::*member, const Variant& v) {
 
 // --- CompressiveEncoding ----------------------------------------------------------------------
 
+/// Constant{ optional bytes value }: CompressiveEncoding field 3. nanom's message has no member for it,
+/// so the bytes are written here: field 3, length-delimited, holding Constant's field 1 when there is a
+/// value. Without a value the Constant is empty (an all-null column), as Lance writes it.
+inline Bytes constant(const Bytes& value, bool has_value = true) {
+    const auto put_varint = [](Bytes& out, std::uint64_t n) {
+        while (n >= 0x80U) {
+            out.push_back(static_cast<std::uint8_t>(n | 0x80U));
+            n >>= 7U;
+        }
+        out.push_back(static_cast<std::uint8_t>(n));
+    };
+    Bytes payload;
+    if (has_value) {
+        payload.push_back(0x0AU);  // field 1, length-delimited
+        put_varint(payload, value.size());
+        payload.insert(payload.end(), value.begin(), value.end());
+    }
+    Bytes out{0x1AU};  // field 3, length-delimited
+    put_varint(out, payload.size());
+    out.insert(out.end(), payload.begin(), payload.end());
+    return out;
+}
+
 /// Flat{ bits_per_value }.
 inline Bytes flat(std::uint64_t bits) {
     wire::Flat v;
