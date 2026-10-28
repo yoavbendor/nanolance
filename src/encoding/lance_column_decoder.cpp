@@ -1725,579 +1725,500 @@ bool decode_legacy_blob_column(const EncodingsIo& io, const pb::Field& field,
 
 namespace {
 
-/// The whole decoder for one physical column. `item_view` is set only for a list column's second
-/// pass (decode_list_column), which reads the leaf values as a flat column of items.
-bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
-                        const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
-                        const std::shared_ptr<ItemView>& item_view) {
-    error.clear();
-    out = ColumnValues{};
+namespace {
 
-    // The per-page row count comes from the untrusted protobuf. Bound the declared total up front
-    // (overflow-safe) so no decode branch below can be tricked into a runaway allocation; the inner
-    // loops then run without re-checking.
-    std::uint64_t declared_rows = 0;
+/// Decodes a blob-v2 column (packed blob descriptions, payloads stored elsewhere).
+/// One branch of decode_column_impl, which has already bounded the row count.
+bool decode_blob_v2_column(const EncodingsIo& io, const pb::Field& on_disk_field,
+                           const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {
+    out.kind = ColumnValues::Kind::BlobV2External;
+    out.blob_v2.data_file = io.name();
+    // Hoisted out of the loop (not freshly declared per page): read_lance_data_file_bytes reuses
+    // whatever capacity/bytes are already here rather than re-zeroing a fresh buffer every page.
+    std::vector<std::uint8_t> control;
+    std::vector<std::uint8_t> values;
     for (const auto& page : column_metadata.pages) {
-        if (!checked_add(declared_rows, page.length, declared_rows)) {
-            error = "column page row count overflows";
+        if (!read_page_buffers(io, page, true, control, values, error)) {
             return false;
         }
-    }
-    if (declared_rows > default_read_limits().max_rows_per_column) {
-        error = "column row count exceeds safety limit";
-        return false;
-    }
-
-    // `lance-encoding:blob` is checked FIRST and stays a metadata check. It is a Lance-standard key
-    // (stock Lance writes it too) describing the COLUMN's role rather than a page's encoding, and a
-    // blob-v2 packed page uses FullZipLayout (PageLayout field 3), which the descriptor classifier
-    // below does not model -- classifying first would refuse the library's headline feature.
-    const bool blob_packed = field_metadata_is_true(on_disk_field, "lance-encoding:blob");
-    if (blob_packed && (on_disk_field.logical_type == "large_binary" || on_disk_field.logical_type == "binary")) {
-        return decode_legacy_blob_column(io, on_disk_field, column_metadata, out, error);
-    }
-    if (blob_packed) {
-        out.kind = ColumnValues::Kind::BlobV2External;
-        out.blob_v2.data_file = io.name();
-        // Hoisted out of the loop (not freshly declared per page): read_lance_data_file_bytes reuses
-        // whatever capacity/bytes are already here rather than re-zeroing a fresh buffer every page.
-        std::vector<std::uint8_t> control;
-        std::vector<std::uint8_t> values;
-        for (const auto& page : column_metadata.pages) {
-            if (!read_page_buffers(io, page, true, control, values, error)) {
-                return false;
-            }
-            std::vector<std::uint32_t> row_sizes;
-            if (!blob_v2_control_buffer_to_row_sizes(control, page.length, row_sizes, error)) {
-                return false;
-            }
-            // A nullable blob column (pylance writes one whenever a row is null) puts a control word
-            // -- the row's definition level -- in front of every row, and a null row is that word
-            // alone. nanolance's own blob columns are never null and carry none.
-            std::size_t control_bytes = 0;
-            std::uint32_t def_mask = 0;
-            if (!page.encoding.empty()) {
-                page_layout::PageLayout layout;
-                std::string why;
-                if (page_layout::decode_page_layout(page.encoding, layout, why) &&
-                    layout.kind == page_layout::LayoutKind::kFullZip) {
-                    if (layout.full_zip.bits_rep != 0U) {
-                        error = "column '" + on_disk_field.name + "': a blob column inside a list is not read";
-                        return false;
-                    }
-                    const auto bits = layout.full_zip.bits_def;
-                    if (bits > 16U) {
-                        error = "blob page declares an implausible definition width";
-                        return false;
-                    }
-                    control_bytes = bits == 0U ? 0U : bits <= 8U ? 1U : 2U;
-                    def_mask = bits == 0U ? 0U : ((1U << bits) - 1U);
-                }
-            }
-            std::size_t offset = 0;
-            for (const auto row_size : row_sizes) {
-                if (offset + row_size > values.size() || row_size < control_bytes) {
-                    error = "blob packed row exceeds values buffer";
+        std::vector<std::uint32_t> row_sizes;
+        if (!blob_v2_control_buffer_to_row_sizes(control, page.length, row_sizes, error)) {
+            return false;
+        }
+        // A nullable blob column (pylance writes one whenever a row is null) puts a control word
+        // -- the row's definition level -- in front of every row, and a null row is that word
+        // alone. nanolance's own blob columns are never null and carry none.
+        std::size_t control_bytes = 0;
+        std::uint32_t def_mask = 0;
+        if (!page.encoding.empty()) {
+            page_layout::PageLayout layout;
+            std::string why;
+            if (page_layout::decode_page_layout(page.encoding, layout, why) &&
+                layout.kind == page_layout::LayoutKind::kFullZip) {
+                if (layout.full_zip.bits_rep != 0U) {
+                    error = "column '" + on_disk_field.name + "': a blob column inside a list is not read";
                     return false;
                 }
-                std::uint32_t def = 0;
-                for (std::size_t b = 0; b < control_bytes; ++b) {
-                    def |= static_cast<std::uint32_t>(values[offset + b]) << (8U * b);
-                }
-                def &= def_mask;
-                const auto row = out.blob_v2.row_packed_sizes.size();
-                if (def != 0U || !out.validity.empty()) {
-                    if (out.validity.empty()) {
-                        out.validity.assign((row + 8U) / 8U, 0xFFU);
-                    }
-                    out.validity.resize((row + 8U) / 8U, 0xFFU);
-                    if (def != 0U) {
-                        out.validity[row / 8U] &= static_cast<std::uint8_t>(~(1U << (row % 8U)));
-                        ++out.null_count;
-                    } else {
-                        out.validity[row / 8U] |= static_cast<std::uint8_t>(1U << (row % 8U));
-                    }
-                }
-                const auto payload = def != 0U ? 0U : row_size - static_cast<std::uint32_t>(control_bytes);
-                out.blob_v2.packed_payload.insert(
-                    out.blob_v2.packed_payload.end(),
-                    values.begin() + static_cast<std::ptrdiff_t>(offset + control_bytes),
-                    values.begin() + static_cast<std::ptrdiff_t>(offset + control_bytes + payload));
-                out.blob_v2.row_packed_sizes.push_back(payload);
-                offset += row_size;
-            }
-            if (offset != values.size()) {
-                error = "blob values buffer has trailing bytes";
-                return false;
-            }
-        }
-        return true;
-    }
-
-    // Constant column: the single value is stored once in field metadata; expand to one value per row.
-    // Selected from the page descriptor when there is one, from the legacy field metadata otherwise.
-    auto encoding_plan = classify_column_encoding(on_disk_field, column_metadata);
-    if (item_view) {
-        // Item validity comes from the unravelled levels, not from each chunk's definition levels,
-        // which here count list and struct layers too. Constant pages are expanded by the nested
-        // path itself, so never reach here.
-        encoding_plan.repdef = nullptr;
-        encoding_plan.item_view = item_view;
-        if (encoding_plan.kind == ColumnEncodingKind::kConstant) {
-            error = "column '" + on_disk_field.name + "': a constant page reached the nested item pass";
-            return false;
-        }
-    }
-    if (encoding_plan.kind == ColumnEncodingKind::kUnsupported) {
-        // Refuse by name, before a single buffer byte is interpreted. The old code had no way to do
-        // this: with no descriptor read, an encoding it did not implement fell through to the flat
-        // path and was misparsed, surfacing later as a size mismatch -- which is why a 3-row
-        // stock-Lance table decoded and a 5000-row one did not.
-        error = "column '" + on_disk_field.name + "': " + encoding_plan.unsupported_reason;
-        return false;
-    }
-
-    // A constant page carries a value when the descriptor has an inline one, or when the page has 1
-    // or 3 buffers (value; value + rep + def). 0 or 2 buffers with no inline value is how Lance says
-    // every row is null. This is `ConstantPageScheduler::try_new`'s `has_scalar_value` inverted, and
-    // it has to be read off the PAGE: a definition layer in the descriptor is equally how a nullable
-    // constant column is spelled, so keying "all null" off the layers alone made every nullable
-    // string constant read back entirely null. Fixed-width columns escaped it only because they
-    // carry their value inline.
-    const std::size_t constant_buffer_count =
-        column_metadata.pages.empty() ? 0U : column_metadata.pages.front().buffer_sizes.size();
-    const bool constant_has_value = encoding_plan.constant_inline_value.has_value() ||
-                                    constant_buffer_count == 1U || constant_buffer_count == 3U;
-    const bool constant_all_null = encoding_plan.constant_declares_levels && !constant_has_value;
-
-    if (encoding_plan.kind == ColumnEncodingKind::kConstant && constant_all_null) {
-        // Every row is null. There are no value bytes on disk, so materialize the column's zeroed
-        // storage and an all-clear validity bitmap.
-        std::uint64_t total_rows = 0;
-        for (const auto& page : column_metadata.pages) {
-            total_rows += page.length;
-        }
-        const bool variable = lance_field_is_variable_width(on_disk_field.logical_type);
-        out.kind = variable ? ColumnValues::Kind::VariableWidth : ColumnValues::Kind::FixedWidth;
-        if (variable) {
-            out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
-            const auto offset_width = out.variable.large ? 8U : 4U;
-            out.variable.offsets.assign(static_cast<std::size_t>(total_rows + 1U) * offset_width, 0U);
-        } else {
-            std::string internal = on_disk_field.logical_type;
-            if (internal == "string") {
-                internal = "utf8";
-            }
-            const auto bpv = lance_logical_type_value_bytes(internal);
-            std::uint64_t bytes = 0;
-            if (!checked_mul(total_rows, static_cast<std::uint64_t>(bpv), bytes) || !fits_size_t(bytes)) {
-                error = "all-null column size overflows";
-                return false;
-            }
-            out.fixed.assign(static_cast<std::size_t>(bytes), 0U);
-        }
-        out.validity.assign(static_cast<std::size_t>((total_rows + 7U) / 8U), 0U);
-        out.null_count = total_rows;
-        return true;
-    }
-
-    if (encoding_plan.kind == ColumnEncodingKind::kConstant) {
-        // Resolve the repeated value, preferring the sources any writer produces over nanolance's
-        // own metadata: the descriptor's inline value (fixed-width), then the page's single data
-        // buffer (variable-width), then `nanolance:const-value` for files predating the descriptor
-        // being read back.
-        std::vector<std::uint8_t> constant_value;
-        const std::vector<std::uint8_t>* value = nullptr;
-        if (encoding_plan.constant_inline_value) {
-            constant_value = *encoding_plan.constant_inline_value;
-            value = &constant_value;
-        } else if (!column_metadata.pages.empty() && !column_metadata.pages.front().buffer_offsets.empty() &&
-                   !column_metadata.pages.front().buffer_sizes.empty()) {
-            const auto& page = column_metadata.pages.front();
-            std::vector<std::uint8_t> scalar_buffer;
-            if (!io.read(page.buffer_offsets[0], page.buffer_sizes[0],
-                                            scalar_buffer, error) ||
-                !scalar_value::decode_variable(scalar_buffer, constant_value, error)) {
-                return false;
-            }
-            value = &constant_value;
-        } else {
-            value = field_metadata_bytes(on_disk_field, "nanolance:const-value");
-        }
-        if (value == nullptr) {
-            error = "constant column '" + on_disk_field.name +
-                    "' has no value: the page descriptor carries none inline, the page has no data "
-                    "buffer, and nanolance:const-value is absent";
-            return false;
-        }
-        std::uint64_t total_rows = 0;
-        for (const auto& page : column_metadata.pages) {
-            total_rows += page.length;
-        }
-        if (encoding_plan.constant_declares_levels) {
-            std::uint64_t rows_so_far = 0;
-            for (const auto& page : column_metadata.pages) {
-                if (!apply_constant_definition_levels(io, page,
-                                                      encoding_plan.constant_inline_value.has_value(), rows_so_far,
-                                                      out, error)) {
+                const auto bits = layout.full_zip.bits_def;
+                if (bits > 16U) {
+                    error = "blob page declares an implausible definition width";
                     return false;
                 }
-                rows_so_far += page.length;
+                control_bytes = bits == 0U ? 0U : bits <= 8U ? 1U : 2U;
+                def_mask = bits == 0U ? 0U : ((1U << bits) - 1U);
             }
         }
-        if (on_disk_field.encoding == 2) {  // variable-width
-            out.kind = ColumnValues::Kind::VariableWidth;
-            out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
-            const std::size_t len = value->size();
-            const auto rows = static_cast<std::size_t>(total_rows);
-            if (!append_repeated_value(out.variable.data, value->data(), len, rows)) {  // every row = value
-                error = "constant column expansion overflows";
+        std::size_t offset = 0;
+        for (const auto row_size : row_sizes) {
+            if (offset + row_size > values.size() || row_size < control_bytes) {
+                error = "blob packed row exceeds values buffer";
                 return false;
             }
-            // offsets are arithmetic (0, len, 2*len, ...); build typed then one bulk copy.
-            if (out.variable.large) {
-                std::vector<std::uint64_t> offs(rows + 1U);
-                for (std::size_t i = 0; i <= rows; ++i) offs[i] = static_cast<std::uint64_t>(i) * len;
-                out.variable.offsets.resize(offs.size() * 8U);
-                std::memcpy(out.variable.offsets.data(), offs.data(), offs.size() * 8U);
-            } else {
-                std::vector<std::uint32_t> offs(rows + 1U);
-                for (std::size_t i = 0; i <= rows; ++i) offs[i] = static_cast<std::uint32_t>(i * len);
-                out.variable.offsets.resize(offs.size() * 4U);
-                std::memcpy(out.variable.offsets.data(), offs.data(), offs.size() * 4U);
+            std::uint32_t def = 0;
+            for (std::size_t b = 0; b < control_bytes; ++b) {
+                def |= static_cast<std::uint32_t>(values[offset + b]) << (8U * b);
             }
-            return true;
+            def &= def_mask;
+            const auto row = out.blob_v2.row_packed_sizes.size();
+            if (def != 0U || !out.validity.empty()) {
+                if (out.validity.empty()) {
+                    out.validity.assign((row + 8U) / 8U, 0xFFU);
+                }
+                out.validity.resize((row + 8U) / 8U, 0xFFU);
+                if (def != 0U) {
+                    out.validity[row / 8U] &= static_cast<std::uint8_t>(~(1U << (row % 8U)));
+                    ++out.null_count;
+                } else {
+                    out.validity[row / 8U] |= static_cast<std::uint8_t>(1U << (row % 8U));
+                }
+            }
+            const auto payload = def != 0U ? 0U : row_size - static_cast<std::uint32_t>(control_bytes);
+            out.blob_v2.packed_payload.insert(
+                out.blob_v2.packed_payload.end(),
+                values.begin() + static_cast<std::ptrdiff_t>(offset + control_bytes),
+                values.begin() + static_cast<std::ptrdiff_t>(offset + control_bytes + payload));
+            out.blob_v2.row_packed_sizes.push_back(payload);
+            offset += row_size;
         }
-        out.kind = ColumnValues::Kind::FixedWidth;
-        if (!append_repeated_value(out.fixed, value->data(), value->size(),
-                                   static_cast<std::size_t>(total_rows))) {
-            error = "constant column expansion overflows";
+        if (offset != values.size()) {
+            error = "blob values buffer has trailing bytes";
             return false;
         }
-        return true;
     }
+    return true;
+}
 
-    // Run-length encoded fixed-width column: one chunk with two buffers (run values + run lengths).
-    if (encoding_plan.kind == ColumnEncodingKind::kRle) {
-        out.kind = ColumnValues::Kind::FixedWidth;
+/// Decodes a constant column whose every row is null.
+/// One branch of decode_column_impl, which has already bounded the row count.
+bool decode_constant_null_column(const pb::Field& on_disk_field, const pb::ColumnMetadata& column_metadata,
+                                 ColumnValues& out, std::string& error) {
+    // Every row is null. There are no value bytes on disk, so materialize the column's zeroed
+    // storage and an all-clear validity bitmap.
+    std::uint64_t total_rows = 0;
+    for (const auto& page : column_metadata.pages) {
+        total_rows += page.length;
+    }
+    const bool variable = lance_field_is_variable_width(on_disk_field.logical_type);
+    out.kind = variable ? ColumnValues::Kind::VariableWidth : ColumnValues::Kind::FixedWidth;
+    if (variable) {
+        out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
+        const auto offset_width = out.variable.large ? 8U : 4U;
+        out.variable.offsets.assign(static_cast<std::size_t>(total_rows + 1U) * offset_width, 0U);
+    } else {
         std::string internal = on_disk_field.logical_type;
         if (internal == "string") {
             internal = "utf8";
         }
         const auto bpv = lance_logical_type_value_bytes(internal);
-        // Reserve the whole column upfront: without this, each run's append_repeated_value() call
-        // resize()s out.fixed to an exact new size (no growth slack), so libstdc++ reallocates and
-        // re-copies everything already written on essentially every run -- O(n^2) memcpy for a column
-        // with many runs. declared_rows is already validated against the safety limit above.
-        std::uint64_t reserve_bytes = 0;
-        if (checked_mul(declared_rows, static_cast<std::uint64_t>(bpv), reserve_bytes) && fits_size_t(reserve_bytes)) {
-            reserve_capped(out.fixed, reserve_bytes);
+        std::uint64_t bytes = 0;
+        if (!checked_mul(total_rows, static_cast<std::uint64_t>(bpv), bytes) || !fits_size_t(bytes)) {
+            error = "all-null column size overflows";
+            return false;
         }
-        PageScratch control_scratch;
-        PageScratch data_scratch;
-        auto& control = control_scratch.get();
-        auto& data = data_scratch.get();
-        Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
-        auto& chunks = chunks_scratch.get();
-        std::uint64_t validity_rows = 0;
+        out.fixed.assign(static_cast<std::size_t>(bytes), 0U);
+    }
+    out.validity.assign(static_cast<std::size_t>((total_rows + 7U) / 8U), 0U);
+    out.null_count = total_rows;
+    return true;
+}
+
+/// Decodes a constant column: one value, expanded to one per row.
+/// One branch of decode_column_impl, which has already bounded the row count.
+bool decode_constant_column(const EncodingsIo& io, const pb::Field& on_disk_field,
+                            const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
+                            const ColumnEncodingPlan& encoding_plan) {
+    // Resolve the repeated value, preferring the sources any writer produces over nanolance's
+    // own metadata: the descriptor's inline value (fixed-width), then the page's single data
+    // buffer (variable-width), then `nanolance:const-value` for files predating the descriptor
+    // being read back.
+    std::vector<std::uint8_t> constant_value;
+    const std::vector<std::uint8_t>* value = nullptr;
+    if (encoding_plan.constant_inline_value) {
+        constant_value = *encoding_plan.constant_inline_value;
+        value = &constant_value;
+    } else if (!column_metadata.pages.empty() && !column_metadata.pages.front().buffer_offsets.empty() &&
+               !column_metadata.pages.front().buffer_sizes.empty()) {
+        const auto& page = column_metadata.pages.front();
+        std::vector<std::uint8_t> scalar_buffer;
+        if (!io.read(page.buffer_offsets[0], page.buffer_sizes[0],
+                                        scalar_buffer, error) ||
+            !scalar_value::decode_variable(scalar_buffer, constant_value, error)) {
+            return false;
+        }
+        value = &constant_value;
+    } else {
+        value = field_metadata_bytes(on_disk_field, "nanolance:const-value");
+    }
+    if (value == nullptr) {
+        error = "constant column '" + on_disk_field.name +
+                "' has no value: the page descriptor carries none inline, the page has no data "
+                "buffer, and nanolance:const-value is absent";
+        return false;
+    }
+    std::uint64_t total_rows = 0;
+    for (const auto& page : column_metadata.pages) {
+        total_rows += page.length;
+    }
+    if (encoding_plan.constant_declares_levels) {
+        std::uint64_t rows_so_far = 0;
         for (const auto& page : column_metadata.pages) {
-            if (!read_page_buffers(io, page, false, control, data, error)) {
+            if (!apply_constant_definition_levels(io, page,
+                                                  encoding_plan.constant_inline_value.has_value(), rows_so_far,
+                                                  out, error)) {
                 return false;
             }
-            // Shared chunk split, not a second hand-rolled one. This branch used to parse the chunk
-            // itself as [u16 num_levels][u32 size0][u32 size1], which is the right header only for a
-            // NON-nullable RLE column: a nullable one carries a `u16 def_size` slot between the level
-            // count and the buffer sizes, so every offset after it was two bytes out and the read died
-            // with "rle chunk buffer sizes invalid". A pylance float64 column whose nulls come in runs
-            // is exactly that shape.
-            if (!read_page_chunks_with_validity(data, encoding_plan, page.length, chunks, validity_rows,
-                                                out, error)) {
-                return false;
-            }
-            for (const auto& chunk : chunks) {
-                if (chunk.extra_buffers.empty()) {
-                    error = "rle chunk is missing its run-lengths buffer";
-                    return false;
-                }
-                if (!rle::decode(chunk.values, chunk.extra_buffers[0], bpv, out.fixed, error)) {
-                    return false;
-                }
-            }
+            rows_so_far += page.length;
+        }
+    }
+    if (on_disk_field.encoding == 2) {  // variable-width
+        out.kind = ColumnValues::Kind::VariableWidth;
+        out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
+        const std::size_t len = value->size();
+        const auto rows = static_cast<std::size_t>(total_rows);
+        if (!append_repeated_value(out.variable.data, value->data(), len, rows)) {  // every row = value
+            error = "constant column expansion overflows";
+            return false;
+        }
+        // offsets are arithmetic (0, len, 2*len, ...); build typed then one bulk copy.
+        if (out.variable.large) {
+            std::vector<std::uint64_t> offs(rows + 1U);
+            for (std::size_t i = 0; i <= rows; ++i) offs[i] = static_cast<std::uint64_t>(i) * len;
+            out.variable.offsets.resize(offs.size() * 8U);
+            std::memcpy(out.variable.offsets.data(), offs.data(), offs.size() * 8U);
+        } else {
+            std::vector<std::uint32_t> offs(rows + 1U);
+            for (std::size_t i = 0; i <= rows; ++i) offs[i] = static_cast<std::uint32_t>(i * len);
+            out.variable.offsets.resize(offs.size() * 4U);
+            std::memcpy(out.variable.offsets.data(), offs.data(), offs.size() * 4U);
         }
         return true;
     }
+    out.kind = ColumnValues::Kind::FixedWidth;
+    if (!append_repeated_value(out.fixed, value->data(), value->size(),
+                               static_cast<std::size_t>(total_rows))) {
+        error = "constant column expansion overflows";
+        return false;
+    }
+    return true;
+}
 
-    // Dictionary with RLE'd indices: buffer[1] = the miniblock payload, buffer[2] = the dictionary.
-    //
-    // This branch used to parse the payload itself as [u16 num_levels][u32 size0][u32 size1] and take
-    // the whole page to be one chunk. That is nanolance's own dict-rle page and nothing else. Lance
-    // writes the ordinary miniblock grammar -- a chunk header whose shape the descriptor declares,
-    // as many chunks as the page needs -- so a pylance column with runs decoded only its first 1024
-    // values per chunk read and then failed downstream with a buffer-size mismatch rather than
-    // anything naming the cause. A repetitive string column past ~5000 rows is exactly that shape,
-    // and so is any integer column with runs, whose dictionary is fixed-width rather than variable.
-    if (encoding_plan.kind == ColumnEncodingKind::kDictRle) {
-        const bool fixed_dict = encoding_plan.dict_value_bits != 0U;
-        out.kind = fixed_dict ? ColumnValues::Kind::FixedWidth : ColumnValues::Kind::VariableWidth;
-        out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
-        std::vector<std::uint8_t> payload;
-        std::vector<std::uint8_t> dict_stored;
-        DictionaryBlock dict;
-        Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
-        auto& chunks = chunks_scratch.get();
-        std::vector<std::pair<std::uint32_t, std::uint8_t>> runs;  // (dictionary index, run length)
-        std::uint64_t validity_rows = 0;
-        for (const auto& page : column_metadata.pages) {
-            if (page.buffer_offsets.size() < 3U || page.buffer_sizes.size() < 3U) {
-                error = "dict-rle page missing buffers";
+/// Decodes a run-length encoded fixed-width column.
+/// One branch of decode_column_impl, which has already bounded the row count.
+bool decode_rle_column(const EncodingsIo& io, const pb::Field& on_disk_field, const pb::ColumnMetadata& column_metadata,
+                       ColumnValues& out, std::string& error, const ColumnEncodingPlan& encoding_plan,
+                       std::uint64_t declared_rows) {
+    out.kind = ColumnValues::Kind::FixedWidth;
+    std::string internal = on_disk_field.logical_type;
+    if (internal == "string") {
+        internal = "utf8";
+    }
+    const auto bpv = lance_logical_type_value_bytes(internal);
+    // Reserve the whole column upfront: without this, each run's append_repeated_value() call
+    // resize()s out.fixed to an exact new size (no growth slack), so libstdc++ reallocates and
+    // re-copies everything already written on essentially every run -- O(n^2) memcpy for a column
+    // with many runs. declared_rows is already validated against the safety limit above.
+    std::uint64_t reserve_bytes = 0;
+    if (checked_mul(declared_rows, static_cast<std::uint64_t>(bpv), reserve_bytes) && fits_size_t(reserve_bytes)) {
+        reserve_capped(out.fixed, reserve_bytes);
+    }
+    PageScratch control_scratch;
+    PageScratch data_scratch;
+    auto& control = control_scratch.get();
+    auto& data = data_scratch.get();
+    Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
+    auto& chunks = chunks_scratch.get();
+    std::uint64_t validity_rows = 0;
+    for (const auto& page : column_metadata.pages) {
+        if (!read_page_buffers(io, page, false, control, data, error)) {
+            return false;
+        }
+        // Shared chunk split, not a second hand-rolled one. This branch used to parse the chunk
+        // itself as [u16 num_levels][u32 size0][u32 size1], which is the right header only for a
+        // NON-nullable RLE column: a nullable one carries a `u16 def_size` slot between the level
+        // count and the buffer sizes, so every offset after it was two bytes out and the read died
+        // with "rle chunk buffer sizes invalid". A pylance float64 column whose nulls come in runs
+        // is exactly that shape.
+        if (!read_page_chunks_with_validity(data, encoding_plan, page.length, chunks, validity_rows,
+                                            out, error)) {
+            return false;
+        }
+        for (const auto& chunk : chunks) {
+            if (chunk.extra_buffers.empty()) {
+                error = "rle chunk is missing its run-lengths buffer";
                 return false;
             }
-            if (!io.read(page.buffer_offsets[1], page.buffer_sizes[1], payload,
-                                            error) ||
-                !io.read(page.buffer_offsets[2], page.buffer_sizes[2], dict_stored,
+            if (!rle::decode(chunk.values, chunk.extra_buffers[0], bpv, out.fixed, error)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Decodes a dictionary column whose indices are run-length encoded.
+/// One branch of decode_column_impl, which has already bounded the row count.
+bool decode_dict_rle_column(const EncodingsIo& io, const pb::Field& on_disk_field,
+                            const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
+                            const ColumnEncodingPlan& encoding_plan) {
+    const bool fixed_dict = encoding_plan.dict_value_bits != 0U;
+    out.kind = fixed_dict ? ColumnValues::Kind::FixedWidth : ColumnValues::Kind::VariableWidth;
+    out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
+    std::vector<std::uint8_t> payload;
+    std::vector<std::uint8_t> dict_stored;
+    DictionaryBlock dict;
+    Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
+    auto& chunks = chunks_scratch.get();
+    std::vector<std::pair<std::uint32_t, std::uint8_t>> runs;  // (dictionary index, run length)
+    std::uint64_t validity_rows = 0;
+    for (const auto& page : column_metadata.pages) {
+        if (page.buffer_offsets.size() < 3U || page.buffer_sizes.size() < 3U) {
+            error = "dict-rle page missing buffers";
+            return false;
+        }
+        if (!io.read(page.buffer_offsets[1], page.buffer_sizes[1], payload,
+                                        error) ||
+            !io.read(page.buffer_offsets[2], page.buffer_sizes[2], dict_stored,
+                                        error)) {
+            return false;
+        }
+        if (!decode_dictionary_block(encoding_plan, on_disk_field.logical_type, dict_stored, dict, error)) {
+            return false;
+        }
+        // Same splitter as every other miniblock path, so a nullable column's definition levels
+        // are read here rather than being mistaken for run data.
+        if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, chunks, validity_rows, out,
                                             error)) {
+            return false;
+        }
+        runs.clear();
+        for (const auto& chunk : chunks) {
+            if (chunk.extra_buffers.empty()) {
+                error = "dict-rle chunk is missing its run-lengths buffer";
                 return false;
             }
-            if (!decode_dictionary_block(encoding_plan, on_disk_field.logical_type, dict_stored, dict, error)) {
+            const auto& values = chunk.values;    // one dictionary index per run (u32 unless declared)
+            const auto& lengths = chunk.extra_buffers[0];  // one u8 run length per run
+            const std::size_t iw = encoding_plan.dict_index_bits / 8U;
+            if (values.size() % iw != 0U || values.size() / iw != lengths.size()) {
+                error = "dict-rle run count mismatch between indices and lengths";
                 return false;
             }
-            // Same splitter as every other miniblock path, so a nullable column's definition levels
-            // are read here rather than being mistaken for run data.
-            if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, chunks, validity_rows, out,
-                                                error)) {
-                return false;
-            }
-            runs.clear();
-            for (const auto& chunk : chunks) {
-                if (chunk.extra_buffers.empty()) {
-                    error = "dict-rle chunk is missing its run-lengths buffer";
+            const std::size_t num_runs = lengths.size();
+            reserve_more(runs, num_runs);
+            for (std::size_t r = 0; r < num_runs; ++r) {
+                std::uint64_t wide = 0;
+                std::memcpy(&wide, values.data() + r * iw, iw);  // little-endian
+                if (wide > std::numeric_limits<std::uint32_t>::max()) {
+                    error = "dict-rle index out of range";
                     return false;
                 }
-                const auto& values = chunk.values;    // one dictionary index per run (u32 unless declared)
-                const auto& lengths = chunk.extra_buffers[0];  // one u8 run length per run
-                const std::size_t iw = encoding_plan.dict_index_bits / 8U;
-                if (values.size() % iw != 0U || values.size() / iw != lengths.size()) {
-                    error = "dict-rle run count mismatch between indices and lengths";
+                const auto index = static_cast<std::uint32_t>(wide);
+                if (index >= dict.count) {
+                    error = "dict-rle index out of range";
                     return false;
                 }
-                const std::size_t num_runs = lengths.size();
-                reserve_more(runs, num_runs);
-                for (std::size_t r = 0; r < num_runs; ++r) {
-                    std::uint64_t wide = 0;
-                    std::memcpy(&wide, values.data() + r * iw, iw);  // little-endian
-                    if (wide > std::numeric_limits<std::uint32_t>::max()) {
-                        error = "dict-rle index out of range";
-                        return false;
-                    }
-                    const auto index = static_cast<std::uint32_t>(wide);
-                    if (index >= dict.count) {
-                        error = "dict-rle index out of range";
-                        return false;
-                    }
-                    runs.emplace_back(index, lengths[r]);
-                }
+                runs.emplace_back(index, lengths[r]);
             }
+        }
 
-            // Pre-pass over the whole page: how many rows, and how many bytes they expand to.
-            std::size_t total_rows = 0;
-            std::size_t total_data = 0;
+        // Pre-pass over the whole page: how many rows, and how many bytes they expand to.
+        std::size_t total_rows = 0;
+        std::size_t total_data = 0;
+        for (const auto& [index, run] : runs) {
+            total_rows += run;
+            total_data += static_cast<std::size_t>(run) * dict.entry_size(index);
+        }
+        if (total_rows != page.length) {
+            error = "dict-rle runs cover " + std::to_string(total_rows) + " rows but the page declares " +
+                    std::to_string(page.length);
+            return false;
+        }
+
+        if (fixed_dict) {
+            const std::size_t base = out.fixed.size();
+            out.fixed.resize(base + total_data);
+            std::uint8_t* dest = out.fixed.data() + base;
             for (const auto& [index, run] : runs) {
-                total_rows += run;
-                total_data += static_cast<std::size_t>(run) * dict.entry_size(index);
-            }
-            if (total_rows != page.length) {
-                error = "dict-rle runs cover " + std::to_string(total_rows) + " rows but the page declares " +
-                        std::to_string(page.length);
-                return false;
-            }
-
-            if (fixed_dict) {
-                const std::size_t base = out.fixed.size();
-                out.fixed.resize(base + total_data);
-                std::uint8_t* dest = out.fixed.data() + base;
-                for (const auto& [index, run] : runs) {
-                    const std::uint8_t* src = dict.entry(index);
-                    for (std::uint8_t c = 0; c < run; ++c) {
-                        std::memcpy(dest, src, dict.value_bytes);
-                        dest += dict.value_bytes;
-                    }
+                const std::uint8_t* src = dict.entry(index);
+                for (std::uint8_t c = 0; c < run; ++c) {
+                    std::memcpy(dest, src, dict.value_bytes);
+                    dest += dict.value_bytes;
                 }
-                continue;
             }
+            continue;
+        }
 
-            reserve_more(out.variable.data, total_data);
-            const bool first_page = out.variable.offsets.empty();
-            std::uint64_t cumulative = out.variable.data.size();  // byte offset (continues across pages)
+        reserve_more(out.variable.data, total_data);
+        const bool first_page = out.variable.offsets.empty();
+        std::uint64_t cumulative = out.variable.data.size();  // byte offset (continues across pages)
 
-            // Expand: bulk-fill data once per run, and write each offset straight into the output --
-            // not into a temporary copied over afterwards, which cost a second fresh buffer per page.
-            auto expand = [&](auto zero) -> bool {
-                using OT = decltype(zero);
-                const std::size_t count = total_rows + (first_page ? 1U : 0U);
-                const std::size_t base = out.variable.offsets.size();
-                reserve_more(out.variable.offsets, count * sizeof(OT));
-                out.variable.offsets.resize(base + count * sizeof(OT));
-                std::uint8_t* dst = out.variable.offsets.data() + base;
-                const auto put = [&dst](std::uint64_t offset) {
-                    const auto o = static_cast<OT>(offset);
-                    std::memcpy(dst, &o, sizeof(OT));
-                    dst += sizeof(OT);
-                };
-                if (first_page) {
+        // Expand: bulk-fill data once per run, and write each offset straight into the output --
+        // not into a temporary copied over afterwards, which cost a second fresh buffer per page.
+        auto expand = [&](auto zero) -> bool {
+            using OT = decltype(zero);
+            const std::size_t count = total_rows + (first_page ? 1U : 0U);
+            const std::size_t base = out.variable.offsets.size();
+            reserve_more(out.variable.offsets, count * sizeof(OT));
+            out.variable.offsets.resize(base + count * sizeof(OT));
+            std::uint8_t* dst = out.variable.offsets.data() + base;
+            const auto put = [&dst](std::uint64_t offset) {
+                const auto o = static_cast<OT>(offset);
+                std::memcpy(dst, &o, sizeof(OT));
+                dst += sizeof(OT);
+            };
+            if (first_page) {
+                put(cumulative);
+            }
+            for (const auto& [index, run] : runs) {
+                const std::size_t len = dict.entry_size(index);
+                if (!append_repeated_value(out.variable.data, dict.entry(index), len, run)) {
+                    return false;
+                }
+                for (std::uint8_t c = 0; c < run; ++c) {
+                    cumulative += len;
                     put(cumulative);
                 }
-                for (const auto& [index, run] : runs) {
-                    const std::size_t len = dict.entry_size(index);
-                    if (!append_repeated_value(out.variable.data, dict.entry(index), len, run)) {
-                        return false;
-                    }
-                    for (std::uint8_t c = 0; c < run; ++c) {
-                        cumulative += len;
-                        put(cumulative);
-                    }
-                }
-                return true;
-            };
-            const bool ok = out.variable.large ? expand(std::uint64_t{0}) : expand(std::uint32_t{0});
-            if (!ok) {
-                error = "dict-rle expansion overflows";
-                return false;
             }
+            return true;
+        };
+        const bool ok = out.variable.large ? expand(std::uint64_t{0}) : expand(std::uint32_t{0});
+        if (!ok) {
+            error = "dict-rle expansion overflows";
+            return false;
         }
-        return true;
     }
+    return true;
+}
 
-    // Structural dictionary column: buffer[1] = bitpacked u32 indices, buffer[2] = dictionary.
-    //
-    // The dictionary block comes in two shapes and the descriptor says which. `Variable` is a block
-    // with an offset header, which is what a low-cardinality string column gets. `Flat(N)` is N-bit
-    // values end to end with no header at all, which is what Lance builds for a time64 or decimal128
-    // column once its cardinality justifies a dictionary. Reading a flat block as a variable-width
-    // one read the first value as an offset header and refused with "dict block header invalid".
-    if (encoding_plan.kind == ColumnEncodingKind::kDict) {
-        const bool fixed_dict = encoding_plan.dict_value_bits != 0U;
-        out.kind = fixed_dict ? ColumnValues::Kind::FixedWidth : ColumnValues::Kind::VariableWidth;
-        out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
-        std::vector<std::uint8_t> payload;
-        std::vector<std::uint8_t> dict_stored;
-        DictionaryBlock dict;
-        std::vector<std::uint8_t> indices_bytes;
-        std::vector<miniblock::ChunkView> index_chunks;
-        std::uint64_t validity_rows = 0;
-        for (const auto& page : column_metadata.pages) {
-            if (page.buffer_offsets.size() < 3U || page.buffer_sizes.size() < 3U) {
-                error = "dict page missing buffers";
+/// Decodes a dictionary column.
+/// One branch of decode_column_impl, which has already bounded the row count.
+bool decode_dict_column(const EncodingsIo& io, const pb::Field& on_disk_field,
+                        const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
+                        const ColumnEncodingPlan& encoding_plan) {
+    const bool fixed_dict = encoding_plan.dict_value_bits != 0U;
+    out.kind = fixed_dict ? ColumnValues::Kind::FixedWidth : ColumnValues::Kind::VariableWidth;
+    out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
+    std::vector<std::uint8_t> payload;
+    std::vector<std::uint8_t> dict_stored;
+    DictionaryBlock dict;
+    std::vector<std::uint8_t> indices_bytes;
+    std::vector<miniblock::ChunkView> index_chunks;
+    std::uint64_t validity_rows = 0;
+    for (const auto& page : column_metadata.pages) {
+        if (page.buffer_offsets.size() < 3U || page.buffer_sizes.size() < 3U) {
+            error = "dict page missing buffers";
+            return false;
+        }
+        if (!io.read(page.buffer_offsets[1], page.buffer_sizes[1], payload,
+                                        error) ||
+            !io.read(page.buffer_offsets[2], page.buffer_sizes[2], dict_stored,
+                                        error)) {
+            return false;
+        }
+        if (!decode_dictionary_block(encoding_plan, on_disk_field.logical_type, dict_stored, dict, error)) {
+            return false;
+        }
+        const std::size_t num_dict = dict.count;
+        // The index chunks go through the same splitter every other miniblock path uses, so a
+        // nullable dictionary column (a categorical column with missing values -- the shape this
+        // encoding exists for) carries its definition levels here like anywhere else. The
+        // dedicated chunk-list parser this replaced rejected the level buffer outright with
+        // "unexpected miniblock payload prefix".
+        if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, index_chunks,
+                                            validity_rows, out, error)) {
+            return false;
+        }
+        if (index_chunks.empty()) {
+            error = "dict page has no index chunks";
+            return false;
+        }
+        indices_bytes.clear();  // hoisted out of the loop; accumulates fresh per page via insert()
+        std::uint64_t rows_remaining = page.length;
+        const std::size_t flat_width = encoding_plan.dict_flat_index_bits / 8U;
+        for (const auto& chunk : index_chunks) {
+            const auto count = chunk.items != 0U ? chunk.items
+                               : encoding_plan.repdef != nullptr
+                                   ? static_cast<std::uint64_t>(chunk.repdef_values)
+                               : flat_width != 0U ? static_cast<std::uint64_t>(chunk.values.size() / flat_width)
+                                                  : std::min<std::uint64_t>(1024U, rows_remaining);
+            if (count == 0U || count > rows_remaining) {
+                error = "dict index chunk covers " + std::to_string(count) + " values with " +
+                        std::to_string(rows_remaining) + " left in the page";
                 return false;
             }
-            if (!io.read(page.buffer_offsets[1], page.buffer_sizes[1], payload,
-                                            error) ||
-                !io.read(page.buffer_offsets[2], page.buffer_sizes[2], dict_stored,
-                                            error)) {
-                return false;
-            }
-            if (!decode_dictionary_block(encoding_plan, on_disk_field.logical_type, dict_stored, dict, error)) {
-                return false;
-            }
-            const std::size_t num_dict = dict.count;
-            // The index chunks go through the same splitter every other miniblock path uses, so a
-            // nullable dictionary column (a categorical column with missing values -- the shape this
-            // encoding exists for) carries its definition levels here like anywhere else. The
-            // dedicated chunk-list parser this replaced rejected the level buffer outright with
-            // "unexpected miniblock payload prefix".
-            if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, index_chunks,
-                                                validity_rows, out, error)) {
-                return false;
-            }
-            if (index_chunks.empty()) {
-                error = "dict page has no index chunks";
-                return false;
-            }
-            indices_bytes.clear();  // hoisted out of the loop; accumulates fresh per page via insert()
-            std::uint64_t rows_remaining = page.length;
-            const std::size_t flat_width = encoding_plan.dict_flat_index_bits / 8U;
-            for (const auto& chunk : index_chunks) {
-                const auto count = chunk.items != 0U ? chunk.items
-                                   : encoding_plan.repdef != nullptr
-                                       ? static_cast<std::uint64_t>(chunk.repdef_values)
-                                   : flat_width != 0U ? static_cast<std::uint64_t>(chunk.values.size() / flat_width)
-                                                      : std::min<std::uint64_t>(1024U, rows_remaining);
-                if (count == 0U || count > rows_remaining) {
-                    error = "dict index chunk covers " + std::to_string(count) + " values with " +
-                            std::to_string(rows_remaining) + " left in the page";
+            if (flat_width != 0U) {
+                if (chunk.values.size() != count * flat_width) {
+                    error = "dict index chunk holds " + std::to_string(chunk.values.size()) + " bytes for " +
+                            std::to_string(count) + " indices";
                     return false;
                 }
-                if (flat_width != 0U) {
-                    if (chunk.values.size() != count * flat_width) {
-                        error = "dict index chunk holds " + std::to_string(chunk.values.size()) + " bytes for " +
-                                std::to_string(count) + " indices";
-                        return false;
-                    }
-                    const auto base = indices_bytes.size();
-                    indices_bytes.resize(base + static_cast<std::size_t>(count) * 4U);
-                    for (std::uint64_t i = 0; i < count; ++i) {
-                        std::uint64_t wide = 0;
-                        std::memcpy(&wide, chunk.values.data() + i * flat_width, flat_width);  // little-endian
-                        if (wide > std::numeric_limits<std::uint32_t>::max()) {
-                            error = "dict index out of range";
-                            return false;
-                        }
-                        const auto index = static_cast<std::uint32_t>(wide);
-                        std::memcpy(indices_bytes.data() + base + i * 4U, &index, 4U);
-                    }
-                } else if (encoding_plan.dict_index_bits != 32U) {
-                    // Packed indices of an Arrow dictionary's own index width: unpacked at that width,
-                    // then widened to the u32 the expansion below reads.
-                    const std::size_t iw = encoding_plan.dict_index_bits / 8U;
-                    std::vector<std::uint8_t> narrow;
-                    if (!bitpack::decode_block(chunk.values, count, iw, narrow, error)) {
-                        return false;
-                    }
-                    const auto base = indices_bytes.size();
-                    indices_bytes.resize(base + static_cast<std::size_t>(count) * 4U);
-                    for (std::uint64_t i = 0; i < count; ++i) {
-                        std::uint64_t index = 0;
-                        std::memcpy(&index, narrow.data() + i * iw, iw);
-                        if (index > std::numeric_limits<std::uint32_t>::max()) {
-                            error = "dict index out of range";
-                            return false;
-                        }
-                        const auto index32 = static_cast<std::uint32_t>(index);
-                        std::memcpy(indices_bytes.data() + base + i * 4U, &index32, 4U);
-                    }
-                } else if (!bitpack::decode_block(chunk.values, count, 4U, indices_bytes, error)) {
-                    return false;
-                }
-                rows_remaining -= count;
-            }
-            if (rows_remaining != 0U || indices_bytes.size() != page.length * 4U) {
-                error = "dict index count mismatch";
-                return false;
-            }
-            if (fixed_dict) {
-                // Every row is the same width, so the destination is sized once and written through
-                // a pointer -- no per-row growth, and no offsets to maintain.
-                const std::size_t base = out.fixed.size();
-                out.fixed.resize(base + static_cast<std::size_t>(page.length) * dict.value_bytes);
-                std::uint8_t* dest = out.fixed.data() + base;
-                for (std::uint64_t r = 0; r < page.length; ++r) {
-                    std::uint32_t index = 0;
-                    std::memcpy(&index, indices_bytes.data() + r * 4U, 4U);
-                    if (index >= num_dict) {
+                const auto base = indices_bytes.size();
+                indices_bytes.resize(base + static_cast<std::size_t>(count) * 4U);
+                for (std::uint64_t i = 0; i < count; ++i) {
+                    std::uint64_t wide = 0;
+                    std::memcpy(&wide, chunk.values.data() + i * flat_width, flat_width);  // little-endian
+                    if (wide > std::numeric_limits<std::uint32_t>::max()) {
                         error = "dict index out of range";
                         return false;
                     }
-                    std::memcpy(dest, dict.entry(index), dict.value_bytes);
-                    dest += dict.value_bytes;
+                    const auto index = static_cast<std::uint32_t>(wide);
+                    std::memcpy(indices_bytes.data() + base + i * 4U, &index, 4U);
                 }
-                continue;
+            } else if (encoding_plan.dict_index_bits != 32U) {
+                // Packed indices of an Arrow dictionary's own index width: unpacked at that width,
+                // then widened to the u32 the expansion below reads.
+                const std::size_t iw = encoding_plan.dict_index_bits / 8U;
+                std::vector<std::uint8_t> narrow;
+                if (!bitpack::decode_block(chunk.values, count, iw, narrow, error)) {
+                    return false;
+                }
+                const auto base = indices_bytes.size();
+                indices_bytes.resize(base + static_cast<std::size_t>(count) * 4U);
+                for (std::uint64_t i = 0; i < count; ++i) {
+                    std::uint64_t index = 0;
+                    std::memcpy(&index, narrow.data() + i * iw, iw);
+                    if (index > std::numeric_limits<std::uint32_t>::max()) {
+                        error = "dict index out of range";
+                        return false;
+                    }
+                    const auto index32 = static_cast<std::uint32_t>(index);
+                    std::memcpy(indices_bytes.data() + base + i * 4U, &index32, 4U);
+                }
+            } else if (!bitpack::decode_block(chunk.values, count, 4U, indices_bytes, error)) {
+                return false;
             }
-            if (out.variable.offsets.empty()) {
-                append_list_offset(out.variable.offsets, 0, out.variable.large);
-            }
-            // Two passes over the indices: the page's expanded size first (checking every index),
-            // then the values copied into a buffer grown once. Growing it value by value doubled a
-            // large column into place, faulting in about twice its size of fresh memory per read.
-            std::uint64_t page_bytes = 0;
+            rows_remaining -= count;
+        }
+        if (rows_remaining != 0U || indices_bytes.size() != page.length * 4U) {
+            error = "dict index count mismatch";
+            return false;
+        }
+        if (fixed_dict) {
+            // Every row is the same width, so the destination is sized once and written through
+            // a pointer -- no per-row growth, and no offsets to maintain.
+            const std::size_t base = out.fixed.size();
+            out.fixed.resize(base + static_cast<std::size_t>(page.length) * dict.value_bytes);
+            std::uint8_t* dest = out.fixed.data() + base;
             for (std::uint64_t r = 0; r < page.length; ++r) {
                 std::uint32_t index = 0;
                 std::memcpy(&index, indices_bytes.data() + r * 4U, 4U);
@@ -2305,480 +2226,513 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
                     error = "dict index out of range";
                     return false;
                 }
-                page_bytes += dict.entry_size(index);
+                std::memcpy(dest, dict.entry(index), dict.value_bytes);
+                dest += dict.value_bytes;
             }
-            const std::size_t data_base = out.variable.data.size();
-            std::uint64_t data_end = 0;
-            if (!checked_add(static_cast<std::uint64_t>(data_base), page_bytes, data_end) || !fits_size_t(data_end) ||
-                data_end > default_read_limits().max_uncompressed_bytes ||
-                (!out.variable.large && data_end > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()))) {
-                error = "dictionary column expands past the decoded-size limit";
+            continue;
+        }
+        if (out.variable.offsets.empty()) {
+            append_list_offset(out.variable.offsets, 0, out.variable.large);
+        }
+        // Two passes over the indices: the page's expanded size first (checking every index),
+        // then the values copied into a buffer grown once. Growing it value by value doubled a
+        // large column into place, faulting in about twice its size of fresh memory per read.
+        std::uint64_t page_bytes = 0;
+        for (std::uint64_t r = 0; r < page.length; ++r) {
+            std::uint32_t index = 0;
+            std::memcpy(&index, indices_bytes.data() + r * 4U, 4U);
+            if (index >= num_dict) {
+                error = "dict index out of range";
                 return false;
             }
-            const auto width = static_cast<std::size_t>(out.variable.large ? 8U : 4U);
-            const std::size_t offsets_base = out.variable.offsets.size();
-            if (data_end > out.variable.data.capacity()) {
-                out.variable.data.reserve(static_cast<std::size_t>(data_end));
-                advise_huge_pages(out.variable.data);
+            page_bytes += dict.entry_size(index);
+        }
+        const std::size_t data_base = out.variable.data.size();
+        std::uint64_t data_end = 0;
+        if (!checked_add(static_cast<std::uint64_t>(data_base), page_bytes, data_end) || !fits_size_t(data_end) ||
+            data_end > default_read_limits().max_uncompressed_bytes ||
+            (!out.variable.large && data_end > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()))) {
+            error = "dictionary column expands past the decoded-size limit";
+            return false;
+        }
+        const auto width = static_cast<std::size_t>(out.variable.large ? 8U : 4U);
+        const std::size_t offsets_base = out.variable.offsets.size();
+        if (data_end > out.variable.data.capacity()) {
+            out.variable.data.reserve(static_cast<std::size_t>(data_end));
+            advise_huge_pages(out.variable.data);
+        }
+        out.variable.data.resize(static_cast<std::size_t>(data_end));
+        out.variable.offsets.resize(offsets_base + static_cast<std::size_t>(page.length) * width);
+        std::uint8_t* dest = out.variable.data.data() + data_base;
+        std::uint8_t* offsets = out.variable.offsets.data() + offsets_base;
+        auto cumulative = static_cast<std::uint64_t>(data_base);
+        for (std::uint64_t r = 0; r < page.length; ++r) {
+            std::uint32_t index = 0;
+            std::memcpy(&index, indices_bytes.data() + r * 4U, 4U);
+            const std::size_t len = dict.entry_size(index);
+            if (len != 0U) {
+                std::memcpy(dest, dict.entry(index), len);
             }
-            out.variable.data.resize(static_cast<std::size_t>(data_end));
-            out.variable.offsets.resize(offsets_base + static_cast<std::size_t>(page.length) * width);
-            std::uint8_t* dest = out.variable.data.data() + data_base;
-            std::uint8_t* offsets = out.variable.offsets.data() + offsets_base;
-            auto cumulative = static_cast<std::uint64_t>(data_base);
-            for (std::uint64_t r = 0; r < page.length; ++r) {
-                std::uint32_t index = 0;
-                std::memcpy(&index, indices_bytes.data() + r * 4U, 4U);
-                const std::size_t len = dict.entry_size(index);
-                if (len != 0U) {
-                    std::memcpy(dest, dict.entry(index), len);
-                }
-                dest += len;
-                cumulative += len;
-                if (out.variable.large) {
-                    std::memcpy(offsets + r * 8U, &cumulative, 8U);
-                } else {
-                    const auto narrow = static_cast<std::int32_t>(cumulative);
-                    std::memcpy(offsets + r * 4U, &narrow, 4U);
-                }
+            dest += len;
+            cumulative += len;
+            if (out.variable.large) {
+                std::memcpy(offsets + r * 8U, &cumulative, 8U);
+            } else {
+                const auto narrow = static_cast<std::int32_t>(cumulative);
+                std::memcpy(offsets + r * 4U, &narrow, 4U);
             }
         }
-        return true;
     }
+    return true;
+}
 
-    // FullZip: values stored row by row, each behind a control word. What Lance writes when a page's
-    // longest value is 256 bytes or more -- a long string, or a float32 fixed_size_list of 64+ dims.
-    if (encoding_plan.kind == ColumnEncodingKind::kFullZip) {
-        std::vector<std::uint8_t> data;
-        std::vector<std::uint16_t> levels;  // definition level of each value-carrying level (item)
-        std::uint64_t rows_so_far = 0;      // items so far: rows, unless the page has lists
-        bool variable = false;
-        for (std::size_t page_index = 0; page_index < column_metadata.pages.size(); ++page_index) {
-            const auto& page = column_metadata.pages[page_index];
-            page_layout::PageLayout layout;
-            FullZipPageParams params;
-            std::string why;
-            if (!page_layout::decode_page_layout(page.encoding, layout, why) ||
-                !full_zip_page_params(layout, page.length, params, why)) {
+/// Decodes a FullZip column (values stored row by row behind control words).
+/// One branch of decode_column_impl, which has already bounded the row count.
+bool decode_full_zip_column(const EncodingsIo& io, const pb::Field& on_disk_field,
+                            const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
+                            const std::shared_ptr<ItemView>& item_view) {
+    std::vector<std::uint8_t> data;
+    std::vector<std::uint16_t> levels;  // definition level of each value-carrying level (item)
+    std::uint64_t rows_so_far = 0;      // items so far: rows, unless the page has lists
+    bool variable = false;
+    for (std::size_t page_index = 0; page_index < column_metadata.pages.size(); ++page_index) {
+        const auto& page = column_metadata.pages[page_index];
+        page_layout::PageLayout layout;
+        FullZipPageParams params;
+        std::string why;
+        if (!page_layout::decode_page_layout(page.encoding, layout, why) ||
+            !full_zip_page_params(layout, page.length, params, why)) {
+            error = "column '" + on_disk_field.name + "' page " + std::to_string(page_index) + ": " + why;
+            return false;
+        }
+        if (page_index == 0U) {
+            variable = params.length_bytes != 0U;
+            if (variable) {
+                out.kind = ColumnValues::Kind::VariableWidth;
+                out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
+                append_list_offset(out.variable.offsets, 0, out.variable.large);
+            } else {
+                out.kind = ColumnValues::Kind::FixedWidth;
+                const auto schema_bytes = lance_logical_type_value_bytes(on_disk_field.logical_type);
+                if (schema_bytes != params.value_bytes - params.item_validity_bytes) {
+                    error = "column '" + on_disk_field.name + "': FullZip values are " +
+                            std::to_string(params.value_bytes) + " bytes but the type is " +
+                            std::to_string(schema_bytes);
+                    return false;
+                }
+            }
+        } else if (variable != (params.length_bytes != 0U)) {
+            error = "column '" + on_disk_field.name + "' mixes fixed- and variable-width FullZip pages";
+            return false;
+        }
+        if (page.buffer_offsets.empty() || page.buffer_sizes.empty()) {
+            error = "column '" + on_disk_field.name + "': FullZip page has no data buffer";
+            return false;
+        }
+        if (!io.read(page.buffer_offsets[0], page.buffer_sizes[0], data, error)) {
+            return false;
+        }
+        if (item_view && item_view->full_zip_window) {
+            if (!count_full_zip_levels(data, params, params.levels, params.visible, why)) {
                 error = "column '" + on_disk_field.name + "' page " + std::to_string(page_index) + ": " + why;
                 return false;
             }
-            if (page_index == 0U) {
-                variable = params.length_bytes != 0U;
-                if (variable) {
-                    out.kind = ColumnValues::Kind::VariableWidth;
-                    out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
-                    append_list_offset(out.variable.offsets, 0, out.variable.large);
-                } else {
-                    out.kind = ColumnValues::Kind::FixedWidth;
-                    const auto schema_bytes = lance_logical_type_value_bytes(on_disk_field.logical_type);
-                    if (schema_bytes != params.value_bytes - params.item_validity_bytes) {
-                        error = "column '" + on_disk_field.name + "': FullZip values are " +
-                                std::to_string(params.value_bytes) + " bytes but the type is " +
-                                std::to_string(schema_bytes);
-                        return false;
-                    }
-                }
-            } else if (variable != (params.length_bytes != 0U)) {
-                error = "column '" + on_disk_field.name + "' mixes fixed- and variable-width FullZip pages";
+            item_view->full_zip_visible += params.visible;
+        }
+        if (params.levels > std::numeric_limits<std::uint32_t>::max()) {
+            error = "FullZip page row count exceeds 2^32";
+            return false;
+        }
+        // Without lists: one level per row, each with a value. With lists: `levels` control words,
+        // `visible` of them followed by a value (rows = items there, for everything below).
+        const auto num_levels = static_cast<std::size_t>(params.levels);
+        const auto rows = static_cast<std::size_t>(params.visible);
+        // Every control word is at least a byte when there are lists, so a page cannot declare
+        // more levels than it has bytes -- checked before anything is sized from the count.
+        if (params.control_bytes != 0U && num_levels > data.size() / params.control_bytes) {
+            error = "column '" + on_disk_field.name + "': FullZip page declares " + std::to_string(num_levels) +
+                    " levels in " + std::to_string(data.size()) + " bytes";
+            return false;
+        }
+        levels.assign(rows, 0U);
+        std::vector<std::uint16_t> page_rep;
+        std::vector<std::uint16_t> page_def;
+        if (params.bits_rep != 0U) {
+            page_rep.resize(num_levels);
+            page_def.resize(num_levels);
+        }
+        bool page_has_nulls = false;
+        std::size_t at = 0;
+        if (!variable) {
+            std::uint64_t page_bytes = 0;
+            std::uint64_t value_total = 0;
+            if (!checked_mul(static_cast<std::uint64_t>(rows), static_cast<std::uint64_t>(params.value_bytes),
+                             value_total) ||
+                !checked_mul(static_cast<std::uint64_t>(num_levels),
+                             static_cast<std::uint64_t>(params.control_bytes), page_bytes) ||
+                page_bytes > std::numeric_limits<std::uint64_t>::max() - value_total ||
+                page_bytes + value_total != data.size()) {
+                error = "column '" + on_disk_field.name + "': FullZip page is " + std::to_string(data.size()) +
+                        " bytes, expected " + std::to_string(page_bytes + value_total);
                 return false;
             }
-            if (page.buffer_offsets.empty() || page.buffer_sizes.empty()) {
-                error = "column '" + on_disk_field.name + "': FullZip page has no data buffer";
+            reserve_more(out.fixed, rows * (params.value_bytes - params.item_validity_bytes));
+            if (params.items != 0U) {
+                out.items_per_row = params.items;
+            }
+        } else {
+            reserve_full_zip_values(out.variable.data, params, data.size());
+        }
+        std::size_t r = 0;  // the next item
+        const auto shape = params.shape();
+        full_zip::Level lv;
+        for (std::size_t level = 0; level < num_levels; ++level) {
+            if (!full_zip::next_level(data, at, shape, lv, error)) {
+                error = "column '" + on_disk_field.name + "': " + error;
                 return false;
             }
-            if (!io.read(page.buffer_offsets[0], page.buffer_sizes[0], data, error)) {
-                return false;
-            }
-            if (item_view && item_view->full_zip_window) {
-                if (!count_full_zip_levels(data, params, params.levels, params.visible, why)) {
-                    error = "column '" + on_disk_field.name + "' page " + std::to_string(page_index) + ": " + why;
-                    return false;
-                }
-                item_view->full_zip_visible += params.visible;
-            }
-            if (params.levels > std::numeric_limits<std::uint32_t>::max()) {
-                error = "FullZip page row count exceeds 2^32";
-                return false;
-            }
-            // Without lists: one level per row, each with a value. With lists: `levels` control words,
-            // `visible` of them followed by a value (rows = items there, for everything below).
-            const auto num_levels = static_cast<std::size_t>(params.levels);
-            const auto rows = static_cast<std::size_t>(params.visible);
-            // Every control word is at least a byte when there are lists, so a page cannot declare
-            // more levels than it has bytes -- checked before anything is sized from the count.
-            if (params.control_bytes != 0U && num_levels > data.size() / params.control_bytes) {
-                error = "column '" + on_disk_field.name + "': FullZip page declares " + std::to_string(num_levels) +
-                        " levels in " + std::to_string(data.size()) + " bytes";
-                return false;
-            }
-            levels.assign(rows, 0U);
-            std::vector<std::uint16_t> page_rep;
-            std::vector<std::uint16_t> page_def;
+            const auto def = lv.def;
             if (params.bits_rep != 0U) {
-                page_rep.resize(num_levels);
-                page_def.resize(num_levels);
+                page_rep[level] = static_cast<std::uint16_t>(lv.rep);
+                page_def[level] = static_cast<std::uint16_t>(def);
             }
-            bool page_has_nulls = false;
-            std::size_t at = 0;
+            if (!lv.visible) {
+                continue;  // an empty or null list: the control word is all there is
+            }
+            if (params.control_bytes != 0U) {
+                if (r == rows) {
+                    error = "column '" + on_disk_field.name + "': FullZip page has more values than the " +
+                            std::to_string(rows) + " it declares";
+                    return false;
+                }
+                levels[r] = static_cast<std::uint16_t>(def);
+                page_has_nulls = page_has_nulls || def != 0U;
+            }
             if (!variable) {
-                std::uint64_t page_bytes = 0;
-                std::uint64_t value_total = 0;
-                if (!checked_mul(static_cast<std::uint64_t>(rows), static_cast<std::uint64_t>(params.value_bytes),
-                                 value_total) ||
-                    !checked_mul(static_cast<std::uint64_t>(num_levels),
-                                 static_cast<std::uint64_t>(params.control_bytes), page_bytes) ||
-                    page_bytes > std::numeric_limits<std::uint64_t>::max() - value_total ||
-                    page_bytes + value_total != data.size()) {
-                    error = "column '" + on_disk_field.name + "': FullZip page is " + std::to_string(data.size()) +
-                            " bytes, expected " + std::to_string(page_bytes + value_total);
-                    return false;
+                const auto* slot = data.data() + lv.value_at;
+                const auto first_item = (rows_so_far + r) * params.items;
+                if (params.item_validity_bytes != 0U) {
+                    append_item_validity(out, slot, params.items, first_item);
+                } else if (params.items != 0U) {
+                    append_item_validity(out, nullptr, params.items, first_item);
                 }
-                reserve_more(out.fixed, rows * (params.value_bytes - params.item_validity_bytes));
-                if (params.items != 0U) {
-                    out.items_per_row = params.items;
-                }
-            } else {
-                reserve_full_zip_values(out.variable.data, params, data.size());
-            }
-            std::size_t r = 0;  // the next item
-            const auto shape = params.shape();
-            full_zip::Level lv;
-            for (std::size_t level = 0; level < num_levels; ++level) {
-                if (!full_zip::next_level(data, at, shape, lv, error)) {
-                    error = "column '" + on_disk_field.name + "': " + error;
-                    return false;
-                }
-                const auto def = lv.def;
-                if (params.bits_rep != 0U) {
-                    page_rep[level] = static_cast<std::uint16_t>(lv.rep);
-                    page_def[level] = static_cast<std::uint16_t>(def);
-                }
-                if (!lv.visible) {
-                    continue;  // an empty or null list: the control word is all there is
-                }
-                if (params.control_bytes != 0U) {
-                    if (r == rows) {
-                        error = "column '" + on_disk_field.name + "': FullZip page has more values than the " +
-                                std::to_string(rows) + " it declares";
-                        return false;
-                    }
-                    levels[r] = static_cast<std::uint16_t>(def);
-                    page_has_nulls = page_has_nulls || def != 0U;
-                }
-                if (!variable) {
-                    const auto* slot = data.data() + lv.value_at;
-                    const auto first_item = (rows_so_far + r) * params.items;
-                    if (params.item_validity_bytes != 0U) {
-                        append_item_validity(out, slot, params.items, first_item);
-                    } else if (params.items != 0U) {
-                        append_item_validity(out, nullptr, params.items, first_item);
-                    }
-                    out.fixed.insert(out.fixed.end(), slot + params.item_validity_bytes, slot + lv.value_size);
-                    ++r;
-                    continue;
-                }
-                if (lv.has_value) {
-                    const auto* value = data.data() + lv.value_at;
-                    const auto length = lv.value_size;
-                    if (params.fsst) {
-                        if (!fsst::decompress_value(*params.fsst, value, length, out.variable.data, error)) {
-                            return false;
-                        }
-                    } else if (params.value_scheme != page_layout::BufferScheme::kNone && length != 0U) {
-                        if (!decompress_full_zip_value(params.value_scheme, value, length, out.variable.data, error)) {
-                            error = "column '" + on_disk_field.name + "': " + error;
-                            return false;
-                        }
-                    } else if (params.value_scheme != page_layout::BufferScheme::kNone) {
-                        // An empty compressed value is an empty value (Lance's decompressor skips it).
-                    } else {
-                        out.variable.data.insert(out.variable.data.end(), value, value + length);
-                    }
-                    if (out.variable.data.size() > default_read_limits().max_uncompressed_bytes ||
-                        (!out.variable.large &&
-                         out.variable.data.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))) {
-                        error = "column '" + on_disk_field.name + "' exceeds the decoded-size limit";
-                        return false;
-                    }
-                }
-                append_list_offset(out.variable.offsets, static_cast<std::int64_t>(out.variable.data.size()),
-                                   out.variable.large);
+                out.fixed.insert(out.fixed.end(), slot + params.item_validity_bytes, slot + lv.value_size);
                 ++r;
+                continue;
             }
-            if (r != rows) {
-                error = "column '" + on_disk_field.name + "': FullZip page has " + std::to_string(r) +
-                        " values, it declares " + std::to_string(rows);
-                return false;
-            }
-            if (at != data.size()) {
-                error = "column '" + on_disk_field.name + "': FullZip page has " + std::to_string(data.size() - at) +
-                        " bytes left over after its " + std::to_string(rows) + " rows";
-                return false;
-            }
-            if (item_view) {
-                if (params.bits_rep != 0U) {
-                    item_view->full_zip_levels.insert(item_view->full_zip_levels.end(), page_def.begin(), page_def.end());
-                    item_view->full_zip_rep.insert(item_view->full_zip_rep.end(), page_rep.begin(), page_rep.end());
+            if (lv.has_value) {
+                const auto* value = data.data() + lv.value_at;
+                const auto length = lv.value_size;
+                if (params.fsst) {
+                    if (!fsst::decompress_value(*params.fsst, value, length, out.variable.data, error)) {
+                        return false;
+                    }
+                } else if (params.value_scheme != page_layout::BufferScheme::kNone && length != 0U) {
+                    if (!decompress_full_zip_value(params.value_scheme, value, length, out.variable.data, error)) {
+                        error = "column '" + on_disk_field.name + "': " + error;
+                        return false;
+                    }
+                } else if (params.value_scheme != page_layout::BufferScheme::kNone) {
+                    // An empty compressed value is an empty value (Lance's decompressor skips it).
                 } else {
-                    item_view->full_zip_levels.insert(item_view->full_zip_levels.end(), levels.begin(), levels.end());
+                    out.variable.data.insert(out.variable.data.end(), value, value + length);
+                }
+                if (out.variable.data.size() > default_read_limits().max_uncompressed_bytes ||
+                    (!out.variable.large &&
+                     out.variable.data.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))) {
+                    error = "column '" + on_disk_field.name + "' exceeds the decoded-size limit";
+                    return false;
                 }
             }
-            // The validity bitmap stays empty until the first null, then covers every row so far.
-            if (page_has_nulls && out.validity.empty() && rows_so_far != 0U) {
-                std::vector<std::uint16_t> earlier(static_cast<std::size_t>(rows_so_far), 0U);
-                append_levels_to_validity(earlier.data(), static_cast<std::uint32_t>(rows_so_far), 0U, out.validity,
-                                          out.null_count);
-            }
-            if (page_has_nulls || !out.validity.empty()) {
-                append_levels_to_validity(levels.data(), static_cast<std::uint32_t>(rows), rows_so_far, out.validity,
-                                          out.null_count);
-            }
-            rows_so_far += rows;
+            append_list_offset(out.variable.offsets, static_cast<std::int64_t>(out.variable.data.size()),
+                               out.variable.large);
+            ++r;
         }
-        return true;
+        if (r != rows) {
+            error = "column '" + on_disk_field.name + "': FullZip page has " + std::to_string(r) +
+                    " values, it declares " + std::to_string(rows);
+            return false;
+        }
+        if (at != data.size()) {
+            error = "column '" + on_disk_field.name + "': FullZip page has " + std::to_string(data.size() - at) +
+                    " bytes left over after its " + std::to_string(rows) + " rows";
+            return false;
+        }
+        if (item_view) {
+            if (params.bits_rep != 0U) {
+                item_view->full_zip_levels.insert(item_view->full_zip_levels.end(), page_def.begin(), page_def.end());
+                item_view->full_zip_rep.insert(item_view->full_zip_rep.end(), page_rep.begin(), page_rep.end());
+            } else {
+                item_view->full_zip_levels.insert(item_view->full_zip_levels.end(), levels.begin(), levels.end());
+            }
+        }
+        // The validity bitmap stays empty until the first null, then covers every row so far.
+        if (page_has_nulls && out.validity.empty() && rows_so_far != 0U) {
+            std::vector<std::uint16_t> earlier(static_cast<std::size_t>(rows_so_far), 0U);
+            append_levels_to_validity(earlier.data(), static_cast<std::uint32_t>(rows_so_far), 0U, out.validity,
+                                      out.null_count);
+        }
+        if (page_has_nulls || !out.validity.empty()) {
+            append_levels_to_validity(levels.data(), static_cast<std::uint32_t>(rows), rows_so_far, out.validity,
+                                      out.null_count);
+        }
+        rows_so_far += rows;
     }
+    return true;
+}
 
-    // Byte-stream-split + zstd fixed-width column (float/double): each page's payload is a zstd frame
-    // of vlen contiguous byte-planes; un-zstd then inverse-transpose to reconstruct the original bytes.
-    if (encoding_plan.kind == ColumnEncodingKind::kBssZstd) {
-        out.kind = ColumnValues::Kind::FixedWidth;
-        const auto bytes_per_value = lance_logical_type_value_bytes(on_disk_field.logical_type);
-        {
-            std::uint64_t reserve_bytes = 0;
-            if (checked_mul(declared_rows, static_cast<std::uint64_t>(bytes_per_value), reserve_bytes) &&
-                fits_size_t(reserve_bytes)) {
-                reserve_capped(out.fixed, reserve_bytes);
+/// Decodes a byte-stream-split + zstd fixed-width column.
+/// One branch of decode_column_impl, which has already bounded the row count.
+bool decode_bss_zstd_column(const EncodingsIo& io, const pb::Field& on_disk_field,
+                            const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
+                            const ColumnEncodingPlan& encoding_plan, std::uint64_t declared_rows) {
+    out.kind = ColumnValues::Kind::FixedWidth;
+    const auto bytes_per_value = lance_logical_type_value_bytes(on_disk_field.logical_type);
+    {
+        std::uint64_t reserve_bytes = 0;
+        if (checked_mul(declared_rows, static_cast<std::uint64_t>(bytes_per_value), reserve_bytes) &&
+            fits_size_t(reserve_bytes)) {
+            reserve_capped(out.fixed, reserve_bytes);
+        }
+    }
+    PageScratch control_scratch;
+    PageScratch payload_scratch;
+    auto& control = control_scratch.get();
+    auto& payload = payload_scratch.get();
+    Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
+    auto& chunks = chunks_scratch.get();
+    std::vector<std::uint8_t> raw;
+    std::uint64_t validity_rows = 0;
+    for (const auto& page : column_metadata.pages) {
+        if (!read_page_buffers(io, page, false, control, payload, error)) {
+            return false;
+        }
+        if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, chunks, validity_rows,
+                                            out, error)) {
+            return false;
+        }
+        std::uint64_t remaining = page.length;
+        for (const auto& chunk : chunks) {
+            if (!general::zstd_unframe(chunk.values, raw, error)) {
+                return false;
+            }
+            if (bytes_per_value == 0U || raw.size() % bytes_per_value != 0U) {
+                error = "bss-zstd page byte count mismatch";
+                return false;
+            }
+            const auto chunk_values = raw.size() / bytes_per_value;
+            if (chunk_values == 0U || chunk_values > remaining) {
+                error = "bss-zstd chunk covers more values than the page has left";
+                return false;
+            }
+            const auto base = out.fixed.size();
+            out.fixed.resize(base + raw.size());
+            (void)byte_stream_split::decode(
+                std::as_bytes(std::span(raw)), bytes_per_value,
+                std::as_writable_bytes(std::span(out.fixed.data() + base, raw.size())));
+            remaining -= chunk_values;
+        }
+        if (remaining != 0U) {
+            error = "bss-zstd page chunks cover fewer rows than the page declares";
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Decodes a bit-packed bool column.
+/// One branch of decode_column_impl, which has already bounded the row count.
+bool decode_bool_packed_column(const EncodingsIo& io, const pb::ColumnMetadata& column_metadata, ColumnValues& out,
+                               std::string& error, const ColumnEncodingPlan& encoding_plan,
+                               std::uint64_t declared_rows) {
+    out.kind = ColumnValues::Kind::FixedWidth;
+    reserve_capped(out.fixed, declared_rows);
+    std::vector<std::uint8_t> control;
+    std::vector<std::uint8_t> payload;
+    Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
+    auto& chunks = chunks_scratch.get();
+    std::uint64_t validity_rows = 0;
+    for (const auto& page : column_metadata.pages) {
+        if (!read_page_buffers(io, page, false, control, payload, error)) {
+            return false;
+        }
+        if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, chunks, validity_rows,
+                                            out, error)) {
+            return false;
+        }
+        std::uint64_t remaining = page.length;
+        for (const auto& chunk : chunks) {
+            // A bool chunk's byte count only bounds its value count (the last byte is partial),
+            // so the exact count comes from the levels when present and from what is left in the
+            // page otherwise.
+            const auto chunk_values = static_cast<std::size_t>(
+                chunk.items != 0U ? chunk.items
+                : encoding_plan.repdef != nullptr
+                    ? chunk.repdef_values
+                    : std::min<std::uint64_t>(remaining, chunk.values.size() * 8U));
+            if (chunk_values == 0U || chunk_values > remaining ||
+                chunk.values.size() != (chunk_values + 7U) / 8U) {
+                error = "bool page byte count mismatch";
+                return false;
+            }
+            const auto base = out.fixed.size();
+            out.fixed.resize(base + chunk_values);
+            boolpack::unpack_lsb_first(chunk.values.data(), chunk_values, out.fixed.data() + base);
+            remaining -= chunk_values;
+        }
+        if (remaining != 0U) {
+            error = "bool page chunks cover fewer rows than the page declares";
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Decodes a variable-width column.
+/// One branch of decode_column_impl, which has already bounded the row count.
+bool decode_variable_column(const EncodingsIo& io, const pb::Field& on_disk_field,
+                            const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
+                            const ColumnEncodingPlan& encoding_plan, std::uint64_t declared_rows) {
+    out.kind = ColumnValues::Kind::VariableWidth;
+    out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
+    PageScratch control_scratch;
+    PageScratch payload_scratch;
+    auto& control = control_scratch.get();
+    auto& payload = payload_scratch.get();
+    Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
+    auto& chunks = chunks_scratch.get();
+    std::vector<std::uint8_t> raw;
+    // Scratch for the FSST path only; hoisted so their capacity is reused across chunks.
+    std::vector<std::uint8_t> fsst_offsets;
+    std::vector<std::uint8_t> fsst_data;
+    std::uint64_t validity_rows = 0;
+    std::uint64_t rows_done = 0;
+    ColumnEncodingPlan later_page;
+    for (std::size_t page_index = 0; page_index < column_metadata.pages.size(); ++page_index) {
+        const auto& page = column_metadata.pages[page_index];
+        // Every page carries its own descriptor, and the column's plan was taken from the first.
+        // A string page's FSST symbol table, offset width and buffer compression are per page:
+        // Lance trains a table per page, and a page too small for FSST is written plain. Using
+        // page 0's for all of them decoded later pages against the wrong table.
+        const ColumnEncodingPlan* plan = &encoding_plan;
+        if (page_index != 0U && !page.encoding.empty()) {
+            pb::ColumnMetadata one_page;
+            one_page.pages.push_back(page);
+            later_page = ColumnEncodingPlan{};
+            if (classify_from_descriptor(one_page, later_page)) {
+                if (later_page.kind != ColumnEncodingKind::kVariable) {
+                    error = "column '" + on_disk_field.name + "' page " + std::to_string(page_index) +
+                            " is not a variable-width page like the column's first" +
+                            (later_page.unsupported_reason.empty() ? "" : ": " + later_page.unsupported_reason);
+                    return false;
+                }
+                later_page.item_view = encoding_plan.item_view;
+                plan = &later_page;
             }
         }
-        PageScratch control_scratch;
-        PageScratch payload_scratch;
-        auto& control = control_scratch.get();
-        auto& payload = payload_scratch.get();
-        Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
-        auto& chunks = chunks_scratch.get();
-        std::vector<std::uint8_t> raw;
-        std::uint64_t validity_rows = 0;
-        for (const auto& page : column_metadata.pages) {
-            if (!read_page_buffers(io, page, false, control, payload, error)) {
-                return false;
-            }
-            if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, chunks, validity_rows,
-                                                out, error)) {
-                return false;
-            }
-            std::uint64_t remaining = page.length;
-            for (const auto& chunk : chunks) {
+        const auto value_scheme = plan->value_scheme;
+        const bool nullable = plan->repdef != nullptr;
+        // The offset width of the block actually stored in the chunk. Without FSST that is the
+        // column's own (utf8 -> 32-bit, large_utf8 -> 64-bit). With FSST the stored block is the
+        // COMPRESSED one, whose offsets index compressed bytes and whose width the descriptor
+        // declares independently (Fsst.values = Variable{Flat(bits)}).
+        const bool stored_offsets_large = plan->fsst && plan->variable_offset_bits != 0U
+                                              ? plan->variable_offset_bits == 64U
+                                              : out.variable.large;
+        const auto offset_width = static_cast<std::uint64_t>(stored_offsets_large ? 8U : 4U);
+        if (!read_page_buffers(io, page, false, control, payload, error)) {
+            return false;
+        }
+        if (!read_page_chunks_with_validity(payload, *plan, page.length, chunks, validity_rows, out, error)) {
+            return false;
+        }
+        std::uint64_t remaining = page.length;
+        for (auto& chunk : chunks) {
+            if (value_scheme == page_layout::BufferScheme::kZstd) {
+                // The value buffer is a [u64 uncompressed size][zstd frame] envelope.
                 if (!general::zstd_unframe(chunk.values, raw, error)) {
                     return false;
                 }
-                if (bytes_per_value == 0U || raw.size() % bytes_per_value != 0U) {
-                    error = "bss-zstd page byte count mismatch";
+                // swap (not move): a move would leave `raw` empty every iteration, discarding its
+                // capacity right when the next chunk's call could have reused it.
+                std::swap(chunk.values, raw);
+            } else if (value_scheme == page_layout::BufferScheme::kLz4) {
+                // LZ4's envelope is [u32 uncompressed size][block] -- see lz4_block.hpp.
+                if (!lz4_block::decompress_sized(chunk.values, raw, error)) {
                     return false;
                 }
-                const auto chunk_values = raw.size() / bytes_per_value;
-                if (chunk_values == 0U || chunk_values > remaining) {
-                    error = "bss-zstd chunk covers more values than the page has left";
-                    return false;
-                }
-                const auto base = out.fixed.size();
-                out.fixed.resize(base + raw.size());
-                (void)byte_stream_split::decode(
-                    std::as_bytes(std::span(raw)), bytes_per_value,
-                    std::as_writable_bytes(std::span(out.fixed.data() + base, raw.size())));
-                remaining -= chunk_values;
+                std::swap(chunk.values, raw);
             }
-            if (remaining != 0U) {
-                error = "bss-zstd page chunks cover fewer rows than the page declares";
+            // How many values the chunk holds. With definition levels the chunk header states it.
+            // Without them it is still derivable from the chunk itself rather than assumed: a
+            // variable-width chunk starts with an (n+1)-entry offset table and offsets[0] is the
+            // byte position where the data begins, i.e. exactly (n+1) * offset_width. Deriving it
+            // is what lets a multi-chunk page written by stock Lance decode at all -- the previous
+            // code concatenated every chunk and handed the whole page to one offset table, which
+            // only ever worked because nanolance's writer emits one chunk per page.
+            std::uint64_t chunk_values = 0;
+            if (chunk.items != 0U) {
+                chunk_values = chunk.items;
+            } else if (nullable) {
+                chunk_values = chunk.repdef_values;
+            } else {
+                if (chunk.values.size() < offset_width) {
+                    error = "variable-width chunk is too short to hold an offset table";
+                    return false;
+                }
+                const auto data_base = read_list_offset(chunk.values, 0, stored_offsets_large);
+                if (data_base < static_cast<std::int64_t>(offset_width) ||
+                    static_cast<std::uint64_t>(data_base) % offset_width != 0U) {
+                    error = "variable-width chunk has no usable offset table";
+                    return false;
+                }
+                chunk_values = static_cast<std::uint64_t>(data_base) / offset_width - 1U;
+            }
+            if (chunk_values == 0U || chunk_values > remaining) {
+                error = "variable-width chunk covers " + std::to_string(chunk_values) +
+                        " values with " + std::to_string(remaining) + " left in the page";
                 return false;
             }
+            if (plan->fsst) {
+                // The FSST-compressed bytes are themselves a variable-width block, so decode
+                // that into scratch buffers first and then expand each value onto the column's.
+                fsst_offsets.clear();
+                fsst_data.clear();
+                if (!decode_variable_width_page(chunk.values, chunk_values, stored_offsets_large,
+                                                fsst_offsets, fsst_data, error)) {
+                    return false;
+                }
+                if (!expand_fsst_values(*plan->fsst, fsst_offsets, stored_offsets_large,
+                                        fsst_data, chunk_values, out.variable.large,
+                                        out.variable.offsets, out.variable.data, error)) {
+                    return false;
+                }
+            } else if (!decode_variable_width_page(chunk.values, chunk_values, out.variable.large,
+                                                   out.variable.offsets, out.variable.data, error)) {
+                return false;
+            }
+            remaining -= chunk_values;
+            // Per chunk, not only per page: a column of one or two big pages would otherwise
+            // double its way through the first of them.
+            reserve_projected(out.variable.data, rows_done + page.length - remaining, declared_rows);
+            reserve_projected(out.variable.offsets, rows_done + page.length - remaining, declared_rows);
         }
-        return true;
-    }
-
-    // bool is always bit-packed on disk (1 bit/value, LSB-first), matching stock Lance's own
-    // Flat{bits_per_value:1} representation -- the writer never tags it, since it's not opt-in (see
-    // data_file_writer.cpp's bool_pack). nanolance's internal representation stays one byte per value.
-    if (encoding_plan.kind == ColumnEncodingKind::kBoolPacked) {
-        out.kind = ColumnValues::Kind::FixedWidth;
-        reserve_capped(out.fixed, declared_rows);
-        std::vector<std::uint8_t> control;
-        std::vector<std::uint8_t> payload;
-        Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
-        auto& chunks = chunks_scratch.get();
-        std::uint64_t validity_rows = 0;
-        for (const auto& page : column_metadata.pages) {
-            if (!read_page_buffers(io, page, false, control, payload, error)) {
-                return false;
-            }
-            if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, chunks, validity_rows,
-                                                out, error)) {
-                return false;
-            }
-            std::uint64_t remaining = page.length;
-            for (const auto& chunk : chunks) {
-                // A bool chunk's byte count only bounds its value count (the last byte is partial),
-                // so the exact count comes from the levels when present and from what is left in the
-                // page otherwise.
-                const auto chunk_values = static_cast<std::size_t>(
-                    chunk.items != 0U ? chunk.items
-                    : encoding_plan.repdef != nullptr
-                        ? chunk.repdef_values
-                        : std::min<std::uint64_t>(remaining, chunk.values.size() * 8U));
-                if (chunk_values == 0U || chunk_values > remaining ||
-                    chunk.values.size() != (chunk_values + 7U) / 8U) {
-                    error = "bool page byte count mismatch";
-                    return false;
-                }
-                const auto base = out.fixed.size();
-                out.fixed.resize(base + chunk_values);
-                boolpack::unpack_lsb_first(chunk.values.data(), chunk_values, out.fixed.data() + base);
-                remaining -= chunk_values;
-            }
-            if (remaining != 0U) {
-                error = "bool page chunks cover fewer rows than the page declares";
-                return false;
-            }
+        if (remaining != 0U) {
+            error = "variable-width page chunks cover fewer rows than the page declares";
+            return false;
         }
-        return true;
+        rows_done += page.length;
+        reserve_projected(out.variable.data, rows_done, declared_rows);
+        reserve_projected(out.variable.offsets, rows_done, declared_rows);
     }
+    return true;
+}
 
-    if (encoding_plan.kind == ColumnEncodingKind::kVariable) {
-        out.kind = ColumnValues::Kind::VariableWidth;
-        out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
-        PageScratch control_scratch;
-        PageScratch payload_scratch;
-        auto& control = control_scratch.get();
-        auto& payload = payload_scratch.get();
-        Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
-        auto& chunks = chunks_scratch.get();
-        std::vector<std::uint8_t> raw;
-        // Scratch for the FSST path only; hoisted so their capacity is reused across chunks.
-        std::vector<std::uint8_t> fsst_offsets;
-        std::vector<std::uint8_t> fsst_data;
-        std::uint64_t validity_rows = 0;
-        std::uint64_t rows_done = 0;
-        ColumnEncodingPlan later_page;
-        for (std::size_t page_index = 0; page_index < column_metadata.pages.size(); ++page_index) {
-            const auto& page = column_metadata.pages[page_index];
-            // Every page carries its own descriptor, and the column's plan was taken from the first.
-            // A string page's FSST symbol table, offset width and buffer compression are per page:
-            // Lance trains a table per page, and a page too small for FSST is written plain. Using
-            // page 0's for all of them decoded later pages against the wrong table.
-            const ColumnEncodingPlan* plan = &encoding_plan;
-            if (page_index != 0U && !page.encoding.empty()) {
-                pb::ColumnMetadata one_page;
-                one_page.pages.push_back(page);
-                later_page = ColumnEncodingPlan{};
-                if (classify_from_descriptor(one_page, later_page)) {
-                    if (later_page.kind != ColumnEncodingKind::kVariable) {
-                        error = "column '" + on_disk_field.name + "' page " + std::to_string(page_index) +
-                                " is not a variable-width page like the column's first" +
-                                (later_page.unsupported_reason.empty() ? "" : ": " + later_page.unsupported_reason);
-                        return false;
-                    }
-                    later_page.item_view = encoding_plan.item_view;
-                    plan = &later_page;
-                }
-            }
-            const auto value_scheme = plan->value_scheme;
-            const bool nullable = plan->repdef != nullptr;
-            // The offset width of the block actually stored in the chunk. Without FSST that is the
-            // column's own (utf8 -> 32-bit, large_utf8 -> 64-bit). With FSST the stored block is the
-            // COMPRESSED one, whose offsets index compressed bytes and whose width the descriptor
-            // declares independently (Fsst.values = Variable{Flat(bits)}).
-            const bool stored_offsets_large = plan->fsst && plan->variable_offset_bits != 0U
-                                                  ? plan->variable_offset_bits == 64U
-                                                  : out.variable.large;
-            const auto offset_width = static_cast<std::uint64_t>(stored_offsets_large ? 8U : 4U);
-            if (!read_page_buffers(io, page, false, control, payload, error)) {
-                return false;
-            }
-            if (!read_page_chunks_with_validity(payload, *plan, page.length, chunks, validity_rows, out, error)) {
-                return false;
-            }
-            std::uint64_t remaining = page.length;
-            for (auto& chunk : chunks) {
-                if (value_scheme == page_layout::BufferScheme::kZstd) {
-                    // The value buffer is a [u64 uncompressed size][zstd frame] envelope.
-                    if (!general::zstd_unframe(chunk.values, raw, error)) {
-                        return false;
-                    }
-                    // swap (not move): a move would leave `raw` empty every iteration, discarding its
-                    // capacity right when the next chunk's call could have reused it.
-                    std::swap(chunk.values, raw);
-                } else if (value_scheme == page_layout::BufferScheme::kLz4) {
-                    // LZ4's envelope is [u32 uncompressed size][block] -- see lz4_block.hpp.
-                    if (!lz4_block::decompress_sized(chunk.values, raw, error)) {
-                        return false;
-                    }
-                    std::swap(chunk.values, raw);
-                }
-                // How many values the chunk holds. With definition levels the chunk header states it.
-                // Without them it is still derivable from the chunk itself rather than assumed: a
-                // variable-width chunk starts with an (n+1)-entry offset table and offsets[0] is the
-                // byte position where the data begins, i.e. exactly (n+1) * offset_width. Deriving it
-                // is what lets a multi-chunk page written by stock Lance decode at all -- the previous
-                // code concatenated every chunk and handed the whole page to one offset table, which
-                // only ever worked because nanolance's writer emits one chunk per page.
-                std::uint64_t chunk_values = 0;
-                if (chunk.items != 0U) {
-                    chunk_values = chunk.items;
-                } else if (nullable) {
-                    chunk_values = chunk.repdef_values;
-                } else {
-                    if (chunk.values.size() < offset_width) {
-                        error = "variable-width chunk is too short to hold an offset table";
-                        return false;
-                    }
-                    const auto data_base = read_list_offset(chunk.values, 0, stored_offsets_large);
-                    if (data_base < static_cast<std::int64_t>(offset_width) ||
-                        static_cast<std::uint64_t>(data_base) % offset_width != 0U) {
-                        error = "variable-width chunk has no usable offset table";
-                        return false;
-                    }
-                    chunk_values = static_cast<std::uint64_t>(data_base) / offset_width - 1U;
-                }
-                if (chunk_values == 0U || chunk_values > remaining) {
-                    error = "variable-width chunk covers " + std::to_string(chunk_values) +
-                            " values with " + std::to_string(remaining) + " left in the page";
-                    return false;
-                }
-                if (plan->fsst) {
-                    // The FSST-compressed bytes are themselves a variable-width block, so decode
-                    // that into scratch buffers first and then expand each value onto the column's.
-                    fsst_offsets.clear();
-                    fsst_data.clear();
-                    if (!decode_variable_width_page(chunk.values, chunk_values, stored_offsets_large,
-                                                    fsst_offsets, fsst_data, error)) {
-                        return false;
-                    }
-                    if (!expand_fsst_values(*plan->fsst, fsst_offsets, stored_offsets_large,
-                                            fsst_data, chunk_values, out.variable.large,
-                                            out.variable.offsets, out.variable.data, error)) {
-                        return false;
-                    }
-                } else if (!decode_variable_width_page(chunk.values, chunk_values, out.variable.large,
-                                                       out.variable.offsets, out.variable.data, error)) {
-                    return false;
-                }
-                remaining -= chunk_values;
-                // Per chunk, not only per page: a column of one or two big pages would otherwise
-                // double its way through the first of them.
-                reserve_projected(out.variable.data, rows_done + page.length - remaining, declared_rows);
-                reserve_projected(out.variable.offsets, rows_done + page.length - remaining, declared_rows);
-            }
-            if (remaining != 0U) {
-                error = "variable-width page chunks cover fewer rows than the page declares";
-                return false;
-            }
-            rows_done += page.length;
-            reserve_projected(out.variable.data, rows_done, declared_rows);
-            reserve_projected(out.variable.offsets, rows_done, declared_rows);
-        }
-        return true;
-    }
-
+/// Decodes a fixed-width column, flat or bit-packed (the path every other plan falls back to).
+/// One branch of decode_column_impl, which has already bounded the row count.
+bool decode_fixed_width_column(const EncodingsIo& io, const pb::Field& on_disk_field,
+                               const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
+                               const ColumnEncodingPlan& encoding_plan, std::uint64_t declared_rows) {
     out.kind = ColumnValues::Kind::FixedWidth;
     std::string internal_type = on_disk_field.logical_type;
     if (internal_type == "string") {
@@ -2950,6 +2904,142 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
         return false;
     }
     return true;
+}
+
+}  // namespace
+
+/// The whole decoder for one physical column. `item_view` is set only for a list column's second
+/// pass (decode_list_column), which reads the leaf values as a flat column of items.
+bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
+                        const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
+                        const std::shared_ptr<ItemView>& item_view) {
+    error.clear();
+    out = ColumnValues{};
+
+    // The per-page row count comes from the untrusted protobuf. Bound the declared total up front
+    // (overflow-safe) so no decode branch below can be tricked into a runaway allocation; the inner
+    // loops then run without re-checking.
+    std::uint64_t declared_rows = 0;
+    for (const auto& page : column_metadata.pages) {
+        if (!checked_add(declared_rows, page.length, declared_rows)) {
+            error = "column page row count overflows";
+            return false;
+        }
+    }
+    if (declared_rows > default_read_limits().max_rows_per_column) {
+        error = "column row count exceeds safety limit";
+        return false;
+    }
+
+    // `lance-encoding:blob` is checked FIRST and stays a metadata check. It is a Lance-standard key
+    // (stock Lance writes it too) describing the COLUMN's role rather than a page's encoding, and a
+    // blob-v2 packed page uses FullZipLayout (PageLayout field 3), which the descriptor classifier
+    // below does not model -- classifying first would refuse the library's headline feature.
+    const bool blob_packed = field_metadata_is_true(on_disk_field, "lance-encoding:blob");
+    if (blob_packed && (on_disk_field.logical_type == "large_binary" || on_disk_field.logical_type == "binary")) {
+        return decode_legacy_blob_column(io, on_disk_field, column_metadata, out, error);
+    }
+    if (blob_packed) {
+        return decode_blob_v2_column(io, on_disk_field, column_metadata, out, error);
+    }
+
+    // Constant column: the single value is stored once in field metadata; expand to one value per row.
+    // Selected from the page descriptor when there is one, from the legacy field metadata otherwise.
+    auto encoding_plan = classify_column_encoding(on_disk_field, column_metadata);
+    if (item_view) {
+        // Item validity comes from the unravelled levels, not from each chunk's definition levels,
+        // which here count list and struct layers too. Constant pages are expanded by the nested
+        // path itself, so never reach here.
+        encoding_plan.repdef = nullptr;
+        encoding_plan.item_view = item_view;
+        if (encoding_plan.kind == ColumnEncodingKind::kConstant) {
+            error = "column '" + on_disk_field.name + "': a constant page reached the nested item pass";
+            return false;
+        }
+    }
+    if (encoding_plan.kind == ColumnEncodingKind::kUnsupported) {
+        // Refuse by name, before a single buffer byte is interpreted. The old code had no way to do
+        // this: with no descriptor read, an encoding it did not implement fell through to the flat
+        // path and was misparsed, surfacing later as a size mismatch -- which is why a 3-row
+        // stock-Lance table decoded and a 5000-row one did not.
+        error = "column '" + on_disk_field.name + "': " + encoding_plan.unsupported_reason;
+        return false;
+    }
+
+    // A constant page carries a value when the descriptor has an inline one, or when the page has 1
+    // or 3 buffers (value; value + rep + def). 0 or 2 buffers with no inline value is how Lance says
+    // every row is null. This is `ConstantPageScheduler::try_new`'s `has_scalar_value` inverted, and
+    // it has to be read off the PAGE: a definition layer in the descriptor is equally how a nullable
+    // constant column is spelled, so keying "all null" off the layers alone made every nullable
+    // string constant read back entirely null. Fixed-width columns escaped it only because they
+    // carry their value inline.
+    const std::size_t constant_buffer_count =
+        column_metadata.pages.empty() ? 0U : column_metadata.pages.front().buffer_sizes.size();
+    const bool constant_has_value = encoding_plan.constant_inline_value.has_value() ||
+                                    constant_buffer_count == 1U || constant_buffer_count == 3U;
+    const bool constant_all_null = encoding_plan.constant_declares_levels && !constant_has_value;
+
+    if (encoding_plan.kind == ColumnEncodingKind::kConstant && constant_all_null) {
+        return decode_constant_null_column(on_disk_field, column_metadata, out, error);
+    }
+
+    if (encoding_plan.kind == ColumnEncodingKind::kConstant) {
+        return decode_constant_column(io, on_disk_field, column_metadata, out, error, encoding_plan);
+    }
+
+    // Run-length encoded fixed-width column: one chunk with two buffers (run values + run lengths).
+    if (encoding_plan.kind == ColumnEncodingKind::kRle) {
+        return decode_rle_column(io, on_disk_field, column_metadata, out, error, encoding_plan, declared_rows);
+    }
+
+    // Dictionary with RLE'd indices: buffer[1] = the miniblock payload, buffer[2] = the dictionary.
+    //
+    // This branch used to parse the payload itself as [u16 num_levels][u32 size0][u32 size1] and take
+    // the whole page to be one chunk. That is nanolance's own dict-rle page and nothing else. Lance
+    // writes the ordinary miniblock grammar -- a chunk header whose shape the descriptor declares,
+    // as many chunks as the page needs -- so a pylance column with runs decoded only its first 1024
+    // values per chunk read and then failed downstream with a buffer-size mismatch rather than
+    // anything naming the cause. A repetitive string column past ~5000 rows is exactly that shape,
+    // and so is any integer column with runs, whose dictionary is fixed-width rather than variable.
+    if (encoding_plan.kind == ColumnEncodingKind::kDictRle) {
+        return decode_dict_rle_column(io, on_disk_field, column_metadata, out, error, encoding_plan);
+    }
+
+    // Structural dictionary column: buffer[1] = bitpacked u32 indices, buffer[2] = dictionary.
+    //
+    // The dictionary block comes in two shapes and the descriptor says which. `Variable` is a block
+    // with an offset header, which is what a low-cardinality string column gets. `Flat(N)` is N-bit
+    // values end to end with no header at all, which is what Lance builds for a time64 or decimal128
+    // column once its cardinality justifies a dictionary. Reading a flat block as a variable-width
+    // one read the first value as an offset header and refused with "dict block header invalid".
+    if (encoding_plan.kind == ColumnEncodingKind::kDict) {
+        return decode_dict_column(io, on_disk_field, column_metadata, out, error, encoding_plan);
+    }
+
+    // FullZip: values stored row by row, each behind a control word. What Lance writes when a page's
+    // longest value is 256 bytes or more -- a long string, or a float32 fixed_size_list of 64+ dims.
+    if (encoding_plan.kind == ColumnEncodingKind::kFullZip) {
+        return decode_full_zip_column(io, on_disk_field, column_metadata, out, error, item_view);
+    }
+
+    // Byte-stream-split + zstd fixed-width column (float/double): each page's payload is a zstd frame
+    // of vlen contiguous byte-planes; un-zstd then inverse-transpose to reconstruct the original bytes.
+    if (encoding_plan.kind == ColumnEncodingKind::kBssZstd) {
+        return decode_bss_zstd_column(io, on_disk_field, column_metadata, out, error, encoding_plan, declared_rows);
+    }
+
+    // bool is always bit-packed on disk (1 bit/value, LSB-first), matching stock Lance's own
+    // Flat{bits_per_value:1} representation -- the writer never tags it, since it's not opt-in (see
+    // data_file_writer.cpp's bool_pack). nanolance's internal representation stays one byte per value.
+    if (encoding_plan.kind == ColumnEncodingKind::kBoolPacked) {
+        return decode_bool_packed_column(io, column_metadata, out, error, encoding_plan, declared_rows);
+    }
+
+    if (encoding_plan.kind == ColumnEncodingKind::kVariable) {
+        return decode_variable_column(io, on_disk_field, column_metadata, out, error, encoding_plan, declared_rows);
+    }
+
+    return decode_fixed_width_column(io, on_disk_field, column_metadata, out, error, encoding_plan, declared_rows);
 }
 
 
