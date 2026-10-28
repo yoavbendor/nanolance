@@ -169,6 +169,10 @@ second. A column gets the rows that fill 16 MiB (at least 1000), so the int64 co
 variable-width one. The timing includes allocating the decoded buffers. The full-zip column holds 4200-byte strings, since
 the writer lays a column out as FullZip only when its values average 4096 bytes or more.
 
+On a shared machine the numbers move between runs: two back-to-back runs of the same build on the 4-core cloud sandbox
+differed by up to 34% on some cases. Before calling a change a regression there, run each build several times and
+compare the best median of each; on a dedicated machine the 15% threshold of `tools/compare_bench.py` applies as is.
+
 ```
 cmake --build build --target nl_bench_encoding
 ./build/nl_bench_encoding --json out.json
