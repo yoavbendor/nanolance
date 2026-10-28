@@ -254,13 +254,7 @@ void test_reads(const std::string& path) {
         require(rc != NANO_LANCE_READER_OK, "an unknown projected column must fail");
         require(std::strlen(r.error) > 0, "an unknown projected column must say so");
         require(r.schema.release == nullptr, "a failed projected read must leave the schema released");
-        // BUG: an unknown projected column is a caller mistake, but map_status() matches the message's
-        // "not found" and reports NANO_LANCE_READER_IO_ERROR (2). Input: a valid dataset, projection
-        // {"no_such_column"}. Expected status INVALID_ARGUMENT (1); observed IO_ERROR (2).
-        if (rc != NANO_LANCE_READER_INVALID_ARGUMENT) {
-            std::cout << "KNOWN BUG: unknown projected column returned status " << rc << " (expected 1, "
-                      << "INVALID_ARGUMENT): \"" << r.error << "\"\n";
-        }
+        require(rc == NANO_LANCE_READER_INVALID_ARGUMENT, "an unknown projected column is INVALID_ARGUMENT");
     }
     {
         // A range: rows [600, 850), read as the fragments they fall in.
