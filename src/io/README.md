@@ -1,5 +1,10 @@
 # io: where bytes live: local files and object stores (S3 is a registered backend)
 
+<!-- layer-deps:start -->
+Layer 2 of 11 (1 is the bottom, 11 the top). Uses: [base](../base/README.md). Used by: [file](../file/README.md), [table](../table/README.md), [scan](../scan/README.md), [dataset](../dataset/README.md), [api](../api/README.md). See [docs/LAYERS.md](../../docs/LAYERS.md).
+<!-- layer-deps:end -->
+Example: [examples/layers/io.cpp](../../examples/layers/io.cpp) (run with ctest -R nano_lance_example_io).
+
 The io layer reads and writes whole files and byte ranges, and knows nothing of what they hold. A dataset's
 manifests, data files, deletion files and index files are all opened through it, by a local path or a
 `scheme://` URI, so the same reader runs on a local directory, on S3 and on an in-memory store a test

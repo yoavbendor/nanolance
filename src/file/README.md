@@ -1,5 +1,10 @@
 # file: how a .lance file is framed
 
+<!-- layer-deps:start -->
+Layer 5 of 11 (1 is the bottom, 11 the top). Uses: [base](../base/README.md), [io](../io/README.md), [arrow](../arrow/README.md), [encoding](../encoding/README.md). Used by: [table](../table/README.md), [scan](../scan/README.md), [index](../index/README.md), [dataset](../dataset/README.md), [api](../api/README.md). See [docs/LAYERS.md](../../docs/LAYERS.md).
+<!-- layer-deps:end -->
+Example: [examples/layers/file.cpp](../../examples/layers/file.cpp) (run with ctest -R nano_lance_example_file).
+
 This layer reads and writes the container a Lance data file is: data pages, column metadata, the column
 metadata and global buffer offset tables, global buffers (the schema in buffer 0) and the 40-byte footer, plus
 the file-level storage of Blob v2 values (inline bytes in the data file, packed and dedicated sidecar files,
@@ -87,3 +92,33 @@ Against the Lance format specification at https://lance.org/format/ (as of Lance
 - **The FixedSizeList all-null compatibility caveat** is untested in both spellings; a pylance-written file of
   that shape belongs in `test_lance_read_matrix.py`.
 - **Statistics** in global buffers are not written: the specification leaves their format open.
+
+## Performance
+
+Measured by [bench/file/file_bench.cpp](../../bench/file/file_bench.cpp) (`nl_bench_file`). Four cases, each checked before
+it is timed, each the median of 7 runs after one warm-up. The footer cases read the footer and schema of a 1-column,
+100-row file and of a 50-column, 10,000-row file. The metadata case reads every column's metadata of the wide file. The
+end-to-end case reads the footer, the metadata and one column of a one-column int64 file of 1,000,000 rows, and decodes it.
+The reader keeps a per-thread cache of open handles and checks each one's size and mtime on every call, so after the first
+call the footer cases open no file. Footer and metadata cases decode no values, so they have no decoded bytes or MB/s, and their rows/s counts the rows
+of the file.
+
+```
+cmake --build build --target nl_bench_file
+./build/nl_bench_file --json out.json
+python3 tools/compare_bench.py bench/results/layers/file.json out.json
+```
+
+`--rows N` sets the rows of the end-to-end file (default 1000000), `--runs N` the timed runs, and `--quick` a small run.
+ctest runs the quick mode as `nano_lance_bench_file_quick`.
+
+Baseline from one full run, saved as [bench/results/layers/file.json](../../bench/results/layers/file.json), built the same
+way as the encoding baseline. The numbers come from a 4-core cloud sandbox with a Release build (gcc 13.3.0), so they are
+for comparison on the same machine, not absolute.
+
+| case | rows | decoded bytes | median ms | rows/s | MB/s |
+|---|---:|---:|---:|---:|---:|
+| footer_small_1col | 100 | - | 0.0094 | 10,654,166 | - |
+| footer_wide_50col | 10,000 | - | 0.0213 | 469,263,257 | - |
+| column_metadata_wide_50col | 10,000 | - | 0.0427 | 234,055,003 | - |
+| end_to_end_int64_1col | 1,000,000 | 8,000,000 | 2.5268 | 395,757,167 | 3,166 |

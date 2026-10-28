@@ -1,5 +1,10 @@
 # arrow: Arrow arrays and schemas, and how they map to Lance's types
 
+<!-- layer-deps:start -->
+Layer 3 of 11 (1 is the bottom, 11 the top). Uses: [base](../base/README.md). Used by: [encoding](../encoding/README.md), [file](../file/README.md), [table](../table/README.md), [expr](../expr/README.md), [scan](../scan/README.md), [index](../index/README.md), [dataset](../dataset/README.md), [api](../api/README.md). See [docs/LAYERS.md](../../docs/LAYERS.md).
+<!-- layer-deps:end -->
+Example: [examples/layers/arrow.cpp](../../examples/layers/arrow.cpp) (run with ctest -R nano_lance_example_arrow).
+
 This layer is the boundary between Arrow (the C data interface, through nanoarrow) and Lance's schema. It maps
 an Arrow schema to Lance fields (logical type, field id, parent id, nullability, metadata) and back, reads a
 record batch's columns into `ColumnValues` for the encoders, slices batches without copying, builds Blob v2

@@ -1,5 +1,10 @@
 # encoding: how one page of one column is laid out, in both directions
 
+<!-- layer-deps:start -->
+Layer 4 of 11 (1 is the bottom, 11 the top). Uses: [base](../base/README.md), [arrow](../arrow/README.md). Used by: [file](../file/README.md), [scan](../scan/README.md), [dataset](../dataset/README.md). See [docs/LAYERS.md](../../docs/LAYERS.md).
+<!-- layer-deps:end -->
+Example: [examples/layers/encoding.cpp](../../examples/layers/encoding.cpp) (run with ctest -R nano_lance_example_encoding).
+
 This layer turns a page's bytes into a column's values and back: the value encodings (bitpacking, run-length,
 dictionary, FSST, general zstd / LZ4 compression, byte-stream split), the page layouts around them (mini-block,
 full-zip, constant and all-null, the legacy blob layout), repetition and definition levels, and the format 2.0
@@ -151,3 +156,47 @@ separate rows where nanolance does only one.
   included), and most `lance-encoding:*` field options ignored. Every choice made is one Lance reads;
   the cost is size or random-access speed against pylance on some shapes, not correctness.
 - **Format 2.0** is read, not written (nanolance writes 2.2, and appends 2.2 files to older datasets).
+
+## Performance
+
+Measured by [bench/encoding/decode_bench.cpp](../../bench/encoding/decode_bench.cpp) (`nl_bench_encoding`). It writes one
+`.lance` file per column, one column per kind of encoding this layer decodes. The writer picks each column's kind from its
+field tag (`nanolance:packing`). The benchmark reads each column's page layout to name its kind, checks the values read
+back, and times `decode_lance_physical_column` on each column: the median of 7 runs after one warm-up, with the file in the
+OS cache. Each column is sized to the same decoded bytes, 16 MiB, so the cases take milliseconds and compare by bytes per
+second. A column gets the rows that fill 16 MiB (at least 1000), so the int64 columns hold about 2 million rows and the
+4200-byte strings about 4000. Decoded bytes are the values of a fixed-width column, or the offsets and text of a
+variable-width one. The timing includes allocating the decoded buffers. The full-zip column holds 4200-byte strings, since
+the writer lays a column out as FullZip only when its values average 4096 bytes or more.
+
+On a shared machine the numbers move between runs: two back-to-back runs of the same build on the 4-core cloud sandbox
+differed by up to 34% on some cases. Before calling a change a regression there, run each build several times and
+compare the best median of each; on a dedicated machine the 15% threshold of `tools/compare_bench.py` applies as is.
+
+```
+cmake --build build --target nl_bench_encoding
+./build/nl_bench_encoding --json out.json
+python3 tools/compare_bench.py bench/results/layers/encoding.json out.json
+```
+
+`--mb N` sets the decoded MiB per column (default 16). `--rows N` forces one row count for every column instead, which
+overrides `--mb`. `--runs N` sets the timed runs, and `--quick` a small run (0.5 MiB per column, 2 runs). ctest runs the
+quick mode as `nano_lance_bench_encoding_quick`.
+
+Baseline from one full run, saved as [bench/results/layers/encoding.json](../../bench/results/layers/encoding.json). The
+library sources are unchanged since commit 7330b61, and the benchmark code was uncommitted when it ran. The numbers come from
+a 4-core cloud sandbox with a Release build (gcc 13.3.0), so they are for comparison on the same machine, not absolute.
+
+| column | kind | rows | decoded bytes | median ms | rows/s | MB/s |
+|---|---|---:|---:|---:|---:|---:|
+| int64_seq | bitpack | 2,097,152 | 16,777,216 | 5.670 | 369,890,584 | 2,959 |
+| int64_random | flat | 2,097,152 | 16,777,216 | 4.880 | 429,719,342 | 3,438 |
+| int64_constant | constant | 2,097,152 | 16,777,216 | 1.860 | 1,127,684,172 | 9,021 |
+| int64_runs | rle | 2,097,152 | 16,777,216 | 1.146 | 1,830,628,907 | 14,645 |
+| float64_random | byte-stream-split+zstd | 2,097,152 | 16,777,216 | 6.259 | 335,048,770 | 2,680 |
+| bool | bool-packed | 16,777,216 | 16,777,216 | 2.912 | 5,760,644,970 | 5,761 |
+| str_few_values | dict | 1,198,373 | 16,777,226 | 8.466 | 141,550,863 | 1,982 |
+| str_runs | dict-rle | 1,864,136 | 16,777,228 | 3.367 | 553,605,538 | 4,982 |
+| str_unique | variable | 1,277,738 | 16,777,226 | 12.889 | 99,131,321 | 1,302 |
+| str_320_bytes | variable | 51,782 | 16,777,372 | 5.046 | 10,262,010 | 3,325 |
+| str_4200_bytes | full-zip | 3,991 | 16,778,168 | 5.048 | 790,630 | 3,324 |

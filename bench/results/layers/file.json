@@ -1,0 +1,19 @@
+{
+  "header": {
+    "program": "nl_bench_file",
+    "git_commit": "7330b61fba580087ec04321cd17a986bc0b0cb0f",
+    "git_dirty": true,
+    "compiler": "gcc 13.3.0",
+    "build_type": "Release",
+    "cores": 4,
+    "quick": false,
+    "rows": 1000000,
+    "runs": 7
+  },
+  "results": [
+    {"name": "footer_small_1col", "rows": 100, "bytes": null, "median_ns": 9386, "rows_per_s": 10654165.8, "mb_per_s": null},
+    {"name": "footer_wide_50col", "rows": 10000, "bytes": null, "median_ns": 21310, "rows_per_s": 469263256.7, "mb_per_s": null},
+    {"name": "column_metadata_wide_50col", "rows": 10000, "bytes": null, "median_ns": 42725, "rows_per_s": 234055002.9, "mb_per_s": null},
+    {"name": "end_to_end_int64_1col", "rows": 1000000, "bytes": 8000000, "median_ns": 2526802, "rows_per_s": 395757166.6, "mb_per_s": 3166.057}
+  ]
+}

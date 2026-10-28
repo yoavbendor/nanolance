@@ -1,0 +1,27 @@
+{
+  "header": {
+    "program": "nl_bench_encoding",
+    "git_commit": "3132bf451e2aed135ff720a71226060c5e14b16c",
+    "git_dirty": true,
+    "compiler": "gcc 13.3.0",
+    "build_type": "Release",
+    "cores": 4,
+    "quick": false,
+    "rows": 0,
+    "scale": "about 16 MiB decoded per column",
+    "runs": 7
+  },
+  "results": [
+    {"name": "decode/int64_seq", "rows": 2097152, "bytes": 16777216, "median_ns": 5669655, "rows_per_s": 369890584.2, "mb_per_s": 2959.125},
+    {"name": "decode/int64_random", "rows": 2097152, "bytes": 16777216, "median_ns": 4880283, "rows_per_s": 429719342.1, "mb_per_s": 3437.755},
+    {"name": "decode/int64_constant", "rows": 2097152, "bytes": 16777216, "median_ns": 1859698, "rows_per_s": 1127684172.4, "mb_per_s": 9021.473},
+    {"name": "decode/int64_runs", "rows": 2097152, "bytes": 16777216, "median_ns": 1145591, "rows_per_s": 1830628906.8, "mb_per_s": 14645.031},
+    {"name": "decode/float64_random", "rows": 2097152, "bytes": 16777216, "median_ns": 6259244, "rows_per_s": 335048769.5, "mb_per_s": 2680.390},
+    {"name": "decode/bool", "rows": 16777216, "bytes": 16777216, "median_ns": 2912385, "rows_per_s": 5760644969.7, "mb_per_s": 5760.645},
+    {"name": "decode/str_few_values", "rows": 1198373, "bytes": 16777226, "median_ns": 8466024, "rows_per_s": 141550862.6, "mb_per_s": 1981.713},
+    {"name": "decode/str_runs", "rows": 1864136, "bytes": 16777228, "median_ns": 3367264, "rows_per_s": 553605538.5, "mb_per_s": 4982.451},
+    {"name": "decode/str_unique", "rows": 1277738, "bytes": 16777226, "median_ns": 12889347, "rows_per_s": 99131321.4, "mb_per_s": 1301.635},
+    {"name": "decode/str_320_bytes", "rows": 51782, "bytes": 16777372, "median_ns": 5045990, "rows_per_s": 10262010.0, "mb_per_s": 3324.892},
+    {"name": "decode/str_4200_bytes", "rows": 3991, "bytes": 16778168, "median_ns": 5047871, "rows_per_s": 790630.3, "mb_per_s": 3323.811}
+  ]
+}

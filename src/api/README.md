@@ -1,5 +1,10 @@
 # api: the C APIs and lance-c
 
+<!-- layer-deps:start -->
+Layer 11 of 11 (1 is the bottom, 11 the top). Uses: [base](../base/README.md), [io](../io/README.md), [arrow](../arrow/README.md), [file](../file/README.md), [table](../table/README.md), [expr](../expr/README.md), [scan](../scan/README.md), [index](../index/README.md), [dataset](../dataset/README.md). Used by: none. See [docs/LAYERS.md](../../docs/LAYERS.md).
+<!-- layer-deps:end -->
+Example: [examples/layers/api.cpp](../../examples/layers/api.cpp) (run with ctest -R nano_lance_example_api).
+
 The api layer is what programs outside nanolance link against: nanolance's own C writer and reader
 (`nano_lance_writer.h`, `nano_lance_reader.h`), their C++ wrappers (`writer.hpp`, the compile-time
 `typed_writer.hpp`), the hooks the dataset layer's operations use on a writer (`writer_internal.hpp`), and

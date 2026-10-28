@@ -73,6 +73,7 @@ nav:
   - Roadmap & review: OPTIMIZATION_PLAN.md
   - Implementation progress: PROGRESS.md
   - Internals:
+      - Layers: LAYERS.md
       - S3 reader notes: s3_reader_notes.md
       - Disk LRU block cache: disk-lru-block-cache.md
       - Table reader design notes: lance_table_reader_plan.md

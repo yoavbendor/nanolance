@@ -1,5 +1,10 @@
 # scan: reading the rows of a dataset's fragments, given a row selection
 
+<!-- layer-deps:start -->
+Layer 8 of 11 (1 is the bottom, 11 the top). Uses: [base](../base/README.md), [io](../io/README.md), [arrow](../arrow/README.md), [encoding](../encoding/README.md), [file](../file/README.md), [table](../table/README.md), [expr](../expr/README.md). Used by: [index](../index/README.md), [dataset](../dataset/README.md), [api](../api/README.md). See [docs/LAYERS.md](../../docs/LAYERS.md).
+<!-- layer-deps:end -->
+Example: [examples/layers/scan.cpp](../../examples/layers/scan.cpp) (run with ctest -R nano_lance_example_scan).
+
 The scan layer turns a version's manifest into Arrow batches: it plans which fragments and data files a read
 touches, decodes their columns through the file and encoding layers, joins a fragment's columns across its data
 files, fills columns no file holds with nulls, applies deletion files, data overlays, row-address masks, a filter

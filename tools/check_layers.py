@@ -7,6 +7,9 @@ violation. Known violations are listed in tools/layers_allow.txt: the check fail
 not listed there, and on a listed entry that is no longer a violation, so the list can only shrink.
 Dependency cycles between modules are reported, but do not fail the check.
 
+The example programs examples/layers/<layer>.cpp are checked too: each belongs to the layer its name gives,
+and may include only headers of that layer or of a layer below. Nothing in them is allowlisted.
+
 Usage: check_layers.py [--root PATH] [--write-allowlist]
 Exit codes: 0 clean, 1 failure, 2 usage error.
 """
@@ -22,6 +25,8 @@ ALLOW_NAME = "layers_allow.txt"
 SRC_SUFFIXES = {".cpp", ".hpp", ".h", ".inc"}
 PUBLIC_SUFFIXES = {".h", ".hpp"}
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
+# Examples include public headers as <nanolance/x.hpp> or "nanolance/x.hpp", and internal ones as "layer/x.hpp".
+EXAMPLE_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+[<"]([^>"]+)[>"]')
 ALLOW_RE = re.compile(r"^(\S+)\s*->\s*(\S+)$")
 
 
@@ -45,6 +50,38 @@ def scan_files(root):
     if inc.is_dir():
         out += sorted(p for p in inc.glob("*") if p.is_file() and p.suffix in PUBLIC_SUFFIXES)
     return out
+
+
+def scan_examples(root):
+    """The example programs the check reads: examples/layers/<layer>.cpp."""
+    d = root / "examples" / "layers"
+    return sorted(p for p in d.glob("*.cpp") if p.is_file()) if d.is_dir() else []
+
+
+def check_examples(root, layout, layer_of):
+    """Checks each example. Returns (errors, violations, files, includes): violations are (layer, target layer,
+    target module, file, line) for an include of a module above the example's layer. Includes that name no
+    module of tools/layout.py (the standard library, nanoarrow, the generated protobuf) are not counted."""
+    rank = layout.rank()
+    errors, violations, files, includes = [], [], 0, 0
+    for path in scan_examples(root):
+        rel = path.relative_to(root).as_posix()
+        layer = path.stem
+        files += 1
+        if layer not in rank:
+            errors.append(f"{rel}: '{layer}' is not a layer in tools/layout.py (an example is named for its layer)")
+            continue
+        for n, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            m = EXAMPLE_INCLUDE_RE.match(line)
+            if not m:
+                continue
+            target = m.group(1).rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            if target not in layer_of:
+                continue
+            includes += 1
+            if rank[layer_of[target]] > rank[layer]:
+                violations.append((layer, layer_of[target], target, rel, n))
+    return errors, violations, files, includes
 
 
 def read_allowlist(path):
@@ -109,10 +146,12 @@ def strongly_connected(nodes, adj):
     return sorted(out)
 
 
-def run(root, write):
+def collect(root):
+    """Read the layout and every file the check scans. Returns (layout, layer_of, errors, per_layer, modules,
+    edges), where edges are (includer module, included module, file, line) for each include between known
+    modules. tools/gen_layer_docs.py reads the same edges."""
     layout = load_layout(root)
     layer_of = layout.module_layer()
-    rank = layout.rank()
     layer_dir = {name: d for name, d, _ in layout.LAYERS}
     errors = []
     per_layer = {name: [0, 0] for name, _, _ in layout.LAYERS}  # files, lines
@@ -150,6 +189,15 @@ def run(root, write):
                 continue  # self-edge, or third-party / system header
             edges.append((module, target, rel, n))
 
+    return layout, layer_of, errors, per_layer, modules, edges
+
+
+def run(root, write):
+    layout, layer_of, errors, per_layer, modules, edges = collect(root)
+    rank = layout.rank()
+    ex_errors, ex_violations, ex_files, ex_includes = check_examples(root, layout, layer_of)
+    errors += ex_errors
+
     occurrences = [(a, b, rel, n) for a, b, rel, n in edges if rank[layer_of[b]] > rank[layer_of[a]]]
     pairs = sorted({(a, b) for a, b, _, _ in occurrences})
 
@@ -174,6 +222,8 @@ def run(root, write):
     for name, d, _ in layout.LAYERS:
         print(f"{name:<10}{d:<12}{per_layer[name][0]:>6}{per_layer[name][1]:>9}")
     print(f"include edges between known modules: {len(edges)} ({len({(a, b) for a, b, _, _ in edges})} distinct)")
+    print(f"examples/layers: {ex_files} file(s), {ex_includes} include(s) of known modules, "
+          f"{len(ex_violations)} violation(s)")
     print(f"violations: {len(occurrences)} occurrence(s) in {len(pairs)} module pair(s); "
           f"allowlist: {len(allowed)} entr(y/ies)")
 
@@ -186,6 +236,10 @@ def run(root, write):
         for a, b, rel, n in occurrences:
             tag = "allowed" if (a, b) in allowed else "NEW"
             print(f"  {a} ({layer_of[a]}) -> {b} ({layer_of[b]})  [{rel}:{n}]  {tag}")
+    if ex_violations:
+        print("\nexample violations (an example may include only its own layer and the layers below):")
+        for layer, tlayer, target, rel, n in ex_violations:
+            print(f"  example {layer} includes {target} ({tlayer})  [{rel}:{n}]")
     if new:
         print(f"\nnot in {ALLOW_NAME} (fix the include, or add the pair with --write-allowlist):")
         for a, b in new:
@@ -201,7 +255,7 @@ def run(root, write):
     else:
         print("\ndependency cycles (informational): none")
 
-    failed = bool(errors or new or stale)
+    failed = bool(errors or new or stale or ex_violations)
     if write:
         print(f"\nwrote {allow_path.relative_to(root).as_posix()} with {len(pairs)} entr(y/ies)")
     print("\nFAIL" if failed else "\nOK")

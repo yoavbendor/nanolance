@@ -1,5 +1,10 @@
 # index: each index kind, built, looked up and described in Lance's format
 
+<!-- layer-deps:start -->
+Layer 9 of 11 (1 is the bottom, 11 the top). Uses: [base](../base/README.md), [arrow](../arrow/README.md), [file](../file/README.md), [table](../table/README.md), [expr](../expr/README.md), [scan](../scan/README.md). Used by: [dataset](../dataset/README.md), [api](../api/README.md). See [docs/LAYERS.md](../../docs/LAYERS.md).
+<!-- layer-deps:end -->
+Example: [examples/layers/index.cpp](../../examples/layers/index.cpp) (run with ctest -R nano_lance_example_index).
+
 This layer builds Lance's secondary indices -- the scalar ones (BTREE, BITMAP, LABEL_LIST, ZONEMAP,
 BLOOMFILTER, NGRAM, and the JSON index over a BTREE), the full-text INVERTED index, and the IVF vector
 indices (IVF_FLAT, IVF_SQ, IVF_PQ, IVF_RQ, IVF_HNSW_FLAT / _SQ / _PQ) -- in the files and manifest entries
