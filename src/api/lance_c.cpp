@@ -338,8 +338,12 @@ LanceDataset* open_dataset(const char* uri, const char* const* storage_opts, uin
             pairs.emplace_back(kv[0], kv[1]);
         }
         std::string error;
-        if (!nano_lance::io::set_object_store_options(path.native(), nano_lance::io::object_store_options_from(pairs),
-                                                      error)) {
+        const auto options = nano_lance::io::object_store_options_from(pairs, &error);
+        if (!error.empty()) {
+            invalid(error);
+            return nullptr;
+        }
+        if (!nano_lance::io::set_object_store_options(path.native(), options, error)) {
             set_error(code_for(error), error);
             return nullptr;
         }
