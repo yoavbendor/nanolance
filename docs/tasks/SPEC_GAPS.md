@@ -41,7 +41,7 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1g | `encoding.config` | Honour the `lance-encoding:*` field metadata Lance honours | partial (Haiku session, 2026-10-29): done `rle-threshold`, `dict-divisor`, `dict-size-ratio` (refused by name outside (0, 1]), `dict-values-compression` (+ level); reader General over InlineBitpacking. Left: `dict` columns under `compression` (indices as General{codec,BSS{Flat(32)}}: needs the reader's dictionary-index path to unwrap General, then the writer), integer dictionaries (pylance dictionary-encodes low-cardinality ints; nanolance has none), `bss`, `structural-encoding`, multi-chunk RLE, the C++ tests for the refusal and the decode | next |
 | W1h | `encoding.compression.general.write` | LZ4 | done for the value layouts measured (LZ4 writer; `compression=lz4` on 64-bit ints and variable-width). Left: General over dictionaries under the option, float zstd layout | done |
 | W1i | `encoding.layout.full_zip.write` | Fixed-width full-zip and per-value compression | measured and done 2026-10-29, see "Result for W1i" | partial (Haiku session, 2026-10-29): the 256-byte rule and `structural-encoding` for fixed-width FSL and fixed_size_binary, element validity included, layout text equal to pylance's for 21 cases. Left: the page split (pylance: one page per input batch), per-value compression of a fixed-width FullZip page, `structural-encoding=fullzip` on variable width, a bool column or a list of lists under fullzip, and a fixed-width FullZip scan that is slower than mini-block (measured) |
-| W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs, read and write | to measure | later |
+| W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs: read pylance's first, then write them for `lance-encoding:packed` | measured 2026-10-29, see "Measured for W1j" | next |
 | W1k | `arrow.types.fixed_size_list`, `arrow.types.dictionary` | FSL of variable-width elements; dictionaries inside structs and lists | to measure | later |
 | W1p | `encoding.config` | Integer dictionaries: pylance dictionary-encodes int64 / float64 columns with 1,000-10,000 distinct values (`dict=InlineBitpacking(64)` / `General{LZ4,Flat(64)}`); nanolance has no such encoding | W1g, W1h | later |
 | W1q | `encoding.compression.rle` | RLE over more than one mini-block chunk: nanolance's RLE holds its runs in one chunk, so a column of 25,000 runs is not RLE-encoded | W1g | later |
@@ -352,3 +352,34 @@ pylance reads the new files faster too (best of 3, scan / take): 768 floats 0.71
 
 Byte-identical check (narrow columns): `nlbench_gendata <out> 50000` data file md5 is equal between the base and
 the new build (84b4dce7912cd80d047e779f01a143fb), and `test_write_encoding_matrix.py` passes unchanged.
+
+## Measured for W1j (packed structs, 2026-10-29)
+
+pylance 12.0.0, 20,000 rows. A struct field with `lance-encoding:packed` = `true` (or the legacy key `packed`):
+
+| struct | pylance's page | nanolance reads it |
+|---|---|---|
+| struct<int32, float64> | `MiniBlock{values=PackedStruct}` (CompressiveEncoding 12) | no: "unsupported encoding ... (CompressiveEncoding variant 12)" |
+| same, with null rows | `MiniBlock{values=PackedStruct, repdef=Bitpacked(16,Flat(1)), nullable}` | no |
+| same, legacy key `packed=true` | as with `lance-encoding:packed` | no |
+| struct<int32, string> | `FullZip{values=VariablePackedStruct, offset_bits=32}` (CompressiveEncoding 13) | no: "unsupported FullZip value compression" |
+| struct<int32, fixed_size_list<float32,4>> | `FullZip{values=VariablePackedStruct, offset_bits=32}` | no |
+| struct<int32, float64>, no option | one column per child (`a`, `b`), as nanolance writes | yes |
+
+Lance 12 `encodings_v2_1.proto`:
+
+```
+message PackedStruct {               // fixed-width children concatenated row by row into one fixed-width block
+  repeated uint64 bits_per_value = 1;  // bits each child contributes to a packed row
+  CompressiveEncoding values = 2;      // the compression of the packed fixed-width values
+}
+message VariablePackedStruct {       // 2.2: each child value compressed on its own, then transposed row-major
+  repeated FieldEncoding fields = 1;   // in struct order
+  message FieldEncoding {
+    CompressiveEncoding value = 1;
+    oneof layout { uint64 bits_per_value = 2; uint64 bits_per_length = 3; }
+  }
+}
+```
+
+So W1j starts with reading: a dataset pylance wrote with a packed struct cannot be read by nanolance today.
