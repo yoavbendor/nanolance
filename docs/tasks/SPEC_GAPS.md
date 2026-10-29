@@ -38,14 +38,14 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1e | `arrow.fields.primary_key`, `table.schema.primary_key` | Unenforced primary key: Arrow metadata to fields 12-15, and back | done 2026-10-29: fields 12, 13, 15 written and read; the Arrow key metadata read as pylance does; pylance's write checks; merge_insert's default key by position. Left: whether pylance writes the key into a data file's schema (not measured); a key nested in a struct as the merge_insert default |
 | W1m | `file.version.2_0`, `file.version.2_1` | Which older pylance / LanceDB releases read a dataset with nanolance's 2.2 files beside 2.0 / 2.1 ones | measured 2026-10-29, see below | done: only pylance 12 and later read the mix |
 | W1f | `file.structure.page_priority` | Write each page's priority as Lance does | measured 2026-10-29, see "Measured for W1f (page priority)" | done 2026-10-29: every page's `priority` is the top-level row of its first row, as pylance writes it (int64, list, string, FSL128 measured); single-page columns keep 0 |
-| W1g | `encoding.config` | Honour the `lance-encoding:*` field metadata Lance honours | partial (Haiku session, 2026-10-29): done `rle-threshold`, `dict-divisor`, `dict-size-ratio` (refused by name outside (0, 1]), `dict-values-compression` (+ level); reader General over InlineBitpacking. Left: `dict` columns under `compression` (indices as General{codec,BSS{Flat(32)}}: needs the reader's dictionary-index path to unwrap General, then the writer), integer dictionaries (pylance dictionary-encodes low-cardinality ints; nanolance has none), `bss`, `structural-encoding`, multi-chunk RLE, the C++ tests for the refusal and the decode | next |
+| W1g | `encoding.config` | Honour the `lance-encoding:*` field metadata Lance honours | partial (Haiku session, 2026-10-29): done `rle-threshold`, `dict-divisor`, `dict-size-ratio` (refused by name outside (0, 1]), `dict-values-compression` (+ level); reader General over InlineBitpacking. Left (dict columns under `compression` done in W1r): integer dictionaries (pylance dictionary-encodes low-cardinality ints; nanolance has none), `bss`, `structural-encoding`, multi-chunk RLE, the C++ tests for the refusal and the decode | next |
 | W1h | `encoding.compression.general.write` | LZ4 | done for the value layouts measured (LZ4 writer; `compression=lz4` on 64-bit ints and variable-width). Left: General over dictionaries under the option, float zstd layout | done |
 | W1i | `encoding.layout.full_zip.write` | Fixed-width full-zip and per-value compression | measured and done 2026-10-29, see "Result for W1i" | partial (Haiku session, 2026-10-29): the 256-byte rule and `structural-encoding` for fixed-width FSL and fixed_size_binary, element validity included, layout text equal to pylance's for 21 cases. Left: the page split (pylance: one page per input batch), per-value compression of a fixed-width FullZip page, `structural-encoding=fullzip` on variable width, a bool column or a list of lists under fullzip, and a fixed-width FullZip scan that is slower than mini-block (measured) |
 | W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs: read pylance's first, then write them for `lance-encoding:packed` | measured 2026-10-29, see "Measured for W1j" | later, reviewer-led design: reading needs a packed-struct read plan with child fan-out (as `v20_packed_struct_sources` does for 2.0), and the VariablePackedStruct byte layout from Lance's source. Opt-in only, so behind the gaps every dataset meets |
 | W1k | `arrow.types.fixed_size_list`, `arrow.types.dictionary` | FSL of variable-width elements; dictionaries inside structs and lists | to measure | later |
 | W1p | `encoding.config` | Integer dictionaries: pylance dictionary-encodes int64 / float64 columns with 1,000-10,000 distinct values (`dict=InlineBitpacking(64)` / `General{LZ4,Flat(64)}`); nanolance has no such encoding | W1g, W1h | later |
 | W1q | `encoding.compression.rle` | RLE over more than one mini-block chunk: nanolance's RLE holds its runs in one chunk, so a column of 25,000 runs is not RLE-encoded | W1g | later |
-| W1r | `encoding.config` | Dictionary indices under `lance-encoding:compression` (`General{codec,ByteStreamSplit{Flat(32)}}`, or `Flat(32)` for none): the reader's dictionary-index path has to unwrap them before the writer may emit them | W1g, W1h | next after W1i |
+| W1r | `encoding.config` | Dictionary indices under `lance-encoding:compression` (`General{codec,ByteStreamSplit{Flat(32)}}`, or `Flat(32)` for none): the reader's dictionary-index path has to unwrap them before the writer may emit them | W1g, W1h | partial (Haiku session, 2026-10-29): done for string, int64 and float64 dictionaries (reader unwraps General and byte-stream-split per index chunk; writer emits pylance's index layout under lz4 / zstd / none; the dictionary buffer unchanged; `dict-rle` keeps the option erased, not measured). Layout text equal to pylance's, read and take checked, see "W1r measured". Left: `dict-rle` under the option, and integer dictionaries written by nanolance (W1p) |
 | W1o | `file.version.2_0`, `file.version.2_1` | Warn when a write adds the first 2.2 file to a 2.0 / 2.1 dataset, naming the readers it cuts off | W1m table | done 2026-10-29: `MixedFormatWarning` before the commit of each write that adds the first 2.2 file to a 2.0 / 2.1 dataset (write_dataset append, update, merge_insert, add_columns, compaction, fragment writes); `error` filter aborts it; `_target_file_version` is the one line W1n changes |
 | W1n | `file.version.2_1` | Write 2.1 files into a 2.1 dataset, so its writes stay 2.1 | measured 2026-10-29, see "W1n: what writing 2.1 needs" | deferred (decided 2026-10-29): after W1i, and only if a user needs older readers for 2.1 datasets |
 
@@ -271,6 +271,26 @@ divisor default 2, size ratio default 0.8, min 100 rows, cap 100,000 distinct, a
 Byte-identical check: `nlbench_gendata <dir> 50000` on the base commit and on this branch writes the same data-file md5
 (one data file, `84b4dce7912cd80d047e779f01a143fb`); manifests and transactions differ only by their random names and
 timestamps, as they always do.
+
+## W1r measured (dictionary indices under lance-encoding:compression)
+
+pylance 12.0.0, 50,000 rows, `dict-divisor=1` on strings (1,000 distinct) so the column is a dictionary; `dict-values-compression=none`
+on both sides for the layout comparison (pylance's default wraps the dictionary in LZ4; nanolance keeps the plain buffer, as W1g).
+
+| column, option | pylance's page (`build/nlance-pagelayout`) |
+|---|---|
+| string, lz4 / zstd | `values=General{LZ4 / ZSTD,ByteStreamSplit{Flat(32)}}`, dict `General{LZ4,Variable}` by default |
+| string, none | `values=Flat(32)` |
+| int64 1,000 values, lz4 / zstd / none | indices as above (asserted by the read tests; nanolance has no integer dictionary to write: W1p) |
+| float64 1,000 values, lz4 / zstd / none | indices as above (asserted by the read tests) |
+
+Before W1r the reader classified `General{..,ByteStreamSplit}` as a plain byte-stream-split column and ignored the dictionary; the
+dictionary path now unwraps it per chunk. Writer: a dictionary column keeps the option; the writer-wide `compression=True` flag
+no longer overrides a column's own option. nanolance-written string dictionaries under each option match pylance's layout
+(`dict-values-compression=none` on both sides), and pylance reads them.
+
+Byte-identical without the option: `nlbench_gendata` data file md5 on the base commit and on this branch is the same
+(`84b4dce7912cd80d047e779f01a143fb`).
 
 ## Measured for W1i (fixed-width FullZip)
 
