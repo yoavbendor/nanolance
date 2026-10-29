@@ -36,14 +36,14 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1d | (test coverage) | Direct C++ tests for the modules in `tools/tests_allow.txt` that can have one | -- | done 2026-10-28: 4 direct tests; found and fixed the projected-column status; the create-mode commit question is open |
 | W1l | `file.version.2_0`, `file.version.2_1` | Test every modification of a 2.0 / 2.1 dataset against pylance, and document what works | measured 2026-10-29, see below | done 2026-10-29: 22 cases (2.0 and 2.1 x 11 operations) match pylance, no library change; left: nothing for these rows (writing 2.0 / 2.1 stays unscheduled, W1n) |
 | W1e | `arrow.fields.primary_key`, `table.schema.primary_key` | Unenforced primary key: Arrow metadata to fields 12-15, and back | done 2026-10-29: fields 12, 13, 15 written and read; the Arrow key metadata read as pylance does; pylance's write checks; merge_insert's default key by position. Left: whether pylance writes the key into a data file's schema (not measured); a key nested in a struct as the merge_insert default |
-| W1m | `file.version.2_0`, `file.version.2_1` | Which older pylance / LanceDB releases read a dataset with nanolance's 2.2 files beside 2.0 / 2.1 ones | to measure | next; decides W1n |
+| W1m | `file.version.2_0`, `file.version.2_1` | Which older pylance / LanceDB releases read a dataset with nanolance's 2.2 files beside 2.0 / 2.1 ones | measured 2026-10-29, see below | done: only pylance 12 and later read the mix |
 | W1f | `file.structure.page_priority` | Write each page's priority as Lance does | to measure | next |
 | W1g | `encoding.config` | Honour the `lance-encoding:*` field metadata Lance honours | to measure, per key | next |
 | W1h | `encoding.compression.general.write` | LZ4 | to measure | next |
 | W1i | `encoding.layout.full_zip.write` | Fixed-width full-zip and per-value compression | to measure | later |
 | W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs, read and write | to measure | later |
 | W1k | `arrow.types.fixed_size_list`, `arrow.types.dictionary` | FSL of variable-width elements; dictionaries inside structs and lists | to measure | later |
-| W1n | `file.version.2_1` | Write 2.1 files into a 2.1 dataset, so its writes stay 2.1 | the 2.2-only encodings pylance leaves out for 2.1: to measure | only if W1m finds readers that need it |
+| W1n | `file.version.2_1` | Write 2.1 files into a 2.1 dataset, so its writes stay 2.1 | the 2.2-only encodings pylance leaves out for 2.1: to measure | needed (W1m); waits on the decision below |
 
 ## Datasets in formats 2.0 and 2.1 (measured 2026-10-29)
 
@@ -65,6 +65,31 @@ encodings, which nanolance only reads, so it stays unscheduled until a user need
 
 Risk: W1l and W1m change no library code. W1n touches the writer's encoding choice behind a version switch,
 so 2.2 output must stay byte-identical (`nl_bench_encoding` / `nlbench_gendata` A/B, as in the refactors).
+
+### Older readers (W1m, measured 2026-10-29)
+
+pylance wrote 2.0 and 2.1 datasets. Copies were then appended to or updated by nanolance ("mixed": 2.2 files
+beside the old ones, with the mixed-version flag). Each release read every copy in its own venv.
+
+| pylance | pure 2.0 | pure 2.1 | mixed 2.0 or 2.1 (after any nanolance write) |
+|---|---|---|---|
+| 0.20.0, 0.25.2, 0.30.0, 0.35.0 | reads | fails ("Task was aborted") | refused: "This dataset cannot be read by this version of Lance. Please upgrade Lance to read this dataset" |
+| 0.39.0, 1.0.4, 4.0.2, 7.1.0, 9.0.1, 11.0.0 | reads | reads | refused, the same message |
+| 12.0.0, 14.0.2 | reads | reads | reads |
+
+So after nanolance modifies a 2.0 or 2.1 dataset, only pylance 12 and later can read it. For a 2.1 dataset,
+W1n (writing 2.1 files) keeps it readable back to pylance 0.39. For a 2.0 dataset, only a 2.0 writer keeps every
+release reading it: 2.0 is what LanceDB wrote, and 281 of the 621 Lance tables on the Hugging Face Hub use it.
+
+Options, cheapest first. They can be combined:
+
+1. Warn when a write would add the first 2.2 file to a 2.0 or 2.1 dataset, and document the table above. Small.
+2. W1n: write 2.1 into 2.1 datasets. Small to medium, behind a version switch, with 2.2 output kept
+   byte-identical.
+3. A 2.0 writer for the common flat types (integers, floats, strings, fixed-size-list vectors, plain lists and
+   structs), refusing the rest by name. Medium to large: the 2.0 page encodings are written for the first time.
+4. Refuse to write into a 2.0 / 2.1 dataset unless the caller opts in (for example `allow_mixed_versions=True`).
+   Small, but it changes behaviour that works today with pylance 12+.
 
 ## Wave 2 onwards
 
