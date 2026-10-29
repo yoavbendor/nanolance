@@ -390,7 +390,10 @@ int main() {
         // nanolance commits rewrite the manifest of every version they append to.
         std::vector<std::uint8_t> field_bytes;
         put_varint(field_bytes, 3, 7);       // id = 7
-        put_varint(field_bytes, 12, 1);      // unenforced_primary_key = true (not modelled)
+        put_varint(field_bytes, 12, 1);      // unenforced_primary_key = true (modelled since W1e)
+        put_varint(field_bytes, 13, 2);      // unenforced_primary_key_position = 2 (modelled)
+        put_varint(field_bytes, 15, 5);      // unenforced_clustering_key_position = 5 (modelled)
+        put_varint(field_bytes, 14, 1);      // unenforced_clustering_key: reserved by Lance, kept as unknown
         std::vector<std::uint8_t> fragment_bytes;
         put_varint(fragment_bytes, 1, 4);    // id = 4
         put_varint(fragment_bytes, 4, 10);   // physical_rows = 10
@@ -410,7 +413,11 @@ int main() {
         require(m.version == 5 && m.fields.size() == 1 && m.fields[0].id == 7 && m.fragments.size() == 1 &&
                     m.fragments[0].physical_rows == 10,
                 "modelled fields of that manifest");
-        require(m.fields[0].unknown == std::vector<std::uint8_t>{0x60, 0x01}, "the field keeps its unmodelled field");
+        require(m.fields[0].unenforced_primary_key && m.fields[0].unenforced_primary_key_position == 2 &&
+                    m.fields[0].unenforced_clustering_key_position == 5,
+                "the field's unenforced keys (fields 12, 13 and 15) are modelled");
+        require(m.fields[0].unknown == std::vector<std::uint8_t>{0x70, 0x01},
+                "the field keeps the fields it does not model, and only those");
         require(m.fragments[0].unknown == std::vector<std::uint8_t>{0x2a, 0x02, 0x08, 0x01},
                 "the fragment keeps its row id sequence");
         require(m.unknown == std::vector<std::uint8_t>{0x8a, 0x01, 0x03, 'b', 'r', 'x'},
@@ -422,6 +429,32 @@ int main() {
         require(again.version == 6 && again.unknown == m.unknown && again.fields[0].unknown == m.fields[0].unknown &&
                     again.fragments[0].unknown == m.fragments[0].unknown,
                 "unmodelled fields survive the rewrite");
+        require(again.fields[0].unenforced_primary_key && again.fields[0].unenforced_primary_key_position == 2 &&
+                    again.fields[0].unenforced_clustering_key_position == 5,
+                "the unenforced keys survive the rewrite, once each on the wire");
+        {
+            // A field with no keys writes no key bytes (proto3 leaves out the false and zero ones); a key set in
+            // the model is written in fields 12 and 13.
+            nano_lance::pb::Field plain;
+            plain.id = 1;
+            nano_lance::pb::Field plain_back;
+            require(nano_lance::pb::decode_field(nano_lance::pb::encode_field(plain), plain_back) &&
+                        !plain_back.unenforced_primary_key && plain_back.unenforced_primary_key_position == 0 &&
+                        plain_back.unknown.empty(),
+                    "a plain field writes no key fields");
+            nano_lance::pb::Field keyed;
+            keyed.id = 1;
+            keyed.unenforced_primary_key = true;
+            keyed.unenforced_primary_key_position = 1;
+            const auto bytes = nano_lance::pb::encode_field(keyed);
+            nano_lance::pb::Field decoded;
+            require(nano_lance::pb::decode_field(bytes, decoded) && decoded.unenforced_primary_key &&
+                        decoded.unenforced_primary_key_position == 1 && decoded.unknown.empty(),
+                    "a key set in the model is written and read back");
+            const std::vector<std::uint8_t> key_only = {0x60, 0x01, 0x68, 0x01};  // 12: 1, 13: 1
+            require(std::search(bytes.begin(), bytes.end(), key_only.begin(), key_only.end()) != bytes.end(),
+                    "the key is written as Lance writes it: fields 12 and 13");
+        }
     }
     {
         // An index the commit does not touch is copied byte for byte, whatever it holds; one whose

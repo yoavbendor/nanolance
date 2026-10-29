@@ -319,11 +319,164 @@ void test_golden_blob_ipc_schema() {
     release_schema(schema);
 }
 
+// The unenforced primary key of an Arrow field, read from its metadata the way pylance 12 reads it (measured:
+// a position that parses wins over the flag; a truthy flag alone is position 0; the clustering position is
+// only read when it parses). The write checks use pylance's own messages.
+void test_unenforced_primary_key() {
+    const char* const kKey = "lance-schema:unenforced-primary-key";
+    const char* const kPosition = "lance-schema:unenforced-primary-key:position";
+    const char* const kClustering = "lance-schema:unenforced-clustering-key:position";
+
+    // Maps one non-null int64 column `id` carrying the given metadata; returns the mapped field.
+    auto map_one = [](const char* key, const char* value, nano_lance::LanceField& out) {
+        ArrowSchema id{};
+        id.format = "l";
+        id.name = "id";
+        id.flags = 0;
+        require(set_metadata(id, key, value), "failed to set key metadata");
+        ArrowSchema* children[] = {&id};
+        ArrowSchema root{};
+        root.format = "+s";
+        root.name = "";
+        root.flags = 0;
+        root.n_children = 1;
+        root.children = children;
+        nano_lance::LanceSchemaMapping mapping;
+        std::string error;
+        const bool ok = nano_lance::map_arrow_schema(root, mapping, error);
+        if (ok) {
+            out = mapping.fields[0];
+        }
+        if (id.metadata != nullptr) {
+            ArrowFree(const_cast<char*>(id.metadata));
+        }
+        require(ok, error);
+    };
+
+    nano_lance::LanceField key;
+    map_one(kKey, "true", key);
+    require(key.unenforced_primary_key && key.unenforced_primary_key_position == 0, "a truthy flag is a key at 0");
+    map_one(kKey, "TRUE", key);
+    require(key.unenforced_primary_key, "the flag is read without case");
+    map_one(kKey, "yes", key);
+    require(key.unenforced_primary_key, "yes is truthy");
+    map_one(kKey, "y", key);
+    require(key.unenforced_primary_key, "y is truthy");
+    map_one(kKey, "1", key);
+    require(key.unenforced_primary_key, "1 is truthy");
+    for (const char* falsy : {"false", "0", "no", "", "2", "t", " true"}) {
+        map_one(kKey, falsy, key);
+        require(!key.unenforced_primary_key, "a falsy flag is not a key");
+    }
+    map_one(kPosition, "2", key);
+    require(key.unenforced_primary_key && key.unenforced_primary_key_position == 2, "a position makes a key");
+    map_one(kPosition, "+007", key);
+    require(key.unenforced_primary_key && key.unenforced_primary_key_position == 7, "+007 parses as 7");
+    map_one(kPosition, "0", key);
+    require(key.unenforced_primary_key && key.unenforced_primary_key_position == 0, "position 0 is still a key");
+    map_one(kPosition, "4294967295", key);
+    require(key.unenforced_primary_key && key.unenforced_primary_key_position == 4294967295U, "u32 max parses");
+    map_one(kPosition, "abc", key);
+    require(!key.unenforced_primary_key, "an unparseable position without a flag is no key");
+    // A position that does not parse does not stop the flag from making a key.
+    map_one(kPosition, "-1", key);
+    require(!key.unenforced_primary_key, "a position that does not parse is no key");
+    map_one(kClustering, "1", key);
+    require(!key.unenforced_primary_key && key.unenforced_clustering_key_position == 1 &&
+                key.unenforced_primary_key_position == 0,
+            "a clustering position is not a primary key");
+    map_one(kClustering, "0", key);
+    require(key.unenforced_clustering_key_position == 0, "clustering position 0 is not in the key");
+
+    // A non-null leaf inside a non-null struct maps; the Field carries the key, and the metadata stays as given.
+    ArrowSchema leaf{};
+    leaf.format = "l";
+    leaf.name = "id";
+    leaf.flags = 0;
+    require(set_metadata(leaf, kPosition, "1"), "failed to set key metadata on a struct leaf");
+    ArrowSchema* struct_children[] = {&leaf};
+    ArrowSchema strukt{};
+    strukt.format = "+s";
+    strukt.name = "s";
+    strukt.flags = 0;
+    strukt.n_children = 1;
+    strukt.children = struct_children;
+    ArrowSchema* root_children[] = {&strukt};
+    ArrowSchema root{};
+    root.format = "+s";
+    root.name = "";
+    root.flags = 0;
+    root.n_children = 1;
+    root.children = root_children;
+    nano_lance::LanceSchemaMapping mapping;
+    std::string error;
+    require(nano_lance::map_arrow_schema(root, mapping, error), error);
+    const auto* leaf_field = find_field(mapping, "id");
+    require(leaf_field != nullptr && leaf_field->unenforced_primary_key_position == 1 &&
+                leaf_field->metadata.count(kPosition) == 1,
+            "a non-null leaf inside a non-null struct is a key, and keeps its metadata");
+    if (leaf.metadata != nullptr) {
+        ArrowFree(const_cast<char*>(leaf.metadata));
+    }
+
+    // The refusals, with pylance 12's messages.
+    {
+        ArrowSchema nullable_key{};
+        nullable_key.format = "l";
+        nullable_key.name = "id";
+        nullable_key.flags = ARROW_FLAG_NULLABLE;
+        require(set_metadata(nullable_key, kKey, "true"), "failed to set key metadata");
+        ArrowSchema* children[] = {&nullable_key};
+        ArrowSchema root_schema{};
+        root_schema.format = "+s";
+        root_schema.name = "";
+        root_schema.flags = 0;
+        root_schema.n_children = 1;
+        root_schema.children = children;
+        nano_lance::LanceSchemaMapping refused;
+        std::string refusal;
+        require(!nano_lance::map_arrow_schema(root_schema, refused, refusal), "a nullable key is refused");
+        require(refusal == "Primary key column and all its ancestors must not be nullable: "
+                           "Field(id=0, name=id, type=int64)",
+                refusal.c_str());
+        ArrowFree(const_cast<char*>(nullable_key.metadata));
+    }
+    {
+        ArrowSchema list_item{};
+        list_item.format = "i";
+        list_item.name = "item";
+        list_item.flags = ARROW_FLAG_NULLABLE;
+        ArrowSchema* item_children[] = {&list_item};
+        ArrowSchema list{};
+        list.format = "+l";
+        list.name = "l";
+        list.flags = 0;
+        list.n_children = 1;
+        list.children = item_children;
+        require(set_metadata(list, kKey, "true"), "failed to set key metadata on a list");
+        ArrowSchema* children[] = {&list};
+        ArrowSchema root_schema{};
+        root_schema.format = "+s";
+        root_schema.name = "";
+        root_schema.flags = 0;
+        root_schema.n_children = 1;
+        root_schema.children = children;
+        nano_lance::LanceSchemaMapping refused;
+        std::string refusal;
+        require(!nano_lance::map_arrow_schema(root_schema, refused, refusal), "a list key is refused");
+        require(refusal == "Primary key column must be a leaf: "
+                           "Field(id=0, name=l, type=list, children=[Field(id=1, name=item, type=int32), ])",
+                refusal.c_str());
+        ArrowFree(const_cast<char*>(list.metadata));
+    }
+}
+
 }  // namespace
 
 int main() {
     test_flat_schema();
     test_nullable_flag_is_accepted();
+    test_unenforced_primary_key();
     test_fixed_size_binary();
     test_dictionary_schema();
     test_extension_struct();
