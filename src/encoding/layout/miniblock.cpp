@@ -3,6 +3,7 @@
 
 #include "encoding/layout/miniblock.hpp"
 
+#include <algorithm>
 #include <string>
 
 namespace nano_lance::miniblock {
@@ -54,7 +55,12 @@ void append_chunk(std::vector<std::uint8_t>& out, std::size_t num_levels, std::s
         sizes.push_back(b.size());
     }
     const auto header = chunk_header(num_levels, def.size(), sizes);
-    out.reserve(out.size() + chunk_bytes(def.size(), sizes));
+    // Grow geometrically: an exact reserve per chunk copied the whole page on every append (quadratic in a
+    // page of many chunks, such as multi-chunk RLE).
+    const auto needed = out.size() + chunk_bytes(def.size(), sizes);
+    if (needed > out.capacity()) {
+        out.reserve(std::max(needed, out.capacity() * 2U));
+    }
     out.insert(out.end(), header.begin(), header.end());
     if (!def.empty()) {
         out.insert(out.end(), def.begin(), def.end());

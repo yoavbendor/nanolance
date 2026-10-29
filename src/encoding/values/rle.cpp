@@ -52,19 +52,10 @@ constexpr std::size_t kChunkMaxRows = 4096U;
 constexpr std::size_t kChunkMaxBytes = 8192U;
 constexpr std::size_t kChunkHeaderBytes = 8U;
 
-/// Encoded bytes of `rows` rows that start at run `run`, `offset` rows into it.
-std::size_t window_bytes(std::span<const std::uint64_t> lengths, std::size_t value_bytes, std::size_t run,
-                         std::uint64_t offset, std::uint64_t rows) {
-    std::uint64_t pieces = 0;
-    std::uint64_t left = rows;
-    std::uint64_t off = offset;
-    for (std::size_t r = run; left > 0U && r < lengths.size(); ++r, off = 0U) {
-        const std::uint64_t take = std::min(lengths[r] - off, left);
-        pieces += (take + 254U) / 255U;
-        left -= take;
-    }
+/// Encoded bytes of a chunk holding `pieces` (value, 8-bit length) pairs.
+std::uint64_t chunk_bytes(std::uint64_t pieces, std::size_t value_bytes) {
     const std::uint64_t raw = kChunkHeaderBytes + pieces * (static_cast<std::uint64_t>(value_bytes) + 1U);
-    return static_cast<std::size_t>((raw + 7U) / 8U * 8U);
+    return (raw + 7U) / 8U * 8U;
 }
 
 }  // namespace
@@ -78,13 +69,37 @@ std::vector<std::size_t> chunk_rows(std::span<const std::uint64_t> run_lengths, 
     std::size_t run = 0;
     std::uint64_t offset = 0;
     while (remaining > 0U) {
+        // The candidates, smallest first: 1, 2, 4, ... below `remaining`, then min(remaining, 4096). A chunk's
+        // size only grows with its rows, so one walk from the chunk's start finds the largest that fits, and
+        // stops at the first that does not (pylance's choice; at least one row always goes).
+        const std::uint64_t last = std::min<std::uint64_t>(remaining, kChunkMaxRows);
+        std::uint64_t target = 1U;
         std::uint64_t chosen = 1U;
-        for (std::size_t p = kChunkMaxRows; p >= 1U; p /= 2U) {
-            const std::uint64_t rows = std::min<std::uint64_t>(remaining, p);
-            if (window_bytes(run_lengths, value_bytes, run, offset, rows) <= kChunkMaxBytes) {
-                chosen = rows;
-                break;
+        std::uint64_t rows = 0;    // rows walked from the chunk's start
+        std::uint64_t pieces = 0;  // pairs those rows encode to
+        std::size_t r = run;
+        std::uint64_t off = offset;
+        bool done = false;
+        while (!done && r < run_lengths.size()) {
+            const std::uint64_t seg = std::min(run_lengths[r] - off, last - rows);
+            // Every candidate that ends inside this segment.
+            while (target <= rows + seg) {
+                const std::uint64_t in_seg = target - rows;
+                if (chunk_bytes(pieces + (in_seg + 254U) / 255U, value_bytes) > kChunkMaxBytes) {
+                    done = true;
+                    break;
+                }
+                chosen = target;
+                if (target == last) {
+                    done = true;
+                    break;
+                }
+                target = std::min(target * 2U, last);
             }
+            rows += seg;
+            pieces += (seg + 254U) / 255U;
+            ++r;
+            off = 0U;
         }
         out.push_back(static_cast<std::size_t>(chosen));
         remaining -= chosen;

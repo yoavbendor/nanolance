@@ -613,6 +613,19 @@ chunk per entry, runs cut at chunk ends), the size-model cutoff and removal of t
   does not show this flag, so it is not part of the text comparison. Decision for the owner: u16 would match
   pylance's bytes exactly but only in a 2.1 file.
 - Left: float64 runs stay flat (the float path has its own decision, not changed); W1p2.
+
+Review (write time, 1,000,000 rows, one int64 column, best of 5; pylance 12 for the same column in brackets):
+
+| column | before W1q | W1q as delivered | after review | size before / after |
+|---|---|---|---|---|
+| runs of 2 | 14.8 ms (InlineBitpacking) | 212 ms | 32.4 ms [29.3 ms] | 5.02 MB / 4.52 MB |
+| runs of 50 | 72.1 ms (W1p dictionary) | 5.2 ms | 4.1 ms | 1.79 MB / 0.19 MB |
+| random | 13.7 ms | 13.3 ms | 12.6 ms [35.8 ms] | unchanged |
+
+The 212 ms was `miniblock::append_chunk` reserving exactly each chunk's bytes, so every chunk copied the page
+(quadratic; harmless while RLE pages had one chunk). It now grows geometrically. `rle::chunk_rows` walks each
+chunk once instead of once per candidate size (same chunks; `test_rle` unchanged). Control words stay u32: nanolance
+writes 2.2. `nlbench_gendata` 50,000: data file md5 unchanged.
 - md5 of `nlbench_gendata <dir> 50000` data file: `84b4dce7912cd80d047e779f01a143fb`, unchanged.
 
 ## Result for W1p (2026-10-29, stopped: no writer change)
