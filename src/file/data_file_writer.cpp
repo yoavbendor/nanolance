@@ -2102,6 +2102,146 @@ bool write_dictionary_column(const ColumnEncodeContext& ctx, std::ostream& out,
     return true;
 }
 
+/// Lance 12's rule for fixed-width values (`MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE` in primitive.rs): a column
+/// whose values are this wide or wider is written as FullZip pages, a narrower one as mini-block chunks. The
+/// width counts the values only; element validity is not in it (measured on pylance 12.0.0:
+/// FixedSizeList{64 x float32, validity} is FullZip, FixedSizeList{63 x float32, validity} is mini-block).
+constexpr std::uint64_t kFullZipMinFixedRowBytes = 256U;
+
+/// The FullZip value encoding of a fixed-width column: a flat fixed-width value, or a fixed_size_list of one
+/// (`FixedSizeList{N x Flat(b)}`, with `has_validity` when its items carry validity). False for a type this writer
+/// does not lay out as FullZip: bool (not whole bytes as a list element), a list of lists, variable width.
+bool fixed_full_zip_value_encoding(const LanceField& field, bool item_validity, std::vector<std::uint8_t>& encoding) {
+    std::string element;
+    std::uint64_t items = 0;
+    if (lance_fixed_size_list_parts(field.logical_type, element, items)) {
+        if (element == "bool" || element.rfind("fixed_size_list:", 0) == 0 || lance_field_is_variable_width(element)) {
+            return false;
+        }
+        const auto element_bytes = lance_logical_type_value_bytes(element);
+        if (element_bytes == 0U) {
+            return false;
+        }
+        encoding = descriptor::fixed_size_list(items, descriptor::flat(static_cast<std::uint64_t>(element_bytes) * 8U),
+                                               item_validity);
+        return true;
+    }
+    if (field.logical_type == "bool" || lance_field_is_variable_width(field.logical_type)) {
+        return false;
+    }
+    const auto bytes = lance_logical_type_value_bytes(field.logical_type);
+    if (bytes == 0U) {
+        return false;
+    }
+    encoding = descriptor::flat(static_cast<std::uint64_t>(bytes) * 8U);
+    return true;
+}
+
+/// Whether a fixed-width column is written as FullZip pages. The default is Lance's rule (256 bytes or more per
+/// value); `lance-encoding:structural-encoding=fullzip` forces FullZip on any type that can take it (a 64-bit
+/// integer included) and `miniblock` keeps mini-block. A fullzip request this writer cannot lay out is refused by
+/// name. A list of bools is refused with pylance's own message (measured); a bool column and a list of lists
+/// pylance writes, which nanolance does not yet.
+bool fixed_column_wants_full_zip(const LanceField& field, bool item_validity, bool& wanted, std::string& error) {
+    wanted = false;
+    const auto option = field.metadata.find("lance-encoding:structural-encoding");
+    const std::string text = option == field.metadata.end() ? std::string() : option->second;
+    if (text == "miniblock") {
+        return true;
+    }
+    std::vector<std::uint8_t> encoding;
+    if (fixed_full_zip_value_encoding(field, item_validity, encoding)) {
+        wanted = text == "fullzip" || lance_logical_type_value_bytes(field.logical_type) >= kFullZipMinFixedRowBytes;
+        return true;
+    }
+    if (text != "fullzip") {
+        return true;  // the default rule: this type stays on its mini-block / flat path
+    }
+    error = "lance-encoding:structural-encoding=fullzip on column '" + field.name + "' of type " + field.logical_type +
+            " is not written yet by nanolance";
+    return false;
+}
+
+/// A fixed-width column as FullZip pages, the layout Lance writes for values of 256 bytes or more: each row
+/// stored whole -- [control word when the column has nulls][the item validity bytes, when the items carry
+/// validity][the row's values] -- and no repetition index, since every row has the same width. A null row keeps
+/// its slot (zeros), as Lance's fixed-width FullZip does. Pages hold whole rows, cut at kFullZipFixedPageBytes.
+bool write_full_zip_fixed_column(const ColumnEncodeContext& ctx, std::ostream& out,
+                                 std::vector<pb::ColumnMetadata>& columns, std::string& error) {
+    constexpr std::uint64_t kFullZipFixedPageBytes = std::uint64_t{8} << 20U;
+    const auto& field = ctx.field;
+    const auto& values = ctx.values;
+    const bool nulls = ctx.column_has_nulls;
+    const bool item_validity = !values.item_validity.empty();
+    std::string element;
+    std::uint64_t items = 0;
+    if (item_validity && !lance_fixed_size_list_parts(field.logical_type, element, items)) {
+        error = "element validity on a column that is not a fixed_size_list: " + field.name;
+        return false;
+    }
+    const std::size_t value_bytes = value_width_bytes(field);
+    const std::size_t validity_bytes = item_validity ? static_cast<std::size_t>((items + 7U) / 8U) : 0U;
+    const std::size_t row_bytes = validity_bytes + value_bytes;
+    std::vector<std::uint8_t> encoding;
+    if (value_bytes == 0U || !fixed_full_zip_value_encoding(field, item_validity, encoding)) {
+        error = "column '" + field.name + "' cannot be written as FullZip pages";
+        return false;
+    }
+    const std::size_t control = full_zip::control_bytes(0U, nulls ? 1U : 0U);
+    const std::uint64_t rows = ctx.rows;
+    const std::uint64_t per_page = std::max<std::uint64_t>(1U, kFullZipFixedPageBytes / (control + row_bytes));
+    const std::vector<std::uint8_t> zeros(row_bytes, 0U);
+    std::vector<std::uint8_t> row(row_bytes);
+    pb::ColumnMetadata column;
+    column.encoding = column_encoding_bytes();
+    std::vector<std::uint8_t> data;
+    for (std::uint64_t first = 0; first < rows;) {
+        const auto end = std::min(rows, first + per_page);
+        data.clear();
+        data.reserve(static_cast<std::size_t>(end - first) * (control + row_bytes));
+        for (auto r = first; r < end; ++r) {
+            const bool valid = !nulls || validity_bit(values.validity, r);
+            full_zip::append_level(data, control, valid ? 0U : 1U, nullptr, 0U, 0U);
+            if (!valid) {
+                data.insert(data.end(), zeros.begin(), zeros.end());
+            } else if (!item_validity) {
+                const auto* bytes = values.fixed_data() + static_cast<std::size_t>(r) * value_bytes;
+                data.insert(data.end(), bytes, bytes + value_bytes);
+            } else {
+                // Element validity: bit j of the row is item j's bit, LSB-first, as mini-block writes it.
+                std::fill(row.begin(), row.begin() + static_cast<std::ptrdiff_t>(validity_bytes), 0U);
+                for (std::uint64_t j = 0; j < items; ++j) {
+                    const auto at = r * items + j;
+                    if ((values.item_validity[at >> 3U] >> (at & 7U)) & 1U) {
+                        row[j >> 3U] |= static_cast<std::uint8_t>(1U << (j & 7U));
+                    }
+                }
+                const auto* bytes = values.fixed_data() + static_cast<std::size_t>(r) * value_bytes;
+                std::copy(bytes, bytes + value_bytes, row.begin() + static_cast<std::ptrdiff_t>(validity_bytes));
+                data.insert(data.end(), row.begin(), row.end());
+            }
+        }
+        descriptor::FullZip layout;
+        layout.bits_def = nulls ? 1U : 0U;
+        layout.bits_per_value = static_cast<std::uint64_t>(row_bytes) * 8U;
+        layout.num_items = end - first;
+        layout.num_visible_items = end - first;
+        layout.value_compression = encoding;
+        layout.layers = {nulls ? static_cast<std::uint8_t>(repdef::kNullableItem)
+                               : static_cast<std::uint8_t>(repdef::kAllValidItem)};
+        pb::ColumnPage page;
+        page.buffer_offsets.push_back(write_buffer(out, data));
+        page.buffer_sizes.push_back(data.size());
+        page.length = end - first;
+        page.priority = first;
+        page.encoding = descriptor::page_encoding(layout);
+        column.pages.push_back(std::move(page));
+        first = end;
+    }
+    columns.push_back(std::move(column));
+    return true;
+}
+
 /// Writes a fixed_size_list column with null elements: validity bits, then the values.
 /// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
 bool write_fixed_size_list_column(const ColumnEncodeContext& ctx, std::ostream& out,
@@ -2922,6 +3062,15 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
                 "' (expected lz4, zstd or none)";
         return false;
     }
+    // lance-encoding:structural-encoding is fullzip or miniblock; anything else is refused with pylance's message
+    // (measured on pylance 12.0.0), before any page is written.
+    if (const auto so = field.metadata.find("lance-encoding:structural-encoding");
+        so != field.metadata.end() && so->second != "fullzip" && so->second != "miniblock") {
+        error = "Invalid user input: Cannot determine structural encoding for field " + field.name +
+                ".  This typically indicates an invalid value of the field metadata key "
+                "lance-encoding:structural-encoding";
+        return false;
+    }
     // `lance-encoding:compression-level` sets the zstd level of a zstd column (pylance: a number is the
     // level, zstd clamps it to its range; anything else keeps the writer's level). lz4 has no level.
     if (codec == ColumnCodec::kZstd) {
@@ -2997,9 +3146,32 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
     }
 
     // A fixed_size_list with null elements inside valid rows: Lance's mini-block chunks of two
-    // buffers, the elements' validity bits then the values, under FixedSizeList{has_validity}.
+    // buffers, the elements' validity bits then the values, under FixedSizeList{has_validity}. From 256
+    // bytes of values on (or when asked with structural-encoding=fullzip) it is FullZip instead, with the
+    // validity bits in each row's slot.
     if (!values.item_validity.empty()) {
+        bool full_zip_items = false;
+        if (!fixed_column_wants_full_zip(field, true, full_zip_items, error)) {
+            return false;
+        }
+        if (full_zip_items) {
+            return write_full_zip_fixed_column(ctx, out, columns, error);
+        }
         return write_fixed_size_list_column(ctx, out, columns, error);
+    }
+
+    // A fixed-width column of 256-byte values, or one asked for with structural-encoding=fullzip, as FullZip
+    // pages (see write_full_zip_fixed_column). A constant column stays Constant even when fullzip is asked for
+    // (measured on pylance 12.0.0). Fixed-width columns with element validity took the path above.
+    const bool constant_tagged = packing_it != field.metadata.end() && packing_it->second == "constant";
+    if (values.kind == ColumnValues::Kind::FixedWidth && !constant_tagged) {
+        bool full_zip_fixed = false;
+        if (!fixed_column_wants_full_zip(field, false, full_zip_fixed, error)) {
+            return false;
+        }
+        if (full_zip_fixed) {
+            return write_full_zip_fixed_column(ctx, out, columns, error);
+        }
     }
 
     // Constant column (tagged by the writer): ConstantLayout. The single value comes from the

@@ -14,6 +14,7 @@
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/data_file_writer.hpp"
 #include "nanolance/lance_column_decoder.hpp"
+#include "nanolance/page_layout.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include "lance_minimal.pb.hpp"
@@ -335,6 +336,63 @@ void check_priorities(const std::filesystem::path& path, std::uint64_t rows, std
     }
 }
 
+// A fixed_size_list<float32, 64> column is 256 bytes a row, Lance's FullZip threshold: it is written as FullZip
+// pages, and an explicit structural-encoding=fullzip on a 4-byte int32 column gives FullZip{Flat(32)}. Both keep
+// their values: the rows are read back from the page bytes by the same layout the reader decodes.
+void check_fixed_full_zip(const std::filesystem::path& dir) {
+    constexpr std::uint64_t kRowsFz = 1000;
+    constexpr std::size_t kItems = 64;
+    ArrowSchema schema;
+    ArrowSchemaInit(&schema);
+    require(ArrowSchemaSetTypeStruct(&schema, 1) == NANOARROW_OK, "struct schema (fsl)");
+    ArrowSchema* col = schema.children[0];
+    const std::string format = "+w:" + std::to_string(kItems);
+    require(ArrowSchemaSetFormat(col, format.c_str()) == NANOARROW_OK, "fixed_size_list schema");
+    require(ArrowSchemaSetName(col, "v") == NANOARROW_OK, "fsl name");
+    require(ArrowSchemaAllocateChildren(col, 1) == NANOARROW_OK, "fsl child");
+    ArrowSchemaInit(col->children[0]);
+    require(ArrowSchemaSetType(col->children[0], NANOARROW_TYPE_FLOAT) == NANOARROW_OK, "float item");
+    require(ArrowSchemaSetName(col->children[0], "item") == NANOARROW_OK, "item name");
+    col->flags &= ~ARROW_FLAG_NULLABLE;
+    nano_lance::LanceSchemaMapping mapping;
+    std::string error;
+    require(nano_lance::map_arrow_schema(schema, mapping, error), "map fsl schema: " + error);
+    schema.release(&schema);
+
+    nano_lance::ColumnValues values;
+    values.kind = nano_lance::ColumnValues::Kind::FixedWidth;
+    values.rows = kRowsFz;
+    values.fixed.resize(kRowsFz * kItems * 4U);
+    for (std::uint64_t i = 0; i < kRowsFz * kItems; ++i) {
+        const auto v = static_cast<float>(i);
+        std::memcpy(values.fixed.data() + i * 4U, &v, 4U);
+    }
+    nano_lance::DataFileResult result;
+    std::vector<nano_lance::ColumnValues> columns{std::move(values)};
+    require(nano_lance::write_lance_data_file(dir, "fsl_fullzip.lance", mapping, columns, kRowsFz, 3, false, result,
+                                              error),
+            "write fsl: " + error);
+    const auto path = dir / result.relative_path;
+    nano_lance::pb::FileDescriptor descriptor;
+    nano_lance::LanceDataFileFooterLayout layout;
+    require(nano_lance::read_lance_data_file_footer_and_descriptor(path, descriptor, layout, error), "footer: " + error);
+    std::vector<nano_lance::pb::ColumnMetadata> metadata;
+    require(nano_lance::read_lance_data_file_column_metadatas(path, layout, metadata, error), "columns: " + error);
+    require(metadata.size() == 1U, "the fixed_size_list column is the file's one column");
+    const auto& column = metadata[0];
+    require(!column.pages.empty(), "the fixed_size_list column has pages");
+    std::uint64_t rows = 0;
+    for (const auto& page : column.pages) {
+        nano_lance::page_layout::PageLayout decoded;
+        require(nano_lance::page_layout::decode_page_layout(page.encoding, decoded, error), "page layout: " + error);
+        require(decoded.kind == nano_lance::page_layout::LayoutKind::kFullZip,
+                "a 256-byte fixed_size_list is a FullZip page");
+        require(decoded.full_zip.bits_per_value == kItems * 32U, "FullZip row width is 64 floats");
+        rows += page.length;
+    }
+    require(rows == kRowsFz, "FullZip pages hold every row");
+}
+
 }  // namespace
 
 int main() {
@@ -368,6 +426,8 @@ int main() {
         check_priorities(write_priority_file(dir, "priority_big.lance", true, std::move(columns), kBigRows, false),
                          kBigRows, 1);
     }
+
+    check_fixed_full_zip(dir);
 
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
