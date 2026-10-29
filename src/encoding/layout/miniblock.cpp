@@ -90,7 +90,6 @@ std::vector<std::uint8_t> control_buffer(std::span<const ChunkMeta> chunks) {
     }
     return out;
 }
-
 bool decode_chunk_items(std::span<const std::uint8_t> control, bool large_words, std::uint64_t num_items,
                         std::vector<std::uint64_t>& out, std::string& error) {
     out.clear();

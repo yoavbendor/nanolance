@@ -45,6 +45,64 @@ bool append_repeated(std::vector<std::uint8_t>& out, const std::uint8_t* val, st
 
 }  // namespace
 
+namespace {
+
+// Chunk limits measured from pylance 12 (W1q): at most 4096 rows, and at most 8192 encoded bytes.
+constexpr std::size_t kChunkMaxRows = 4096U;
+constexpr std::size_t kChunkMaxBytes = 8192U;
+constexpr std::size_t kChunkHeaderBytes = 8U;
+
+/// Encoded bytes of `rows` rows that start at run `run`, `offset` rows into it.
+std::size_t window_bytes(std::span<const std::uint64_t> lengths, std::size_t value_bytes, std::size_t run,
+                         std::uint64_t offset, std::uint64_t rows) {
+    std::uint64_t pieces = 0;
+    std::uint64_t left = rows;
+    std::uint64_t off = offset;
+    for (std::size_t r = run; left > 0U && r < lengths.size(); ++r, off = 0U) {
+        const std::uint64_t take = std::min(lengths[r] - off, left);
+        pieces += (take + 254U) / 255U;
+        left -= take;
+    }
+    const std::uint64_t raw = kChunkHeaderBytes + pieces * (static_cast<std::uint64_t>(value_bytes) + 1U);
+    return static_cast<std::size_t>((raw + 7U) / 8U * 8U);
+}
+
+}  // namespace
+
+std::vector<std::size_t> chunk_rows(std::span<const std::uint64_t> run_lengths, std::size_t value_bytes) {
+    std::vector<std::size_t> out;
+    std::uint64_t remaining = 0;
+    for (const auto length : run_lengths) {
+        remaining += length;
+    }
+    std::size_t run = 0;
+    std::uint64_t offset = 0;
+    while (remaining > 0U) {
+        std::uint64_t chosen = 1U;
+        for (std::size_t p = kChunkMaxRows; p >= 1U; p /= 2U) {
+            const std::uint64_t rows = std::min<std::uint64_t>(remaining, p);
+            if (window_bytes(run_lengths, value_bytes, run, offset, rows) <= kChunkMaxBytes) {
+                chosen = rows;
+                break;
+            }
+        }
+        out.push_back(static_cast<std::size_t>(chosen));
+        remaining -= chosen;
+        // Advance past the chosen rows, splitting a run that the chunk ends inside.
+        std::uint64_t left = chosen;
+        while (left > 0U) {
+            const std::uint64_t take = std::min(run_lengths[run] - offset, left);
+            left -= take;
+            offset += take;
+            if (offset == run_lengths[run]) {
+                ++run;
+                offset = 0U;
+            }
+        }
+    }
+    return out;
+}
+
 void append_run(std::span<const std::uint8_t> value, std::uint64_t length, std::vector<std::uint8_t>& values,
                 std::vector<std::uint8_t>& lengths) {
     for (std::uint64_t remaining = length; remaining > 0;) {

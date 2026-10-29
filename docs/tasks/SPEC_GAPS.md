@@ -47,7 +47,7 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1k3 | `arrow.types.fixed_size_list` (read) | `fixed_size_list<bool, N>`: a bit-level item path in the mini-block chunk reader (`FixedSizeList{Nx Flat(1)}`) | "Result for W1k1" | later (rare shape; touches the shared chunk reader) |
 | W1k4 | `arrow.types.fixed_size_list` (read) | `fixed_size_list<struct>`: assemble a struct child of rows x N items from the leaf columns under the fixed-size layer | "Result for W1k1" | later (refused by name now) |
 | W1p | `encoding.config` | Integer and float dictionaries as Lance 12 writes them (files up to 1.9x pylance's size today) | measured 2026-10-29, see "Measured for W1p" and "Result for W1p" | partial 2026-10-29: int64, uint64, timestamp and date64 dictionaries (no nulls) write pylance's layout (all measured cases, see "Result for W1p, second pass"); left: nullable (W1p3), sorted RLE over dictionary indices (W1p2), float64 and 128-bit |
-| W1q | `encoding.compression.rle` | RLE over more than one mini-block chunk: nanolance's RLE holds its runs in one chunk, so a column of 25,000 runs is not RLE-encoded | W1g | later |
+| W1q | `encoding.compression.rle` | RLE over more than one mini-block chunk: nanolance's RLE holds its runs in one chunk, so a column of 25,000 runs is not RLE-encoded | W1g | partial (Haiku session, 2026-10-29): plain RLE splits across mini-block chunks as pylance 12 splits them (same chunk values and bytes; read back both ways; take checked; see "Measured for W1q" and "Result for W1q"). The default cutoff is pylance's size model. Left: float64 runs (still flat), u32 control words where pylance 2.1 writes u16 (nanolance's 2.2 files), W1p2 (sorted RLE over dictionary indices) |
 | W1r | `encoding.config` | Dictionary indices under `lance-encoding:compression` (`General{codec,ByteStreamSplit{Flat(32)}}`, or `Flat(32)` for none): the reader's dictionary-index path has to unwrap them before the writer may emit them | W1g, W1h | partial (Haiku session, 2026-10-29): done for string, int64 and float64 dictionaries (reader unwraps General and byte-stream-split per index chunk; writer emits pylance's index layout under lz4 / zstd / none; the dictionary buffer unchanged; `dict-rle` keeps the option erased, not measured). Layout text equal to pylance's, read and take checked, see "W1r measured". Left: `dict-rle` under the option, and integer dictionaries written by nanolance (W1p) |
 | W1o | `file.version.2_0`, `file.version.2_1` | Warn when a write adds the first 2.2 file to a 2.0 / 2.1 dataset, naming the readers it cuts off | W1m table | done 2026-10-29: `MixedFormatWarning` before the commit of each write that adds the first 2.2 file to a 2.0 / 2.1 dataset (write_dataset append, update, merge_insert, add_columns, compaction, fragment writes); `error` filter aborts it; `_target_file_version` is the one line W1n changes |
 | W1n | `file.version.2_1` | Write 2.1 files into a 2.1 dataset, so its writes stay 2.1 | measured 2026-10-29, see "W1n: what writing 2.1 needs" | deferred (decided 2026-10-29): after W1i, and only if a user needs older readers for 2.1 datasets |
@@ -197,6 +197,37 @@ rows of the pages before it in its column:
 
 nanolance's pages differ in size (its list and string pages hold up to 32,768 rows; its FSL pages 1,024), but its
 priorities follow the same rule. The interop test compares the rule, not the page splits.
+
+## Measured for W1q (RLE over several chunks, 2026-10-29, pylance 12.0.0, 2.1 files)
+
+Pylance's chunk rule, fitted on 40+ files (runs of 1 to 8 and boundary cases; `build/nlance-pagelayout` for the
+descriptor, the miniblock control buffer for the chunks):
+
+- chunk rows = the largest power of two up to 4,096 whose encoding is at most 8,192 bytes; the encoding is an 8-byte
+  header plus one (value, length) pair per run piece, padded to 8. The limit was pinned: 8,191 fails, 8,192 passes.
+- pylance's control words are u16 (`has_large_chunk` false). The chunk payload is the same as nanolance's apart from
+  nanolance's u32 buffer-size header (8 bytes more per chunk).
+- default RLE choice (no `rle-threshold`): RLE when `runs * (bytes + 1) < rows * bytes`. Pinned at run ratios
+  0.79 (RLE) / 0.81 (not) for int32 and 0.885 (RLE) / 0.895 (not) for int64.
+
+| column, 50,000 rows (measured) | pylance 12 chunks: values per chunk | last chunk |
+|---|---|---|
+| int64 runs of 2 (default and `rle-threshold=1`) | 1,024 x 48 | 848 rows (3,824 bytes) |
+| int64 runs of 3 | 2,048 x 24 | 848 rows |
+| int64 runs of 4 | 2,048 x 23 | the rest |
+| int64 runs of 5 | 4,096 x 12 | 848 rows (1,544 bytes) |
+| int64 runs of 8 | 4,096 x 12 | 848 rows |
+| int64 runs of 50 (pylance also dictionary-encodes: W1p2) | 4,096 x 12 | 848 rows |
+| int32 runs of 2 | 2,048 x 23 | the rest |
+| int32 runs of 3 / 8 | 4,096 x 12 | 848 rows / the rest |
+| int64 runs of 2, 1,000,000 rows | 1,024 (chunk values asserted equal to pylance in `test_rle_multichunk.py`) | the rest |
+
+The pylance descriptor for the int64 runs of 2 and runs of 5 files is `Rle{values=Flat(64),lengths=Flat(8)}` with
+`buffers=2`; the other rows were checked by chunk count and bytes only. Float64 runs of 2 are pylance RLE (1,024 per
+chunk), and nanolance still writes them flat (see Result).
+
+Nanolance's pagelayout output for the same files is the same text for every int case above (asserted in
+`bindings/python/tests/test_rle_multichunk.py`).
 
 ## Measured for W1g and W1h (field encoding options)
 
@@ -567,6 +598,22 @@ Lance 12's rule (`rust/lance-encoding/src/encodings/logical/primitive.rs`, `shou
 - then the dictionary is tried with a budget: at most `threshold` entries and an encoded size of at most
   `dict-size-ratio` (default 0.8) x the data size;
 - the dictionary's values are compressed with `dict-values-compression` (default lz4) when it pays.
+
+## Result for W1q (2026-10-29)
+
+Written: `rle::chunk_rows` (src/encoding/values/rle.cpp), the chunked RLE writer (`write_rle_column`, one mini-block
+chunk per entry, runs cut at chunk ends), the size-model cutoff and removal of the one-chunk guard in
+`fixed_column_rle_plan`. Tests: `tests/encoding/test_rle.cpp::test_chunk_rows`,
+`bindings/python/tests/test_rle_multichunk.py`.
+
+- Layout text equal to pylance's for every measured int case, and the chunk values equal; the chunk bytes differ by
+  nanolance's u32 header (8 bytes per chunk). Both libraries read both files; `take` checked.
+- Kept u32 control words, not pylance's u16: nanolance writes data storage version 2.2, and the note on
+  `control_buffer_for` records that stock Lance's 2.2 validator refuses u16 mini-block pages. The pagelayout text
+  does not show this flag, so it is not part of the text comparison. Decision for the owner: u16 would match
+  pylance's bytes exactly but only in a 2.1 file.
+- Left: float64 runs stay flat (the float path has its own decision, not changed); W1p2.
+- md5 of `nlbench_gendata <dir> 50000` data file: `84b4dce7912cd80d047e779f01a143fb`, unchanged.
 
 ## Result for W1p (2026-10-29, stopped: no writer change)
 

@@ -137,7 +137,11 @@ void test_fixed_rle() {
     require(cv.fixed_rle_plan.runs[0].first == 0U && cv.fixed_rle_plan.runs[0].second == 4U, "run is (0, 4)");
 
     cv = fixed_column(std::vector<std::uint32_t>{1, 1, 2, 2});
-    require(!ec::fixed_column_rle_plan(cv, 4), "2 runs in 4 rows: 2 >= 2 rejects");
+    // Pylance's size model (W1q): a 4-byte value and its length cost 5 bytes a run, so 2 runs (10 bytes) beat
+    // 4 rows of 4 bytes (16); 4 runs (20 bytes) do not.
+    require(ec::fixed_column_rle_plan(cv, 4), "2 runs in 4 rows: 10 < 16 bytes is RLE");
+    cv = fixed_column(std::vector<std::uint32_t>{1, 2, 3, 4});
+    require(!ec::fixed_column_rle_plan(cv, 4), "4 runs in 4 rows: 20 >= 16 bytes rejects");
     require(!cv.fixed_rle_plan.computed && cv.fixed_rle_plan.runs.empty(), "rejected plan is empty");
 
     cv = fixed_column(std::vector<std::uint32_t>{1, 1, 1, 2, 2});
@@ -173,11 +177,12 @@ void test_fixed_rle() {
     cv = fixed_column(alternating_runs(2, 256));
     require(ec::fixed_column_rle_plan(cv, 1), "2 runs of 256");
 
-    // One-chunk run buffer: split * (bpv + 1) + 32 must stay within 32760, so 16364 runs of a u8 pass, 16365 do not.
-    cv = fixed_column(alternating_runs(16364, 3));
-    require(ec::fixed_column_rle_plan(cv, 1), "16364 u8 runs fit the chunk");
+    // Runs no longer have to fit one chunk (W1q): the writer splits them. The size model still applies, so
+    // 16365 u8 runs of 3 (2 bytes a run against 3 bytes a row) are RLE, and runs of 1 are not.
     cv = fixed_column(alternating_runs(16365, 3));
-    require(!ec::fixed_column_rle_plan(cv, 1), "16365 u8 runs overflow the chunk");
+    require(ec::fixed_column_rle_plan(cv, 1), "16365 u8 runs of 3 are RLE across chunks");
+    cv = fixed_column(alternating_runs(16365, 1));
+    require(!ec::fixed_column_rle_plan(cv, 1), "u8 runs of 1 are not RLE");
 
     // A big scattered column fails (through the prefix sample); a big run column passes.
     std::vector<std::uint32_t> scattered(20000);

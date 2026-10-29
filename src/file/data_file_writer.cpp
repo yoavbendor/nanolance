@@ -2461,18 +2461,10 @@ bool write_rle_column(const ColumnEncodeContext& ctx, std::ostream& out, std::ve
 
     const auto bpv = value_width_bytes(field);
     const std::size_t n = values.fixed_size() / bpv;
-    std::vector<std::uint8_t> run_values;
-    std::vector<std::uint8_t> run_lengths;  // Lance requires 8-bit run lengths
-    auto emit_run = [&](std::size_t row, std::uint64_t run) {
-        rle::append_run(std::span<const std::uint8_t>(values.fixed_data() + row * bpv, bpv), run, run_values,
-                        run_lengths);
-    };
+    // (row, length) of every run: the write-side "is RLE beneficial?" scan already found them, or scan here.
+    std::vector<std::pair<std::size_t, std::uint64_t>> runs;
     if (values.fixed_rle_plan.computed) {
-        // The write-side "is RLE beneficial?" heuristic already detected every run while
-        // deciding -- reuse it verbatim instead of re-running the same memcmp-based scan.
-        for (const auto& [row, run] : values.fixed_rle_plan.runs) {
-            emit_run(row, run);
-        }
+        runs = values.fixed_rle_plan.runs;
     } else {
         std::size_t i = 0;
         while (i < n) {
@@ -2481,16 +2473,50 @@ bool write_rle_column(const ColumnEncodeContext& ctx, std::ostream& out, std::ve
                                               values.fixed_data() + i * bpv, bpv) == 0) {
                 ++run;
             }
-            emit_run(i, run);
+            runs.emplace_back(i, run);
             i += run;
         }
     }
+    // One mini-block chunk per rle::chunk_rows entry, as pylance writes them (W1q): a run that a chunk ends
+    // inside is cut there, and each chunk carries its own run values and run lengths.
+    std::vector<std::uint64_t> run_lengths_in_rows;
+    run_lengths_in_rows.reserve(runs.size());
+    for (const auto& run : runs) {
+        run_lengths_in_rows.push_back(run.second);
+    }
+    const auto rows_per_chunk = rle::chunk_rows(run_lengths_in_rows, bpv);
     const std::size_t length_bytes = 1U;
     std::vector<std::uint8_t> chunk_bytes;
-    const std::span<const std::uint8_t> run_buffers[2] = {run_values, run_lengths};
-    miniblock::append_chunk(chunk_bytes, 0U, {}, run_buffers);
-    const miniblock::ChunkMeta meta[1] = {{chunk_bytes.size(), n}};
-    const auto control = miniblock::control_buffer(meta);
+    std::vector<miniblock::ChunkMeta> metas;
+    metas.reserve(rows_per_chunk.size());
+    std::size_t run_index = 0;
+    std::uint64_t run_offset = 0;
+    for (const std::size_t chunk_rows_count : rows_per_chunk) {
+        std::vector<std::uint8_t> run_values;
+        std::vector<std::uint8_t> run_lengths;  // Lance requires 8-bit run lengths
+        std::uint64_t left = chunk_rows_count;
+        while (left > 0U) {
+            const std::size_t row = runs[run_index].first;
+            const std::uint64_t run_len = runs[run_index].second;
+            const std::uint64_t take = std::min(run_len - run_offset, left);
+            rle::append_run(std::span<const std::uint8_t>(values.fixed_data() + (row + run_offset) * bpv, bpv),
+                            take, run_values, run_lengths);
+            left -= take;
+            run_offset += take;
+            if (run_offset == run_len) {
+                ++run_index;
+                run_offset = 0U;
+            }
+        }
+        const std::span<const std::uint8_t> run_buffers[2] = {run_values, run_lengths};
+        const std::size_t before = chunk_bytes.size();
+        miniblock::append_chunk(chunk_bytes, 0U, {}, run_buffers);
+        metas.push_back({chunk_bytes.size() - before, chunk_rows_count});
+    }
+    // u32 metadata words, has_large_chunk as every nanolance mini-block page: nanolance writes data storage
+    // version 2.2, whose validator refuses u16 words (control_buffer_for). Pylance 12 writes u16 words in 2.1
+    // files; the chunk sizes and values are the same.
+    const auto control = miniblock::control_buffer(metas);
 
     align64(out);
     const auto control_offset = pos(out);

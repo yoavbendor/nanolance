@@ -142,11 +142,14 @@ bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv, const 
         return false;
     }
     const std::size_t n = cv.fixed_size() / bpv;
-    // The run cutoff: nanolance's default is ceil(n/2) (a run ratio below one half). An explicit
-    // rle-threshold t takes RLE only when split_runs < n * t, pylance's guard, so the cutoff is ceil(n * t).
+    // The run cutoff. Without rle-threshold, pylance's size model: a run costs its value plus a one-byte
+    // length, so RLE is taken only when split_runs * (bpv + 1) < n * bpv, that is split_runs < ceil(n * bpv /
+    // (bpv + 1)). For u8 that is one half; for int64 it is 8/9 (measured for W1q: pylance takes RLE at run
+    // ratios 0.885 and below, and not at 0.895). An explicit rle-threshold t takes RLE only when
+    // split_runs < n * t, pylance's guard, so the cutoff is ceil(n * t).
     const std::size_t reject_at =
         options.rle_set ? static_cast<std::size_t>(std::ceil(static_cast<double>(n) * options.rle_threshold))
-                        : (n + 1U) / 2U;
+                        : (n * bpv + bpv) / (bpv + 1U);
     // Prefix-sample pre-check (same pattern as variable_column_dict_beneficial's sampling): even with
     // the reject-early exit, a scattered column scans ~n/2 rows before failing (split_runs grows one
     // per row, crossing n/2 halfway through). A 4096-row prefix predicts that verdict at ~1/25 the
@@ -160,7 +163,10 @@ bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv, const 
             options.rle_set ? std::min<std::size_t>(
                                   kSampleRows, static_cast<std::size_t>(std::ceil(
                                                    static_cast<double>(kSampleRows) * options.rle_threshold * 1.5)))
-                            : kSampleRows * 3U / 4U;
+                            : std::min<std::size_t>(
+                                  kSampleRows, static_cast<std::size_t>(std::ceil(
+                                                   static_cast<double>(kSampleRows) *
+                                                   static_cast<double>(bpv) / static_cast<double>(bpv + 1U) * 1.5)));
         std::size_t sample_split_runs = 0;
         if (!dispatch_rle_scan(cv.fixed_data(), kSampleRows, bpv, sample_reject, sample_split_runs, nullptr)) {
             return false;
@@ -169,12 +175,6 @@ bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv, const 
     std::size_t split_runs = 0;
     // reject_at == ceil(n/2) is exactly the previous `split_runs * 2 >= n` cutoff.
     if (!dispatch_rle_scan(cv.fixed_data(), n, bpv, reject_at, split_runs, nullptr)) {
-        return false;
-    }
-    // One chunk for the whole column: run buffers must fit the miniblock (12-bit word => 32760 bytes).
-    const std::size_t values_size = split_runs * bpv;
-    const std::size_t lengths_size = split_runs;  // 1 byte each
-    if ((values_size + lengths_size + 32U) > 32760U) {
         return false;
     }
     std::vector<std::pair<std::size_t, std::uint64_t>> runs;
