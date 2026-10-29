@@ -35,6 +35,7 @@ from nanolance.lance._errors import NotSupportedError
 from nanolance.lance.dataset import (
     LanceDataset,
     LanceScanner,
+    MixedFormatWarning,
     ScanStatistics,
     ScannerBuilder,
     dataset,
@@ -71,6 +72,7 @@ __all__ = [
     "PackedBlobWriter",
     "LanceOperation",
     "LanceScanner",
+    "MixedFormatWarning",
     "NotSupportedError",
     "ScanStatistics",
     "ScannerBuilder",

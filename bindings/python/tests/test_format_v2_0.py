@@ -12,6 +12,7 @@ from __future__ import annotations
 import glob
 import os
 import struct
+import warnings
 
 import numpy as np
 import pyarrow as pa
@@ -214,7 +215,9 @@ def test_append_to_an_older_format(lance, tmp_path, version):
     })
     lance.write_dataset(first, path, data_storage_version=version, max_rows_per_file=200)
     more = nl.dataset(path).to_table(offset=10, limit=50)  # what a user appends: rows like the others
-    nl.write_dataset(more, path, mode="append")
+    with warnings.catch_warnings():  # the first 2.2 file beside 2.0 / 2.1 ones: test_mixed_format_warning.py
+        warnings.simplefilter("ignore", nl.MixedFormatWarning)
+        nl.write_dataset(more, path, mode="append")
     ds = lance.dataset(path)
     ds.validate()
     assert ds.count_rows() == 450
@@ -306,7 +309,9 @@ def test_operation_on_an_older_dataset(lance, tmp_path, version, op):
     for path in paths.values():
         lance.write_dataset(_rows(range(N_ROWS)), path, data_storage_version=version, max_rows_per_file=100)
     before = {k: _manifest_files(lance.dataset(p)) for k, p in paths.items()}
-    _apply(nl, paths["nl"], op)
+    with warnings.catch_warnings():  # the mixed-format warning is checked in test_mixed_format_warning.py
+        warnings.simplefilter("ignore", nl.MixedFormatWarning)
+        _apply(nl, paths["nl"], op)
     _apply(lance, paths["pl"], op)
 
     ours = lance.dataset(paths["nl"])

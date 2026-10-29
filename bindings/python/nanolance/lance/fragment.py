@@ -461,6 +461,9 @@ class LanceFragment(pa.dataset.Fragment):
                              "LanceFragment.merge_columns.  You must apply your own checkpointing for "
                              "fragment-level operations.")
         if isinstance(transforms, dict):
+            from nanolance.lance.dataset import _warn_mixed_format
+
+            _warn_mixed_format(self._ds._info, self._ds._uri)
             with native():
                 message, fields = _nanolance._fragment_add_columns_sql(
                     self._ds._uri, self._ds.version, self._id, [(str(k), str(v)) for k, v in transforms.items()],
@@ -623,6 +626,9 @@ class LanceFragment(pa.dataset.Fragment):
         from nanolance.lance.dataset import _coerce_reader
 
         reader = _coerce_reader(live.combine_chunks())  # JSON columns as the JSONB Lance stores
+        from nanolance.lance.dataset import _warn_mixed_format
+
+        _warn_mixed_format(self._ds._info, self._ds._uri)
         with native():
             message, fields, written = _nanolance._fragment_write_columns(
                 self._ds._uri, self._ds.version, self._id, reader, replace, self._ds.max_field_id)
@@ -800,6 +806,10 @@ def _write_uncommitted(data, dataset_uri, schema, *, mode: str, max_rows_per_fil
     if data_storage_version not in (None, "stable", "2.2", "next"):
         raise unsupported(f"data_storage_version={data_storage_version!r} (nanolance writes 2.2)")
     path = _path_of(dataset_uri if not isinstance(dataset_uri, Path) else str(dataset_uri))
+    if mode == "append":
+        from nanolance.lance.dataset import _latest_info, _warn_mixed_format
+
+        _warn_mixed_format(_latest_info(path), path)
     reader = _coerce_reader(data, schema)
     if single and (len(reader.schema) == 0):
         raise OSError("Invalid user input: Cannot write a fragment without any columns")

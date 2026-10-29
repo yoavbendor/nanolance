@@ -143,6 +143,59 @@ def _exists(path: str) -> bool:
     )
 
 
+class MixedFormatWarning(UserWarning):
+    """A write adds format-2.2 data files to a dataset whose data files are all 2.0 or all 2.1. After
+    that commit only Lance (pylance) 12 and later can read the dataset. Under
+    ``warnings.simplefilter("error", MixedFormatWarning)`` the write raises before it commits."""
+
+
+_MIXED_CHECK_QUIET = [0]  # > 0 inside a write that is already checked (a UDF's per-fragment writes)
+
+
+@contextlib.contextmanager
+def _mixed_check_quiet():
+    _MIXED_CHECK_QUIET[0] += 1
+    try:
+        yield
+    finally:
+        _MIXED_CHECK_QUIET[0] -= 1
+
+
+def _target_file_version(dataset_info: dict) -> str:
+    """The data file version nanolance writes into the dataset described by ``dataset_info``. W1n changes
+    this to "2.1" for datasets whose files are 2.1; until then every write is 2.2."""
+    return "2.2"
+
+
+def _latest_info(path: str) -> Optional[dict]:
+    """The latest version's info of an existing dataset, or None when there is none."""
+    if not _exists(path):
+        return None
+    with native():
+        return _nanolance._ds_info(path, None)
+
+
+def _warn_mixed_format(dataset_info: Optional[dict], uri) -> None:
+    """Called before a write's commit (its data files may already be staged; nothing is committed): warns
+    once when the write would add the first file of the target version beside the dataset's 2.0 or 2.1
+    files. A new dataset, a dataset already mixed and one of a single current version do not warn."""
+    if dataset_info is None or _MIXED_CHECK_QUIET[0]:
+        return
+    found = {f"{f['major_version']}.{f['minor_version']}"
+             for fragment in dataset_info["fragments"] for f in fragment["files"]}
+    if len(found) != 1 or not found <= {"2.0", "2.1"}:
+        return
+    own = found.pop()
+    target = _target_file_version(dataset_info)
+    if target == own:
+        return
+    warnings.warn(
+        f"Writing format {target} data files into a format {own} dataset at {uri}. After this commit only "
+        f"Lance (pylance) 12 and later can read the dataset; earlier releases refuse it ('Please upgrade "
+        f"Lance'). Rewrite the dataset with mode='overwrite' to make it {target} throughout, or use pylance "
+        f"to keep writing {own}.", MixedFormatWarning, stacklevel=4)
+
+
 def _plain_column(expr) -> bool:
     """A projection value that names a column (renamed by its alias), not an SQL expression."""
     return isinstance(expr, str) and expr.isidentifier()
@@ -1213,6 +1266,7 @@ class LanceDataset(pa.dataset.Dataset):
             self.checkout_latest()
             addresses = self.to_table(columns=[], filter=sql, with_row_address=True).column("_rowaddr")
             allowlist, sql = serialize_row_addrs(addresses.to_pylist()), None
+        _warn_mixed_format(self._info, self._uri)
         with native():
             updated, _ = _nanolance._ds_update(self._uri, sql, assignments, allowlist, self._version)
         self._refresh_latest("Update")
@@ -1227,6 +1281,7 @@ class LanceDataset(pa.dataset.Dataset):
         if isinstance(transforms, dict):
             columns = [(str(k), str(v)) for k, v in transforms.items()]
             self._check_new_columns([(name, None) for name, _ in columns])
+            _warn_mixed_format(self._info, self._uri)
             with native():
                 _nanolance._ds_add_columns_sql(self._uri, columns, self._version)
         elif isinstance(transforms, (pa.Field, pa.Schema)) or (
@@ -1234,14 +1289,18 @@ class LanceDataset(pa.dataset.Dataset):
         ):
             fields = [transforms] if isinstance(transforms, pa.Field) else list(transforms)
             self._check_new_columns([(f.name, f.type) for f in fields])
+            _warn_mixed_format(self._info, self._uri)
             with native():
                 _nanolance._ds_add_columns_nulls(self._uri, pa.schema(fields), self._version)
         elif callable(transforms):
-            self._add_columns_udf(transforms, read_columns, batch_size)
+            _warn_mixed_format(self._info, self._uri)
+            with _mixed_check_quiet():
+                self._add_columns_udf(transforms, read_columns, batch_size)
             return
         else:
             reader = _coerce_reader(transforms, reader_schema)
             self._check_new_columns([(f.name, f.type) for f in reader.schema])
+            _warn_mixed_format(self._info, self._uri)
             with native():
                 _nanolance._ds_add_columns_stream(self._uri, reader, self._version)
         self._refresh_latest("Merge")
@@ -1313,6 +1372,7 @@ class LanceDataset(pa.dataset.Dataset):
         added = right.drop_columns([right_on]).take(take)
         fields = [f.with_nullable(True) if added.column(f.name).null_count else f for f in added.schema]
         added = pa.table(added.columns, schema=pa.schema(fields, metadata=added.schema.metadata))
+        _warn_mixed_format(self._info, self._uri)
         with native():
             _nanolance._ds_add_columns_stream(self._uri, pa.RecordBatchReader.from_batches(
                 added.schema, added.to_batches()), self._version)
@@ -3564,6 +3624,7 @@ class MergeInsertBuilder:
             self._ds._refresh_latest("Update")
             return {k: int(v) for k, v in stats.items()}
         _check_append_schema(target, reader.schema, allow_subset=True)
+        _warn_mixed_format(self._ds._info, self._ds._uri)
         dirs, base_ids = self._targets()
         if self._write_mode == "rewrite_columns":
             if len(reader.schema.names) >= len(target.names) or self._insert_all:
@@ -3743,6 +3804,7 @@ class DatasetOptimizer:
         indexes (a second version; nanolance's `reindex=False` leaves them covering fewer fragments)."""
         from nanolance.lance.optimize import CompactionMetrics
 
+        _warn_mixed_format(self._ds._info, self._ds._uri)
         with native():
             metrics, _ = _nanolance._ds_compact_files(
                 self._ds.uri, int(target_rows_per_fragment or 1024 * 1024),
@@ -5184,6 +5246,8 @@ def write_dataset(
     append = mode == "append" and exists
     code = _MODES["append" if append else ("create" if mode == "create" else "overwrite")]
     shown = _display_uri(uri, path)
+    if append:
+        _warn_mixed_format(_latest_info(path), shown)
     log = _native_log.enabled(_native_log.DATASET_EVENTS) or _native_log.enabled(_native_log.FILE_AUDIT)
     if log:
         # Lance's log for a write: opened (or not, for a create), writing, data files, commit.
