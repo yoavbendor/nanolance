@@ -507,3 +507,22 @@ rule names. Item 1 needs the source. Next step: read `should_dictionary_encode` 
 choice in Lance's `primitive.rs` / `compression.rs` (a rust checkout, not pylance's wheel), then implement items 1-4 as one change.
 
 Byte-identical: no writer change in this session, so `nlbench_gendata` output is unchanged.
+
+### W1p: how Lance stores the dictionary values (reviewer, from the Lance 12 source)
+
+The dictionary block goes through `compress_required_block` with a synthetic field whose `compression` is
+`dict-values-compression` (default `lz4`). For a fixed-width block, `try_bitpack_for_block`
+(`rust/lance-encoding/src/compression.rs`) runs first:
+
+- only 8/16/32/64-bit values;
+- "too small": a single bit-width (one chunk, i.e. at most 1,024 values) whose `InlineBitpacking::min_size_bytes(width)`
+  -- a whole 1,024-value chunk, 1024 x width / 8 bytes -- is at least the block's raw size. Then no bitpacking;
+- otherwise `InlineBitpacking(bits)` when there are at most 1,024 values, else `OutOfLineBitpacking(max_width, bits)`.
+
+When bitpacking is not taken, the general codec applies (LZ4 by default; `none` keeps `Flat`). This predicts every
+case measured: 100 x 40-bit = 800 B < 5,120 B, so LZ4; 1,000 x 40-bit = 8,000 B > 5,000 B, so InlineBitpacking;
+500 x 8-bit (1,024 B < 4,000 B) and 24-bit (3,072 B) bitpack, 32-bit (4,096 B) and 40-bit (5,120 B) are LZ4;
+700 x 40-bit = 5,600 B > 5,120 B, so InlineBitpacking. It is not a size comparison with LZ4's output.
+
+nanolance reads `OutOfLineBitpacking` (`bitpack::decode_out_of_line`) but has no encoder for it: one width for every
+1,024-value chunk, no per-chunk header -- the inverse of the decoder.
