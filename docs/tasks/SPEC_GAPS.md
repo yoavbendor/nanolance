@@ -44,7 +44,7 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs, read and write | to measure | later |
 | W1k | `arrow.types.fixed_size_list`, `arrow.types.dictionary` | FSL of variable-width elements; dictionaries inside structs and lists | to measure | later |
 | W1o | `file.version.2_0`, `file.version.2_1` | Warn when a write adds the first 2.2 file to a 2.0 / 2.1 dataset, naming the readers it cuts off | W1m table | done 2026-10-29: `MixedFormatWarning` before the commit of each write that adds the first 2.2 file to a 2.0 / 2.1 dataset (write_dataset append, update, merge_insert, add_columns, compaction, fragment writes); `error` filter aborts it; `_target_file_version` is the one line W1n changes |
-| W1n | `file.version.2_1` | Write 2.1 files into a 2.1 dataset, so its writes stay 2.1 | measured 2026-10-29, see "W1n: what writing 2.1 needs" | blocked on a decision: needs a 2.1 mini-block writer (medium) |
+| W1n | `file.version.2_1` | Write 2.1 files into a 2.1 dataset, so its writes stay 2.1 | measured 2026-10-29, see "W1n: what writing 2.1 needs" | deferred (decided 2026-10-29): after W1i, and only if a user needs older readers for 2.1 datasets |
 
 ## Datasets in formats 2.0 and 2.1 (measured 2026-10-29)
 
@@ -169,3 +169,34 @@ A first implementation is on the local branch `haiku/w1n-finish` (commit e5da80e
 `keep_dataset_format` for staged writes, the ConstantLayout gate, a 2.2 fallback for blob v2 columns, and a
 28-column test matrix against pylance 12 and old readers. It is not merged: with item 1 missing, its 2.1 files are
 unreadable.
+
+## Measured for W1f (page priority)
+
+Lance 12 (`rust/lance-encoding/src/encoder.rs` `write_page_to_data_buffer`) writes a page's `priority` as
+`page.row_number`: "the top-level row number of the first row in the page". A top-level row is never split
+across pages, so for a list column the page's first item's row is used, not the item index. nanolance writes 0
+everywhere (`page.priority = 0` in about ten places in `src/file/data_file_writer.cpp`).
+
+## Measured for W1g and W1h (field encoding options)
+
+pylance 12.0.0, one table of 50,000 rows, each column with one option (`build/nlance-pagelayout`):
+
+| column, option | pylance's page |
+|---|---|
+| strings (5,000 distinct), none | `values=InlineBitpacking(32), dict=General{LZ4,Variable}x5000` |
+| same, `compression=lz4` | `values=General{LZ4,ByteStreamSplit{Flat(32)}}`, dict as default |
+| same, `compression=zstd` (level 9 too) | `values=General{ZSTD,ByteStreamSplit{Flat(32)}}`, dict as default |
+| same, `compression=none` | `values=Flat(32)` (no bitpacking), dict as default |
+| random int64, `compression=lz4` / `zstd` | `General{LZ4 / ZSTD,ByteStreamSplit{Flat(64)}}` |
+| int64 in runs of 50, none | `Rle{values=Flat(32),lengths=Flat(8)}, dict=InlineBitpacking(64)x1000` |
+| same, `rle-threshold=0` | `InlineBitpacking(32), dict=...` (no RLE); `rle-threshold=1` as default |
+| strings, `dict-divisor=1000` | `Fsst{...}` (no dictionary); `dict-divisor=1` as default |
+| strings, `dict-size-ratio=0.5` | as default; `dict-size-ratio=0.0` makes pylance panic ("not in the range (0, 1]") |
+| strings, `dict-values-compression=zstd` / `none` | `dict=General{ZSTD,Variable}` / `dict=Variable` |
+| random int64, `structural-encoding=fullzip` | `FullZip{values=Flat(64)}` (fixed-width FullZip: W1i); strings: ignored here |
+| random float64, `bss=on` / `off` | `InlineBitpacking(64)` either way |
+| int64, `minichunk-size=1024` | as default |
+
+So the options that change the layout are `compression` (lz4 / zstd / none), `rle-threshold`, `dict-divisor`,
+`dict-values-compression` and `structural-encoding`. `compression-level` changes only the codec level. nanolance
+honours `compression=zstd` only, and has no LZ4 encoder (`nanolance/lz4_block.hpp` decodes only).
