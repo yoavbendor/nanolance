@@ -501,3 +501,36 @@ def test_pylance_blobs_read_back(lance, tmp_path):
         assert mine.read() == pylances.read_range(pylances.size() - 4, 4)
     with pytest.raises(ValueError):
         ours.take_blobs("raw", indices=[0])
+
+
+def _page_priorities(path):
+    """Per column, each page's (rows, priority), read from the file's column metadata by nanolance."""
+    return [[(rows, priority) for rows, priority in column]
+            for column in nanolance._nanolance._file_page_priorities(path)]
+
+
+@pytest.mark.parametrize("writer", ["nanolance", "pylance"])
+def test_page_priority_is_the_first_top_level_row(lance, tmp_path, writer):
+    # Lance's page priority is the top-level row of the page's first row: 0 for a column's first page, then the
+    # rows of the pages before it (a list page counts its rows, not its items). pylance and nanolance must agree.
+    from lance.file import LanceFileWriter as TheirWriter
+
+    rows = 200_000
+    data = pa.table({
+        "a": pa.array([(i * 2654435761) % 2**40 for i in range(rows)], pa.int64()),
+        "l": pa.array([list(range(i % 5)) for i in range(rows)], pa.list_(pa.int64())),
+        "s": pa.array([None if i % 7 == 3 else f"x{i % 11}" * (1 + i % 3) for i in range(rows)]),
+    })
+    Writer = nl.file.LanceFileWriter if writer == "nanolance" else TheirWriter
+    path = str(tmp_path / "f.lance")
+    with Writer(path, data.schema) as w:
+        for batch in data.to_batches(max_chunksize=50_000):
+            w.write_batch(batch)
+    columns = _page_priorities(path)
+    assert len(columns[1]) > 1, "the list column has several pages"  # pylance keeps 200k int64 in one page
+    for column in columns:
+        first_row = 0
+        for rows_in_page, priority in column:
+            assert priority == first_row
+            first_row += rows_in_page
+        assert first_row == rows

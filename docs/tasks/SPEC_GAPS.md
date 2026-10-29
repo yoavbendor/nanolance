@@ -37,7 +37,7 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1l | `file.version.2_0`, `file.version.2_1` | Test every modification of a 2.0 / 2.1 dataset against pylance, and document what works | measured 2026-10-29, see below | done 2026-10-29: 22 cases (2.0 and 2.1 x 11 operations) match pylance, no library change; left: nothing for these rows (writing 2.0 / 2.1 stays unscheduled, W1n) |
 | W1e | `arrow.fields.primary_key`, `table.schema.primary_key` | Unenforced primary key: Arrow metadata to fields 12-15, and back | done 2026-10-29: fields 12, 13, 15 written and read; the Arrow key metadata read as pylance does; pylance's write checks; merge_insert's default key by position. Left: whether pylance writes the key into a data file's schema (not measured); a key nested in a struct as the merge_insert default |
 | W1m | `file.version.2_0`, `file.version.2_1` | Which older pylance / LanceDB releases read a dataset with nanolance's 2.2 files beside 2.0 / 2.1 ones | measured 2026-10-29, see below | done: only pylance 12 and later read the mix |
-| W1f | `file.structure.page_priority` | Write each page's priority as Lance does | to measure | next |
+| W1f | `file.structure.page_priority` | Write each page's priority as Lance does | measured 2026-10-29, see "Measured for W1f (page priority)" | done 2026-10-29: every page's `priority` is the top-level row of its first row, as pylance writes it (int64, list, string, FSL128 measured); single-page columns keep 0 |
 | W1g | `encoding.config` | Honour the `lance-encoding:*` field metadata Lance honours | to measure, per key | next |
 | W1h | `encoding.compression.general.write` | LZ4 | to measure | next |
 | W1i | `encoding.layout.full_zip.write` | Fixed-width full-zip and per-value compression | to measure | later |
@@ -176,6 +176,21 @@ Lance 12 (`rust/lance-encoding/src/encoder.rs` `write_page_to_data_buffer`) writ
 `page.row_number`: "the top-level row number of the first row in the page". A top-level row is never split
 across pages, so for a list column the page's first item's row is used, not the item index. nanolance writes 0
 everywhere (`page.priority = 0` in about ten places in `src/file/data_file_writer.cpp`).
+
+pylance 12.0.0 (priorities read by nanolance's C++ reader, `_file_page_priorities`), each page's priority is the
+rows of the pages before it in its column:
+
+| column | pylance's pages (rows, priority) |
+|---|---|
+| int64, 3,000,000 rows | 3 pages: (1,250,000, 0), (1,250,000, 1,250,000), (500,000, 2,500,000) |
+| list<int64>, 300,000 rows | 22 pages of ~14,000 rows: (14,362, 0), (14,310, 14,362), ... last (7,192, 292,808) |
+| string, 400,000 rows | 2 pages: (300,000, 0), (100,000, 300,000) |
+| fixed_size_list<float,128>, 200,000 rows | 4 pages of 50,000: priority 0, 50,000, 100,000, 150,000 |
+| int64 in runs of 50, 500,000 rows (RLE) | 1 page: (500,000, 0) |
+| string from 50 values, 500,000 rows (dictionary) | 1 page: (500,000, 0) |
+
+nanolance's pages differ in size (its list and string pages hold up to 32,768 rows; its FSL pages 1,024), but its
+priorities follow the same rule. The interop test compares the rule, not the page splits.
 
 ## Measured for W1g and W1h (field encoding options)
 

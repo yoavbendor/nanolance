@@ -421,7 +421,8 @@ public:
         page.buffer_offsets = {control_offset, payload_offset_};
         page.buffer_sizes = {control_.size(), payload_size_};
         page.length = rows_;
-        page.priority = 0;
+        page.priority = first_row_;  // the pages before this one hold this many top-level rows
+        first_row_ += rows_;
         control_.clear();
         payload_size_ = 0;
         rows_ = 0;
@@ -434,6 +435,7 @@ private:
     std::uint64_t payload_offset_ = 0;
     std::uint64_t payload_size_ = 0;
     std::uint64_t rows_ = 0;
+    std::uint64_t first_row_ = 0;  // top-level rows in the pages finished so far
     std::size_t chunks_ = 0;
 };
 
@@ -1607,7 +1609,7 @@ bool write_nested_column(std::ostream& out, const LanceField& field, const Colum
         }
         pb::ColumnPage page;
         page.length = n;
-        page.priority = 0;
+        page.priority = row;
         if (ser.items.empty()) {
             // No values at all -- every list empty or null. Lance writes a ConstantLayout with no
             // value and the levels as raw u16 buffers [rep, def]; so does this.
@@ -1744,7 +1746,7 @@ bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& value
         page.buffer_offsets.push_back(write_buffer(out, rep_index));
         page.buffer_sizes.push_back(rep_index.size());
         page.length = end - first;
-        page.priority = 0;
+        page.priority = first;
         page.encoding = descriptor::page_encoding(layout);
         column.pages.push_back(std::move(page));
         row = end;
@@ -2649,6 +2651,7 @@ bool write_zstd_variable_column(const ColumnEncodeContext& ctx, std::ostream& ou
     // avoids re-zeroing already-there bytes when the buffer is reused across calls of similar size,
     // which requires swap (not move) below so `framed`'s capacity survives being handed off.
     std::vector<std::uint8_t> framed;
+    std::uint64_t first_row = 0;
     for (auto& chunk : chunks) {
         if (zstd_variable) {
             if (!general::zstd_frame(chunk.bytes, compression_level, framed, error)) {
@@ -2673,7 +2676,8 @@ bool write_zstd_variable_column(const ColumnEncodeContext& ctx, std::ostream& ou
         page.buffer_sizes.push_back(control.size());
         page.buffer_sizes.push_back(payload.size());
         page.length = chunk.value_count;
-        page.priority = 0;
+        page.priority = first_row;
+        first_row += chunk.value_count;
         const auto bits_token =
             values.variable.large ? static_cast<std::uint8_t>(0x40U) : static_cast<std::uint8_t>(0x20U);
         page.encoding = zstd_variable

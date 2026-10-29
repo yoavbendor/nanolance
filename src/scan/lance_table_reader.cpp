@@ -3499,6 +3499,7 @@ bool open_file_plan(const std::filesystem::path& file_path, const LanceScanReque
             for (const auto& p : c.pages) {
                 LanceFileInfo::Page page;
                 page.rows = p.length;
+                page.priority = p.priority;
                 page_layout::PageLayout layout_of_page;
                 std::string ignored;
                 page.encoding = page_layout::decode_page_layout(p.encoding, layout_of_page, ignored)

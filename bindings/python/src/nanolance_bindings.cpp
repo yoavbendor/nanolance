@@ -1562,6 +1562,26 @@ NB_MODULE(_nanolance, m) {
     m.def("_file_take", &file_take, nb::arg("path"), nb::arg("rows"), nb::arg("columns").none());
     m.def("_file_info", &file_info, nb::arg("path"));
     m.def("_file_top_fields", &file_top_fields, nb::arg("path"));
+    m.def("_file_page_priorities", [](const std::filesystem::path& path) {  // per column: (rows, priority) per page
+        nano_lance::LanceFileInfo info;
+        ArrowSchema schema{};
+        std::string error;
+        if (!nano_lance::lance_file_info(path, info, schema, error)) {
+            throw_dataset(error);
+        }
+        if (schema.release != nullptr) {
+            schema.release(&schema);
+        }
+        nb::list columns;
+        for (const auto& pages : info.pages) {
+            nb::list column;
+            for (const auto& page : pages) {
+                column.append(nb::make_tuple(page.rows, page.priority));
+            }
+            columns.append(column);
+        }
+        return columns;
+    }, nb::arg("path"));
     m.def("_file_size", &file_size, nb::arg("path"));
     nb::class_<StagedWriter>(m, "_StagedWriter")
         .def(nb::init<const std::filesystem::path&, const LanceWriterOptions&, bool, std::int64_t, std::uint64_t>(),
