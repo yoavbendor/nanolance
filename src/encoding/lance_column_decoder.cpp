@@ -1205,9 +1205,10 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
             return true;
         }
         if (inner->values->kind == page_layout::CompressiveKind::kByteStreamSplit) {
-            // The byte-stream-split path un-zstds the page itself; it has no other framing to fall
-            // back on, so a differently-compressed one is refused rather than read as raw planes.
-            if (!out.zstd) {
+            // The byte-stream-split path un-frames each chunk itself (zstd or LZ4); it has no other framing to
+            // fall back on, so a differently-compressed one is refused rather than read as raw planes.
+            if (out.value_scheme != page_layout::BufferScheme::kZstd &&
+                out.value_scheme != page_layout::BufferScheme::kLz4) {
                 out.kind = ColumnEncodingKind::kUnsupported;
                 out.unsupported_reason =
                     "unsupported buffer compression in " + page_layout::describe(layout);
@@ -2564,7 +2565,10 @@ bool decode_bss_zstd_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
         }
         std::uint64_t remaining = page.length;
         for (const auto& chunk : chunks) {
-            if (!general::zstd_unframe(chunk.values, raw, error)) {
+            const bool unframed = encoding_plan.value_scheme == page_layout::BufferScheme::kLz4
+                                      ? lz4_block::decompress_sized(chunk.values, raw, error)
+                                      : general::zstd_unframe(chunk.values, raw, error);
+            if (!unframed) {
                 return false;
             }
             if (bytes_per_value == 0U || raw.size() % bytes_per_value != 0U) {
