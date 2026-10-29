@@ -844,9 +844,30 @@ struct FullZipPageParams {
     /// validity bits, then the items. `value_bytes` counts both.
     std::uint64_t items = 0;
     std::size_t item_validity_bytes = 0;
+    /// fixed_size_list whose items are a Constant: each slot holds no item bytes of its own (only the
+    /// value's width when the Constant has a value). Every item of the output is `constant_item`: the
+    /// value, or zeros at the schema's width when there is no value (validity makes those null).
+    bool constant_items = false;
+    std::vector<std::uint8_t> constant_item;
+    /// Fixed width: the bytes a row occupies in the output. Equal to value_bytes - item_validity_bytes
+    /// except for constant items, whose output is wider than their slot.
+    std::size_t out_row_bytes = 0;
 
     full_zip::RowShape shape() const { return {bits_rep, bits_def, max_visible_def, value_bytes, length_bytes}; }
 };
+
+/// Appends one fixed-width row's output from its slot bytes [begin, end). Constant items send no bytes
+/// of their own: the output is the constant item once per item, whatever the slot holds.
+void append_fixed_row(std::vector<std::uint8_t>& out, const std::uint8_t* begin, const std::uint8_t* end,
+                      const FullZipPageParams& params) {
+    if (!params.constant_items) {
+        out.insert(out.end(), begin, end);
+        return;
+    }
+    for (std::uint64_t i = 0; i < params.items; ++i) {
+        out.insert(out.end(), params.constant_item.begin(), params.constant_item.end());
+    }
+}
 
 /// Room for a FullZip page's variable-width values at once, given `encoded` bytes of them: growing
 /// value by value doubled the buffer a dozen times over a page, each a fresh mapping to fault in and
@@ -873,7 +894,7 @@ thread_local bool g_blob_descriptor_values = false;
 
 /// Fills `out` from a FullZip layout, or explains why it cannot be read.
 bool full_zip_page_params(const page_layout::PageLayout& layout, std::uint64_t page_rows,
-                          FullZipPageParams& out, std::string& why) {
+                          FullZipPageParams& out, std::string& why, std::size_t schema_row_bytes = 0) {
     out = FullZipPageParams{};
     if (layout.kind != page_layout::LayoutKind::kFullZip) {
         why = "a FullZip column has a page with a different layout";
@@ -978,6 +999,37 @@ bool full_zip_page_params(const page_layout::PageLayout& layout, std::uint64_t p
     if (values->kind == page_layout::CompressiveKind::kFlat) {
         described_bits = values->bits_per_value;
     } else if (values->kind == page_layout::CompressiveKind::kFixedSizeList && values->values != nullptr &&
+               values->values->kind == page_layout::CompressiveKind::kConstant && values->items_per_value != 0U) {
+        // Constant items: the slot carries the value's bytes per item when there is a value, none when
+        // there is not (the items are all null). The output's item width is the value's, or the
+        // schema's when there is no value to say.
+        const auto& constant = *values->values;
+        const std::uint64_t slot_item_bytes = constant.has_constant_value ? constant.constant_value.size() : 0U;
+        const std::uint64_t validity_bytes = values->has_validity ? (values->items_per_value + 7U) / 8U : 0U;
+        std::uint64_t item_slot_bits = 0;
+        if (!checked_mul(values->items_per_value, slot_item_bytes * 8U, item_slot_bits) ||
+            item_slot_bits > std::numeric_limits<std::uint64_t>::max() - validity_bytes * 8U) {
+            why = "unsupported FullZip value compression";
+            return false;
+        }
+        described_bits = item_slot_bits + validity_bytes * 8U;
+        out.constant_items = true;
+        out.items = values->items_per_value;
+        out.item_validity_bytes = static_cast<std::size_t>(validity_bytes);
+        if (constant.has_constant_value) {
+            out.constant_item = constant.constant_value;
+        } else if (schema_row_bytes != 0U && schema_row_bytes % values->items_per_value == 0U) {
+            // The schema's row is items x item width; a row that does not split evenly is left to the
+            // caller's width check.
+            out.constant_item.assign(schema_row_bytes / values->items_per_value, 0U);
+        }
+        out.out_row_bytes = static_cast<std::size_t>(values->items_per_value) * out.constant_item.size();
+        if (described_bits != fz.bits_per_value) {
+            why = "unsupported FullZip value compression";
+            return false;
+        }
+        return true;
+    } else if (values->kind == page_layout::CompressiveKind::kFixedSizeList && values->values != nullptr &&
                values->values->kind == page_layout::CompressiveKind::kFlat && values->items_per_value != 0U &&
                values->values->bits_per_value % 8U == 0U) {
         // With element validity the slot is [ceil(N/8) bytes of bits][N items]; Lance's
@@ -997,6 +1049,7 @@ bool full_zip_page_params(const page_layout::PageLayout& layout, std::uint64_t p
         why = "unsupported FullZip value compression";
         return false;
     }
+    out.out_row_bytes = out.value_bytes - out.item_validity_bytes;
     return true;
 }
 
@@ -2293,13 +2346,14 @@ bool decode_full_zip_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
     std::vector<std::uint16_t> levels;  // definition level of each value-carrying level (item)
     std::uint64_t rows_so_far = 0;      // items so far: rows, unless the page has lists
     bool variable = false;
+    const auto schema_bytes = lance_logical_type_value_bytes(on_disk_field.logical_type);
     for (std::size_t page_index = 0; page_index < column_metadata.pages.size(); ++page_index) {
         const auto& page = column_metadata.pages[page_index];
         page_layout::PageLayout layout;
         FullZipPageParams params;
         std::string why;
         if (!page_layout::decode_page_layout(page.encoding, layout, why) ||
-            !full_zip_page_params(layout, page.length, params, why)) {
+            !full_zip_page_params(layout, page.length, params, why, schema_bytes)) {
             error = "column '" + on_disk_field.name + "' page " + std::to_string(page_index) + ": " + why;
             return false;
         }
@@ -2311,10 +2365,9 @@ bool decode_full_zip_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
                 append_list_offset(out.variable.offsets, 0, out.variable.large);
             } else {
                 out.kind = ColumnValues::Kind::FixedWidth;
-                const auto schema_bytes = lance_logical_type_value_bytes(on_disk_field.logical_type);
-                if (schema_bytes != params.value_bytes - params.item_validity_bytes) {
+                if (schema_bytes != params.out_row_bytes) {
                     error = "column '" + on_disk_field.name + "': FullZip values are " +
-                            std::to_string(params.value_bytes) + " bytes but the type is " +
+                            std::to_string(params.out_row_bytes) + " bytes but the type is " +
                             std::to_string(schema_bytes);
                     return false;
                 }
@@ -2374,7 +2427,7 @@ bool decode_full_zip_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
                         " bytes, expected " + std::to_string(page_bytes + value_total);
                 return false;
             }
-            reserve_more(out.fixed, rows * (params.value_bytes - params.item_validity_bytes));
+            reserve_more(out.fixed, rows * params.out_row_bytes);
             if (params.items != 0U) {
                 out.items_per_row = params.items;
             }
@@ -2414,7 +2467,7 @@ bool decode_full_zip_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
                 } else if (params.items != 0U) {
                     append_item_validity(out, nullptr, params.items, first_item);
                 }
-                out.fixed.insert(out.fixed.end(), slot + params.item_validity_bytes, slot + lv.value_size);
+                append_fixed_row(out.fixed, slot + params.item_validity_bytes, slot + lv.value_size, params);
                 ++r;
                 continue;
             }
@@ -3779,8 +3832,9 @@ bool full_zip_row_addressable(const pb::ColumnPage& page, page_layout::PageLayou
     if (page.encoding.empty() || page.buffer_offsets.empty() || page.buffer_sizes.empty() ||
         !page_layout::decode_page_layout(page.encoding, layout, why) ||
         layout.kind != page_layout::LayoutKind::kFullZip || layout.full_zip.layers.size() != 1U ||
-        !full_zip_page_params(layout, page.length, params, why) || params.bits_rep != 0U) {
-        return false;
+        !full_zip_page_params(layout, page.length, params, why) || params.bits_rep != 0U ||
+        params.constant_items) {
+        return false;  // constant items: the page is decoded whole, where the schema's width is known
     }
     if (params.length_bytes == 0U) {
         return params.value_bytes != 0U && params.control_bytes <= 2U &&

@@ -23,10 +23,16 @@ struct ObjectStoreOptions {
 /// process-wide and per bucket: each open of a dataset in that bucket sets them again, and default
 /// options clear them (the environment chain applies). False and `error` for a URI with no bucket, or
 /// in a build without S3 support.
-/// Options from Lance's storage-option keys (`access_key_id`, `secret_access_key`, `session_token`,
-/// `region`, `endpoint`, each also with an `aws_` prefix; `allow_http` "true"/"1"), as pylance and
-/// lance-c take them. Other keys are ignored.
-ObjectStoreOptions object_store_options_from(const std::vector<std::pair<std::string, std::string>>& pairs);
+/// Options from the storage-option keys pylance (object_store 0.12.4) takes for these fields: the
+/// credentials, `region` (`default_region` when no region is given), `endpoint` (`endpoint_url`) and
+/// `allow_http`, each under every spelling object_store accepts (`aws_`-prefixed or bare). When two
+/// spellings of one field are given, the `aws_`-prefixed one wins; `allow_http` booleans are
+/// object_store's ("1", "true", "on", "yes", "y", and the false ones; case-insensitive). Other keys are
+/// ignored. A boolean that does not parse is an error, as in pylance: `error` (when given) names it and
+/// the result holds default options. Without `error` the failure is not reported, so callers that take
+/// user input should pass one.
+ObjectStoreOptions object_store_options_from(const std::vector<std::pair<std::string, std::string>>& pairs,
+                                             std::string* error = nullptr);
 
 bool set_object_store_options(const std::string& uri, const ObjectStoreOptions& options, std::string& error);
 

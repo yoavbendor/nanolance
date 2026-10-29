@@ -625,8 +625,11 @@ nb::dict ds_info(const std::filesystem::path& path, std::optional<std::uint64_t>
 // pylance's storage_options for an object-store bucket, as the next open of that bucket uses them. Keys
 // are pylance's (and the aws_-prefixed forms); keys this binding does not use are ignored.
 void ds_set_storage_options(const std::string& uri, const std::map<std::string, std::string>& options) {
-    const auto o = nano_lance::io::object_store_options_from({options.begin(), options.end()});
     std::string error;
+    const auto o = nano_lance::io::object_store_options_from({options.begin(), options.end()}, &error);
+    if (!error.empty()) {
+        throw std::invalid_argument(error);  // pylance raises ValueError for these
+    }
     if (!nano_lance::io::set_object_store_options(uri, o, error)) {
         throw std::runtime_error(error);
     }

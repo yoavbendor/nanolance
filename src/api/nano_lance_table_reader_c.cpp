@@ -25,6 +25,10 @@ void set_error(char* error_message, const size_t error_message_capacity, const s
 }
 
 int map_status(const std::string& error) {
+    // A projected column the schema does not have is the caller's mistake, not a missing file.
+    if (error.find("projected column") != std::string::npos) {
+        return NANO_LANCE_READER_INVALID_ARGUMENT;
+    }
     if (error.find("not found") != std::string::npos || error.find("failed to open") != std::string::npos ||
         error.find("unreadable") != std::string::npos) {
         return NANO_LANCE_READER_IO_ERROR;

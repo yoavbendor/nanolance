@@ -35,6 +35,11 @@ def options(spelling: str = "pylance") -> dict:
     if spelling == "aws":
         return {"aws_access_key_id": key, "aws_secret_access_key": secret, "aws_region": region,
                 "aws_endpoint": ENDPOINT, "allow_http": "true"}
+    if spelling == "alias":
+        # The other names object_store takes: default_region for the region, endpoint_url, and a boolean
+        # spelled "yes" under the aws_ name.
+        return {"aws_access_key_id": key, "aws_secret_access_key": secret, "default_region": region,
+                "endpoint_url": ENDPOINT, "aws_allow_http": "yes"}
     return {"access_key_id": key, "secret_access_key": secret, "region": region, "endpoint": ENDPOINT,
             "allow_http": "true"}
 
@@ -170,10 +175,20 @@ def test_filtered_scan_reads_a_fraction_of_the_dataset():
     assert filtered["largest_read"] <= 64 * 1024, filtered
 
 
-def test_storage_option_spellings_agree(uri):
+@pytest.mark.parametrize("spelling", ["aws", "alias"])
+def test_storage_option_spellings_agree(uri, spelling):
     plain = nl.dataset(uri, storage_options=options("pylance")).to_table(columns=["id"])
-    prefixed = nl.dataset(uri, storage_options=options("aws")).to_table(columns=["id"])
-    assert_same_table(plain, prefixed)
+    other = nl.dataset(uri, storage_options=options(spelling)).to_table(columns=["id"])
+    assert_same_table(plain, other)
+    assert_same_table(plain, lance.dataset(uri, storage_options=options(spelling)).to_table(columns=["id"]))
+
+
+@pytest.mark.parametrize("opened", [nl.dataset, lance.dataset], ids=["nanolance", "pylance"])
+def test_unparsable_boolean_is_a_value_error(uri, opened):
+    # pylance raises ValueError before any request: object_store's "failed to parse ... as boolean".
+    bad = dict(options(), allow_http="maybe")
+    with pytest.raises(ValueError, match='failed to parse "maybe" as boolean'):
+        opened(uri, storage_options=bad)
 
 
 WRITES = {

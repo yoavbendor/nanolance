@@ -4,9 +4,13 @@
 
 #include "nanolance/object_store.hpp"
 
+#include <cctype>
+#include <cstddef>
 #include <filesystem>
+#include <initializer_list>
 #include <map>
 #include <mutex>
+#include <string_view>
 #include <system_error>
 
 #if defined(NANO_LANCE_HAS_S3_BYTE_SOURCE)
@@ -273,22 +277,89 @@ void register_list_factory(const std::string& scheme, ListFactory factory) {
     }
 }
 
-ObjectStoreOptions object_store_options_from(const std::vector<std::pair<std::string, std::string>>& pairs) {
-    ObjectStoreOptions o;
-    for (const auto& [key, value] : pairs) {
-        if (key == "access_key_id" || key == "aws_access_key_id") {
-            o.access_key_id = value;
-        } else if (key == "secret_access_key" || key == "aws_secret_access_key") {
-            o.secret_access_key = value;
-        } else if (key == "session_token" || key == "aws_session_token") {
-            o.session_token = value;
-        } else if (key == "region" || key == "aws_region") {
-            o.region = value;
-        } else if (key == "endpoint" || key == "aws_endpoint") {
-            o.endpoint = value;
-        } else if (key == "allow_http") {
-            o.allow_http = value == "true" || value == "True" || value == "1";
+namespace {
+
+using StorageOptionPairs = std::vector<std::pair<std::string, std::string>>;
+
+// The value of the most preferred of `spellings` among `pairs`: an earlier spelling in the list wins over a
+// later one, whatever the order of the pairs. Between two pairs with the same spelling, the first wins.
+// False when none of the spellings is given.
+bool preferred_value(const StorageOptionPairs& pairs, std::initializer_list<std::string_view> spellings,
+                     std::string& value) {
+    std::size_t best = spellings.size();
+    for (const auto& [key, v] : pairs) {
+        std::size_t rank = 0;
+        for (const std::string_view name : spellings) {
+            if (rank >= best) {
+                break;
+            }
+            if (key == name) {
+                best = rank;
+                value = v;
+                break;
+            }
+            ++rank;
         }
+    }
+    return best < spellings.size();
+}
+
+// object_store's `impl Parse for bool` (src/config.rs): the value lower-cased, then "1", "true", "on", "yes" or
+// "y" for true, and "0", "false", "off", "no" or "n" for false. Anything else is an error.
+bool parse_bool(std::string text, bool& out) {
+    for (char& c : text) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (text == "1" || text == "true" || text == "on" || text == "yes" || text == "y") {
+        out = true;
+        return true;
+    }
+    if (text == "0" || text == "false" || text == "off" || text == "no" || text == "n") {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+ObjectStoreOptions object_store_options_from(const std::vector<std::pair<std::string, std::string>>& pairs,
+                                             std::string* error) {
+    if (error != nullptr) {
+        error->clear();
+    }
+    ObjectStoreOptions o;
+    std::string value;
+    if (preferred_value(pairs, {"aws_access_key_id", "access_key_id"}, value)) {
+        o.access_key_id = value;
+    }
+    if (preferred_value(pairs, {"aws_secret_access_key", "secret_access_key"}, value)) {
+        o.secret_access_key = value;
+    }
+    if (preferred_value(pairs, {"aws_session_token", "aws_token", "session_token", "token"}, value)) {
+        o.session_token = value;
+    }
+    // object_store uses aws_default_region / default_region as the region only when no region is given.
+    if (preferred_value(pairs, {"aws_region", "region"}, value) ||
+        preferred_value(pairs, {"aws_default_region", "default_region"}, value)) {
+        o.region = value;
+    }
+    if (preferred_value(pairs, {"aws_endpoint_url", "aws_endpoint", "endpoint_url", "endpoint"}, value)) {
+        o.endpoint = value;
+    }
+    // object_store parses every allow_http spelling it is given, so a bad value is an error even when the other
+    // spelling is the one used.
+    for (const auto& [key, text] : pairs) {
+        bool ignored = false;
+        if ((key == "aws_allow_http" || key == "allow_http") && !parse_bool(text, ignored)) {
+            if (error != nullptr) {
+                *error = "failed to parse \"" + text + "\" as boolean";
+            }
+            return ObjectStoreOptions{};
+        }
+    }
+    if (preferred_value(pairs, {"aws_allow_http", "allow_http"}, value)) {
+        parse_bool(value, o.allow_http);
     }
     return o;
 }

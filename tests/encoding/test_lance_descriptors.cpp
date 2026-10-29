@@ -104,6 +104,21 @@ void test_compressive_builders() {
         const auto v = parse_value(d::fixed_size_list(4, d::flat(32), true));
         require(v->has_validity && v->items_per_value == 4U, "fixed_size_list with validity");
     }
+    {
+        // Constant (field 3) is read from the unknown fields: with a value, its bytes; without, none.
+        const auto c = parse_value(d::constant({0x01, 0x00, 0x00, 0x00}));
+        require(c->kind == pl::CompressiveKind::kConstant && c->wire_field == 3U && c->has_constant_value &&
+                    c->constant_value == Bytes({0x01, 0x00, 0x00, 0x00}),
+                "constant with a value");
+        const auto n = parse_value(d::constant({}, false));
+        require(n->kind == pl::CompressiveKind::kConstant && !n->has_constant_value && n->constant_value.empty(),
+                "constant without a value");
+        // Inside a FixedSizeList, as an all-null list's items are written.
+        const auto f = parse_value(d::fixed_size_list(2, d::constant({}, false), true));
+        require(f->kind == pl::CompressiveKind::kFixedSizeList && f->values != nullptr &&
+                    f->values->kind == pl::CompressiveKind::kConstant && !f->values->has_constant_value,
+                "fixed_size_list of a constant without a value");
+    }
     // Canonical protobuf: Flat(0) is CompressiveEncoding{ f1 Flat{} } -- the zero is left out.
     require(d::flat(0) == Bytes({0x0a, 0x00}), "a zero field is not written");
     require(d::flat(1) == Bytes({0x0a, 0x02, 0x08, 0x01}), "Flat(1) as Lance writes it");

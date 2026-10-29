@@ -52,6 +52,7 @@ where a schema is stored (the manifest) is the table layer's. It uses `base`.
 | `blob_builder` | Blob v2 write-side arrays | `nano_lance_blob_builder` |
 | `jsonb` | JSON text <-> JSONB, JSONPath selection | `nano_lance_jsonb` |
 | `arrow_owned` | owning wrappers and small array builders | `nano_lance_arrow_owned` |
+| `arrow_views` | Utf8View / BinaryView columns copied as string / binary, for the write path | `nano_lance_arrow_views` |
 
 ## Spec coverage
 
@@ -62,7 +63,7 @@ Against the Lance format specification at https://lance.org/format/ (as of Lance
 |---|---|---|---|---|---|---|
 | `arrow.types.primitive` | [Primitive Types](https://lance.org/format/table/schema/#primitive-types) | done | `src/arrow/schema_mapper.cpp::parse_format` | `nano_lance_schema_mapper`, `bindings/python/tests/test_type_support_matrix.py::test_stock_lance_reads_what_nanolance_wrote`, `bindings/python/tests/test_type_support_matrix.py::test_stock_lance_written_type_reads_back` | unit+interop | `null`, `bool`, `int8`..`int64`, `uint8`..`uint64`. |
 | `arrow.types.float` | [Floating Point Types](https://lance.org/format/table/schema/#floating-point-types) | done | `src/arrow/schema_mapper.cpp::parse_format` | `bindings/python/tests/test_type_support_matrix.py::test_stock_lance_reads_what_nanolance_wrote`, `bindings/python/tests/test_type_support_matrix.py::test_stock_lance_written_type_reads_back` | interop | `halffloat`, `float`, `double`. |
-| `arrow.types.string_binary` | [String and Binary Types](https://lance.org/format/table/schema/#string-and-binary-types) | partial | `src/arrow/schema_mapper.cpp::parse_format`, `include/nanolance/schema_mapper.hpp::lance_on_disk_logical_type` | `nano_lance_schema_mapper`, `bindings/python/tests/test_type_support_matrix.py::test_stock_lance_reads_what_nanolance_wrote`, `bindings/python/tests/test_type_support_matrix.py::test_stock_lance_written_type_reads_back` | unit+interop | `string`, `binary`, `large_string`, `large_binary`. Missing: Utf8View and BinaryView, which the specification maps to `string` / `binary`, are refused on write ("unsupported Arrow C format: vu"). |
+| `arrow.types.string_binary` | [String and Binary Types](https://lance.org/format/table/schema/#string-and-binary-types) | done | `src/arrow/schema_mapper.cpp::parse_format`, `include/nanolance/schema_mapper.hpp::lance_on_disk_logical_type`, `src/arrow/arrow_views.hpp::ViewlessBatch`, `src/dataset/write_session.cpp::WriteSession::write_batch` | `nano_lance_schema_mapper`, `nano_lance_arrow_views`, `bindings/python/tests/test_type_support_matrix.py::test_stock_lance_reads_what_nanolance_wrote`, `bindings/python/tests/test_type_support_matrix.py::test_stock_lance_written_type_reads_back`, `bindings/python/tests/test_arrow_views.py::test_nanolance_writes_the_schema_pylance_writes`, `bindings/python/tests/test_arrow_views.py::test_view_data_is_the_plain_string_data` | unit+interop | `string`, `binary`, `large_string`, `large_binary`, and the view types Utf8View and BinaryView, which are written as `string` / `binary` as pylance 12 writes them (the view types are not kept in the schema; the data files are the plain string files for the same values). The conversion runs only for a batch with a view column. |
 | `arrow.types.decimal` | [Decimal Types](https://lance.org/format/table/schema/#decimal-types) | done | `src/arrow/schema_mapper.cpp::parse_format` | `bindings/python/tests/test_type_support_matrix.py::test_stock_lance_reads_what_nanolance_wrote`, `bindings/python/tests/test_expr_types.py::test_decimal_filters_equal_pylance` | interop | `decimal:128:p:s` and `decimal:256:p:s`. |
 | `arrow.types.temporal` | [Date and Time Types](https://lance.org/format/table/schema/#date-and-time-types), [Timestamp Types](https://lance.org/format/table/schema/#timestamp-types) | done | `src/arrow/schema_mapper.cpp::parse_format` | `bindings/python/tests/test_type_support_matrix.py::test_stock_lance_reads_what_nanolance_wrote`, `bindings/python/tests/test_type_support_matrix.py::test_stock_lance_written_type_reads_back`, `bindings/python/tests/test_expr_types.py::test_duration_filters_equal_pylance` | interop | Dates, times, durations of every unit; timestamps with a time zone or `-`. |
 | `arrow.types.struct` | [Complex Types](https://lance.org/format/table/schema/#complex-types) (struct) | done | `src/arrow/schema_mapper.cpp::map_field`, `src/arrow/array_accessor.cpp::resolve_field_array` | `nano_lance_schema_mapper`, `nano_lance_array_accessor`, `bindings/python/tests/test_type_support_matrix.py::test_stock_lance_written_type_reads_back`, `bindings/python/tests/test_lance_lists.py::test_null_structs_read_as_null` | unit+interop | Nested and nullable structs; a struct with no fields is a column of its own, as in Lance. |
@@ -85,9 +86,7 @@ Against the Lance format specification at https://lance.org/format/ (as of Lance
 
 ## Known gaps
 
-The view types (Utf8View, BinaryView) are the one Arrow type family the specification names that nanolance
-refuses; supporting them means reading the view buffers in `array_accessor.cpp` into the existing string
-path (the on-disk form is `string` / `binary`, so nothing changes in the file). Dictionaries are written only
+Dictionaries are written only
 for top-level columns of scalar values, and fixed-size lists only of fixed-width elements; both are refused
 by name otherwise, never stored wrongly. The primary-key and clustering-key fields of the schema have no place in
 `LanceField`: nanolance neither sets them from Arrow metadata nor shows them to a reader.

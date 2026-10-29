@@ -42,6 +42,111 @@ std::uint32_t first_unknown_variant(const nm::unknown_fields& u) {
     return field;
 }
 
+bool read_varint(std::span<const std::byte> b, std::size_t& at, std::uint64_t& v) {
+    v = 0;
+    for (unsigned shift = 0; shift < 64U; shift += 7U) {
+        if (at >= b.size()) {
+            return false;
+        }
+        const auto byte = std::to_integer<std::uint8_t>(b[at++]);
+        v |= static_cast<std::uint64_t>(byte & 0x7FU) << shift;
+        if ((byte & 0x80U) == 0U) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Advances `at` past one protobuf field value of wire type `wt`. False on a malformed or group value.
+bool skip_field(std::span<const std::byte> b, std::size_t& at, std::uint8_t wt) {
+    std::uint64_t n = 0;
+    switch (wt) {
+        case 0U:
+            return read_varint(b, at, n);
+        case 1U:
+            if (b.size() - at < 8U) {
+                return false;
+            }
+            at += 8U;
+            return true;
+        case 2U:
+            if (!read_varint(b, at, n) || n > b.size() - at) {
+                return false;
+            }
+            at += static_cast<std::size_t>(n);
+            return true;
+        case 5U:
+            if (b.size() - at < 4U) {
+                return false;
+            }
+            at += 4U;
+            return true;
+        default:
+            return false;
+    }
+}
+
+/// CompressiveEncoding field 3, Constant{ optional bytes value = 1 }. nanom's CompressiveEncoding has
+/// no member for it, so it arrives in `unknown` and is read here. `found` says whether it was there.
+bool convert_constant(const nm::unknown_fields& u, Compressive& out, bool& found, std::string& error) {
+    const std::span<const std::byte> all(u.bytes);
+    std::size_t at = 0;
+    while (at < all.size()) {
+        std::uint64_t key = 0;
+        if (!read_varint(all, at, key)) {
+            error = "page layout: malformed CompressiveEncoding";
+            return false;
+        }
+        const auto wt = static_cast<std::uint8_t>(key & 7U);
+        if (key >> 3U != 3U || wt != 2U) {
+            if (!skip_field(all, at, wt)) {
+                error = "page layout: malformed CompressiveEncoding";
+                return false;
+            }
+            continue;
+        }
+        std::uint64_t n = 0;
+        if (!read_varint(all, at, n) || n > all.size() - at) {
+            error = "page layout: malformed Constant";
+            return false;
+        }
+        const auto payload = all.subspan(at, static_cast<std::size_t>(n));
+        at += static_cast<std::size_t>(n);
+        found = true;
+        out.kind = CompressiveKind::kConstant;
+        out.wire_field = 3U;
+        out.has_constant_value = false;
+        out.constant_value.clear();
+        std::size_t p = 0;
+        while (p < payload.size()) {
+            std::uint64_t pkey = 0;
+            if (!read_varint(payload, p, pkey)) {
+                error = "page layout: malformed Constant";
+                return false;
+            }
+            const auto pwt = static_cast<std::uint8_t>(pkey & 7U);
+            if (pkey >> 3U == 1U && pwt == 2U) {
+                std::uint64_t len = 0;
+                if (!read_varint(payload, p, len) || len > payload.size() - p) {
+                    error = "page layout: malformed Constant value";
+                    return false;
+                }
+                const auto value = payload.subspan(p, static_cast<std::size_t>(len));
+                out.has_constant_value = true;
+                out.constant_value.resize(value.size());
+                for (std::size_t i = 0; i < value.size(); ++i) {
+                    out.constant_value[i] = std::to_integer<std::uint8_t>(value[i]);
+                }
+                p += value.size();
+            } else if (!skip_field(payload, p, pwt)) {
+                error = "page layout: malformed Constant";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool convert(const wire::CompressiveEncoding& w, Compressive& out, int depth, std::string& error);
 
 /// A child node: its bytes were only length-checked with the parent, so they are decoded (and
@@ -144,6 +249,13 @@ bool convert(const wire::CompressiveEncoding& w, Compressive& out, int depth, st
         out.items_per_value = *v->items_per_value;
         out.has_validity = *v->has_validity != 0U;
         return child(*v->values, out.values, depth, error);
+    }
+    bool constant = false;
+    if (!convert_constant(*w.unknown, out, constant, error)) {
+        return false;
+    }
+    if (constant) {
+        return true;
     }
     // Parsed, just not modeled. Recording the wire field lets the caller refuse by name instead of
     // misreading the page's buffers.
@@ -334,6 +446,10 @@ void describe_compressive(const Compressive* node, std::string& out) {
             out += "FixedSizeList{" + std::to_string(node->items_per_value) + "x";
             describe_compressive(node->values.get(), out);
             out += node->has_validity ? ",validity}" : "}";
+            return;
+        case CompressiveKind::kConstant:
+            out += node->has_constant_value ? "Constant{" + std::to_string(node->constant_value.size()) + "B}"
+                                            : "Constant{null}";
             return;
         case CompressiveKind::kUnknown:
         default:

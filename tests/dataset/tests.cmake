@@ -27,3 +27,10 @@ target_compile_features(nano_lance_index_optimize_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_index_optimize_test PRIVATE nanolance)
 add_test(NAME nano_lance_index_optimize COMMAND $<TARGET_FILE:nano_lance_index_optimize_test>)
 set_tests_properties(nano_lance_index_optimize PROPERTIES LABELS "smoke")
+
+# lance_dataset_scan and LanceTableStream::open_request: a whole scan request (version, fragments, projection,
+# row addresses, range, filter) and its failures.
+add_executable(nano_lance_dataset_scan_test tests/dataset/test_dataset_scan.cpp)
+target_compile_features(nano_lance_dataset_scan_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_dataset_scan_test PRIVATE nanolance)
+add_test(NAME nano_lance_dataset_scan COMMAND $<TARGET_FILE:nano_lance_dataset_scan_test>)

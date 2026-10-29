@@ -47,6 +47,9 @@ enum class CompressiveKind {
     kRle = 8,                ///< f8  Rle{ f1 values, f2 lengths }
     kByteStreamSplit = 9,    ///< f9  ByteStreamSplit{ f1 values }
     kGeneral = 10,           ///< f10 General{ f1 BufferCompression{ f1 scheme }, f3 values }
+    /// f3 Constant{ f1 value (optional) }. Carries no bytes in the page: every value is `constant_value`
+    /// (or, when absent, zeros, with nulls from validity). See Compressive::constant_value.
+    kConstant = 3,
     /// f11 FixedSizeList{ f1 items_per_value, f2 values, f3 has_validity }. How Lance stores an Arrow
     /// fixed_size_list: NOT with repetition levels, but as a wrapper saying "every N consecutive
     /// values are one row". The schema has no child field for it either.
@@ -87,6 +90,11 @@ struct Compressive {
     /// FixedSizeList: values per row, and whether the list itself carries a validity buffer.
     std::uint64_t items_per_value = 0;
     bool has_validity = false;
+
+    /// Constant: the one value every item equals, as its raw bytes. Absent (has_constant_value false)
+    /// means the items are all null and carry no bytes; the reader zero-fills them at the type's width.
+    bool has_constant_value = false;
+    std::vector<std::uint8_t> constant_value;
 
     /// Variable::offsets, ByteStreamSplit::values, General::values, Rle::values, Fsst::values,
     /// FixedSizeList::values.
