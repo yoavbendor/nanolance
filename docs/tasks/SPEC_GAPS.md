@@ -44,7 +44,7 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs: read pylance's first, then write them for `lance-encoding:packed` | measured 2026-10-29, see "Measured for W1j" | later, reviewer-led design: reading needs a packed-struct read plan with child fan-out (as `v20_packed_struct_sources` does for 2.0), and the VariablePackedStruct byte layout from Lance's source. Opt-in only, so behind the gaps every dataset meets |
 | W1k1 | `arrow.types.fixed_size_list` (read) | Read what pylance writes: a null element inside a fixed-size list under a list or struct (also W1a's all-null list<fsl>), `fixed_size_list<bool>`, `fixed_size_list<struct>` | measured 2026-10-29, see "Measured for W1k" | next |
 | W1k2 | `arrow.types.fixed_size_list`, `arrow.types.dictionary` (write) | Write them too, and dictionary columns inside structs and lists | measured 2026-10-29 | after W1k1 |
-| W1p | `encoding.config` | Integer dictionaries: pylance dictionary-encodes int64 / float64 columns with 1,000-10,000 distinct values (`dict=InlineBitpacking(64)` / `General{LZ4,Flat(64)}`); nanolance has no such encoding | W1g, W1h | later |
+| W1p | `encoding.config` | Integer and float dictionaries as Lance 12 writes them (files up to 1.9x pylance's size today) | measured 2026-10-29, see "Measured for W1p" | next |
 | W1q | `encoding.compression.rle` | RLE over more than one mini-block chunk: nanolance's RLE holds its runs in one chunk, so a column of 25,000 runs is not RLE-encoded | W1g | later |
 | W1r | `encoding.config` | Dictionary indices under `lance-encoding:compression` (`General{codec,ByteStreamSplit{Flat(32)}}`, or `Flat(32)` for none): the reader's dictionary-index path has to unwrap them before the writer may emit them | W1g, W1h | partial (Haiku session, 2026-10-29): done for string, int64 and float64 dictionaries (reader unwraps General and byte-stream-split per index chunk; writer emits pylance's index layout under lz4 / zstd / none; the dictionary buffer unchanged; `dict-rle` keeps the option erased, not measured). Layout text equal to pylance's, read and take checked, see "W1r measured". Left: `dict-rle` under the option, and integer dictionaries written by nanolance (W1p) |
 | W1o | `file.version.2_0`, `file.version.2_1` | Warn when a write adds the first 2.2 file to a 2.0 / 2.1 dataset, naming the readers it cuts off | W1m table | done 2026-10-29: `MixedFormatWarning` before the commit of each write that adds the first 2.2 file to a 2.0 / 2.1 dataset (write_dataset append, update, merge_insert, add_columns, compaction, fragment writes); `error` filter aborts it; `_target_file_version` is the one line W1n changes |
@@ -435,3 +435,28 @@ Not measured yet: the byte layout of `VariablePackedStruct` (field 13). The Lanc
 | fixed_size_list<string, N> | panics (found in W1i) | -- | -- |
 
 So W1k starts with reading (W1k1): three shapes pylance writes that nanolance cannot read.
+
+## Measured for W1p (integer and float dictionaries, 2026-10-29)
+
+pylance 12.0.0, 50,000 rows a column; nanolance today in the last column:
+
+| column | pylance | nanolance |
+|---|---|---|
+| int64, 10 / 100 distinct | `InlineBitpacking(32)` indices, `dict=General{LZ4,Flat(64)}` | `InlineBitpacking(64)` values |
+| int64, 1,000 distinct (also with nulls: `x1001`) | `InlineBitpacking(32)` indices, `dict=InlineBitpacking(64)x1000` | values |
+| int64, 5,000 / 10,000 / 20,000 distinct | `InlineBitpacking(64)` values (no dictionary) | the same |
+| float64, 100 / 1,000 distinct | as int64 (`dict=General{LZ4,Flat(64)}` / `InlineBitpacking(64)`) | `Flat(64)` values |
+| float64, 10,000 distinct | `InlineBitpacking(64)` | `Flat(64)` |
+| int32, 100 / 1,000 distinct | `InlineBitpacking(32)` (never a dictionary) | the same |
+
+The whole table: pylance 1.74 MB, nanolance 3.23 MB.
+
+Lance 12's rule (`rust/lance-encoding/src/encodings/logical/primitive.rs`, `should_dictionary_encode`):
+- only 64- and 128-bit fixed-width blocks (and variable width); never fewer than 100 values (`LANCE_ENCODING_DICT_TOO_SMALL`);
+- threshold cardinality = values / `dict-divisor` (default 2), capped at 100,000 (`LANCE_ENCODING_DICT_MAX_CARDINALITY`);
+- a deterministic sample: up to 4,096 values in 32 evenly spaced blocks (none if under 1,024 samples); if the
+  sample's unique ratio is 0.98 or more, no dictionary; else projected cardinality = ratio x values, and above
+  the threshold, no dictionary;
+- then the dictionary is tried with a budget: at most `threshold` entries and an encoded size of at most
+  `dict-size-ratio` (default 0.8) x the data size;
+- the dictionary's values are compressed with `dict-values-compression` (default lz4) when it pays.
