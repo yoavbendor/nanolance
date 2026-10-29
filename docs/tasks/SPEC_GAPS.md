@@ -44,7 +44,7 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs: read pylance's first, then write them for `lance-encoding:packed` | measured 2026-10-29, see "Measured for W1j" | later, reviewer-led design: reading needs a packed-struct read plan with child fan-out (as `v20_packed_struct_sources` does for 2.0), and the VariablePackedStruct byte layout from Lance's source. Opt-in only, so behind the gaps every dataset meets |
 | W1k1 | `arrow.types.fixed_size_list` (read) | Read what pylance writes: a null element inside a fixed-size list under a list or struct (also W1a's all-null list<fsl>), `fixed_size_list<bool>`, `fixed_size_list<struct>` | measured 2026-10-29, see "Measured for W1k" | next |
 | W1k2 | `arrow.types.fixed_size_list`, `arrow.types.dictionary` (write) | Write them too, and dictionary columns inside structs and lists | measured 2026-10-29 | after W1k1 |
-| W1p | `encoding.config` | Integer and float dictionaries as Lance 12 writes them (files up to 1.9x pylance's size today) | measured 2026-10-29, see "Measured for W1p" | next |
+| W1p | `encoding.config` | Integer and float dictionaries as Lance 12 writes them (files up to 1.9x pylance's size today) | measured 2026-10-29, see "Measured for W1p" and "Result for W1p" | partial 2026-10-29: the decision rule matches pylance on every measured case; the page shapes are not written yet (stopped, see "Result for W1p") |
 | W1q | `encoding.compression.rle` | RLE over more than one mini-block chunk: nanolance's RLE holds its runs in one chunk, so a column of 25,000 runs is not RLE-encoded | W1g | later |
 | W1r | `encoding.config` | Dictionary indices under `lance-encoding:compression` (`General{codec,ByteStreamSplit{Flat(32)}}`, or `Flat(32)` for none): the reader's dictionary-index path has to unwrap them before the writer may emit them | W1g, W1h | partial (Haiku session, 2026-10-29): done for string, int64 and float64 dictionaries (reader unwraps General and byte-stream-split per index chunk; writer emits pylance's index layout under lz4 / zstd / none; the dictionary buffer unchanged; `dict-rle` keeps the option erased, not measured). Layout text equal to pylance's, read and take checked, see "W1r measured". Left: `dict-rle` under the option, and integer dictionaries written by nanolance (W1p) |
 | W1o | `file.version.2_0`, `file.version.2_1` | Warn when a write adds the first 2.2 file to a 2.0 / 2.1 dataset, naming the readers it cuts off | W1m table | done 2026-10-29: `MixedFormatWarning` before the commit of each write that adds the first 2.2 file to a 2.0 / 2.1 dataset (write_dataset append, update, merge_insert, add_columns, compaction, fragment writes); `error` filter aborts it; `_target_file_version` is the one line W1n changes |
@@ -460,3 +460,50 @@ Lance 12's rule (`rust/lance-encoding/src/encodings/logical/primitive.rs`, `shou
 - then the dictionary is tried with a budget: at most `threshold` entries and an encoded size of at most
   `dict-size-ratio` (default 0.8) x the data size;
 - the dictionary's values are compressed with `dict-values-compression` (default lz4) when it pays.
+
+## Result for W1p (2026-10-29, stopped: no writer change)
+
+Nothing was written: the 64-bit dictionary needs four things the brief does not settle, so this session stopped
+(the brief's stop rule). What is settled, measured with pylance 12 (default file version 2.2, `build/nlance-pagelayout`):
+
+**The decision (whether to dictionary-encode) is Lance's rule as written above.** A simulation of it (sample of 32
+blocks x 128 values, unique ratio >= 0.98 rejects, projected cardinality = ratio x rows against min(rows / divisor, 100,000))
+gives pylance's choice on all 10 measured shuffled, non-null int64 cases (50,000 and 1,000,000 rows; 10 / 100 / 1,000 /
+5,000 / 25,000 distinct). Dictionary at 50,000 rows: 10, 100, 1,000 distinct; none at 5,000 (sample 0.68 -> 34,000 > 25,000)
+and 25,000. At 1,000,000 rows: 10 and 100 only (1,000 distinct projects to 240,000 > 100,000, so no dictionary).
+
+**Measured shapes** (int64, 50,000 rows unless stated; `w` = value width, the random values are `w`-bit):
+
+| case | pylance layout | pylance bytes | nanolance bytes (unchanged) |
+|---|---|---|---|
+| 10 / 100 / 1,000 distinct, 40-bit | `InlineBitpacking(32)` + `dict=General{LZ4,Flat(64)}` / same / `dict=InlineBitpacking(64)x1000` | 26,548 / 46,069 / 69,230 | 252,296 |
+| 5,000 / 25,000 distinct | `InlineBitpacking(64)` | 252,192 each | 252,296 |
+| 1,000,000 rows, 10 distinct | `InlineBitpacking(32)` + `dict=General{LZ4,Flat(64)}x10` | 520,244 | 5,023,432 |
+| 1,000,000 rows, 1,000 / 5,000 / 25,000 distinct | `InlineBitpacking(64)` | 5,022,113 each | 5,023,432 |
+| 10 distinct, nulls (10%) | `InlineBitpacking(32)`, `repdef=Bitpacked(16,Flat(1))`, `nullable`, `dict=General{LZ4,Flat(64)}x11` | 32,832 | 258,632 |
+| 1,000 distinct, nulls | same repdef, `dict=InlineBitpacking(64)x1001` | 75,514 | 258,632 |
+| sorted, 10 / 1,000 / 5,000 distinct | `Rle{values=Flat(32),lengths=Flat(8)}` + the dictionary (`General{LZ4,Flat(64)}x10`, `InlineBitpacking(64)x1000`, `Bitpacked(64,Flat(40))x4999`) | 1,850 / 10,868 / 51,261 | 2,184 / 9,352 / 252,296 |
+
+Dictionary values, by width and distinct count (50,000 rows, shuffled; the same for 16-, 24-, 32-, 40- and 63-bit values):
+
+| values | 8 | 16 (10-200) | 16 (300-1,000) | 24 | 32 | 40 (10-500) | 40 (700-1,000) | 63 (10-1,000) | any width, 2,000 |
+|---|---|---|---|---|---|---|---|---|---|
+| dictionary at 500 entries | `InlineBitpacking(64)` | `General{LZ4,Flat(64)}` | `InlineBitpacking(64)` | `InlineBitpacking(64)` | `General{LZ4,Flat(64)}` | `General{LZ4,Flat(64)}` | `InlineBitpacking(64)` | `General{LZ4,Flat(64)}` | `Bitpacked(64,Flat(w))` |
+
+**Why it stopped:**
+1. The choice between `General{LZ4,Flat(64)}` and `InlineBitpacking(64)` for the dictionary values is not a size rule. LZ4 is
+   larger than the bitpacked bytes in every measured case (`lz4` on the raw dictionary, measured offline), yet pylance
+   picks LZ4 for 40-bit x 500 and InlineBitpacking for 40-bit x 700. No threshold on bits, count, bits x count or raw
+   bytes separates the table above. The rule is in Lance's source, which is not in this environment.
+2. Above 1,024 entries pylance writes `Bitpacked(64,Flat(w))` (one width for the whole dictionary, out of line). The
+   reader reads that shape; the writer does not write it.
+3. A nullable column gets a null entry in the dictionary (`x11`, `x1001`) and a `repdef` layer. nanolance keeps dictionaries
+   off nullable columns (`!column_has_nulls` in `encode_column`), so this is a new combined page, not a generalisation.
+4. A sorted column is RLE over the dictionary indices (`Rle{Flat(32),Flat(8)}` + dict). nanolance's `dict-rle` path is the
+   string version; the fixed-width version is a new shape.
+
+Items 2 to 4 need writer shapes beyond generalising `write_dict_column` from strings to fixed width, which the brief's stop
+rule names. Item 1 needs the source. Next step: read `should_dictionary_encode` and the dictionary-values compressor
+choice in Lance's `primitive.rs` / `compression.rs` (a rust checkout, not pylance's wheel), then implement items 1-4 as one change.
+
+Byte-identical: no writer change in this session, so `nlbench_gendata` output is unchanged.
