@@ -44,4 +44,14 @@ bool decompress_sized(const std::vector<std::uint8_t>& sized, std::vector<std::u
 bool decompress_block(const std::uint8_t* data, std::size_t size, std::size_t uncompressed_size,
                       std::vector<std::uint8_t>& out, std::string& error);
 
+/// Compress `data` into one standard LZ4 block (greedy matching over a hash table of 4-byte
+/// sequences, offsets up to 65535, the last 5 bytes always literals). `out` is REPLACED. The bytes
+/// are valid LZ4 for any LZ4 decoder, not necessarily the ones lz4-rs would produce.
+void compress_block(const std::uint8_t* data, std::size_t size, std::vector<std::uint8_t>& out);
+
+/// Compress `data` as Lance's `[u32 LE uncompressed size][LZ4 block]`, the envelope
+/// decompress_sized reads. Fails only when `size` does not fit the u32 prefix.
+bool compress_sized(const std::uint8_t* data, std::size_t size, std::vector<std::uint8_t>& out,
+                    std::string& error);
+
 }  // namespace nano_lance::lz4_block
