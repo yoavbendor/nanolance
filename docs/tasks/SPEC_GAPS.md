@@ -271,3 +271,27 @@ divisor default 2, size ratio default 0.8, min 100 rows, cap 100,000 distinct, a
 Byte-identical check: `nlbench_gendata <dir> 50000` on the base commit and on this branch writes the same data-file md5
 (one data file, `84b4dce7912cd80d047e779f01a143fb`); manifests and transactions differ only by their random names and
 timestamps, as they always do.
+
+## Measured for W1i (fixed-width FullZip)
+
+Lance 12's rule (`rust/lance-encoding/src/encodings/logical/primitive.rs`, `is_narrow` / `prefers_miniblock` /
+`prefers_fullzip`): a column is mini-block when its largest value is under 256 bytes
+(`MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE`), and FullZip otherwise. `lance-encoding:structural-encoding` =
+`miniblock` / `fullzip` overrides it. A requested `fullzip` that the value type cannot take (a dictionary, values
+not byte-aligned, a fixed-size list without a flat fixed-width child) is an error, with the messages in that
+function.
+
+pylance 12.0.0, 2,000 rows each:
+
+| column | bytes per value | pylance | nanolance today |
+|---|---|---|---|
+| fixed_size_list<float32, 16..63> | 64..252 | MiniBlock | MiniBlock |
+| fixed_size_list<float32, 64> | 256 | `FullZip{values=FixedSizeList{64xFlat(32)},value_bits=2048}` | MiniBlock, 2,000 rows a page |
+| fixed_size_list<float32, 1024> | 4,096 | FullZip (with `def_bits=1` when rows are null) | MiniBlock, 128 rows a page |
+| fixed_size_list<float32, 4096> | 16,384 | FullZip | MiniBlock, **1 row a page** |
+| fixed_size_list<int8, 768> | 768 | FullZip | MiniBlock |
+| fixed_size_binary(100..200) | < 256 | MiniBlock | MiniBlock |
+| fixed_size_binary(256 / 4096) | 256 / 4,096 | `FullZip{values=Flat(2048 / 32768)}` | MiniBlock |
+
+Embeddings of 768 to 4,096 floats are therefore written very differently. nanolance's mini-block pages shrink
+with the value width, down to one row per page.
