@@ -5,6 +5,10 @@
 // dictionary + RLE): scans of the buffered values that decide whether an encoding pays.
 
 #include "encoding/encoding_choice.hpp"
+#include "encoding/values/bitpack.hpp"
+#include "encoding/values/general.hpp"
+
+#include <nanom/fastlanes.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -442,6 +446,127 @@ bool variable_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnE
     cv.structural_dict_plan.computed = true;
     cv.structural_dict_plan.distinct = std::move(distinct);
     cv.structural_dict_plan.indices = std::move(indices);
+    return true;
+}
+
+// Lance's should_dictionary_encode for a 64-bit fixed-width column (W1p). Mirrors the rule in SPEC_GAPS.md,
+// checked against pylance 12 on every measured shuffled case: a 32-block sample of up to 4,096 values
+// (none under 1,024 samples), unique ratio >= 0.98 rejects, projected = ratio x rows against the threshold.
+bool fixed_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnEncodingOptions& options) {
+    constexpr std::size_t kMinRows = 100U;
+    constexpr std::size_t kMaxCardinality = 100000U;
+    constexpr std::size_t kBlockValues = 1024U;  // one FastLanes block
+    constexpr std::size_t kSampleBlocks = 32U;
+    constexpr std::size_t kSampleBlockValues = 128U;  // 32 x 128 = 4,096 sampled values
+    using FixedDictValues = StructuralDictPlan::FixedDictValues;
+
+    cv.structural_dict_plan = {};
+    if (cv.kind != ColumnValues::Kind::FixedWidth || cv.null_count != 0U || cv.fixed_size() % 8U != 0U) {
+        return false;
+    }
+    const std::size_t rows = cv.fixed_size() / 8U;
+    if (rows < kMinRows) {
+        return false;
+    }
+    const std::size_t divisor = std::max<std::size_t>(options.dict_divisor, 1U);
+    const std::size_t threshold = std::min<std::size_t>(rows / divisor, kMaxCardinality);
+    const std::uint8_t* base = cv.fixed_data();
+    auto value_at = [&](std::size_t i) {
+        std::uint64_t v = 0;
+        std::memcpy(&v, base + i * 8U, 8U);
+        return v;
+    };
+
+    // The sample: 32 evenly spaced blocks, each a run of consecutive values (none under one block).
+    if (rows >= kBlockValues) {
+        const std::size_t stride = rows / kSampleBlocks;
+        const std::size_t per_block = std::min<std::size_t>(kSampleBlockValues, stride);
+        std::vector<std::uint64_t> sample;
+        sample.reserve(kSampleBlocks * per_block);
+        for (std::size_t b = 0; b < kSampleBlocks; ++b) {
+            for (std::size_t j = 0; j < per_block; ++j) {
+                sample.push_back(value_at(b * stride + j));
+            }
+        }
+        std::unordered_set<std::uint64_t> seen(sample.begin(), sample.end());
+        const double ratio = static_cast<double>(seen.size()) / static_cast<double>(sample.size());
+        if (ratio >= 0.98 || ratio * static_cast<double>(rows) > static_cast<double>(threshold)) {
+            return false;
+        }
+    }
+
+    // The whole column: distinct values in first-appearance order, and each row's index.
+    std::unordered_map<std::uint64_t, std::uint32_t> index_of;
+    index_of.reserve(std::min<std::size_t>(threshold + 1U, rows));
+    std::vector<std::uint64_t> distinct;
+    std::vector<std::uint32_t> indices;
+    indices.reserve(rows);
+    for (std::size_t i = 0; i < rows; ++i) {
+        const std::uint64_t v = value_at(i);
+        const auto [it, inserted] = index_of.try_emplace(v, static_cast<std::uint32_t>(distinct.size()));
+        if (inserted) {
+            if (distinct.size() >= threshold) {
+                return false;  // one more entry than the threshold allows
+            }
+            distinct.push_back(v);
+        }
+        indices.push_back(it->second);
+    }
+    if (distinct.size() < 2U) {
+        return false;  // a constant column is stored as one value, not a dictionary
+    }
+
+    // The dictionary's values: bitpacked when one block of the width is smaller than the raw values
+    // (and always out of line above one block); otherwise the general codec.
+    const std::size_t count = distinct.size();
+    std::vector<std::uint8_t> raw(count * 8U);
+    std::memcpy(raw.data(), distinct.data(), raw.size());
+    const unsigned width = bitpack::bit_width(raw.data(), count, 8U);
+    if (width == 0U) {
+        return false;
+    }
+    auto& plan = cv.structural_dict_plan;
+    std::vector<std::uint8_t> block;
+    if (count > kBlockValues) {
+        // The reader's out-of-line tail is ambiguous when its packed size equals its raw size; refuse that case.
+        const std::size_t tail = count % kBlockValues;
+        if (tail != 0U && tail == ::nanom::columnar::fastlanes::packed_words_1024<std::uint64_t>(width)) {
+            return false;
+        }
+        bitpack::encode_out_of_line(raw.data(), count, width, 8U, block);
+        plan.fixed_values = FixedDictValues::kOutOfLineBitpacking;
+        plan.fixed_width = width;
+    } else if (kBlockValues * width / 8U < raw.size()) {
+        bitpack::encode_block(raw.data(), count, 8U, block);
+        plan.fixed_values = FixedDictValues::kInlineBitpacking;
+    } else if (options.dict_values_compression == "none") {
+        block = raw;
+        plan.fixed_values = FixedDictValues::kFlat;
+    } else if (options.dict_values_compression.empty() || options.dict_values_compression == "lz4") {
+        std::string error;
+        if (!general::lz4_frame(raw, block, error)) {
+            return false;
+        }
+        plan.fixed_values = FixedDictValues::kLz4;
+    } else {
+        return false;  // zstd and other codecs are not handled for fixed-width dictionaries yet
+    }
+
+    // Size budget: the indices (InlineBitpacking(32): 4 + 128 x width bytes per 1,024 rows) and the dictionary
+    // block must stay below dict-size-ratio of the flat size.
+    const unsigned index_width = bitpack::bit_width(reinterpret_cast<const std::uint8_t*>(indices.data()),
+                                                    indices.size(), 4U);
+    const std::size_t index_chunks = (rows + kBlockValues - 1U) / kBlockValues;
+    const std::size_t index_bytes = index_chunks * (4U + 128U * static_cast<std::size_t>(index_width));
+    const std::size_t encoded = index_bytes + block.size();
+    if (static_cast<double>(encoded) >= static_cast<double>(rows * 8U) * options.dict_size_ratio) {
+        return false;
+    }
+    plan.computed = true;
+    plan.fixed = true;
+    plan.fixed_distinct = std::move(distinct);
+    plan.fixed_block = std::move(block);
+    plan.indices = std::move(indices);
     return true;
 }
 

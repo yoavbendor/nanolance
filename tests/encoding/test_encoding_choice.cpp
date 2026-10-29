@@ -322,12 +322,66 @@ void test_dict() {
 
 }  // namespace
 
+/// `rows` 64-bit values from `distinct` 40-bit values, in a scrambled order (a shuffled column).
+std::vector<std::uint64_t> shuffled_64(std::size_t rows, std::size_t distinct) {
+    std::vector<std::uint64_t> out(rows);
+    for (std::size_t i = 0; i < rows; ++i) {
+        const std::uint64_t k = (static_cast<std::uint64_t>(i) * 2654435761ULL) % distinct;
+        out[i] = (k * 0x9E3779B97F4A7C15ULL) >> 24;  // 40-bit values
+    }
+    return out;
+}
+
+/// Lance's should_dictionary_encode and its dictionary-values choice (W1p), at the cases pylance 12 was measured on.
+void test_fixed_dict() {
+    using FixedDictValues = nano_lance::StructuralDictPlan::FixedDictValues;
+    auto cv = fixed_column(shuffled_64(99, 2));
+    require(!ec::fixed_column_dict_beneficial(cv), "99 rows");
+
+    cv = fixed_column(shuffled_64(100, 2));
+    require(ec::fixed_column_dict_beneficial(cv), "100 rows, 2 distinct");
+    require(cv.structural_dict_plan.fixed && cv.structural_dict_plan.fixed_distinct.size() == 2U,
+            "plan holds 2 values");
+    require(cv.structural_dict_plan.fixed_values == FixedDictValues::kLz4,
+            "100 rows of 2 values: a 1,024-value block is larger than the raw block, so LZ4");
+
+    cv = fixed_column(shuffled_64(50000, 10));
+    require(ec::fixed_column_dict_beneficial(cv) && cv.structural_dict_plan.fixed_distinct.size() == 10U,
+            "50,000 rows, 10 distinct");
+    require(cv.structural_dict_plan.fixed_values == FixedDictValues::kLz4, "10 values: LZ4");
+
+    cv = fixed_column(shuffled_64(50000, 1000));
+    require(ec::fixed_column_dict_beneficial(cv), "50,000 rows, 1,000 distinct");
+    require(cv.structural_dict_plan.fixed_values == FixedDictValues::kInlineBitpacking,
+            "1,000 x 40-bit: 5,120 bytes of blocks against 8,000 raw, so InlineBitpacking");
+
+    cv = fixed_column(shuffled_64(50000, 2000));
+    require(ec::fixed_column_dict_beneficial(cv), "50,000 rows, 2,000 distinct");
+    require(cv.structural_dict_plan.fixed_values == FixedDictValues::kOutOfLineBitpacking &&
+                cv.structural_dict_plan.fixed_width == 40U,
+            "more than one block: OutOfLineBitpacking at the 40-bit width");
+
+    cv = fixed_column(shuffled_64(50000, 5000));
+    require(!ec::fixed_column_dict_beneficial(cv), "5,000 distinct: the sample projects past rows / 2");
+
+    cv = fixed_column(shuffled_64(1000000, 1000));
+    require(!ec::fixed_column_dict_beneficial(cv), "1,000,000 rows, 1,000 distinct: projected past 100,000");
+
+    cv = fixed_column(shuffled_64(50000, 1000));
+    cv.null_count = 1;
+    require(!ec::fixed_column_dict_beneficial(cv), "a column with nulls is not dictionary-encoded here (W1p3)");
+
+    cv = fixed_column(shuffled_64(50000, 1));
+    require(!ec::fixed_column_dict_beneficial(cv), "a constant column is not a dictionary");
+}
+
 int main() {
     test_bitpack();
     test_fixed_rle();
     test_constant();
     test_dict_rle();
     test_dict();
+    test_fixed_dict();
     std::cout << "encoding_choice: ok\n";
     return 0;
 }

@@ -35,4 +35,9 @@ bool decode_block(const std::vector<std::uint8_t>& chunk, std::uint64_t num_valu
                                       std::size_t width_bytes, std::uint8_t* dest, const char* what,
                                       std::string& error);
 
+/// The inverse of decode_out_of_line: `count` values at `width` bits, one width for every 1,024-value block
+/// with no per-block header, the last block zero-padded. `src` holds `count` values of `width_bytes` each.
+void encode_out_of_line(const std::uint8_t* src, std::size_t count, unsigned width, std::size_t width_bytes,
+                        std::vector<std::uint8_t>& out);
+
 }  // namespace nano_lance::bitpack

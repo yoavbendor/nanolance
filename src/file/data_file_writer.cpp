@@ -2673,6 +2673,76 @@ bool write_dict_column(const ColumnEncodeContext& ctx, std::ostream& out, std::v
     return true;
 }
 
+/// Writes a 64-bit fixed-width structural dictionary (W1p): the indices as write_dict_column writes them
+/// (InlineBitpacking(32) chunks), and the dictionary block the decision stored in the plan, with the
+/// descriptor Lance uses for it: InlineBitpacking(64), OutOfLineBitpacking(64, Flat(width)), Flat(64), or
+/// General{LZ4, Flat(64)} when bitpacking did not pay.
+/// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
+bool write_dict_fixed_column(const ColumnEncodeContext& ctx, std::ostream& out, std::vector<pb::ColumnMetadata>& columns) {
+    const auto& plan = ctx.values.structural_dict_plan;
+    const auto rows = ctx.rows;
+    const auto& indices = plan.indices;
+    std::vector<MiniblockChunk> index_chunks;
+    for (std::size_t off = 0; off < indices.size(); off += 1024U) {
+        const auto count = std::min<std::size_t>(1024U, indices.size() - off);
+        MiniblockChunk chunk;
+        chunk.value_count = count;
+        bitpack::encode_block(reinterpret_cast<const std::uint8_t*>(indices.data() + off), count, 4U, chunk.bytes);
+        index_chunks.push_back(std::move(chunk));
+    }
+    const auto payload = miniblock_payload(index_chunks);
+    const auto control = control_buffer_for(index_chunks);
+
+    using FixedDictValues = StructuralDictPlan::FixedDictValues;
+    descriptor::Bytes dict_desc;
+    switch (plan.fixed_values) {
+        case FixedDictValues::kInlineBitpacking:
+            dict_desc = descriptor::inline_bitpacking(64U);
+            break;
+        case FixedDictValues::kOutOfLineBitpacking:
+            dict_desc = descriptor::out_of_line_bitpacking(64U, descriptor::flat(plan.fixed_width));
+            break;
+        case FixedDictValues::kFlat:
+            dict_desc = descriptor::flat(64U);
+            break;
+        case FixedDictValues::kLz4:
+            dict_desc = descriptor::general(descriptor::kLz4, descriptor::flat(64U));
+            break;
+    }
+
+    align64(out);
+    const auto control_offset = pos(out);
+    out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
+    align64(out);
+    const auto data_offset = pos(out);
+    out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+    align64(out);
+    const auto dict_offset = pos(out);
+    out.write(reinterpret_cast<const char*>(plan.fixed_block.data()),
+              static_cast<std::streamsize>(plan.fixed_block.size()));
+
+    pb::ColumnMetadata column;
+    column.encoding = column_encoding_bytes();
+    pb::ColumnPage page;
+    page.buffer_offsets.push_back(control_offset);
+    page.buffer_offsets.push_back(data_offset);
+    page.buffer_offsets.push_back(dict_offset);
+    page.buffer_sizes.push_back(control.size());
+    page.buffer_sizes.push_back(payload.size());
+    page.buffer_sizes.push_back(plan.fixed_block.size());
+    page.length = rows;
+    page.priority = 0;
+    descriptor::MiniBlock m;
+    m.value_compression = descriptor::inline_bitpacking(32U);
+    m.dictionary = dict_desc;
+    m.num_dictionary_items = static_cast<std::uint32_t>(plan.fixed_distinct.size());
+    miniblock_tail(m, rows, 1U);
+    page.encoding = descriptor::page_encoding(m);
+    column.pages.push_back(std::move(page));
+    columns.push_back(std::move(column));
+    return true;
+}
+
 /// Writes a flat (uncompressed) fixed-width column, streaming each miniblock chunk from the values.
 /// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
 bool write_flat_fixed_column(const ColumnEncodeContext& ctx, const FixedWidthChoice& fixed, std::ostream& out,
@@ -3157,7 +3227,8 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
     // A structural dictionary keeps its tag under any codec: its indices take the codec's layout in write_dict_column.
     const auto tag_it = field.metadata.find("nanolance:packing");
     const bool dict_tagged = tag_it != field.metadata.end() && tag_it->second == "dict" &&
-                             values.kind == ColumnValues::Kind::VariableWidth;
+                             (values.kind == ColumnValues::Kind::VariableWidth ||
+                              values.kind == ColumnValues::Kind::FixedWidth);
     const auto packing_it =
         codec_lays_out_values && !dict_tagged ? field.metadata.end() : tag_it;
     const ColumnEncodeContext ctx{field,           values,      rows,          compression_level,
@@ -3259,6 +3330,12 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
     if (!column_has_nulls && packing_it != field.metadata.end() && packing_it->second == "dict" &&
         values.kind == ColumnValues::Kind::VariableWidth) {
         return write_dict_column(ctx, out, columns);
+    }
+    // A 64-bit fixed-width dictionary (W1p): the decision (encoding_choice::fixed_column_dict_beneficial) stored it.
+    // A slice drops the plan (column_slice.cpp); without one the column is written flat, which is correct.
+    if (!column_has_nulls && packing_it != field.metadata.end() && packing_it->second == "dict" &&
+        values.kind == ColumnValues::Kind::FixedWidth && values.structural_dict_plan.computed) {
+        return write_dict_fixed_column(ctx, out, columns);
     }
 
     const bool is_variable = values.kind == ColumnValues::Kind::VariableWidth;

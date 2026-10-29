@@ -140,6 +140,9 @@ bool read_encoding_options(const LanceField& field, encoding_choice::ColumnEncod
             out.dict_size_ratio = value;
         }
     }
+    if (const auto it = field.metadata.find("lance-encoding:dict-values-compression"); it != field.metadata.end()) {
+        out.dict_values_compression = it->second;
+    }
     return true;
 }
 
@@ -744,10 +747,27 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
             if (cv.kind == ColumnValues::Kind::FixedWidth &&
                 lance_logical_type_is_bitpackable_integer(pf->logical_type)) {
                 const auto bpv = lance_logical_type_value_bytes(pf->logical_type);
+                // A 64-bit dictionary (W1p) is decided after RLE, as pylance does. A column with its own
+                // lance-encoding:compression keeps its layout (the dictionary is not written under a codec yet).
+                bool own_codec = false;
+                for (const auto& original : state->schema_mapping.fields) {
+                    if (original.id == pf->id) {
+                        own_codec = original.metadata.find("lance-encoding:compression") != original.metadata.end();
+                        break;
+                    }
+                }
                 if (encoding_choice::fixed_column_rle_plan(cv, bpv, enc_options)) {
                     for (auto& field : disk_schema.fields) {
                         if (field.id == pf->id) {
                             field.metadata["nanolance:packing"] = "rle";
+                            break;
+                        }
+                    }
+                } else if (bpv == 8U && !own_codec && encoding_choice::fixed_column_dict_beneficial(cv, enc_options)) {
+                    for (auto& field : disk_schema.fields) {
+                        if (field.id == pf->id) {
+                            field.metadata["nanolance:packing"] = "dict";
+                            field.metadata.erase("lance-encoding:compression");
                             break;
                         }
                     }

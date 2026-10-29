@@ -307,4 +307,43 @@ bool decode_block(const std::vector<std::uint8_t>& chunk, std::uint64_t num_valu
     }
 }
 
+// The inverse of decode_out_of_line_typed: whole 1,024-value blocks, each packed at `width` bits with
+// no per-block header, then the final partial block packed too (zero-padded). The decoder's own
+// rule for a tail whose packed size equals its raw size is ambiguous, so the caller must refuse
+// that case (see fixed_dictionary_out_of_line_ambiguous in encoding_choice.cpp).
+template <class T>
+void encode_out_of_line_typed(const std::uint8_t* src, std::size_t count, unsigned width,
+                              std::vector<std::uint8_t>& out) {
+    const auto packed_words = ::nanom::columnar::fastlanes::packed_words_1024<T>(width);
+    const std::size_t blocks = (count + 1023U) / 1024U;
+    out.assign(blocks * packed_words * sizeof(T), 0);
+    thread_local std::vector<T> packed;
+    packed.resize(packed_words != 0U ? packed_words : 1U);
+    T in[1024];
+    for (std::size_t b = 0; b < blocks; ++b) {
+        const std::size_t first = b * 1024U;
+        const std::size_t n = std::min<std::size_t>(1024U, count - first);
+        std::memset(in, 0, sizeof(in));
+        std::memcpy(in, src + first * sizeof(T), n * sizeof(T));
+        ::nanom::columnar::fastlanes::pack_1024_unchecked<T>(width, in, packed.data());
+        if (packed_words != 0U) {
+            std::memcpy(out.data() + b * packed_words * sizeof(T), packed.data(), packed_words * sizeof(T));
+        }
+    }
+}
+
+void encode_out_of_line(const std::uint8_t* src, std::size_t count, unsigned width, std::size_t width_bytes,
+                        std::vector<std::uint8_t>& out) {
+    switch (width_bytes) {
+        case 1U:
+            return encode_out_of_line_typed<std::uint8_t>(src, count, width, out);
+        case 2U:
+            return encode_out_of_line_typed<std::uint16_t>(src, count, width, out);
+        case 4U:
+            return encode_out_of_line_typed<std::uint32_t>(src, count, width, out);
+        default:
+            return encode_out_of_line_typed<std::uint64_t>(src, count, width, out);
+    }
+}
+
 }  // namespace nano_lance::bitpack
