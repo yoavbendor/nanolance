@@ -1433,6 +1433,17 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
             fsst_items[k] = k;
         }
     }
+    // Null elements of a fixed_size_list leaf (W1k2): each chunk carries its items' element validity bits as a
+    // second buffer ahead of the values, as at the top level (write_fixed_size_list_column) and as pylance writes
+    // it under a list or struct: FixedSizeList{N x Flat, validity}, two buffers per chunk.
+    const bool element_validity = !values.item_validity.empty();
+    std::string fsl_element;
+    std::uint64_t fsl_items = 0;
+    if (element_validity && (!lance_fixed_size_list_parts(field.logical_type, fsl_element, fsl_items) || fsl_items == 0U)) {
+        error = "element validity on a column that is not a fixed_size_list: " + field.name;
+        return false;
+    }
+    std::vector<std::uint8_t> element_bits;
     const auto rep_width = ser.has_rep ? level_width(ser.rep) : 0U;
     const auto def_width = ser.has_def ? level_width(ser.def) : 0U;
     const std::uint16_t max_rep = ser.has_rep ? *std::max_element(ser.rep.begin(), ser.rep.end()) : 0U;
@@ -1520,8 +1531,22 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
         if (ser.has_def) {
             append_le16(chunk, static_cast<std::uint16_t>(def_bytes.size()));
         }
+        // With element validity the element bits are a buffer of their own, ahead of the values: the header then
+        // holds the validity buffer's size and the values' size.
+        if (element_validity) {
+            element_bits.assign((values_here * fsl_items + 7U) / 8U, 0U);
+            for (std::size_t k = 0; k < values_here * fsl_items; ++k) {
+                const auto at = ser.items[item_at + k / fsl_items] * fsl_items + k % fsl_items;
+                if ((values.item_validity[at >> 3U] >> (at & 7U)) & 1U) {
+                    element_bits[k >> 3U] |= static_cast<std::uint8_t>(1U << (k & 7U));
+                }
+            }
+        }
         const auto value_size_at = chunk.size();
         append_le32(chunk, 0U);
+        if (element_validity) {
+            append_le32(chunk, 0U);
+        }
         pad8(chunk);
         if (ser.has_rep) {
             chunk.insert(chunk.end(), rep_bytes.begin(), rep_bytes.end());
@@ -1529,6 +1554,10 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
         }
         if (ser.has_def) {
             chunk.insert(chunk.end(), def_bytes.begin(), def_bytes.end());
+            pad8(chunk);
+        }
+        if (element_validity) {
+            chunk.insert(chunk.end(), element_bits.begin(), element_bits.end());
             pad8(chunk);
         }
         const auto values_at = chunk.size();
@@ -1539,7 +1568,13 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
             return false;
         }
         const auto value_size = static_cast<std::uint32_t>(chunk.size() - values_at);
-        std::memcpy(chunk.data() + value_size_at, &value_size, 4U);  // little-endian, as append_le32
+        if (element_validity) {
+            const auto bits_size = static_cast<std::uint32_t>(element_bits.size());
+            std::memcpy(chunk.data() + value_size_at, &bits_size, 4U);  // little-endian, as append_le32
+            std::memcpy(chunk.data() + value_size_at + 4U, &value_size, 4U);
+        } else {
+            std::memcpy(chunk.data() + value_size_at, &value_size, 4U);  // little-endian, as append_le32
+        }
         pad8(chunk);
         const auto footprint = chunk.size() - chunk_start;
         const std::uint32_t log_values = last ? 0U : 10U;
@@ -1612,11 +1647,14 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
     } else if (fsst) {
         mini.value_compression =
             descriptor::fsst(fsst_table, item_value_encoding(encoding, field, values.variable.large));
+    } else if (element_validity) {
+        mini.value_compression =
+            descriptor::fixed_size_list(fsl_items, descriptor::flat(static_cast<std::uint32_t>(lance_logical_type_value_bytes(fsl_element) * 8U)), true);
     } else {
         mini.value_compression = item_value_encoding(encoding, field, values.variable.large);
     }
     mini.layers.assign(ser.layers.begin(), ser.layers.end());
-    mini.num_buffers = 1U;
+    mini.num_buffers = element_validity ? 2U : 1U;
     mini.num_items = ser.items.size();
     mini.has_large_chunk = true;
     page.descriptor = descriptor::page_encoding(mini);

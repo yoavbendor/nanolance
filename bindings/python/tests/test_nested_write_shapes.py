@@ -117,6 +117,61 @@ def _write_pylance(lance, table, path):
     return path
 
 
+def _fsl_table(rows: int, n: int, shape: str, seed: int = 1) -> pa.Table:
+    """fixed_size_list<float32, n> with null ELEMENTS (one in five) under a list (3 items a row) or a struct."""
+    rng = np.random.default_rng(seed)
+    total = rows * 3 if shape == "list" else rows
+    values = pa.array(rng.standard_normal(total * n).astype(np.float32), mask=rng.random(total * n) < 0.2)
+    fsl = pa.FixedSizeListArray.from_arrays(values, n)
+    if shape == "list":
+        return pa.table({"l": pa.ListArray.from_arrays(pa.array(np.arange(0, total + 1, 3, dtype=np.int32)), fsl)})
+    return pa.table({"s": pa.StructArray.from_arrays([fsl, pa.array(np.arange(rows))], names=["f", "i"])})
+
+
+FSL_CASES = [("list", 3_000), ("struct", 3_000), ("list", 300_000), ("struct", 300_000)]
+
+
+@pytest.mark.parametrize("shape,rows", FSL_CASES, ids=[f"{s}-{r}" for s, r in FSL_CASES])
+def test_fsl_element_nulls_match_pylance(tmp_path, shape, rows):
+    """fixed_size_list<float32, 2> with null elements under a list or struct: pylance's layout (FixedSizeList with
+    validity, two buffers a chunk), read back by both, take included."""
+    lance = require_pylance()
+    table = _fsl_table(rows, 2, shape)
+    ours = tmp_path / "ours.lance"
+    theirs = tmp_path / "theirs.lance"
+    nl_write_dataset(table, str(ours))
+    lance.write_dataset(table, str(theirs), data_storage_version="2.2")
+
+    expected = table.to_pylist()
+    assert nl_dataset(str(ours)).to_table().to_pylist() == expected
+    assert lance.dataset(str(ours)).to_table().to_pylist() == expected
+    assert _layout(ours) == _layout(theirs)
+
+    wanted = sorted(np.random.default_rng(4).choice(rows, size=min(200, rows), replace=False).tolist())
+    assert lance.dataset(str(ours)).take(wanted).to_pylist() == [expected[i] for i in wanted]
+
+
+@pytest.mark.parametrize("shape", ["list", "struct"])
+def test_fsl_element_nulls_append_to_pylance_dataset(tmp_path, shape):
+    lance = require_pylance()
+    first = _fsl_table(3_000, 2, shape, seed=1)
+    second = _fsl_table(1_000, 2, shape, seed=2)
+    path = str(tmp_path / "pylance_first.lance")
+    lance.write_dataset(first, path, data_storage_version="2.2")
+    nl_write_dataset(second, path, mode="append")
+    expected = first.to_pylist() + second.to_pylist()
+    assert lance.dataset(path).to_table().to_pylist() == expected
+    assert nl_dataset(path).to_table().to_pylist() == expected
+
+
+@pytest.mark.parametrize("shape", ["list", "struct"])
+def test_fsl_element_nulls_of_256_bytes_or_more_stay_refused(tmp_path, shape):
+    """Rows of 256 bytes or more are FullZip in pylance; nanolance has no nested FullZip writer yet (W1k2 stop)."""
+    table = _fsl_table(100, 256, shape)
+    with pytest.raises(ValueError, match="FullZip pages"):
+        nl_write_dataset(table, str(tmp_path / "wide"))
+
+
 def test_struct_child_with_nulls_is_read_by_pylance(tmp_path):
     """A struct whose child has nulls (and the struct none) read back in pylance: nanolance used to write it with
     flat levels that pylance's reader panics on (found with the dictionary shapes, W1k2)."""
