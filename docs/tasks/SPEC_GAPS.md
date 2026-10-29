@@ -42,7 +42,7 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1h | `encoding.compression.general.write` | LZ4 | done for the value layouts measured (LZ4 writer; `compression=lz4` on 64-bit ints and variable-width). Left: General over dictionaries under the option, float zstd layout | done |
 | W1i | `encoding.layout.full_zip.write` | Fixed-width full-zip and per-value compression | measured and done 2026-10-29, see "Result for W1i" | partial (Haiku session, 2026-10-29): the 256-byte rule and `structural-encoding` for fixed-width FSL and fixed_size_binary, element validity included, layout text equal to pylance's for 21 cases. Left: the page split (pylance: one page per input batch), per-value compression of a fixed-width FullZip page, `structural-encoding=fullzip` on variable width, a bool column or a list of lists under fullzip, and a fixed-width FullZip scan that is slower than mini-block (measured) |
 | W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs: read pylance's first, then write them for `lance-encoding:packed` | measured 2026-10-29, see "Measured for W1j" | later, reviewer-led design: reading needs a packed-struct read plan with child fan-out (as `v20_packed_struct_sources` does for 2.0), and the VariablePackedStruct byte layout from Lance's source. Opt-in only, so behind the gaps every dataset meets |
-| W1k1 | `arrow.types.fixed_size_list` (read) | Read what pylance writes: a null element inside a fixed-size list under a list or struct (also W1a's all-null list<fsl>), `fixed_size_list<bool>`, `fixed_size_list<struct>` | measured 2026-10-29, see "Measured for W1k" | next |
+| W1k1 | `arrow.types.fixed_size_list` (read) | Read what pylance writes: a null element inside a fixed-size list under a list or struct (also W1a's all-null list<fsl>), `fixed_size_list<bool>`, `fixed_size_list<struct>` | measured 2026-10-29, see "Measured for W1k" and "Result for W1k1" | partial 2026-10-29: null elements under a list read (and all-null list<fsl>); stopped: `fixed_size_list<bool>` and `fixed_size_list<struct>` (see "Result for W1k1") |
 | W1k2 | `arrow.types.fixed_size_list`, `arrow.types.dictionary` (write) | Write them too, and dictionary columns inside structs and lists | measured 2026-10-29 | after W1k1 |
 | W1p | `encoding.config` | Integer and float dictionaries as Lance 12 writes them (files up to 1.9x pylance's size today) | measured 2026-10-29, see "Measured for W1p" and "Result for W1p" | partial 2026-10-29: int64, uint64, timestamp and date64 dictionaries (no nulls) write pylance's layout (all measured cases, see "Result for W1p, second pass"); left: nullable (W1p3), sorted RLE over dictionary indices (W1p2), float64 and 128-bit |
 | W1q | `encoding.compression.rle` | RLE over more than one mini-block chunk: nanolance's RLE holds its runs in one chunk, so a column of 25,000 runs is not RLE-encoded | W1g | later |
@@ -435,6 +435,44 @@ Not measured yet: the byte layout of `VariablePackedStruct` (field 13). The Lanc
 | fixed_size_list<string, N> | panics (found in W1i) | -- | -- |
 
 So W1k starts with reading (W1k1): three shapes pylance writes that nanolance cannot read.
+
+## Result for W1k1 (2026-10-29, partial: one of the three shapes read)
+
+pylance 12.0.0 writes, `nanolance.read_table`, `take` and a projection are compared with pylance's own read
+(`bindings/python/tests/test_fsl_read_shapes.py`, 3,000 rows; 300,000 rows for list<fsl> with element nulls).
+
+| shape | result |
+|---|---|
+| list<fixed_size_list<float32, N>> with null elements inside valid items (MiniBlock, and FullZip for N = 256) | **read**, equal to pylance (read, take, projection; multi-page) |
+| list<fixed_size_list> with all items null, and all rows null | read (already); `list_fsl_all_null` and `struct_fsl_all_null` leave the strict xfail list in `test_fsl_all_null_items.py` |
+| fixed_size_list<bool, 4> | **stopped, not read** (see below) |
+| fixed_size_list<struct<x: int64>, 2> | **stopped, not read**; the message is still the misleading one (see below) |
+
+What changed: `decode_nested_fixed_list_validity` (`src/encoding/lance_column_decoder.cpp`) no longer drops or
+refuses a fixed_size_list page's element validity. The bits go into the column's `item_validity` at the element
+offset of each page, the representation a top-level fixed_size_list already uses. The writer's refusals are unchanged.
+
+`nlance-pagelayout` for the shapes that are stopped:
+
+```
+fsl_bool4.lance  v (fixed_size_list:bool:4): MiniBlock{values=FixedSizeList{4xFlat(1)},rows=3000,buffers=1}
+fsl_struct2.lance  v.item.x (int64): MiniBlock{values=InlineBitpacking(64),rows=6000,buffers=1}
+```
+
+- **fixed_size_list<bool, 4>.** The element is 1 bit, so the miniblock fixed_size_list path (which accepts whole-byte
+  elements only, `lance_column_decoder.cpp`, the `kFixedSizeList` case) refuses it as an unsupported encoding. Reading it
+  means a bit-level item path in the shared miniblock chunk reader: `decode_bool_packed_column` sizes chunks and
+  pages by row count (`chunk.items`, `page.length`), which would have to scale by N, and element validity (a second buffer)
+  would need the same. I stopped on that scope and did not size it.
+- **fixed_size_list<struct<x: int64>, 2>.** The struct is a leaf field `v.item.x` of 6,000 items under the fixed-size
+  layer. The per-row fallback in `src/scan/lance_table_reader.cpp` gives one message for its `Skip`, `FixedSizeList` and
+  `Dictionary` plan kinds, and that message is the dictionary one. A working read needs the bulk assembly to build a struct
+  child of `rows * N` items under a FixedSizeList. I tried refusing it by name in the plan builder; that branch was never
+  reached for this column (the plan kind is not `FixedSizeList`), so I reverted it. The message stays misleading. Next step:
+  find which plan kind `v` gets for this column and refuse that case by name.
+
+Not started: the W1k2 writer side (both shapes are still refused on write), and C++ unit tests for the nested element
+validity path (the Python tests cover it end to end).
 
 ## Measured for W1p (integer and float dictionaries, 2026-10-29)
 
