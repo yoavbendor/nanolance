@@ -35,7 +35,7 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1c | `io.store.storage_options` | Every `AmazonS3ConfigKey` alias, and object_store's boolean spellings | object_store 0.12.4 `aws/builder.rs`: see the brief | done 2026-10-28; left: virtual-hosted style and skip_signature (nanos3reader has no switch) |
 | W1d | (test coverage) | Direct C++ tests for the modules in `tools/tests_allow.txt` that can have one | -- | done 2026-10-28: 4 direct tests; found and fixed the projected-column status; the create-mode commit question is open |
 | W1l | `file.version.2_0`, `file.version.2_1` | Test every modification of a 2.0 / 2.1 dataset against pylance, and document what works | measured 2026-10-29, see below | done 2026-10-29: 22 cases (2.0 and 2.1 x 11 operations) match pylance, no library change; left: nothing for these rows (writing 2.0 / 2.1 stays unscheduled, W1n) |
-| W1e | `arrow.fields.primary_key`, `table.schema.primary_key` | Unenforced primary key: Arrow metadata to fields 12-15, and back | measured, see below | next (restarted: the first session's work was lost in a container restart) |
+| W1e | `arrow.fields.primary_key`, `table.schema.primary_key` | Unenforced primary key: Arrow metadata to fields 12-15, and back | done 2026-10-29: fields 12, 13, 15 written and read; the Arrow key metadata read as pylance does; pylance's write checks; merge_insert's default key by position. Left: whether pylance writes the key into a data file's schema (not measured); a key nested in a struct as the merge_insert default |
 | W1m | `file.version.2_0`, `file.version.2_1` | Which older pylance / LanceDB releases read a dataset with nanolance's 2.2 files beside 2.0 / 2.1 ones | to measure | next; decides W1n |
 | W1f | `file.structure.page_priority` | Write each page's priority as Lance does | to measure | next |
 | W1g | `encoding.config` | Honour the `lance-encoding:*` field metadata Lance honours | to measure, per key | next |
@@ -84,3 +84,21 @@ reviewed, from the rows the README tables list at that point.
   its ancestors must not be nullable: Field(id=0, name=id, type=int64)`. A list column is refused with
   `Primary key column must be a leaf: Field(id=0, name=l, type=list, children=[Field(id=1, name=item,
   type=int32), ])`. A non-null leaf inside a non-null struct is accepted.
+- Measured beyond the spec (pylance 12.0.0, 2026-10-29):
+  - Raw manifest fields: `:position=1` writes field 12 = 1 and field 13 = 1; the flag alone writes 12 = 1; `:position=0`
+    writes 12 = 1 (13 is left out); clustering `:position=1` writes field 15 = 1 only; `:position=2` with the flag writes 12 and 13 = 2.
+  - Arrow metadata comes back exactly as written, for both spellings (nothing added).
+  - The flag is truthy when it is `true`, `yes`, `on`, `1` or `y`, without case (`TRUE`, `On`, `Y` count). `0`, `no`, `off`,
+    `false`, `t`, `f`, `2`, `enabled`, `01`, `1 `, ` true`, `true\n` and `""` are not keys.
+  - A position that parses (Rust `u32::from_str`: an optional `+`, digits, 32 bits; `+2` is 2, `007` is 7) decides: a key at
+    that position, whatever the flag says (`:position=3` with flag `false` is a key at 3; `:position=0` with flag `false`
+    is a key). A position that does not parse (`abc`, `-1`, ` 2`, `4294967296`) falls back to the flag: `abc` with the flag
+    `true` is a key at 0, and with no flag it is no key.
+  - Position 0 reads back as no position (`unenforced_primary_key_position()` is None), as proto3 leaves it out; the key
+    still counts for merge_insert. Clustering position 0 is not in the clustering key.
+  - merge_insert without `on` takes every key column (the order of the `on` list is not measured: nanolance sorts by position,
+    then field id); duplicate positions (1 and 1) and gaps are accepted.
+  - Refusals, in the order pylance makes them: a key that is not a leaf (`must be a leaf`, also a struct key); an ancestor
+    that is nullable, root first (`must be nullable`, naming the nullable ancestor, even when the key is nullable too); a
+    list ancestor (`must not be in a list type`, naming the list); the key itself nullable (`must be nullable`, naming the
+    key). The message's Field lists its children: `Field(id=0, name=s, type=struct, children=[Field(id=1, name=id, type=int64), ])`.

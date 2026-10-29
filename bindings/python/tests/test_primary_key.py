@@ -161,3 +161,16 @@ def test_non_null_leaf_in_non_null_struct_is_a_key(tmp_path):
         path = str(tmp_path / f"{name}.lance")
         lib.write_dataset(table, path)
         assert lance.dataset(path).to_table().column("s").combine_chunks().field("id").to_pylist() == [1, 2, 3]
+
+
+def test_append_keeps_the_key_through_the_manifest(tmp_path):
+    # The key is also in the manifest's Field fields 12 and 13, and an append rewrites the manifest: the key must
+    # still be there afterwards, read by pylance as a key and by nanolance as one.
+    lance = require_pylance()
+    path = str(tmp_path / "n.lance")
+    schema = _table({POSITION.encode(): b"1"}).schema
+    nl.write_dataset(_table({POSITION.encode(): b"1"}), path)
+    nl.write_dataset(pa.table({"id": [7], "value": [70]}, schema=schema), path, mode="append")
+    assert _key_positions(lance, path)[0] == 1
+    assert _merged(lance, path, _source()) == [10, 200, 30, 70, 900]
+    assert nl.dataset(path).lance_schema.fields()[0].unenforced_primary_key_position() == 1
