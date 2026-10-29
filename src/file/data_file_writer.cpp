@@ -553,10 +553,14 @@ std::uint8_t offset_bits_token(bool large) {
 // scattered low-cardinality strings): value_compression = InlineBitpacking(32), dictionary =
 // Variable+Flat(32) without general compression, num_buffers=1, has_large_chunk=true (the chunk-meta
 // words are u32 to match -- see control_buffer_for).
-std::vector<std::uint8_t> page_layout_bytes_dict(std::uint32_t num_distinct, std::uint64_t num_items, bool large) {
+// `dict_scheme` 0 is the plain dictionary buffer; descriptor::kZstd / kLz4 wrap it in General (pylance's
+// lance-encoding:dict-values-compression).
+std::vector<std::uint8_t> page_layout_bytes_dict(std::uint32_t num_distinct, std::uint64_t num_items, bool large,
+                                                 std::uint64_t dict_scheme = 0U) {
     descriptor::MiniBlock m;
     m.value_compression = descriptor::inline_bitpacking(32U);
-    m.dictionary = descriptor::variable(descriptor::flat(offset_bits_token(large)));
+    const auto plain = descriptor::variable(descriptor::flat(offset_bits_token(large)));
+    m.dictionary = dict_scheme == 0U ? plain : descriptor::general(dict_scheme, plain);
     m.num_dictionary_items = num_distinct;
     miniblock_tail(m, num_items, 1U);
     return descriptor::page_encoding(m);
@@ -2427,7 +2431,37 @@ bool write_dict_column(const ColumnEncodeContext& ctx, std::ostream& out, std::v
     }
     const auto payload = miniblock_payload(index_chunks);
     const auto control = control_buffer_for(index_chunks);
-    const auto dict_block = dictionary::encode_variable(distinct, values.variable.large);
+    // lance-encoding:dict-values-compression = none | lz4 | zstd (+ dict-values-compression-level) wraps the whole
+    // dictionary buffer in General. Absent keeps the plain buffer, nanolance's default, unchanged.
+    std::uint64_t dict_scheme = 0U;
+    std::vector<std::uint8_t> dict_block = dictionary::encode_variable(distinct, values.variable.large);
+    if (const auto it = field.metadata.find("lance-encoding:dict-values-compression"); it != field.metadata.end()) {
+        int level = ctx.compression_level;
+        if (const auto lv = field.metadata.find("lance-encoding:dict-values-compression-level");
+            lv != field.metadata.end()) {
+            int parsed = 0;
+            const auto [end, ec] = std::from_chars(lv->second.data(), lv->second.data() + lv->second.size(), parsed);
+            if (ec == std::errc{} && end == lv->second.data() + lv->second.size()) {
+                level = parsed;
+            }
+        }
+        // The value was checked by read_dict_values_option before any page was written: none, lz4 or zstd.
+        std::vector<std::uint8_t> framed;
+        std::string error;
+        if (it->second == "zstd") {
+            dict_scheme = descriptor::kZstd;
+            if (!general::zstd_frame(dict_block, level, framed, error)) {
+                return false;
+            }
+            dict_block = std::move(framed);
+        } else if (it->second == "lz4") {
+            dict_scheme = descriptor::kLz4;
+            if (!general::lz4_frame(dict_block, framed, error)) {
+                return false;
+            }
+            dict_block = std::move(framed);
+        }
+    }
 
     align64(out);
     const auto control_offset = pos(out);
@@ -2451,7 +2485,7 @@ bool write_dict_column(const ColumnEncodeContext& ctx, std::ostream& out, std::v
     page.length = rows;
     page.priority = 0;
     page.encoding =
-        page_layout_bytes_dict(static_cast<std::uint32_t>(distinct.size()), rows, values.variable.large);
+        page_layout_bytes_dict(static_cast<std::uint32_t>(distinct.size()), rows, values.variable.large, dict_scheme);
     column.pages.push_back(std::move(page));
     columns.push_back(std::move(column));
     return true;
@@ -2872,6 +2906,14 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
     // stores them uncompressed. Such a column skips FSST, which would otherwise be chosen where it pays.
     ColumnCodec codec = ColumnCodec::kAbsent;
     if (!values.needs_nested_pages() && !read_column_codec(field, codec, error)) {
+        return false;
+    }
+    // lance-encoding:dict-values-compression names the dictionary buffer's codec; refused here, by name, so no
+    // page is written before the value is known to be one the writer can frame.
+    if (const auto dv = field.metadata.find("lance-encoding:dict-values-compression");
+        dv != field.metadata.end() && dv->second != "none" && dv->second != "lz4" && dv->second != "zstd") {
+        error = "unknown lance-encoding:dict-values-compression '" + dv->second + "' on column '" + field.name +
+                "' (expected lz4, zstd or none)";
         return false;
     }
     // `lance-encoding:compression-level` sets the zstd level of a zstd column (pylance: a number is the

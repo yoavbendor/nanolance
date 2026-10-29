@@ -38,7 +38,7 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1e | `arrow.fields.primary_key`, `table.schema.primary_key` | Unenforced primary key: Arrow metadata to fields 12-15, and back | done 2026-10-29: fields 12, 13, 15 written and read; the Arrow key metadata read as pylance does; pylance's write checks; merge_insert's default key by position. Left: whether pylance writes the key into a data file's schema (not measured); a key nested in a struct as the merge_insert default |
 | W1m | `file.version.2_0`, `file.version.2_1` | Which older pylance / LanceDB releases read a dataset with nanolance's 2.2 files beside 2.0 / 2.1 ones | measured 2026-10-29, see below | done: only pylance 12 and later read the mix |
 | W1f | `file.structure.page_priority` | Write each page's priority as Lance does | measured 2026-10-29, see "Measured for W1f (page priority)" | done 2026-10-29: every page's `priority` is the top-level row of its first row, as pylance writes it (int64, list, string, FSL128 measured); single-page columns keep 0 |
-| W1g | `encoding.config` | Honour the `lance-encoding:*` field metadata Lance honours | partial: `compression`, `compression-level` done; `rle-threshold`, `dict-divisor`, `dict-size-ratio`, `dict-values-compression`, `bss`, `structural-encoding` left | next |
+| W1g | `encoding.config` | Honour the `lance-encoding:*` field metadata Lance honours | partial (Haiku session, 2026-10-29): done `rle-threshold`, `dict-divisor`, `dict-size-ratio` (refused by name outside (0, 1]), `dict-values-compression` (+ level); reader General over InlineBitpacking. Left: `dict` columns under `compression` (indices as General{codec,BSS{Flat(32)}}: needs the reader's dictionary-index path to unwrap General, then the writer), integer dictionaries (pylance dictionary-encodes low-cardinality ints; nanolance has none), `bss`, `structural-encoding`, multi-chunk RLE, the C++ tests for the refusal and the decode | next |
 | W1h | `encoding.compression.general.write` | LZ4 | done for the value layouts measured (LZ4 writer; `compression=lz4` on 64-bit ints and variable-width). Left: General over dictionaries under the option, float zstd layout | done |
 | W1i | `encoding.layout.full_zip.write` | Fixed-width full-zip and per-value compression | to measure | later |
 | W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs, read and write | to measure | later |
@@ -234,3 +234,37 @@ The table above does not reproduce for every type: its string rows used a dictio
 | FixedSizeList<f32,4>, list<int32> | ignored | ignored | ignored |
 
 Unknown values: `brotli` and `LZ4` are refused on int, float, bool and string columns (`Unknown compression scheme`), accepted and ignored on fixed-size-list and list. `compression-level` alone changes nothing; with `compression=zstd` a number is the level (`30` is accepted), and a non-number is accepted and ignored (default level). lz4 ignores the level.
+
+### W1g measured (2026-10-29, pylance 12.0.0, 50,000 rows, one column per dataset)
+
+Source for the thresholds: lance v12.0.0 `rust/lance-encoding/src/encodings/logical/primitive.rs` (`should_dictionary_encode`:
+divisor default 2, size ratio default 0.8, min 100 rows, cap 100,000 distinct, a 4,096-row sample with unique ratio
+>= 0.98 rejected and projected cardinality `unique_ratio * rows` above `rows / divisor` rejected) and
+`rust/lance-encoding/src/compression.rs` (`rle_is_applicable`: with `rle-threshold` set, RLE only when
+`run_count < rows * threshold`; without it, the size model alone).
+
+| column, option | pylance 12 layout | nanolance after W1g |
+|---|---|---|
+| int64 runs of 2, default / `rle-threshold=1` | `Rle{Flat(64),Flat(8)}` | `InlineBitpacking(64)` (default unchanged); 25,000 runs do not fit one miniblock, so no RLE: a gap |
+| int64 runs of 5, `rle-threshold=0` / `0.1` | `InlineBitpacking(32)` + `dict=Bitpacked(64)x10000` | `InlineBitpacking(64)`: the RLE is off as set, the dictionary is missing (no integer dictionary) |
+| int64 runs of 5, `rle-threshold=0.5` / default | `Rle{Flat(32),Flat(8)}` + dict | no RLE: 10,000 runs do not fit one miniblock (multi-chunk RLE missing): gap |
+| int64 runs of 50, default | `Rle{Flat(32),Flat(8)}` + `dict=InlineBitpacking(64)x1000` | `Rle{Flat(64)}` without dictionary: gap in the dictionary only |
+| same, `rle-threshold=0` | `InlineBitpacking(32)` + dict | RLE off (asserted); dict missing |
+| same, `rle-threshold=0.1` / `0.5` / `1` | RLE + dict | RLE kept (asserted) |
+| 5,000-distinct strings (`unique-NNNNNNNN-`), default | `Fsst{...}` (sample projection 0.68 x 50,000 > 25,000) | `Variable` dictionary (full count 5,000 <= 25,000): a default that is not changed |
+| same, `dict-divisor=1000` / `0` / `1` | FSST / FSST / `InlineBitpacking(32)` + `General{LZ4,Variable}` | FSST / (`0` reads as 1) / `InlineBitpacking(32)` + plain `Variable` (LZ4 default not adopted; `dict-values-compression=none` is the matching layout) |
+| int64 1,000 values, default / `dict-divisor=1000` / `1` | dict `InlineBitpacking(64)x1000` / `InlineBitpacking(64)` / dict | no integer dictionary: gap for default and `1`; `1000` matches |
+| same strings, `dict-size-ratio=0.1` (divisor 1) | `Fsst{...}` | `Fsst{...}` (asserted) |
+| same, `dict-size-ratio=0.0` / `1.5` | panic `not in the range (0, 1]` | refused by name (asserted) |
+| same, `dict-size-ratio=abc` | default | default (values and readability asserted; layout differs on the default, as above) |
+| dict (divisor 1), `dict-values-compression=none` / `lz4` / `zstd` | `Variable` / `General{LZ4,Variable}` / `General{ZSTD,Variable}` | same (asserted); indices `InlineBitpacking(32)` in both |
+| `dict-values-compression=brotli` | refused: `Unknown compression scheme: brotli` | refused by name, on any column that carries it |
+| same, `dict-values-compression-level` | shape unchanged | accepted; lz4 ignores it, zstd takes it |
+| float64, `compression=zstd` | `General{ZSTD,InlineBitpacking(64)}` | read (xfail removed); nanolance writes `Flat(64)` as before (writer gap, unchanged) |
+| float64, `compression=lz4` | `InlineBitpacking(64)` (lz4 ignored) | unchanged |
+| string dictionary, `compression=lz4` / `zstd` / `none` | `values=General{LZ4 / ZSTD,BSS{Flat(32)}}` (or `Flat(32)`), dict `General{LZ4,Variable}` | not honoured yet: the option is erased on dictionary columns (write_session.cpp), so these stay as before |
+| int64 1,000 values, `compression=lz4` / `zstd` / `none` | `General{..,BSS{Flat(32)}}` / `Flat(32)` indices, dict `InlineBitpacking(64)x1000` | not honoured yet (no integer dictionary) |
+
+Byte-identical check: `nlbench_gendata <dir> 50000` on the base commit and on this branch writes the same data-file md5
+(one data file, `84b4dce7912cd80d047e779f01a143fb`); manifests and transactions differ only by their random names and
+timestamps, as they always do.

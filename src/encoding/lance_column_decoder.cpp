@@ -2846,6 +2846,7 @@ bool decode_fixed_width_column(const EncodingsIo& io, const pb::Field& on_disk_f
     }
     std::uint64_t validity_rows = 0;
     std::uint64_t page_rows_before = 0;
+    std::vector<std::uint8_t> raw;  // one unframed chunk of a General-wrapped bit-packed value buffer
     ColumnEncodingPlan later_page;
     for (std::size_t page_index = 0; page_index < column_metadata.pages.size(); ++page_index) {
         const auto& page = column_metadata.pages[page_index];
@@ -2870,6 +2871,17 @@ bool decode_fixed_width_column(const EncodingsIo& io, const pb::Field& on_disk_f
         //     value count, so a flat int64 chunk holds whatever fits.
         std::uint64_t remaining = page.length;
         for (auto& chunk : chunks) {
+            // General{ZSTD | LZ4, InlineBitpacking} (pylance's float64 zstd layout): each chunk's bit-packed block
+            // is framed by the codec. Unframe it, then decode the block as usual.
+            if (bitpacked && plan->value_scheme != page_layout::BufferScheme::kNone) {
+                const bool unframed = plan->value_scheme == page_layout::BufferScheme::kLz4
+                                          ? lz4_block::decompress_sized(chunk.values, raw, error)
+                                          : general::zstd_unframe(chunk.values, raw, error);
+                if (!unframed) {
+                    return false;
+                }
+                std::swap(chunk.values, raw);
+            }
             if (encoding_plan.fsl_item_validity) {
                 // [element validity bits][values]: move the values into place and keep the bits.
                 if (chunk.extra_buffers.size() != 1U) {

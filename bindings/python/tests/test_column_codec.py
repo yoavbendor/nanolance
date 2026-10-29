@@ -70,11 +70,6 @@ KNOWN_LAYOUT_GAPS = {
     ("float64", "zstd"): "pylance: General{ZSTD,InlineBitpacking(64)}; nanolance's float default is Flat(64)",
 }
 
-# Layouts pylance writes that nanolance does not read yet (measured: General over InlineBitpacking).
-KNOWN_READ_GAPS = {
-    ("float64", "zstd"): "General{ZSTD,InlineBitpacking(64)} from pylance: the reader has no General over bitpacking",
-}
-
 CASES = [
     ("int64", "lz4"), ("int64", "zstd"), ("int64", "none"),
     ("int32", "lz4"), ("int32", "zstd"), ("int32", "none"),
@@ -103,8 +98,6 @@ def test_nanolance_reads_what_pylance_writes_for_the_option(tmp_path, kind, opti
     table = _table(kind, _opt("compression", option))
     path = tmp_path / "pylance.lance"
     lance.write_dataset(table, str(path))
-    if (kind, option) in KNOWN_READ_GAPS:
-        pytest.xfail(KNOWN_READ_GAPS[(kind, option)])
     assert nl_dataset(str(path)).to_table() == table
 
 
