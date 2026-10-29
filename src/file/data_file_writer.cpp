@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -421,7 +422,8 @@ public:
         page.buffer_offsets = {control_offset, payload_offset_};
         page.buffer_sizes = {control_.size(), payload_size_};
         page.length = rows_;
-        page.priority = 0;
+        page.priority = first_row_;  // the pages before this one hold this many top-level rows
+        first_row_ += rows_;
         control_.clear();
         payload_size_ = 0;
         rows_ = 0;
@@ -434,6 +436,7 @@ private:
     std::uint64_t payload_offset_ = 0;
     std::uint64_t payload_size_ = 0;
     std::uint64_t rows_ = 0;
+    std::uint64_t first_row_ = 0;  // top-level rows in the pages finished so far
     std::size_t chunks_ = 0;
 };
 
@@ -466,9 +469,10 @@ std::vector<std::uint8_t> page_layout_bytes(std::uint32_t bits_token, std::uint6
 // chunk's value buffer is interpreted as [u64 LE uncompressed size][zstd frame]. Byte layout mirrors
 // what lance 7.0 emits for a zstd variable-width column (see memory: lance-zstd-variable-encoding).
 descriptor::MiniBlock variable_width_structural_payload_zstd(std::uint8_t bits_token, std::uint64_t rows,
-                                                             bool nullable) {
+                                                             bool nullable,
+                                                             std::uint64_t general_scheme = descriptor::kZstd) {
     descriptor::MiniBlock m;
-    m.value_compression = descriptor::general(descriptor::kZstd, descriptor::variable(descriptor::flat(bits_token)));
+    m.value_compression = descriptor::general(general_scheme, descriptor::variable(descriptor::flat(bits_token)));
     if (nullable) {
         m.def_compression = repdef_encoding_bytes();
     }
@@ -476,9 +480,11 @@ descriptor::MiniBlock variable_width_structural_payload_zstd(std::uint8_t bits_t
     return m;
 }
 
+// `general_scheme` is descriptor::kZstd (the default) or descriptor::kLz4 (`lance-encoding:compression=lz4`).
 std::vector<std::uint8_t> page_layout_bytes_variable_zstd(std::uint8_t bits_token, std::uint64_t rows,
-                                                          bool nullable = false) {
-    return descriptor::page_encoding(variable_width_structural_payload_zstd(bits_token, rows, nullable));
+                                                          bool nullable = false,
+                                                          std::uint64_t general_scheme = descriptor::kZstd) {
+    return descriptor::page_encoding(variable_width_structural_payload_zstd(bits_token, rows, nullable, general_scheme));
 }
 
 // Fixed-width CompressiveEncoding wrapped General(ZSTD) -> ByteStreamSplit -> Flat, matching what stock
@@ -492,11 +498,13 @@ std::vector<std::uint8_t> page_layout_bytes_variable_zstd(std::uint8_t bits_toke
 //   -> ByteStreamSplit{ f1 values = above }                          -- f9 of CompressiveEncoding
 //   -> General{ f1 BufferCompression{f1 scheme=ZSTD(2)}, f3 values = above }   -- f10 of CompressiveEncoding
 //   -> MiniBlockLayout.value_compression (f3) = CompressiveEncoding{ f10 General = above }
-descriptor::MiniBlock fixed_width_structural_payload_bss_zstd(std::uint8_t bits_token, std::uint64_t rows,
-                                                              bool nullable) {
+// The same shape with LZ4 (`lance-encoding:compression=lz4`, pylance's measured layout for an int64 column):
+// General{LZ4, ByteStreamSplit{Flat(64)}}. `general_scheme` is descriptor::kZstd or descriptor::kLz4.
+descriptor::MiniBlock fixed_width_structural_payload_bss_general(std::uint8_t bits_token, std::uint64_t rows,
+                                                                 bool nullable, std::uint64_t general_scheme) {
     descriptor::MiniBlock m;
     m.value_compression =
-        descriptor::general(descriptor::kZstd, descriptor::byte_stream_split(descriptor::flat(bits_token)));
+        descriptor::general(general_scheme, descriptor::byte_stream_split(descriptor::flat(bits_token)));
     if (nullable) {
         m.def_compression = repdef_encoding_bytes();
     }
@@ -504,9 +512,10 @@ descriptor::MiniBlock fixed_width_structural_payload_bss_zstd(std::uint8_t bits_
     return m;
 }
 
-std::vector<std::uint8_t> page_layout_bytes_bss_zstd(std::uint8_t bits_token, std::uint64_t rows,
-                                                     bool nullable = false) {
-    return descriptor::page_encoding(fixed_width_structural_payload_bss_zstd(bits_token, rows, nullable));
+std::vector<std::uint8_t> page_layout_bytes_bss_general(std::uint8_t bits_token, std::uint64_t rows,
+                                                        std::uint64_t general_scheme, bool nullable = false) {
+    return descriptor::page_encoding(
+        fixed_width_structural_payload_bss_general(bits_token, rows, nullable, general_scheme));
 }
 
 void append_le32(std::vector<std::uint8_t>& out, std::uint32_t value) {
@@ -544,10 +553,31 @@ std::uint8_t offset_bits_token(bool large) {
 // scattered low-cardinality strings): value_compression = InlineBitpacking(32), dictionary =
 // Variable+Flat(32) without general compression, num_buffers=1, has_large_chunk=true (the chunk-meta
 // words are u32 to match -- see control_buffer_for).
-std::vector<std::uint8_t> page_layout_bytes_dict(std::uint32_t num_distinct, std::uint64_t num_items, bool large) {
+// `dict_scheme` 0 is the plain dictionary buffer; descriptor::kZstd / kLz4 wrap it in General (pylance's
+// lance-encoding:dict-values-compression).
+// `index_layout` is the indices' encoding: bit-packed (the default), Flat(32) under compression=none, or
+// General{index_scheme, ByteStreamSplit{Flat(32)}} under compression=lz4|zstd (pylance's shape, W1r).
+enum class DictIndexLayout { kBitpacked, kFlat, kGeneral };
+
+std::vector<std::uint8_t> page_layout_bytes_dict(std::uint32_t num_distinct, std::uint64_t num_items, bool large,
+                                                 std::uint64_t dict_scheme = 0U,
+                                                 DictIndexLayout index_layout = DictIndexLayout::kBitpacked,
+                                                 std::uint64_t index_scheme = descriptor::kZstd) {
     descriptor::MiniBlock m;
-    m.value_compression = descriptor::inline_bitpacking(32U);
-    m.dictionary = descriptor::variable(descriptor::flat(offset_bits_token(large)));
+    switch (index_layout) {
+        case DictIndexLayout::kBitpacked:
+            m.value_compression = descriptor::inline_bitpacking(32U);
+            break;
+        case DictIndexLayout::kFlat:
+            m.value_compression = descriptor::flat(32U);
+            break;
+        case DictIndexLayout::kGeneral:
+            m.value_compression =
+                descriptor::general(index_scheme, descriptor::byte_stream_split(descriptor::flat(32U)));
+            break;
+    }
+    const auto plain = descriptor::variable(descriptor::flat(offset_bits_token(large)));
+    m.dictionary = dict_scheme == 0U ? plain : descriptor::general(dict_scheme, plain);
     m.num_dictionary_items = num_distinct;
     miniblock_tail(m, num_items, 1U);
     return descriptor::page_encoding(m);
@@ -1607,7 +1637,7 @@ bool write_nested_column(std::ostream& out, const LanceField& field, const Colum
         }
         pb::ColumnPage page;
         page.length = n;
-        page.priority = 0;
+        page.priority = row;
         if (ser.items.empty()) {
             // No values at all -- every list empty or null. Lance writes a ConstantLayout with no
             // value and the levels as raw u16 buffers [rep, def]; so does this.
@@ -1744,7 +1774,7 @@ bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& value
         page.buffer_offsets.push_back(write_buffer(out, rep_index));
         page.buffer_sizes.push_back(rep_index.size());
         page.length = end - first;
-        page.priority = 0;
+        page.priority = first;
         page.encoding = descriptor::page_encoding(layout);
         column.pages.push_back(std::move(page));
         row = end;
@@ -1867,6 +1897,10 @@ struct FileWriteState {
 
 /// One column's inputs for the per-encoding writers below: its field and values, the row count, what
 /// encode_column has already decided about it (its compression and its nulls), and its nanolance:packing tag.
+/// The per-column general compression a field asks for with `lance-encoding:compression` (pylance's
+/// option). kAbsent: the field says nothing, and nanolance chooses as it always has.
+enum class ColumnCodec { kAbsent, kUncompressed, kLz4, kZstd };
+
 struct ColumnEncodeContext {
     const LanceField& field;
     const ColumnValues& values;
@@ -1877,13 +1911,15 @@ struct ColumnEncodeContext {
     bool compress_column;
     bool column_has_nulls;
     decltype(LanceField::metadata)::const_iterator packing_it;
+    ColumnCodec codec;
 };
 
 /// The fixed-width encoding picked for a column: bit-packed, bool, byte-stream-split + zstd, or flat.
 struct FixedWidthChoice {
     bool bitpack;
     bool bool_pack;
-    bool bss_zstd;
+    bool bss_general;  // byte-stream-split, then General(general_scheme) per chunk
+    std::uint64_t general_scheme;  // descriptor::kZstd or descriptor::kLz4 (bss_general only)
     std::size_t bytes_per_value;
 };
 
@@ -2079,6 +2115,146 @@ bool write_dictionary_column(const ColumnEncodeContext& ctx, std::ostream& out,
     mini_block_tail(m, rows, 1U, column_has_nulls);
     page.encoding = descriptor::page_encoding(m);
     column.pages.push_back(std::move(page));
+    columns.push_back(std::move(column));
+    return true;
+}
+
+/// Lance 12's rule for fixed-width values (`MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE` in primitive.rs): a column
+/// whose values are this wide or wider is written as FullZip pages, a narrower one as mini-block chunks. The
+/// width counts the values only; element validity is not in it (measured on pylance 12.0.0:
+/// FixedSizeList{64 x float32, validity} is FullZip, FixedSizeList{63 x float32, validity} is mini-block).
+constexpr std::uint64_t kFullZipMinFixedRowBytes = 256U;
+
+/// The FullZip value encoding of a fixed-width column: a flat fixed-width value, or a fixed_size_list of one
+/// (`FixedSizeList{N x Flat(b)}`, with `has_validity` when its items carry validity). False for a type this writer
+/// does not lay out as FullZip: bool (not whole bytes as a list element), a list of lists, variable width.
+bool fixed_full_zip_value_encoding(const LanceField& field, bool item_validity, std::vector<std::uint8_t>& encoding) {
+    std::string element;
+    std::uint64_t items = 0;
+    if (lance_fixed_size_list_parts(field.logical_type, element, items)) {
+        if (element == "bool" || element.rfind("fixed_size_list:", 0) == 0 || lance_field_is_variable_width(element)) {
+            return false;
+        }
+        const auto element_bytes = lance_logical_type_value_bytes(element);
+        if (element_bytes == 0U) {
+            return false;
+        }
+        encoding = descriptor::fixed_size_list(items, descriptor::flat(static_cast<std::uint64_t>(element_bytes) * 8U),
+                                               item_validity);
+        return true;
+    }
+    if (field.logical_type == "bool" || lance_field_is_variable_width(field.logical_type)) {
+        return false;
+    }
+    const auto bytes = lance_logical_type_value_bytes(field.logical_type);
+    if (bytes == 0U) {
+        return false;
+    }
+    encoding = descriptor::flat(static_cast<std::uint64_t>(bytes) * 8U);
+    return true;
+}
+
+/// Whether a fixed-width column is written as FullZip pages. The default is Lance's rule (256 bytes or more per
+/// value); `lance-encoding:structural-encoding=fullzip` forces FullZip on any type that can take it (a 64-bit
+/// integer included) and `miniblock` keeps mini-block. A fullzip request this writer cannot lay out is refused by
+/// name. A list of bools is refused with pylance's own message (measured); a bool column and a list of lists
+/// pylance writes, which nanolance does not yet.
+bool fixed_column_wants_full_zip(const LanceField& field, bool item_validity, bool& wanted, std::string& error) {
+    wanted = false;
+    const auto option = field.metadata.find("lance-encoding:structural-encoding");
+    const std::string text = option == field.metadata.end() ? std::string() : option->second;
+    if (text == "miniblock") {
+        return true;
+    }
+    std::vector<std::uint8_t> encoding;
+    if (fixed_full_zip_value_encoding(field, item_validity, encoding)) {
+        wanted = text == "fullzip" || lance_logical_type_value_bytes(field.logical_type) >= kFullZipMinFixedRowBytes;
+        return true;
+    }
+    if (text != "fullzip") {
+        return true;  // the default rule: this type stays on its mini-block / flat path
+    }
+    error = "lance-encoding:structural-encoding=fullzip on column '" + field.name + "' of type " + field.logical_type +
+            " is not written yet by nanolance";
+    return false;
+}
+
+/// A fixed-width column as FullZip pages, the layout Lance writes for values of 256 bytes or more: each row
+/// stored whole -- [control word when the column has nulls][the item validity bytes, when the items carry
+/// validity][the row's values] -- and no repetition index, since every row has the same width. A null row keeps
+/// its slot (zeros), as Lance's fixed-width FullZip does. Pages hold whole rows, cut at kFullZipFixedPageBytes.
+bool write_full_zip_fixed_column(const ColumnEncodeContext& ctx, std::ostream& out,
+                                 std::vector<pb::ColumnMetadata>& columns, std::string& error) {
+    constexpr std::uint64_t kFullZipFixedPageBytes = std::uint64_t{1} << 20U;
+    const auto& field = ctx.field;
+    const auto& values = ctx.values;
+    const bool nulls = ctx.column_has_nulls;
+    const bool item_validity = !values.item_validity.empty();
+    std::string element;
+    std::uint64_t items = 0;
+    if (item_validity && !lance_fixed_size_list_parts(field.logical_type, element, items)) {
+        error = "element validity on a column that is not a fixed_size_list: " + field.name;
+        return false;
+    }
+    const std::size_t value_bytes = value_width_bytes(field);
+    const std::size_t validity_bytes = item_validity ? static_cast<std::size_t>((items + 7U) / 8U) : 0U;
+    const std::size_t row_bytes = validity_bytes + value_bytes;
+    std::vector<std::uint8_t> encoding;
+    if (value_bytes == 0U || !fixed_full_zip_value_encoding(field, item_validity, encoding)) {
+        error = "column '" + field.name + "' cannot be written as FullZip pages";
+        return false;
+    }
+    const std::size_t control = full_zip::control_bytes(0U, nulls ? 1U : 0U);
+    const std::uint64_t rows = ctx.rows;
+    const std::uint64_t per_page = std::max<std::uint64_t>(1U, kFullZipFixedPageBytes / (control + row_bytes));
+    const std::vector<std::uint8_t> zeros(row_bytes, 0U);
+    std::vector<std::uint8_t> row(row_bytes);
+    pb::ColumnMetadata column;
+    column.encoding = column_encoding_bytes();
+    std::vector<std::uint8_t> data;
+    for (std::uint64_t first = 0; first < rows;) {
+        const auto end = std::min(rows, first + per_page);
+        data.clear();
+        data.reserve(static_cast<std::size_t>(end - first) * (control + row_bytes));
+        for (auto r = first; r < end; ++r) {
+            const bool valid = !nulls || validity_bit(values.validity, r);
+            full_zip::append_level(data, control, valid ? 0U : 1U, nullptr, 0U, 0U);
+            if (!valid) {
+                data.insert(data.end(), zeros.begin(), zeros.end());
+            } else if (!item_validity) {
+                const auto* bytes = values.fixed_data() + static_cast<std::size_t>(r) * value_bytes;
+                data.insert(data.end(), bytes, bytes + value_bytes);
+            } else {
+                // Element validity: bit j of the row is item j's bit, LSB-first, as mini-block writes it.
+                std::fill(row.begin(), row.begin() + static_cast<std::ptrdiff_t>(validity_bytes), 0U);
+                for (std::uint64_t j = 0; j < items; ++j) {
+                    const auto at = r * items + j;
+                    if ((values.item_validity[at >> 3U] >> (at & 7U)) & 1U) {
+                        row[j >> 3U] |= static_cast<std::uint8_t>(1U << (j & 7U));
+                    }
+                }
+                const auto* bytes = values.fixed_data() + static_cast<std::size_t>(r) * value_bytes;
+                std::copy(bytes, bytes + value_bytes, row.begin() + static_cast<std::ptrdiff_t>(validity_bytes));
+                data.insert(data.end(), row.begin(), row.end());
+            }
+        }
+        descriptor::FullZip layout;
+        layout.bits_def = nulls ? 1U : 0U;
+        layout.bits_per_value = static_cast<std::uint64_t>(row_bytes) * 8U;
+        layout.num_items = end - first;
+        layout.num_visible_items = end - first;
+        layout.value_compression = encoding;
+        layout.layers = {nulls ? static_cast<std::uint8_t>(repdef::kNullableItem)
+                               : static_cast<std::uint8_t>(repdef::kAllValidItem)};
+        pb::ColumnPage page;
+        page.buffer_offsets.push_back(write_buffer(out, data));
+        page.buffer_sizes.push_back(data.size());
+        page.length = end - first;
+        page.priority = first;
+        page.encoding = descriptor::page_encoding(layout);
+        column.pages.push_back(std::move(page));
+        first = end;
+    }
     columns.push_back(std::move(column));
     return true;
 }
@@ -2401,18 +2577,72 @@ bool write_dict_column(const ColumnEncodeContext& ctx, std::ostream& out, std::v
         have_plan ? values.structural_dict_plan.distinct : local_distinct;
     const std::vector<std::uint32_t>& indices =
         have_plan ? values.structural_dict_plan.indices : local_indices;
+    // The indices' layout follows lance-encoding:compression, as pylance's does for a dictionary column
+    // (measured on 12.0.0): none -> Flat(32); lz4 / zstd -> General{codec, ByteStreamSplit{Flat(32)}}, each
+    // chunk byte-split then framed. Absent keeps the bit-packed indices nanolance has always written.
+    const DictIndexLayout index_layout = ctx.codec == ColumnCodec::kUncompressed ? DictIndexLayout::kFlat
+                                         : (ctx.codec == ColumnCodec::kLz4 || ctx.codec == ColumnCodec::kZstd)
+                                             ? DictIndexLayout::kGeneral
+                                             : DictIndexLayout::kBitpacked;
+    const std::uint64_t index_scheme = ctx.codec == ColumnCodec::kLz4 ? descriptor::kLz4 : descriptor::kZstd;
     std::vector<MiniblockChunk> index_chunks;
+    std::vector<std::uint8_t> planes;  // kGeneral: one chunk's byte-split indices, before framing
     for (std::size_t off = 0; off < indices.size(); off += 1024U) {
         const auto count = std::min<std::size_t>(1024U, indices.size() - off);
         MiniblockChunk chunk;
         chunk.value_count = count;
-        bitpack::encode_block(reinterpret_cast<const std::uint8_t*>(indices.data() + off), count, 4U,
-                              chunk.bytes);
+        const auto* raw = reinterpret_cast<const std::uint8_t*>(indices.data() + off);
+        if (index_layout == DictIndexLayout::kBitpacked) {
+            bitpack::encode_block(raw, count, 4U, chunk.bytes);
+        } else if (index_layout == DictIndexLayout::kFlat) {
+            chunk.bytes.assign(raw, raw + count * 4U);
+        } else {
+            planes.resize(count * 4U);
+            (void)byte_stream_split::encode(std::as_bytes(std::span(raw, count * 4U)), 4U,
+                                            std::as_writable_bytes(std::span(planes)));
+            std::string error;
+            const bool framed_ok = index_scheme == descriptor::kLz4
+                                       ? general::lz4_frame(planes, chunk.bytes, error)
+                                       : general::zstd_frame(planes, ctx.compression_level, chunk.bytes, error);
+            if (!framed_ok) {
+                return false;
+            }
+        }
         index_chunks.push_back(std::move(chunk));
     }
     const auto payload = miniblock_payload(index_chunks);
     const auto control = control_buffer_for(index_chunks);
-    const auto dict_block = dictionary::encode_variable(distinct, values.variable.large);
+    // lance-encoding:dict-values-compression = none | lz4 | zstd (+ dict-values-compression-level) wraps the whole
+    // dictionary buffer in General. Absent keeps the plain buffer, nanolance's default, unchanged.
+    std::uint64_t dict_scheme = 0U;
+    std::vector<std::uint8_t> dict_block = dictionary::encode_variable(distinct, values.variable.large);
+    if (const auto it = field.metadata.find("lance-encoding:dict-values-compression"); it != field.metadata.end()) {
+        int level = ctx.compression_level;
+        if (const auto lv = field.metadata.find("lance-encoding:dict-values-compression-level");
+            lv != field.metadata.end()) {
+            int parsed = 0;
+            const auto [end, ec] = std::from_chars(lv->second.data(), lv->second.data() + lv->second.size(), parsed);
+            if (ec == std::errc{} && end == lv->second.data() + lv->second.size()) {
+                level = parsed;
+            }
+        }
+        // The value was checked by read_dict_values_option before any page was written: none, lz4 or zstd.
+        std::vector<std::uint8_t> framed;
+        std::string error;
+        if (it->second == "zstd") {
+            dict_scheme = descriptor::kZstd;
+            if (!general::zstd_frame(dict_block, level, framed, error)) {
+                return false;
+            }
+            dict_block = std::move(framed);
+        } else if (it->second == "lz4") {
+            dict_scheme = descriptor::kLz4;
+            if (!general::lz4_frame(dict_block, framed, error)) {
+                return false;
+            }
+            dict_block = std::move(framed);
+        }
+    }
 
     align64(out);
     const auto control_offset = pos(out);
@@ -2436,7 +2666,8 @@ bool write_dict_column(const ColumnEncodeContext& ctx, std::ostream& out, std::v
     page.length = rows;
     page.priority = 0;
     page.encoding =
-        page_layout_bytes_dict(static_cast<std::uint32_t>(distinct.size()), rows, values.variable.large);
+        page_layout_bytes_dict(static_cast<std::uint32_t>(distinct.size()), rows, values.variable.large, dict_scheme,
+                               index_layout, index_scheme);
     column.pages.push_back(std::move(page));
     columns.push_back(std::move(column));
     return true;
@@ -2509,7 +2740,8 @@ bool write_packed_fixed_column(const ColumnEncodeContext& ctx, const FixedWidthC
     const bool column_has_nulls = ctx.column_has_nulls;
     const bool bitpack = fixed.bitpack;
     const bool bool_pack = fixed.bool_pack;
-    const bool bss_zstd = fixed.bss_zstd;
+    const bool bss_general = fixed.bss_general;
+    const auto general_scheme = fixed.general_scheme;
     const auto fixed_bytes_per_value = fixed.bytes_per_value;
 
     pb::ColumnMetadata column;
@@ -2526,7 +2758,7 @@ bool write_packed_fixed_column(const ColumnEncodeContext& ctx, const FixedWidthC
     const auto multi = multichunk_values(step);
     step = multi != 0U ? multi : std::size_t{1};
     std::vector<std::uint8_t> scratch;  // built chunk bytes, reused across chunks
-    std::vector<std::uint8_t> framed;   // zstd frame (bss-zstd only), reused across chunks
+    std::vector<std::uint8_t> framed;   // General-compressed chunk (bss only), reused across chunks
     auto build_page_encoding = [&](std::uint64_t count) {
         if (bitpack) {
             return page_layout_bytes_inline_bitpacking(
@@ -2537,8 +2769,8 @@ bool write_packed_fixed_column(const ColumnEncodeContext& ctx, const FixedWidthC
             return page_layout_bytes_flat(flat_bits_per_value(field), count, column_has_nulls);
         }
         // byte-stream-split is restricted to 32/64-bit values, so the cast is safe.
-        return page_layout_bytes_bss_zstd(static_cast<std::uint8_t>(flat_bits_per_value(field)), count,
-                                          column_has_nulls);
+        return page_layout_bytes_bss_general(static_cast<std::uint8_t>(flat_bits_per_value(field)), count,
+                                             general_scheme, column_has_nulls);
     };
     std::uint64_t cached_rows = 0;
     std::vector<std::uint8_t> cached_encoding;
@@ -2561,11 +2793,14 @@ bool write_packed_fixed_column(const ColumnEncodeContext& ctx, const FixedWidthC
                 std::as_bytes(std::span(values.fixed_data() + off * fixed_bytes_per_value,
                                         fixed_bytes_per_value * count)),
                 fixed_bytes_per_value, std::as_writable_bytes(std::span(scratch)));
-            if (!general::zstd_frame(scratch, compression_level, framed, error)) {
+            const bool framed_ok = general_scheme == descriptor::kLz4
+                                       ? general::lz4_frame(scratch, framed, error)
+                                       : general::zstd_frame(scratch, compression_level, framed, error);
+            if (!framed_ok) {
                 return false;
             }
         }
-        const auto& chunk_bytes = bss_zstd ? framed : scratch;
+        const auto& chunk_bytes = bss_general ? framed : scratch;
         const auto chunk_repdef =
             column_has_nulls ? pack_definition_levels(values.validity, off, count)
                              : std::vector<std::uint8_t>{};
@@ -2642,19 +2877,36 @@ bool write_zstd_variable_column(const ColumnEncodeContext& ctx, std::ostream& ou
         }
     }
 
-    const bool zstd_variable = compress_column;
+    // lz4 (`lance-encoding:compression=lz4`) is kept only when it shrinks the first chunk: pylance writes
+    // the plain layout for a column LZ4 does not shrink (measured on 12-letter random strings). zstd
+    // always applies where the column asks for it.
+    const bool lz4_requested = ctx.codec == ColumnCodec::kLz4;
+    const std::uint64_t general_scheme = lz4_requested ? descriptor::kLz4 : descriptor::kZstd;
+    std::vector<std::uint8_t> framed;
+    if (lz4_requested && !chunks.empty()) {
+        if (!general::lz4_frame(chunks.front().bytes, framed, error)) {
+            return false;
+        }
+        if (framed.size() >= chunks.front().bytes.size()) {
+            return write_plain_variable_column(ctx, out, columns, error);
+        }
+    }
+    const bool zstd_variable = lz4_requested || compress_column;
     pb::ColumnMetadata column;
     column.encoding = column_encoding_bytes();
     // Hoisted out of the loop (not freshly declared per chunk): general::zstd_frame's resize() only
     // avoids re-zeroing already-there bytes when the buffer is reused across calls of similar size,
     // which requires swap (not move) below so `framed`'s capacity survives being handed off.
-    std::vector<std::uint8_t> framed;
+    std::uint64_t first_row = 0;
     for (auto& chunk : chunks) {
         if (zstd_variable) {
-            if (!general::zstd_frame(chunk.bytes, compression_level, framed, error)) {
+            const bool framed_ok = lz4_requested
+                                       ? general::lz4_frame(chunk.bytes, framed, error)
+                                       : general::zstd_frame(chunk.bytes, compression_level, framed, error);
+            if (!framed_ok) {
                 return false;
             }
-            std::swap(chunk.bytes, framed);  // value_count unchanged; bytes are now [u64][zstd]
+            std::swap(chunk.bytes, framed);  // value_count unchanged; bytes are now [u32 or u64 size][frame]
         }
         const auto control = control_buffer_for({&chunk, 1});
         const auto payload = miniblock_payload({&chunk, 1});
@@ -2673,12 +2925,13 @@ bool write_zstd_variable_column(const ColumnEncodeContext& ctx, std::ostream& ou
         page.buffer_sizes.push_back(control.size());
         page.buffer_sizes.push_back(payload.size());
         page.length = chunk.value_count;
-        page.priority = 0;
+        page.priority = first_row;
+        first_row += chunk.value_count;
         const auto bits_token =
             values.variable.large ? static_cast<std::uint8_t>(0x40U) : static_cast<std::uint8_t>(0x20U);
         page.encoding = zstd_variable
                             ? page_layout_bytes_variable_zstd(bits_token, chunk.value_count,
-                                                              column_has_nulls)
+                                                              column_has_nulls, general_scheme)
                             : page_layout_bytes(bits_token, chunk.value_count, true, column_has_nulls);
         column.pages.push_back(std::move(page));
     }
@@ -2701,14 +2954,20 @@ bool write_fixed_width_column(const ColumnEncodeContext& ctx, std::ostream& out,
     const bool bitpack = !is_variable && packing_it != field.metadata.end() &&
                          packing_it->second == "bitpack" &&
                          lance_logical_type_is_bitpackable_integer(field.logical_type);
-    // Byte-stream-split + zstd: float/double, tagged when set_compression(true) (writer.cpp).
-    const bool bss_zstd = !is_variable && packing_it != field.metadata.end() &&
-                          packing_it->second == "bss-zstd";
+    // Byte-stream-split + General: float/double, tagged when set_compression(true) (writer.cpp), or any
+    // 32/64-bit column with `lance-encoding:compression=lz4|zstd` (pylance's layout for that option).
+    const bool codec_general = !is_variable && (ctx.codec == ColumnCodec::kLz4 || ctx.codec == ColumnCodec::kZstd) &&
+                               lance_logical_type_is_bitpackable_integer(field.logical_type) &&
+                               value_width_bytes(field) == 8U;
+    const bool bss_general = !is_variable && field.logical_type != "bool" &&
+                             (codec_general || (packing_it != field.metadata.end() &&
+                                                packing_it->second == "bss-zstd"));
+    const std::uint64_t general_scheme = ctx.codec == ColumnCodec::kLz4 ? descriptor::kLz4 : descriptor::kZstd;
     // bool is always stored bit-packed (1 bit/value, LSB-first) on disk, matching stock Lance's own
     // Flat{bits_per_value:1} representation (verified empirically) -- not gated by any opt-in flag.
     const bool bool_pack = !is_variable && field.logical_type == "bool";
     const auto fixed_bytes_per_value = value_width_bytes(field);
-    const FixedWidthChoice fixed{bitpack, bool_pack, bss_zstd, fixed_bytes_per_value};
+    const FixedWidthChoice fixed{bitpack, bool_pack, bss_general, general_scheme, fixed_bytes_per_value};
 
     if (!is_variable) {
         if (values.fixed_size() % fixed_bytes_per_value != 0U) {
@@ -2727,7 +2986,7 @@ bool write_fixed_width_column(const ColumnEncodeContext& ctx, std::ostream& out,
     // buffer -- the chunk bytes are just a slice of values.fixed, so building a MiniblockChunk
     // first would only copy them. Chunks are gathered into pages of ~kTargetMiniblockPageBytes
     // (MiniblockPageWriter); a value too wide for two to share a chunk gets a page per chunk.
-    if (!is_variable && !bitpack && !bss_zstd && !bool_pack) {
+    if (!is_variable && !bitpack && !bss_general && !bool_pack) {
         return write_flat_fixed_column(ctx, fixed, out, columns);
     }
 
@@ -2757,7 +3016,8 @@ bool write_variable_column(const ColumnEncodeContext& ctx, std::ostream& out,
     // Only when the writer's structural detection tagged the column: FSST is one of those
     // encodings, and set_structural_encoding(false) must still write plain pages.
     fsst::Encoder fsst_encoder;
-    if (packing_it != field.metadata.end() && packing_it->second == "fsst" &&
+    // A column that names its codec (lz4, zstd or none) is laid out as that codec says: no FSST.
+    if (packing_it != field.metadata.end() && packing_it->second == "fsst" && ctx.codec == ColumnCodec::kAbsent &&
         train_column_fsst(field, values, fsst_encoder) &&
         !zstd_requested && (!compress || fsst_pays_on_first_page(fsst_encoder, values, rows))) {
         pb::ColumnMetadata column;
@@ -2785,10 +3045,32 @@ bool write_variable_column(const ColumnEncodeContext& ctx, std::ostream& out,
         }
     }
 
-    if (!compress_column || value_too_big_for_a_chunk) {
+    if ((!compress_column && ctx.codec != ColumnCodec::kLz4) || value_too_big_for_a_chunk) {
         return write_plain_variable_column(ctx, out, columns, error);
     }
     return write_zstd_variable_column(ctx, out, columns, error);
+}
+
+/// Reads a field's `lance-encoding:compression`. An unknown scheme is refused, as pylance refuses it
+/// (it spells the three names in lower case and rejects anything else on a scalar column).
+bool read_column_codec(const LanceField& field, ColumnCodec& codec, std::string& error) {
+    const auto it = field.metadata.find("lance-encoding:compression");
+    if (it == field.metadata.end()) {
+        codec = ColumnCodec::kAbsent;
+        return true;
+    }
+    if (it->second == "lz4") {
+        codec = ColumnCodec::kLz4;
+    } else if (it->second == "zstd") {
+        codec = ColumnCodec::kZstd;
+    } else if (it->second == "none") {
+        codec = ColumnCodec::kUncompressed;
+    } else {
+        error = "unknown lance-encoding:compression '" + it->second + "' on column '" + field.name +
+                "' (expected lz4, zstd or none)";
+        return false;
+    }
+    return true;
 }
 
 /// Writes one column's pages to `out` and its metadata to `columns`, choosing its encoding.
@@ -2798,15 +3080,54 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
     const auto& field = *state.physical_fields[field_index];
     const auto& values = *state.column_source[field_index];
     const auto rows = state.rows;
-    const auto compression_level = state.compression_level;
     const bool compress = state.compress;
+    int compression_level = state.compression_level;
 
-    // `lance-encoding:compression=zstd` on one column (pylance's per-column option) zstd-compresses that
-    // column alone, as the writer-wide `compress` flag does for every string column. Such a column
-    // skips FSST, which would otherwise be chosen where it pays.
-    const auto zstd_option = field.metadata.find("lance-encoding:compression");
-    const bool zstd_requested = zstd_option != field.metadata.end() && zstd_option->second == "zstd";
-    const bool compress_column = compress || zstd_requested;
+    // `lance-encoding:compression` on one column (pylance's per-column option): lz4 or zstd compresses that
+    // column's values alone, as the writer-wide `compress` flag does for every string column, and none
+    // stores them uncompressed. Such a column skips FSST, which would otherwise be chosen where it pays.
+    ColumnCodec codec = ColumnCodec::kAbsent;
+    if (!values.needs_nested_pages() && !read_column_codec(field, codec, error)) {
+        return false;
+    }
+    // lance-encoding:dict-values-compression names the dictionary buffer's codec; refused here, by name, so no
+    // page is written before the value is known to be one the writer can frame. Only a column written as a
+    // dictionary is checked: pylance accepts (and ignores) any value on a column it does not dictionary-encode.
+    const auto dict_packing = field.metadata.find("nanolance:packing");
+    const bool dictionary_column = !field.dictionary_index_format.empty() ||
+                                   (dict_packing != field.metadata.end() &&
+                                    (dict_packing->second == "dict" || dict_packing->second == "dict-rle"));
+    if (const auto dv = field.metadata.find("lance-encoding:dict-values-compression");
+        dictionary_column && dv != field.metadata.end() && dv->second != "none" && dv->second != "lz4" &&
+        dv->second != "zstd") {
+        error = "unknown lance-encoding:dict-values-compression '" + dv->second + "' on column '" + field.name +
+                "' (expected lz4, zstd or none)";
+        return false;
+    }
+    // lance-encoding:structural-encoding is fullzip or miniblock; anything else is refused with pylance's message
+    // (measured on pylance 12.0.0), before any page is written.
+    if (const auto so = field.metadata.find("lance-encoding:structural-encoding");
+        so != field.metadata.end() && so->second != "fullzip" && so->second != "miniblock") {
+        error = "Invalid user input: Cannot determine structural encoding for field " + field.name +
+                ".  This typically indicates an invalid value of the field metadata key "
+                "lance-encoding:structural-encoding";
+        return false;
+    }
+    // `lance-encoding:compression-level` sets the zstd level of a zstd column (pylance: a number is the
+    // level, zstd clamps it to its range; anything else keeps the writer's level). lz4 has no level.
+    if (codec == ColumnCodec::kZstd) {
+        const auto level_option = field.metadata.find("lance-encoding:compression-level");
+        if (level_option != field.metadata.end()) {
+            const auto& text = level_option->second;
+            int parsed = 0;
+            const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), parsed);
+            if (ec == std::errc{} && end == text.data() + text.size()) {
+                compression_level = parsed;
+            }
+        }
+    }
+    const bool zstd_requested = codec == ColumnCodec::kZstd;
+    const bool compress_column = codec == ColumnCodec::kAbsent ? compress : zstd_requested;
 
     // Nulls are encodable only on the paths that have been taught the definition-level layer.
     // Everything else must refuse rather than drop them: ingest no longer rejects a null batch,
@@ -2822,9 +3143,26 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
         }
     }
 
-    const auto packing_it = field.metadata.find("nanolance:packing");
-    const ColumnEncodeContext ctx{field, values, rows, compression_level, compress, zstd_requested, compress_column,
-                                  column_has_nulls, packing_it};
+    // A fixed-width column that names its codec is laid out by that option alone: nanolance's own
+    // structural tags (bitpacking, constant, RLE, byte-stream-split) were chosen for the default layout,
+    // and pylance's option replaces them (`none` is a flat page, lz4/zstd a General-wrapped one).
+    // Measured on pylance 12.0.0: `none` is Flat for every fixed-width type; lz4 and zstd change only a
+    // 64-bit integer column (General{codec, ByteStreamSplit{Flat(64)}}); other types keep their layout.
+    const bool wide_integer = values.kind == ColumnValues::Kind::FixedWidth &&
+                              lance_logical_type_is_bitpackable_integer(field.logical_type) &&
+                              value_width_bytes(field) == 8U;
+    const bool codec_lays_out_values =
+        codec == ColumnCodec::kUncompressed ||
+        ((codec == ColumnCodec::kLz4 || codec == ColumnCodec::kZstd) && wide_integer);
+    // A structural dictionary keeps its tag under any codec: its indices take the codec's layout in write_dict_column.
+    const auto tag_it = field.metadata.find("nanolance:packing");
+    const bool dict_tagged = tag_it != field.metadata.end() && tag_it->second == "dict" &&
+                             values.kind == ColumnValues::Kind::VariableWidth;
+    const auto packing_it =
+        codec_lays_out_values && !dict_tagged ? field.metadata.end() : tag_it;
+    const ColumnEncodeContext ctx{field,           values,      rows,          compression_level,
+                                  compress,        zstd_requested, compress_column, column_has_nulls,
+                                  packing_it,      codec};
 
     if (values.kind == ColumnValues::Kind::BlobV2External) {
         return write_blob_v2_column(ctx, out, columns, error);
@@ -2854,9 +3192,32 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
     }
 
     // A fixed_size_list with null elements inside valid rows: Lance's mini-block chunks of two
-    // buffers, the elements' validity bits then the values, under FixedSizeList{has_validity}.
+    // buffers, the elements' validity bits then the values, under FixedSizeList{has_validity}. From 256
+    // bytes of values on (or when asked with structural-encoding=fullzip) it is FullZip instead, with the
+    // validity bits in each row's slot.
     if (!values.item_validity.empty()) {
+        bool full_zip_items = false;
+        if (!fixed_column_wants_full_zip(field, true, full_zip_items, error)) {
+            return false;
+        }
+        if (full_zip_items) {
+            return write_full_zip_fixed_column(ctx, out, columns, error);
+        }
         return write_fixed_size_list_column(ctx, out, columns, error);
+    }
+
+    // A fixed-width column of 256-byte values, or one asked for with structural-encoding=fullzip, as FullZip
+    // pages (see write_full_zip_fixed_column). A constant column stays Constant even when fullzip is asked for
+    // (measured on pylance 12.0.0). Fixed-width columns with element validity took the path above.
+    const bool constant_tagged = packing_it != field.metadata.end() && packing_it->second == "constant";
+    if (values.kind == ColumnValues::Kind::FixedWidth && !constant_tagged) {
+        bool full_zip_fixed = false;
+        if (!fixed_column_wants_full_zip(field, false, full_zip_fixed, error)) {
+            return false;
+        }
+        if (full_zip_fixed) {
+            return write_full_zip_fixed_column(ctx, out, columns, error);
+        }
     }
 
     // Constant column (tagged by the writer): ConstantLayout. The single value comes from the

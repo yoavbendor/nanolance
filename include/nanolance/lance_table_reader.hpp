@@ -186,6 +186,7 @@ struct LanceFileInfo {
     /// Per column, per page: its rows and the (offset, size) of each of its buffers.
     struct Page {
         std::uint64_t rows = 0;
+        std::uint64_t priority = 0;  // the top-level row of the page's first row (Lance's page priority)
         std::vector<std::pair<std::uint64_t, std::uint64_t>> buffers;
         std::string encoding;  // the page layout, described
     };

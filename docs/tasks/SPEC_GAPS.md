@@ -37,14 +37,18 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1l | `file.version.2_0`, `file.version.2_1` | Test every modification of a 2.0 / 2.1 dataset against pylance, and document what works | measured 2026-10-29, see below | done 2026-10-29: 22 cases (2.0 and 2.1 x 11 operations) match pylance, no library change; left: nothing for these rows (writing 2.0 / 2.1 stays unscheduled, W1n) |
 | W1e | `arrow.fields.primary_key`, `table.schema.primary_key` | Unenforced primary key: Arrow metadata to fields 12-15, and back | done 2026-10-29: fields 12, 13, 15 written and read; the Arrow key metadata read as pylance does; pylance's write checks; merge_insert's default key by position. Left: whether pylance writes the key into a data file's schema (not measured); a key nested in a struct as the merge_insert default |
 | W1m | `file.version.2_0`, `file.version.2_1` | Which older pylance / LanceDB releases read a dataset with nanolance's 2.2 files beside 2.0 / 2.1 ones | measured 2026-10-29, see below | done: only pylance 12 and later read the mix |
-| W1f | `file.structure.page_priority` | Write each page's priority as Lance does | to measure | next |
-| W1g | `encoding.config` | Honour the `lance-encoding:*` field metadata Lance honours | to measure, per key | next |
-| W1h | `encoding.compression.general.write` | LZ4 | to measure | next |
-| W1i | `encoding.layout.full_zip.write` | Fixed-width full-zip and per-value compression | to measure | later |
-| W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs, read and write | to measure | later |
-| W1k | `arrow.types.fixed_size_list`, `arrow.types.dictionary` | FSL of variable-width elements; dictionaries inside structs and lists | to measure | later |
+| W1f | `file.structure.page_priority` | Write each page's priority as Lance does | measured 2026-10-29, see "Measured for W1f (page priority)" | done 2026-10-29: every page's `priority` is the top-level row of its first row, as pylance writes it (int64, list, string, FSL128 measured); single-page columns keep 0 |
+| W1g | `encoding.config` | Honour the `lance-encoding:*` field metadata Lance honours | partial (Haiku session, 2026-10-29): done `rle-threshold`, `dict-divisor`, `dict-size-ratio` (refused by name outside (0, 1]), `dict-values-compression` (+ level); reader General over InlineBitpacking. Left (dict columns under `compression` done in W1r): integer dictionaries (pylance dictionary-encodes low-cardinality ints; nanolance has none), `bss`, `structural-encoding`, multi-chunk RLE, the C++ tests for the refusal and the decode | next |
+| W1h | `encoding.compression.general.write` | LZ4 | done for the value layouts measured (LZ4 writer; `compression=lz4` on 64-bit ints and variable-width). Left: General over dictionaries under the option, float zstd layout | done |
+| W1i | `encoding.layout.full_zip.write` | Fixed-width full-zip and per-value compression | measured and done 2026-10-29, see "Result for W1i" | partial (Haiku session, 2026-10-29): the 256-byte rule and `structural-encoding` for fixed-width FSL and fixed_size_binary, element validity included, layout text equal to pylance's for 21 cases. Left: the page split (pylance: one page per input batch), per-value compression of a fixed-width FullZip page, `structural-encoding=fullzip` on variable width, a bool column or a list of lists under fullzip, and a fixed-width FullZip scan that is slower than mini-block (measured) |
+| W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs: read pylance's first, then write them for `lance-encoding:packed` | measured 2026-10-29, see "Measured for W1j" | later, reviewer-led design: reading needs a packed-struct read plan with child fan-out (as `v20_packed_struct_sources` does for 2.0), and the VariablePackedStruct byte layout from Lance's source. Opt-in only, so behind the gaps every dataset meets |
+| W1k1 | `arrow.types.fixed_size_list` (read) | Read what pylance writes: a null element inside a fixed-size list under a list or struct (also W1a's all-null list<fsl>), `fixed_size_list<bool>`, `fixed_size_list<struct>` | measured 2026-10-29, see "Measured for W1k" | next |
+| W1k2 | `arrow.types.fixed_size_list`, `arrow.types.dictionary` (write) | Write them too, and dictionary columns inside structs and lists | measured 2026-10-29 | after W1k1 |
+| W1p | `encoding.config` | Integer dictionaries: pylance dictionary-encodes int64 / float64 columns with 1,000-10,000 distinct values (`dict=InlineBitpacking(64)` / `General{LZ4,Flat(64)}`); nanolance has no such encoding | W1g, W1h | later |
+| W1q | `encoding.compression.rle` | RLE over more than one mini-block chunk: nanolance's RLE holds its runs in one chunk, so a column of 25,000 runs is not RLE-encoded | W1g | later |
+| W1r | `encoding.config` | Dictionary indices under `lance-encoding:compression` (`General{codec,ByteStreamSplit{Flat(32)}}`, or `Flat(32)` for none): the reader's dictionary-index path has to unwrap them before the writer may emit them | W1g, W1h | partial (Haiku session, 2026-10-29): done for string, int64 and float64 dictionaries (reader unwraps General and byte-stream-split per index chunk; writer emits pylance's index layout under lz4 / zstd / none; the dictionary buffer unchanged; `dict-rle` keeps the option erased, not measured). Layout text equal to pylance's, read and take checked, see "W1r measured". Left: `dict-rle` under the option, and integer dictionaries written by nanolance (W1p) |
 | W1o | `file.version.2_0`, `file.version.2_1` | Warn when a write adds the first 2.2 file to a 2.0 / 2.1 dataset, naming the readers it cuts off | W1m table | done 2026-10-29: `MixedFormatWarning` before the commit of each write that adds the first 2.2 file to a 2.0 / 2.1 dataset (write_dataset append, update, merge_insert, add_columns, compaction, fragment writes); `error` filter aborts it; `_target_file_version` is the one line W1n changes |
-| W1n | `file.version.2_1` | Write 2.1 files into a 2.1 dataset, so its writes stay 2.1 | measured 2026-10-29, see "W1n: what writing 2.1 needs" | blocked on a decision: needs a 2.1 mini-block writer (medium) |
+| W1n | `file.version.2_1` | Write 2.1 files into a 2.1 dataset, so its writes stay 2.1 | measured 2026-10-29, see "W1n: what writing 2.1 needs" | deferred (decided 2026-10-29): after W1i, and only if a user needs older readers for 2.1 datasets |
 
 ## Datasets in formats 2.0 and 2.1 (measured 2026-10-29)
 
@@ -169,3 +173,265 @@ A first implementation is on the local branch `haiku/w1n-finish` (commit e5da80e
 `keep_dataset_format` for staged writes, the ConstantLayout gate, a 2.2 fallback for blob v2 columns, and a
 28-column test matrix against pylance 12 and old readers. It is not merged: with item 1 missing, its 2.1 files are
 unreadable.
+
+## Measured for W1f (page priority)
+
+Lance 12 (`rust/lance-encoding/src/encoder.rs` `write_page_to_data_buffer`) writes a page's `priority` as
+`page.row_number`: "the top-level row number of the first row in the page". A top-level row is never split
+across pages, so for a list column the page's first item's row is used, not the item index. nanolance writes 0
+everywhere (`page.priority = 0` in about ten places in `src/file/data_file_writer.cpp`).
+
+pylance 12.0.0 (priorities read by nanolance's C++ reader, `_file_page_priorities`), each page's priority is the
+rows of the pages before it in its column:
+
+| column | pylance's pages (rows, priority) |
+|---|---|
+| int64, 3,000,000 rows | 3 pages: (1,250,000, 0), (1,250,000, 1,250,000), (500,000, 2,500,000) |
+| list<int64>, 300,000 rows | 22 pages of ~14,000 rows: (14,362, 0), (14,310, 14,362), ... last (7,192, 292,808) |
+| string, 400,000 rows | 2 pages: (300,000, 0), (100,000, 300,000) |
+| fixed_size_list<float,128>, 200,000 rows | 4 pages of 50,000: priority 0, 50,000, 100,000, 150,000 |
+| int64 in runs of 50, 500,000 rows (RLE) | 1 page: (500,000, 0) |
+| string from 50 values, 500,000 rows (dictionary) | 1 page: (500,000, 0) |
+
+nanolance's pages differ in size (its list and string pages hold up to 32,768 rows; its FSL pages 1,024), but its
+priorities follow the same rule. The interop test compares the rule, not the page splits.
+
+## Measured for W1g and W1h (field encoding options)
+
+pylance 12.0.0, one table of 50,000 rows, each column with one option (`build/nlance-pagelayout`):
+
+| column, option | pylance's page |
+|---|---|
+| strings (5,000 distinct), none | `values=InlineBitpacking(32), dict=General{LZ4,Variable}x5000` |
+| same, `compression=lz4` | `values=General{LZ4,ByteStreamSplit{Flat(32)}}`, dict as default |
+| same, `compression=zstd` (level 9 too) | `values=General{ZSTD,ByteStreamSplit{Flat(32)}}`, dict as default |
+| same, `compression=none` | `values=Flat(32)` (no bitpacking), dict as default |
+| random int64, `compression=lz4` / `zstd` | `General{LZ4 / ZSTD,ByteStreamSplit{Flat(64)}}` |
+| int64 in runs of 50, none | `Rle{values=Flat(32),lengths=Flat(8)}, dict=InlineBitpacking(64)x1000` |
+| same, `rle-threshold=0` | `InlineBitpacking(32), dict=...` (no RLE); `rle-threshold=1` as default |
+| strings, `dict-divisor=1000` | `Fsst{...}` (no dictionary); `dict-divisor=1` as default |
+| strings, `dict-size-ratio=0.5` | as default; `dict-size-ratio=0.0` makes pylance panic ("not in the range (0, 1]") |
+| strings, `dict-values-compression=zstd` / `none` | `dict=General{ZSTD,Variable}` / `dict=Variable` |
+| random int64, `structural-encoding=fullzip` | `FullZip{values=Flat(64)}` (fixed-width FullZip: W1i); strings: ignored here |
+| random float64, `bss=on` / `off` | `InlineBitpacking(64)` either way |
+| int64, `minichunk-size=1024` | as default |
+
+So the options that change the layout are `compression` (lz4 / zstd / none), `rle-threshold`, `dict-divisor`,
+`dict-values-compression` and `structural-encoding`. `compression-level` changes only the codec level. nanolance
+honours `compression=zstd` only, and has no LZ4 encoder (`nanolance/lz4_block.hpp` decodes only).
+
+### W1h measured again (2026-10-29, same pylance 12.0.0, 50,000 rows, one column per dataset)
+
+The table above does not reproduce for every type: its string rows used a dictionary that the 5,000-value string columns here do not get, and the option is ignored for 8/16/32-bit ints and for float32/float64 under lz4. Measured shapes (`compression=` lz4 / zstd / none):
+
+| column | lz4 | zstd | none |
+|---|---|---|---|
+| int64 random (40-bit) | `General{LZ4,ByteStreamSplit{Flat(64)}}` | `General{ZSTD,ByteStreamSplit{Flat(64)}}` | `Flat(64)` |
+| int64 full range | `Flat(64)` | `Flat(64)` | `Flat(64)` |
+| int64 in 1,000 values (dictionary) | dict indices `General{LZ4,BSS{Flat(32)}}` | same, ZSTD | dict indices `Flat(32)` |
+| int32 / int16 / int8 random | `InlineBitpacking` (ignored) | ignored | `Flat(N)` |
+| float32 random | ignored | ignored | `Flat(32)` |
+| float64 random | ignored | `General{ZSTD,InlineBitpacking(64)}` | `Flat(64)` |
+| string, 50,000 unique values (`unique-NNNNNNNN-` plus up to 6 x) | `General{LZ4,Variable}` | `General{ZSTD,Variable}` | `Variable` (no FSST) |
+| string, 12-letter values from 5,000 (random letters) | `Variable` (LZ4 does not shrink it) | `General{ZSTD,Variable}` | `Variable` |
+| bool | `Flat(1)` | `Flat(1)` | `Flat(1)` |
+| FixedSizeList<f32,4>, list<int32> | ignored | ignored | ignored |
+
+Unknown values: `brotli` and `LZ4` are refused on int, float, bool and string columns (`Unknown compression scheme`), accepted and ignored on fixed-size-list and list. `compression-level` alone changes nothing; with `compression=zstd` a number is the level (`30` is accepted), and a non-number is accepted and ignored (default level). lz4 ignores the level.
+
+### W1g measured (2026-10-29, pylance 12.0.0, 50,000 rows, one column per dataset)
+
+Source for the thresholds: lance v12.0.0 `rust/lance-encoding/src/encodings/logical/primitive.rs` (`should_dictionary_encode`:
+divisor default 2, size ratio default 0.8, min 100 rows, cap 100,000 distinct, a 4,096-row sample with unique ratio
+>= 0.98 rejected and projected cardinality `unique_ratio * rows` above `rows / divisor` rejected) and
+`rust/lance-encoding/src/compression.rs` (`rle_is_applicable`: with `rle-threshold` set, RLE only when
+`run_count < rows * threshold`; without it, the size model alone).
+
+| column, option | pylance 12 layout | nanolance after W1g |
+|---|---|---|
+| int64 runs of 2, default / `rle-threshold=1` | `Rle{Flat(64),Flat(8)}` | `InlineBitpacking(64)` (default unchanged); 25,000 runs do not fit one miniblock, so no RLE: a gap |
+| int64 runs of 5, `rle-threshold=0` / `0.1` | `InlineBitpacking(32)` + `dict=Bitpacked(64)x10000` | `InlineBitpacking(64)`: the RLE is off as set, the dictionary is missing (no integer dictionary) |
+| int64 runs of 5, `rle-threshold=0.5` / default | `Rle{Flat(32),Flat(8)}` + dict | no RLE: 10,000 runs do not fit one miniblock (multi-chunk RLE missing): gap |
+| int64 runs of 50, default | `Rle{Flat(32),Flat(8)}` + `dict=InlineBitpacking(64)x1000` | `Rle{Flat(64)}` without dictionary: gap in the dictionary only |
+| same, `rle-threshold=0` | `InlineBitpacking(32)` + dict | RLE off (asserted); dict missing |
+| same, `rle-threshold=0.1` / `0.5` / `1` | RLE + dict | RLE kept (asserted) |
+| 5,000-distinct strings (`unique-NNNNNNNN-`), default | `Fsst{...}` (sample projection 0.68 x 50,000 > 25,000) | `Variable` dictionary (full count 5,000 <= 25,000): a default that is not changed |
+| same, `dict-divisor=1000` / `0` / `1` | FSST / FSST / `InlineBitpacking(32)` + `General{LZ4,Variable}` | FSST / (`0` reads as 1) / `InlineBitpacking(32)` + plain `Variable` (LZ4 default not adopted; `dict-values-compression=none` is the matching layout) |
+| int64 1,000 values, default / `dict-divisor=1000` / `1` | dict `InlineBitpacking(64)x1000` / `InlineBitpacking(64)` / dict | no integer dictionary: gap for default and `1`; `1000` matches |
+| same strings, `dict-size-ratio=0.1` (divisor 1) | `Fsst{...}` | `Fsst{...}` (asserted) |
+| same, `dict-size-ratio=0.0` / `1.5` | panic `not in the range (0, 1]` | refused by name (asserted) |
+| same, `dict-size-ratio=abc` | default | default (values and readability asserted; layout differs on the default, as above) |
+| dict (divisor 1), `dict-values-compression=none` / `lz4` / `zstd` | `Variable` / `General{LZ4,Variable}` / `General{ZSTD,Variable}` | same (asserted); indices `InlineBitpacking(32)` in both |
+| `dict-values-compression=brotli` | refused: `Unknown compression scheme: brotli` | refused by name, on any column that carries it |
+| same, `dict-values-compression-level` | shape unchanged | accepted; lz4 ignores it, zstd takes it |
+| float64, `compression=zstd` | `General{ZSTD,InlineBitpacking(64)}` | read (xfail removed); nanolance writes `Flat(64)` as before (writer gap, unchanged) |
+| float64, `compression=lz4` | `InlineBitpacking(64)` (lz4 ignored) | unchanged |
+| string dictionary, `compression=lz4` / `zstd` / `none` | `values=General{LZ4 / ZSTD,BSS{Flat(32)}}` (or `Flat(32)`), dict `General{LZ4,Variable}` | not honoured yet: the option is erased on dictionary columns (write_session.cpp), so these stay as before |
+| int64 1,000 values, `compression=lz4` / `zstd` / `none` | `General{..,BSS{Flat(32)}}` / `Flat(32)` indices, dict `InlineBitpacking(64)x1000` | not honoured yet (no integer dictionary) |
+
+Byte-identical check: `nlbench_gendata <dir> 50000` on the base commit and on this branch writes the same data-file md5
+(one data file, `84b4dce7912cd80d047e779f01a143fb`); manifests and transactions differ only by their random names and
+timestamps, as they always do.
+
+## W1r measured (dictionary indices under lance-encoding:compression)
+
+pylance 12.0.0, 50,000 rows, `dict-divisor=1` on strings (1,000 distinct) so the column is a dictionary; `dict-values-compression=none`
+on both sides for the layout comparison (pylance's default wraps the dictionary in LZ4; nanolance keeps the plain buffer, as W1g).
+
+| column, option | pylance's page (`build/nlance-pagelayout`) |
+|---|---|
+| string, lz4 / zstd | `values=General{LZ4 / ZSTD,ByteStreamSplit{Flat(32)}}`, dict `General{LZ4,Variable}` by default |
+| string, none | `values=Flat(32)` |
+| int64 1,000 values, lz4 / zstd / none | indices as above (asserted by the read tests; nanolance has no integer dictionary to write: W1p) |
+| float64 1,000 values, lz4 / zstd / none | indices as above (asserted by the read tests) |
+
+Before W1r the reader classified `General{..,ByteStreamSplit}` as a plain byte-stream-split column and ignored the dictionary; the
+dictionary path now unwraps it per chunk. Writer: a dictionary column keeps the option; the writer-wide `compression=True` flag
+no longer overrides a column's own option. nanolance-written string dictionaries under each option match pylance's layout
+(`dict-values-compression=none` on both sides), and pylance reads them.
+
+Byte-identical without the option: `nlbench_gendata` data file md5 on the base commit and on this branch is the same
+(`84b4dce7912cd80d047e779f01a143fb`).
+
+## Measured for W1i (fixed-width FullZip)
+
+Lance 12's rule (`rust/lance-encoding/src/encodings/logical/primitive.rs`, `is_narrow` / `prefers_miniblock` /
+`prefers_fullzip`): a column is mini-block when its largest value is under 256 bytes
+(`MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE`), and FullZip otherwise. `lance-encoding:structural-encoding` =
+`miniblock` / `fullzip` overrides it. A requested `fullzip` that the value type cannot take (a dictionary, values
+not byte-aligned, a fixed-size list without a flat fixed-width child) is an error, with the messages in that
+function.
+
+pylance 12.0.0, 2,000 rows each:
+
+| column | bytes per value | pylance | nanolance today |
+|---|---|---|---|
+| fixed_size_list<float32, 16..63> | 64..252 | MiniBlock | MiniBlock |
+| fixed_size_list<float32, 64> | 256 | `FullZip{values=FixedSizeList{64xFlat(32)},value_bits=2048}` | MiniBlock, 2,000 rows a page |
+| fixed_size_list<float32, 1024> | 4,096 | FullZip (with `def_bits=1` when rows are null) | MiniBlock, 128 rows a page |
+| fixed_size_list<float32, 4096> | 16,384 | FullZip | MiniBlock, **1 row a page** |
+| fixed_size_list<int8, 768> | 768 | FullZip | MiniBlock |
+| fixed_size_binary(100..200) | < 256 | MiniBlock | MiniBlock |
+| fixed_size_binary(256 / 4096) | 256 / 4,096 | `FullZip{values=Flat(2048 / 32768)}` | MiniBlock |
+
+Embeddings of 768 to 4,096 floats are therefore written very differently. nanolance's mini-block pages shrink
+with the value width, down to one row per page.
+
+## Result for W1i (2026-10-29, pylance 12.0.0, nanolance written and read)
+
+Layouts (`nlance-pagelayout`, the first page of each column), pylance = nanolance for every case in
+`bindings/python/tests/test_fullzip_fixed.py`: FSL<float32> 63 (mini-block), 64, 64 with row or item nulls,
+768 (with row nulls, with item nulls), 1536, 4096; FSL<int8, 768>; fixed_size_binary 255 (mini-block), 256 (with
+and without nulls), 4096; FSL<float32, 16> under `structural-encoding=fullzip` and `miniblock`; int64 under
+`fullzip` (FullZip{Flat(64)}) and `miniblock`; fixed_size_binary(100) under `fullzip`.
+
+Pylance behaviour found while matching it (not in the rule above):
+- an item-validity FSL is FullZip when its values are 256 bytes (`FixedSizeList{64xFlat(32),validity}`, value_bits
+  2112); 63 values with validity stay mini-block: the validity bits are not in the width;
+- `structural-encoding=fullzip` on a dictionary column is ignored (MiniBlock dictionary), on a constant int64
+  it is ignored (Constant); on a bool column it writes `FullZip{Flat(8)}`; on a list of two strings it crashes
+  pylance 12 (`compute_stat should only be called once`, a pylance bug, nothing written);
+- a fixed_size_list of bools with fullzip: `Full-zip fixed-width values must be byte aligned, got 2 bits per value`;
+- a fixed_size_list of fixed_size_list with fullzip: `FullZip{FixedSizeList{2xFixedSizeList{4xFlat(32)}}}`
+  (accepted; nanolance refuses it for now);
+- an unknown `structural-encoding` value: `Invalid user input: Cannot determine structural encoding for field c.
+  This typically indicates an invalid value of the field metadata key lance-encoding:structural-encoding`
+  (nanolance uses this message).
+
+Page split (not matched): pylance wrote 200,000 rows of FSL<float32,768> as ONE page (614 MB); the same rows in
+20 input batches of 10,000 gave 20 pages of 10,000 rows. Pylance cuts a fixed-width FullZip page at its input
+batch boundaries, with no byte limit measured. nanolance cuts at 1 MiB of row data (341 rows of 768 floats); see
+the reviewer's measurements below for why not 8 MiB.
+Only the layout text is compared, not the page count.
+
+Performance (same machine, alternating base and new, one process per run, 200,000 rows, 1,000 random rows for take;
+base = origin tree, new = this change; all six runs per width listed, so the best of three is visible):
+
+| width | side | scan, seconds (3 runs) | take 1,000 rows, seconds (3 runs) |
+|---|---|---|---|
+| 768 | base | 0.163 (first, a warm-cache outlier), 0.746, 0.700 | 0.059, 0.216, 0.210 |
+| 768 | new | 0.548, 0.657, 0.823 | 0.015, 0.018, 0.064 |
+| 1536 | base | 0.607, 0.321, 0.341 | 0.112, 0.182, 0.077 |
+| 1536 | new | 0.534, 0.734, 0.715 | 0.026, 0.054, 0.048 |
+
+The first runs were noisy (1.2 GB files, page cache) and are kept above for the record. The reviewer then
+compared both layouts with one build: the same column written as FullZip (the new default) and with
+`structural-encoding=miniblock` (the old layout), 5 alternating rounds, best of 5, on a 15 GB machine.
+
+| change | 768 floats: scan MB / FZ | 1536 floats: scan MB / FZ | take 1,000 rows MB / FZ (768, 1536) |
+|---|---|---|---|
+| W1i as delegated (8 MiB pages, row-by-row decode) | 0.106 / 0.141 (+33%) | 0.648 / 0.200 | 0.026 / 0.007, 0.164 / 0.010 |
+| + whole-page copy in `decode_full_zip_column` | 0.099 / 0.115 (+16%) | 0.574 / 0.198 | 0.026 / 0.006, 0.181 / 0.010 |
+| + 1 MiB pages (`kFullZipFixedPageBytes`) | 0.105 / **0.089** (-15%) | 0.380 / **0.191** | 0.028 / 0.008, 0.187 / 0.012 |
+
+The whole-page copy applies to a fixed-width page with no control word (no nulls, no lists), no element
+validity and no constant items: the page is its rows back to back, so it is copied in one step. The 1 MiB page
+follows the writer's own earlier finding (`data_file_writer.cpp`, the list-page comment): pages of 8 MiB cost
+nanolance's scan up to 2x in page-sized intermediate buffers.
+pylance reads the new files faster too (best of 3, scan / take): 768 floats 0.717 / 0.035 s as mini-block, 0.571 /
+0.020 s as FullZip; 1536 floats 1.675 / 0.043 s, 1.122 / 0.038 s.
+
+Byte-identical check (narrow columns): `nlbench_gendata <out> 50000` data file md5 is equal between the base and
+the new build (84b4dce7912cd80d047e779f01a143fb), and `test_write_encoding_matrix.py` passes unchanged.
+
+## Measured for W1j (packed structs, 2026-10-29)
+
+pylance 12.0.0, 20,000 rows. A struct field with `lance-encoding:packed` = `true` (or the legacy key `packed`):
+
+| struct | pylance's page | nanolance reads it |
+|---|---|---|
+| struct<int32, float64> | `MiniBlock{values=PackedStruct}` (CompressiveEncoding 12) | no: "unsupported encoding ... (CompressiveEncoding variant 12)" |
+| same, with null rows | `MiniBlock{values=PackedStruct, repdef=Bitpacked(16,Flat(1)), nullable}` | no |
+| same, legacy key `packed=true` | as with `lance-encoding:packed` | no |
+| struct<int32, string> | `FullZip{values=VariablePackedStruct, offset_bits=32}` (CompressiveEncoding 13) | no: "unsupported FullZip value compression" |
+| struct<int32, fixed_size_list<float32,4>> | `FullZip{values=VariablePackedStruct, offset_bits=32}` | no |
+| struct<int32, float64>, no option | one column per child (`a`, `b`), as nanolance writes | yes |
+
+Lance 12 `encodings_v2_1.proto`:
+
+```
+message PackedStruct {               // fixed-width children concatenated row by row into one fixed-width block
+  repeated uint64 bits_per_value = 1;  // bits each child contributes to a packed row
+  CompressiveEncoding values = 2;      // the compression of the packed fixed-width values
+}
+message VariablePackedStruct {       // 2.2: each child value compressed on its own, then transposed row-major
+  repeated FieldEncoding fields = 1;   // in struct order
+  message FieldEncoding {
+    CompressiveEncoding value = 1;
+    oneof layout { uint64 bits_per_value = 2; uint64 bits_per_length = 3; }
+  }
+}
+```
+
+So W1j starts with reading: a dataset pylance wrote with a packed struct cannot be read by nanolance today.
+
+## W1j follow-up measurements (2026-10-29, session haiku/w1j-packed)
+
+pylance 12.0.0, data_storage_version 2.2, 20,000 rows, `lance-encoding:packed` = `true`. Layouts from `build/nlance-pagelayout`:
+
+| struct | pylance's writes | layout |
+|---|---|---|
+| struct<int32, float64> | yes | `MiniBlock{values=Unknown(field 12)}` |
+| same, with null rows | yes | `MiniBlock{values=Unknown(field 12), repdef=Bitpacked(16,Flat(1)), nullable}` |
+| struct<int32, string> | yes | `FullZip{values=Unknown(field 13), offset_bits=32, layers=[valid-item]}` |
+| struct<int32, fixed_size_list<float32,4>> | yes | `FullZip{values=Unknown(field 13), offset_bits=32, layers=[valid-item]}` |
+
+Child types pylance accepts in a packed struct (one int32 sibling, each child in turn): int8, uint8, int16, uint16, uint32, int64, uint64, float32, string, fixed_size_list<int8,3>, fixed_size_binary(3). Refused by pylance: bool (writer panics, `TryFromIntError`), list<int32> (`Field with data type List(Int32) cannot be converted to data block`), a struct child (`Packed struct per-value compression should not be used for fixed-width-only struct`), and a nullable child (`Per-value compression not yet supported for block type Nullable`).
+
+Not measured yet: the byte layout of `VariablePackedStruct` (field 13). The Lance 12 `packed.rs` source could not be fetched in this session (the sandbox refused the download, and the GitHub connector does not have `lance-format/lance` configured), so the reader for both forms is still open. W1j reader: not started; writer: not started.
+
+## Measured for W1k (2026-10-29)
+
+3,000 rows each. pylance 12.0.0 writes, then nanolance reads pylance's dataset, and writes the same table itself:
+
+| column | pylance | nanolance reads pylance's | nanolance writes |
+|---|---|---|---|
+| struct<k: dictionary<string>, v: int64> | writes, reads back the dictionary | equal | refused: "dictionary-encoded column 'k' inside a struct or list is not supported yet; cast it to its value type" |
+| list<dictionary<string>> | writes, reads back the dictionary | equal | refused, the same |
+| fixed_size_list<bool, 4> | writes | **fails**: "unsupported fixed_size_list element type ... fixed_size_list:bool:4" | refused: element must be a fixed-width number |
+| fixed_size_list<struct<x: int64>, 2> | writes | **fails**, with a misleading message ("a dictionary-encoded column cannot be read in the same batch as a skipped logical field") | refused |
+| list<fixed_size_list<float32, 2>> with null elements | writes | **fails**: "a null element inside a fixed_size_list item is not read yet" | refused: "has a null element inside a row under a list or struct" |
+| fixed_size_list<list<int64>, 2> | refuses ("Unsupported data type") | -- | -- |
+| fixed_size_list<string, N> | panics (found in W1i) | -- | -- |
+
+So W1k starts with reading (W1k1): three shapes pylance writes that nanolance cannot read.

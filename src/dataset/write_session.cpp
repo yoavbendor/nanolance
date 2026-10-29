@@ -19,6 +19,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <charconv>
+#include <cstdlib>
+#include <system_error>
 #include <cstring>
 #include <functional>
 #include <filesystem>
@@ -103,6 +107,41 @@ struct WriteSession::State {
 };
 
 namespace {
+
+/// Reads the `lance-encoding:` knobs that move nanolance's structural choices, named as pylance names them:
+/// rle-threshold, dict-divisor and dict-size-ratio. A value that does not parse keeps the default, as pylance
+/// does. A dict-size-ratio outside (0, 1] is refused by name here (pylance panics on it). Returns false with
+/// `error` set on a refusal.
+bool read_encoding_options(const LanceField& field, encoding_choice::ColumnEncodingOptions& out, std::string& error) {
+    if (const auto it = field.metadata.find("lance-encoding:rle-threshold"); it != field.metadata.end()) {
+        char* end = nullptr;
+        const double value = std::strtod(it->second.c_str(), &end);
+        if (end != it->second.c_str() && *end == '\0' && std::isfinite(value) && value >= 0.0) {
+            out.rle_set = true;
+            out.rle_threshold = value;
+        }
+    }
+    if (const auto it = field.metadata.find("lance-encoding:dict-divisor"); it != field.metadata.end()) {
+        std::size_t value = 0;
+        const auto [end, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), value);
+        if (ec == std::errc{} && end == it->second.data() + it->second.size()) {
+            out.dict_divisor = value;
+        }
+    }
+    if (const auto it = field.metadata.find("lance-encoding:dict-size-ratio"); it != field.metadata.end()) {
+        char* end = nullptr;
+        const double value = std::strtod(it->second.c_str(), &end);
+        if (end != it->second.c_str() && *end == '\0' && !std::isnan(value)) {
+            if (!(value > 0.0 && value <= 1.0)) {
+                error = "lance-encoding:dict-size-ratio " + it->second + " on column '" + field.name +
+                        "' is not in (0, 1]";
+                return false;
+            }
+            out.dict_size_ratio = value;
+        }
+    }
+    return true;
+}
 
 /// Bytes the writer is holding for rows not yet committed: the capacity of every buffer it owns,
 /// plus borrowed caller buffers, which stay pinned until the commit.
@@ -639,6 +678,10 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
         const auto physical = lance_physical_fields(disk_schema);
         for (std::size_t i = 0; i < physical.size() && i < commit_columns.size(); ++i) {
             const auto* pf = physical[i];
+            encoding_choice::ColumnEncodingOptions enc_options;
+            if (std::string option_error; !read_encoding_options(*pf, enc_options, option_error)) {
+                return fail(WriteStatus::InvalidArgument, option_error);
+            }
             if (lance_extension_is_lance_owned(pf->extension_name)) {
                 continue;
             }
@@ -701,7 +744,7 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
             if (cv.kind == ColumnValues::Kind::FixedWidth &&
                 lance_logical_type_is_bitpackable_integer(pf->logical_type)) {
                 const auto bpv = lance_logical_type_value_bytes(pf->logical_type);
-                if (encoding_choice::fixed_column_rle_plan(cv, bpv)) {
+                if (encoding_choice::fixed_column_rle_plan(cv, bpv, enc_options)) {
                     for (auto& field : disk_schema.fields) {
                         if (field.id == pf->id) {
                             field.metadata["nanolance:packing"] = "rle";
@@ -719,7 +762,7 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
                     }
                 }
             } else if (cv.kind == ColumnValues::Kind::VariableWidth &&
-                       encoding_choice::variable_column_dict_rle_beneficial(cv)) {
+                       encoding_choice::variable_column_dict_rle_beneficial(cv, enc_options)) {
                 // Low-cardinality run-length string column -> dictionary + RLE'd indices.
                 for (auto& field : disk_schema.fields) {
                     if (field.id == pf->id) {
@@ -729,12 +772,31 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
                     }
                 }
             } else if (cv.kind == ColumnValues::Kind::VariableWidth &&
-                       encoding_choice::variable_column_dict_beneficial(cv)) {
-                // Scattered low-cardinality strings -> structural dictionary + flat indices.
+                       encoding_choice::variable_column_dict_beneficial(cv, enc_options)) {
+                // Scattered low-cardinality strings -> structural dictionary + indices. The indices take the
+                // caller's lance-encoding:compression layout (write_dict_column). The writer-wide compression flag
+                // tagged every string column zstd above; that tag is not the caller's, so it is replaced by the
+                // caller's own option (from the schema as given) or dropped.
+                std::string own_codec;
+                bool has_own_codec = false;
+                for (const auto& original : state->schema_mapping.fields) {
+                    if (original.id == pf->id) {
+                        if (const auto it = original.metadata.find("lance-encoding:compression");
+                            it != original.metadata.end()) {
+                            own_codec = it->second;
+                            has_own_codec = true;
+                        }
+                        break;
+                    }
+                }
                 for (auto& field : disk_schema.fields) {
                     if (field.id == pf->id) {
                         field.metadata["nanolance:packing"] = "dict";
-                        field.metadata.erase("lance-encoding:compression");
+                        if (has_own_codec) {
+                            field.metadata["lance-encoding:compression"] = own_codec;
+                        } else {
+                            field.metadata.erase("lance-encoding:compression");
+                        }
                         break;
                     }
                 }

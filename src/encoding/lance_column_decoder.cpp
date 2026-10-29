@@ -707,6 +707,10 @@ struct ColumnEncodingPlan {
     /// kDict: the indices are `Flat(N)` -- N-bit integers end to end -- rather than FastLanes packed.
     /// Format 2.2 writes them so for a small page of 64-bit values (Flat(32) indices). Zero: packed.
     std::uint32_t dict_flat_index_bits = 0;
+    /// kDict: the indices are General{codec, ByteStreamSplit{Flat(32)}} (pylance's layout under
+    /// lance-encoding:compression=lz4|zstd). Each chunk is codec-framed, then byte-stream-split; the
+    /// codec is value_scheme. Implies dict_flat_index_bits == 32.
+    bool dict_index_bss = false;
     /// kDict with packed indices: their unpacked width (an Arrow dictionary's index type: 8, 16, 32
     /// or 64 bits). kDictRle: the width of each run's index. 32 unless the descriptor says otherwise.
     std::uint32_t dict_index_bits = 32;
@@ -1204,10 +1208,28 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
             out.unsupported_reason = "General encoding has no inner values";
             return true;
         }
+        if (has_dictionary && inner->values->kind == page_layout::CompressiveKind::kByteStreamSplit) {
+            // Dictionary indices under lance-encoding:compression: General{codec, ByteStreamSplit{Flat(32)}}.
+            // The index chunk decode un-frames and un-transposes each chunk (see dict_index_bss).
+            const auto* planes = inner->values.get();
+            if ((out.value_scheme != page_layout::BufferScheme::kZstd &&
+                 out.value_scheme != page_layout::BufferScheme::kLz4) ||
+                planes->values == nullptr || planes->values->kind != page_layout::CompressiveKind::kFlat ||
+                planes->values->bits_per_value != 32U) {
+                out.kind = ColumnEncodingKind::kUnsupported;
+                out.unsupported_reason = "unsupported dictionary index encoding in " + page_layout::describe(layout);
+                return true;
+            }
+            out.kind = ColumnEncodingKind::kDict;
+            out.dict_flat_index_bits = 32U;
+            out.dict_index_bss = true;
+            return true;
+        }
         if (inner->values->kind == page_layout::CompressiveKind::kByteStreamSplit) {
-            // The byte-stream-split path un-zstds the page itself; it has no other framing to fall
-            // back on, so a differently-compressed one is refused rather than read as raw planes.
-            if (!out.zstd) {
+            // The byte-stream-split path un-frames each chunk itself (zstd or LZ4); it has no other framing to
+            // fall back on, so a differently-compressed one is refused rather than read as raw planes.
+            if (out.value_scheme != page_layout::BufferScheme::kZstd &&
+                out.value_scheme != page_layout::BufferScheme::kLz4) {
                 out.kind = ColumnEncodingKind::kUnsupported;
                 out.unsupported_reason =
                     "unsupported buffer compression in " + page_layout::describe(layout);
@@ -2206,11 +2228,32 @@ bool decode_dict_column(const EncodingsIo& io, const pb::Field& on_disk_field,
         indices_bytes.clear();  // hoisted out of the loop; accumulates fresh per page via insert()
         std::uint64_t rows_remaining = page.length;
         const std::size_t flat_width = encoding_plan.dict_flat_index_bits / 8U;
+        std::vector<std::uint8_t> index_raw;     // dict_index_bss: one chunk unframed
+        std::vector<std::uint8_t> index_planes;  // dict_index_bss: one chunk un-transposed
         for (const auto& chunk : index_chunks) {
+            // The flat index bytes of this chunk: the chunk itself, or (dict_index_bss) its unframed,
+            // byte-stream-split planes, which are the Flat(32) indices.
+            const std::vector<std::uint8_t>* chunk_values = &chunk.values;
+            if (encoding_plan.dict_index_bss) {
+                const bool unframed = encoding_plan.value_scheme == page_layout::BufferScheme::kLz4
+                                          ? lz4_block::decompress_sized(chunk.values, index_raw, error)
+                                          : general::zstd_unframe(chunk.values, index_raw, error);
+                if (!unframed) {
+                    return false;
+                }
+                if (index_raw.size() % 4U != 0U) {
+                    error = "dict index chunk is not a whole number of 32-bit indices";
+                    return false;
+                }
+                index_planes.resize(index_raw.size());
+                (void)byte_stream_split::decode(std::as_bytes(std::span(index_raw)), 4U,
+                                                std::as_writable_bytes(std::span(index_planes)));
+                chunk_values = &index_planes;
+            }
             const auto count = chunk.items != 0U ? chunk.items
                                : encoding_plan.repdef != nullptr
                                    ? static_cast<std::uint64_t>(chunk.repdef_values)
-                               : flat_width != 0U ? static_cast<std::uint64_t>(chunk.values.size() / flat_width)
+                               : flat_width != 0U ? static_cast<std::uint64_t>(chunk_values->size() / flat_width)
                                                   : std::min<std::uint64_t>(1024U, rows_remaining);
             if (count == 0U || count > rows_remaining) {
                 error = "dict index chunk covers " + std::to_string(count) + " values with " +
@@ -2218,8 +2261,8 @@ bool decode_dict_column(const EncodingsIo& io, const pb::Field& on_disk_field,
                 return false;
             }
             if (flat_width != 0U) {
-                if (chunk.values.size() != count * flat_width) {
-                    error = "dict index chunk holds " + std::to_string(chunk.values.size()) + " bytes for " +
+                if (chunk_values->size() != count * flat_width) {
+                    error = "dict index chunk holds " + std::to_string(chunk_values->size()) + " bytes for " +
                             std::to_string(count) + " indices";
                     return false;
                 }
@@ -2227,7 +2270,7 @@ bool decode_dict_column(const EncodingsIo& io, const pb::Field& on_disk_field,
                 indices_bytes.resize(base + static_cast<std::size_t>(count) * 4U);
                 for (std::uint64_t i = 0; i < count; ++i) {
                     std::uint64_t wide = 0;
-                    std::memcpy(&wide, chunk.values.data() + i * flat_width, flat_width);  // little-endian
+                    std::memcpy(&wide, chunk_values->data() + i * flat_width, flat_width);  // little-endian
                     if (wide > std::numeric_limits<std::uint32_t>::max()) {
                         error = "dict index out of range";
                         return false;
@@ -2436,8 +2479,21 @@ bool decode_full_zip_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
         }
         std::size_t r = 0;  // the next item
         const auto shape = params.shape();
+        // Fixed width with no control word, no element validity and no constant items: the page is its rows
+        // back to back (the size check above proved it), so it is copied whole rather than row by row. A
+        // 768-float vector column scanned 33% slower than mini-block before this.
+        const bool whole_page = !variable && params.control_bytes == 0U && params.item_validity_bytes == 0U &&
+                                !params.constant_items && params.length_bytes == 0U;
+        if (whole_page) {
+            if (params.items != 0U) {
+                append_item_validity(out, nullptr, rows * params.items, rows_so_far * params.items);
+            }
+            out.fixed.insert(out.fixed.end(), data.begin(), data.end());
+            r = rows;
+            at = data.size();
+        }
         full_zip::Level lv;
-        for (std::size_t level = 0; level < num_levels; ++level) {
+        for (std::size_t level = 0; !whole_page && level < num_levels; ++level) {
             if (!full_zip::next_level(data, at, shape, lv, error)) {
                 error = "column '" + on_disk_field.name + "': " + error;
                 return false;
@@ -2564,7 +2620,10 @@ bool decode_bss_zstd_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
         }
         std::uint64_t remaining = page.length;
         for (const auto& chunk : chunks) {
-            if (!general::zstd_unframe(chunk.values, raw, error)) {
+            const bool unframed = encoding_plan.value_scheme == page_layout::BufferScheme::kLz4
+                                      ? lz4_block::decompress_sized(chunk.values, raw, error)
+                                      : general::zstd_unframe(chunk.values, raw, error);
+            if (!unframed) {
                 return false;
             }
             if (bytes_per_value == 0U || raw.size() % bytes_per_value != 0U) {
@@ -2842,6 +2901,7 @@ bool decode_fixed_width_column(const EncodingsIo& io, const pb::Field& on_disk_f
     }
     std::uint64_t validity_rows = 0;
     std::uint64_t page_rows_before = 0;
+    std::vector<std::uint8_t> raw;  // one unframed chunk of a General-wrapped bit-packed value buffer
     ColumnEncodingPlan later_page;
     for (std::size_t page_index = 0; page_index < column_metadata.pages.size(); ++page_index) {
         const auto& page = column_metadata.pages[page_index];
@@ -2866,6 +2926,17 @@ bool decode_fixed_width_column(const EncodingsIo& io, const pb::Field& on_disk_f
         //     value count, so a flat int64 chunk holds whatever fits.
         std::uint64_t remaining = page.length;
         for (auto& chunk : chunks) {
+            // General{ZSTD | LZ4, InlineBitpacking} (pylance's float64 zstd layout): each chunk's bit-packed block
+            // is framed by the codec. Unframe it, then decode the block as usual.
+            if (bitpacked && plan->value_scheme != page_layout::BufferScheme::kNone) {
+                const bool unframed = plan->value_scheme == page_layout::BufferScheme::kLz4
+                                          ? lz4_block::decompress_sized(chunk.values, raw, error)
+                                          : general::zstd_unframe(chunk.values, raw, error);
+                if (!unframed) {
+                    return false;
+                }
+                std::swap(chunk.values, raw);
+            }
             if (encoding_plan.fsl_item_validity) {
                 // [element validity bits][values]: move the values into place and keep the bits.
                 if (chunk.extra_buffers.size() != 1U) {

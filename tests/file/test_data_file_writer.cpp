@@ -7,12 +7,14 @@
 // the column metadata, the column metadata offset table and every page buffer start on a 64-byte
 // boundary; global buffer 0 is the schema (the FileDescriptor, with its row count and metadata) and
 // buffer 1 the extra one; each column decodes back to what was written, compressed or not; written with
-// and without parallel columns the bytes are identical; and a column count that does not match the
-// schema is refused.
+// and without parallel columns the bytes are identical; a column count that does not match the
+// schema is refused; and every page's priority is the top-level row of its first row (flat, list,
+// string and FullZip pages, plain and zstd).
 
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/data_file_writer.hpp"
 #include "nanolance/lance_column_decoder.hpp"
+#include "nanolance/page_layout.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include "lance_minimal.pb.hpp"
@@ -202,6 +204,195 @@ void check_file(const std::filesystem::path& path) {
     require(names.null_count == nulls, "names null count");
 }
 
+// Lance's page.priority is the top-level row of a page's first row: 0 for a column's first page, then the
+// rows of the pages before it. Each page's length is its top-level rows (a list page too), so the check
+// is per column: every page's priority is the running sum of the lengths before it.
+constexpr std::uint64_t kPriorityRows = 200000;  // a flat int64, a list<int64> and a nullable string
+constexpr std::uint64_t kBigRows = 3000;         // 4 KiB+ strings: FullZip pages of ~8 MiB
+
+nano_lance::LanceSchemaMapping priority_mapping(bool big) {
+    ArrowSchema schema;
+    ArrowSchemaInit(&schema);
+    require(ArrowSchemaSetTypeStruct(&schema, big ? 1 : 3) == NANOARROW_OK, "struct schema");
+    if (big) {
+        require(ArrowSchemaSetType(schema.children[0], NANOARROW_TYPE_STRING) == NANOARROW_OK, "big utf8");
+        require(ArrowSchemaSetName(schema.children[0], "big") == NANOARROW_OK, "big");
+        schema.children[0]->flags &= ~ARROW_FLAG_NULLABLE;
+    } else {
+        require(ArrowSchemaSetType(schema.children[0], NANOARROW_TYPE_INT64) == NANOARROW_OK, "int64");
+        require(ArrowSchemaSetName(schema.children[0], "a") == NANOARROW_OK, "a");
+        schema.children[0]->flags &= ~ARROW_FLAG_NULLABLE;
+        ArrowSchema* list = schema.children[1];
+        require(ArrowSchemaSetFormat(list, "+l") == NANOARROW_OK, "list");
+        require(ArrowSchemaAllocateChildren(list, 1) == NANOARROW_OK, "list child");
+        ArrowSchemaInit(list->children[0]);
+        require(ArrowSchemaSetType(list->children[0], NANOARROW_TYPE_INT64) == NANOARROW_OK, "item");
+        require(ArrowSchemaSetName(list->children[0], "item") == NANOARROW_OK, "item name");
+        require(ArrowSchemaSetName(list, "l") == NANOARROW_OK, "l");
+        require(ArrowSchemaSetType(schema.children[2], NANOARROW_TYPE_STRING) == NANOARROW_OK, "utf8");
+        require(ArrowSchemaSetName(schema.children[2], "s") == NANOARROW_OK, "s");
+    }
+    nano_lance::LanceSchemaMapping out;
+    std::string error;
+    require(nano_lance::map_arrow_schema(schema, out, error), "map priority schema: " + error);
+    schema.release(&schema);
+    return out;
+}
+
+nano_lance::ColumnValues priority_flat(std::uint64_t rows) {
+    nano_lance::ColumnValues out;
+    out.kind = nano_lance::ColumnValues::Kind::FixedWidth;
+    out.rows = rows;
+    out.fixed.resize(rows * 8U);
+    for (std::uint64_t i = 0; i < rows; ++i) {
+        const auto v = static_cast<std::int64_t>(i * 5U);
+        std::memcpy(out.fixed.data() + i * 8U, &v, 8U);
+    }
+    return out;
+}
+
+/// A list<int64> column: row i holds (i * 7) % 5 items, so some rows are empty.
+nano_lance::ColumnValues priority_list(std::uint64_t rows) {
+    nano_lance::ColumnValues out;
+    out.kind = nano_lance::ColumnValues::Kind::FixedWidth;
+    out.rows = rows;
+    nano_lance::ColumnValues::NestedLayer layer;
+    layer.is_list = true;
+    layer.length = rows;
+    layer.offsets.push_back(0);
+    for (std::uint64_t i = 0; i < rows; ++i) {
+        const auto items = static_cast<std::int64_t>((i * 7U) % 5U);
+        layer.offsets.push_back(layer.offsets.back() + items);
+    }
+    out.fixed.resize(static_cast<std::size_t>(layer.offsets.back()) * 8U);
+    for (std::size_t k = 0; k * 8U < out.fixed.size(); ++k) {
+        const auto v = static_cast<std::int64_t>(k * 3U);
+        std::memcpy(out.fixed.data() + k * 8U, &v, 8U);
+    }
+    out.layers.push_back(std::move(layer));
+    return out;
+}
+
+/// A utf8 column of `length_of(i)` bytes per row; `nullable` makes every 7th row (from 3) null.
+nano_lance::ColumnValues priority_strings(std::uint64_t rows, bool nullable, std::size_t (*length_of)(std::uint64_t)) {
+    nano_lance::ColumnValues out;
+    out.kind = nano_lance::ColumnValues::Kind::VariableWidth;
+    out.rows = rows;
+    if (nullable) {
+        out.validity.assign((rows + 7U) / 8U, 0U);
+    }
+    std::int32_t end = 0;
+    out.variable.offsets.resize((rows + 1U) * 4U);
+    std::memcpy(out.variable.offsets.data(), &end, 4U);
+    for (std::uint64_t i = 0; i < rows; ++i) {
+        if (nullable && name_is_null(i)) {
+            ++out.null_count;
+        } else {
+            if (nullable) {
+                out.validity[i / 8U] |= static_cast<std::uint8_t>(1U << (i % 8U));
+            }
+            const auto len = length_of(i);
+            out.variable.data.insert(out.variable.data.end(), len, static_cast<std::uint8_t>('a' + i % 26U));
+            end += static_cast<std::int32_t>(len);
+        }
+        std::memcpy(out.variable.offsets.data() + (i + 1U) * 4U, &end, 4U);
+    }
+    return out;
+}
+
+std::size_t short_length(std::uint64_t i) { return 3U + i % 11U; }
+std::size_t big_length(std::uint64_t i) { return 4200U + i % 64U; }
+
+std::filesystem::path write_priority_file(const std::filesystem::path& dir, const std::string& name, bool big,
+                                          std::vector<nano_lance::ColumnValues> columns, std::uint64_t rows,
+                                          bool compress) {
+    nano_lance::DataFileResult result;
+    std::string error;
+    require(nano_lance::write_lance_data_file(dir, name, priority_mapping(big), columns, rows, 3, compress, result,
+                                              error),
+            "write " + name + ": " + error);
+    return dir / result.relative_path;
+}
+
+/// Each column of `path` has several pages, and each page's priority is the rows before it.
+void check_priorities(const std::filesystem::path& path, std::uint64_t rows, std::size_t columns_expected) {
+    nano_lance::pb::FileDescriptor descriptor;
+    nano_lance::LanceDataFileFooterLayout layout;
+    std::string error;
+    require(nano_lance::read_lance_data_file_footer_and_descriptor(path, descriptor, layout, error), "footer: " + error);
+    std::vector<nano_lance::pb::ColumnMetadata> metadata;
+    require(nano_lance::read_lance_data_file_column_metadatas(path, layout, metadata, error), "columns: " + error);
+    require(metadata.size() == columns_expected, "the priority file's column count");
+    for (const auto& column : metadata) {
+        require(column.pages.size() > 1U, "each priority column has several pages");
+        std::uint64_t first_row = 0;
+        for (const auto& page : column.pages) {
+            require(page.priority == first_row,
+                    "page priority is its first top-level row (" + std::to_string(page.priority) + " != " +
+                        std::to_string(first_row) + ")");
+            first_row += page.length;
+        }
+        require(first_row == rows, "a priority column's pages hold every row");
+    }
+}
+
+// A fixed_size_list<float32, 64> column is 256 bytes a row, Lance's FullZip threshold: it is written as FullZip
+// pages, and an explicit structural-encoding=fullzip on a 4-byte int32 column gives FullZip{Flat(32)}. Both keep
+// their values: the rows are read back from the page bytes by the same layout the reader decodes.
+void check_fixed_full_zip(const std::filesystem::path& dir) {
+    constexpr std::uint64_t kRowsFz = 1000;
+    constexpr std::size_t kItems = 64;
+    ArrowSchema schema;
+    ArrowSchemaInit(&schema);
+    require(ArrowSchemaSetTypeStruct(&schema, 1) == NANOARROW_OK, "struct schema (fsl)");
+    ArrowSchema* col = schema.children[0];
+    const std::string format = "+w:" + std::to_string(kItems);
+    require(ArrowSchemaSetFormat(col, format.c_str()) == NANOARROW_OK, "fixed_size_list schema");
+    require(ArrowSchemaSetName(col, "v") == NANOARROW_OK, "fsl name");
+    require(ArrowSchemaAllocateChildren(col, 1) == NANOARROW_OK, "fsl child");
+    ArrowSchemaInit(col->children[0]);
+    require(ArrowSchemaSetType(col->children[0], NANOARROW_TYPE_FLOAT) == NANOARROW_OK, "float item");
+    require(ArrowSchemaSetName(col->children[0], "item") == NANOARROW_OK, "item name");
+    col->flags &= ~ARROW_FLAG_NULLABLE;
+    nano_lance::LanceSchemaMapping mapping;
+    std::string error;
+    require(nano_lance::map_arrow_schema(schema, mapping, error), "map fsl schema: " + error);
+    schema.release(&schema);
+
+    nano_lance::ColumnValues values;
+    values.kind = nano_lance::ColumnValues::Kind::FixedWidth;
+    values.rows = kRowsFz;
+    values.fixed.resize(kRowsFz * kItems * 4U);
+    for (std::uint64_t i = 0; i < kRowsFz * kItems; ++i) {
+        const auto v = static_cast<float>(i);
+        std::memcpy(values.fixed.data() + i * 4U, &v, 4U);
+    }
+    nano_lance::DataFileResult result;
+    std::vector<nano_lance::ColumnValues> columns{std::move(values)};
+    require(nano_lance::write_lance_data_file(dir, "fsl_fullzip.lance", mapping, columns, kRowsFz, 3, false, result,
+                                              error),
+            "write fsl: " + error);
+    const auto path = dir / result.relative_path;
+    nano_lance::pb::FileDescriptor descriptor;
+    nano_lance::LanceDataFileFooterLayout layout;
+    require(nano_lance::read_lance_data_file_footer_and_descriptor(path, descriptor, layout, error), "footer: " + error);
+    std::vector<nano_lance::pb::ColumnMetadata> metadata;
+    require(nano_lance::read_lance_data_file_column_metadatas(path, layout, metadata, error), "columns: " + error);
+    require(metadata.size() == 1U, "the fixed_size_list column is the file's one column");
+    const auto& column = metadata[0];
+    require(!column.pages.empty(), "the fixed_size_list column has pages");
+    std::uint64_t rows = 0;
+    for (const auto& page : column.pages) {
+        nano_lance::page_layout::PageLayout decoded;
+        require(nano_lance::page_layout::decode_page_layout(page.encoding, decoded, error), "page layout: " + error);
+        require(decoded.kind == nano_lance::page_layout::LayoutKind::kFullZip,
+                "a 256-byte fixed_size_list is a FullZip page");
+        require(decoded.full_zip.bits_per_value == kItems * 32U, "FullZip row width is 64 floats");
+        rows += page.length;
+    }
+    require(rows == kRowsFz, "FullZip pages hold every row");
+}
+
 }  // namespace
 
 int main() {
@@ -221,6 +412,22 @@ int main() {
     require(!nano_lance::write_lance_data_file(dir, "bad.lance", mapping(), one, kRows, 3, false, result, error),
             "a column count that does not match the schema is refused");
     require(error.find("count") != std::string::npos, "the refusal says why: " + error);
+
+    // Page priorities: flat, list and nullable string pages (plain, then zstd), and FullZip pages.
+    const auto list_file = [&](const char* name, bool compress) {
+        std::vector<nano_lance::ColumnValues> columns{priority_flat(kPriorityRows), priority_list(kPriorityRows),
+                                                      priority_strings(kPriorityRows, true, short_length)};
+        return write_priority_file(dir, name, false, std::move(columns), kPriorityRows, compress);
+    };
+    check_priorities(list_file("priority.lance", false), kPriorityRows, 3);
+    check_priorities(list_file("priority_zstd.lance", true), kPriorityRows, 3);
+    {
+        std::vector<nano_lance::ColumnValues> columns{priority_strings(kBigRows, false, big_length)};
+        check_priorities(write_priority_file(dir, "priority_big.lance", true, std::move(columns), kBigRows, false),
+                         kBigRows, 1);
+    }
+
+    check_fixed_full_zip(dir);
 
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);

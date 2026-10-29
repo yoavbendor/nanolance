@@ -50,6 +50,10 @@ bool zstd_frame(const std::vector<std::uint8_t>& raw, int level, std::vector<std
 }
 
 // Inverse of zstd_frame: [u64 LE uncompressed size][zstd frame] -> raw bytes.
+bool lz4_frame(const std::vector<std::uint8_t>& raw, std::vector<std::uint8_t>& out, std::string& error) {
+    return lz4_block::compress_sized(raw.data(), raw.size(), out, error);
+}
+
 bool zstd_unframe(const std::vector<std::uint8_t>& framed, std::vector<std::uint8_t>& out, std::string& error) {
     if (framed.size() < 8U) {
         error = "zstd frame shorter than size header";

@@ -128,12 +128,21 @@ bool bitpack_beats_flat(const nano_lance::ColumnValues& cv, std::size_t bpv) {
 // and zero allocation -- the common case is a scattered column that fails, and the previous version
 // recorded ~n/2 (row, run) pairs into a vector before bailing, all thrown away. Pass 2 records the
 // runs for the encoder's plan and only runs for genuinely beneficial columns.
-bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv) {
+bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv, const ColumnEncodingOptions& options) {
     cv.fixed_rle_plan = {};
     if (bpv == 0U || cv.fixed_size() == 0U || cv.fixed_size() % bpv != 0U) {
         return false;
     }
+    // `lance-encoding:rle-threshold=0`: RLE is off for this column (pylance takes RLE only below the threshold).
+    if (options.rle_set && options.rle_threshold <= 0.0) {
+        return false;
+    }
     const std::size_t n = cv.fixed_size() / bpv;
+    // The run cutoff: nanolance's default is ceil(n/2) (a run ratio below one half). An explicit
+    // rle-threshold t takes RLE only when split_runs < n * t, pylance's guard, so the cutoff is ceil(n * t).
+    const std::size_t reject_at =
+        options.rle_set ? static_cast<std::size_t>(std::ceil(static_cast<double>(n) * options.rle_threshold))
+                        : (n + 1U) / 2U;
     // Prefix-sample pre-check (same pattern as variable_column_dict_beneficial's sampling): even with
     // the reject-early exit, a scattered column scans ~n/2 rows before failing (split_runs grows one
     // per row, crossing n/2 halfway through). A 4096-row prefix predicts that verdict at ~1/25 the
@@ -142,15 +151,20 @@ bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv) {
     // slightly larger bitpack fallback, never wrong data.
     constexpr std::size_t kSampleRows = 4096U;
     if (n > kSampleRows * 4U) {
+        // The sample's own cutoff: the same 1.5x margin above the real cutoff, capped at the sample size.
+        const std::size_t sample_reject =
+            options.rle_set ? std::min<std::size_t>(
+                                  kSampleRows, static_cast<std::size_t>(std::ceil(
+                                                   static_cast<double>(kSampleRows) * options.rle_threshold * 1.5)))
+                            : kSampleRows * 3U / 4U;
         std::size_t sample_split_runs = 0;
-        if (!dispatch_rle_scan(cv.fixed_data(), kSampleRows, bpv, kSampleRows * 3U / 4U,
-                               sample_split_runs, nullptr)) {
+        if (!dispatch_rle_scan(cv.fixed_data(), kSampleRows, bpv, sample_reject, sample_split_runs, nullptr)) {
             return false;
         }
     }
     std::size_t split_runs = 0;
     // reject_at == ceil(n/2) is exactly the previous `split_runs * 2 >= n` cutoff.
-    if (!dispatch_rle_scan(cv.fixed_data(), n, bpv, (n + 1U) / 2U, split_runs, nullptr)) {
+    if (!dispatch_rle_scan(cv.fixed_data(), n, bpv, reject_at, split_runs, nullptr)) {
         return false;
     }
     // One chunk for the whole column: run buffers must fit the miniblock (12-bit word => 32760 bytes).
@@ -216,10 +230,15 @@ bool variable_column_constant_value(const nano_lance::ColumnValues& cv, std::vec
 // be wasted allocation on the common path); only once that pass confirms the column is genuinely
 // run-friendly does a second pass build the dictionary, with one hash-map insert per RUN (using the
 // row/length boundaries the first pass already found, so no re-scanning for run boundaries), not per row.
-bool variable_column_dict_rle_beneficial(nano_lance::ColumnValues& cv) {
+bool variable_column_dict_rle_beneficial(nano_lance::ColumnValues& cv, const ColumnEncodingOptions& options) {
     cv.structural_dict_rle_plan = {};
     const std::size_t ow = cv.variable.large ? 8U : 4U;
     if (cv.variable.offsets.size() < 2U * ow) {
+        return false;
+    }
+    // `lance-encoding:rle-threshold=0` turns RLE off; a positive threshold t moves the run cutoff to n * t
+    // (pylance's guard, see fixed_column_rle_plan). The default cutoff is half the rows.
+    if (options.rle_set && options.rle_threshold <= 0.0) {
         return false;
     }
     auto read_offset = [&](std::size_t index) -> std::int64_t {
@@ -243,6 +262,10 @@ bool variable_column_dict_rle_beneficial(nano_lance::ColumnValues& cv) {
     // Pass 1: cheap run-boundary detection only (memcmp, no hashing/allocation beyond the run list
     // itself, which is at most one entry per run -- far fewer than `rows` for anything run-friendly).
     std::vector<std::pair<std::size_t, std::uint64_t>> row_runs;  // (row start, run length)
+    // The run cutoff: split runs at or above it are not run-friendly. The default is half the rows.
+    const std::size_t run_cutoff =
+        options.rle_set ? static_cast<std::size_t>(std::ceil(static_cast<double>(rows) * options.rle_threshold))
+                        : (rows + 1U) / 2U;
     std::size_t split_runs = 0;
     std::size_t i = 0;
     while (i < rows) {
@@ -265,7 +288,7 @@ bool variable_column_dict_rle_beneficial(nano_lance::ColumnValues& cv) {
             ++run;
         }
         split_runs += (run + 254U) / 255U;  // Lance caps run length at 255
-        if (split_runs * 2U >= rows) {
+        if (split_runs >= run_cutoff) {
             return false;  // not run-friendly (and therefore not low-cardinality)
         }
         if (split_runs * 5U + 32U > 32760U) {
@@ -304,11 +327,12 @@ bool variable_column_dict_rle_beneficial(nano_lance::ColumnValues& cv) {
 // Decide whether a structural dictionary (flat bitpacked indices + dictionary buffer) wins for a
 // scattered low-cardinality string column. Mirrors Lance defaults: dict-divisor=2, dict-size-ratio=0.8,
 // min 100 rows, max 100k distinct values.
-bool variable_column_dict_beneficial(nano_lance::ColumnValues& cv) {
+bool variable_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnEncodingOptions& options) {
     constexpr std::size_t kMinRows = 100U;
-    constexpr std::size_t kDictDivisor = 2U;
-    constexpr double kDictSizeRatio = 0.8;
     constexpr std::size_t kMaxCardinality = 100000U;
+    // lance-encoding:dict-divisor / dict-size-ratio move the two cutoffs (defaults: 2 and 0.8, pylance's).
+    const std::size_t kDictDivisor = std::max<std::size_t>(options.dict_divisor, 1U);
+    const double kDictSizeRatio = options.dict_size_ratio;
 
     cv.structural_dict_plan = {};
     const std::size_t ow = cv.variable.large ? 8U : 4U;

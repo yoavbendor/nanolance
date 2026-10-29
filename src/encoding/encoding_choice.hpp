@@ -26,12 +26,28 @@ namespace nano_lance::encoding_choice {
 /// the read 0.85 ms instead of 0.50 ms. Stock Lance writes `Flat(64)` for the same data.
 bool bitpack_beats_flat(const nano_lance::ColumnValues& cv, std::size_t bpv);
 
-bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv);
+/// The field-level knobs of the `lance-encoding:` family that move nanolance's own choices, named as
+/// pylance names them. A field that sets none of them keeps nanolance's defaults, so its layout is unchanged.
+struct ColumnEncodingOptions {
+    /// `lance-encoding:rle-threshold` was given. pylance then takes RLE only when the run count is
+    /// below `rle_threshold` times the row count; `rle_threshold == 0` disables RLE for the column.
+    bool rle_set = false;
+    double rle_threshold = 0.0;
+    /// `lance-encoding:dict-divisor` (pylance default 2): a dictionary may hold at most rows / divisor
+    /// distinct values. 0 is read as 1, as pylance does.
+    std::size_t dict_divisor = 2;
+    /// `lance-encoding:dict-size-ratio` (pylance default 0.8, valid in (0, 1]): a dictionary is kept
+    /// only when its encoded size is below this fraction of the flat size.
+    double dict_size_ratio = 0.8;
+};
+
+bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv,
+                           const ColumnEncodingOptions& options = {});
 
 bool variable_column_constant_value(const nano_lance::ColumnValues& cv, std::vector<std::uint8_t>& value_out);
 
-bool variable_column_dict_rle_beneficial(nano_lance::ColumnValues& cv);
+bool variable_column_dict_rle_beneficial(nano_lance::ColumnValues& cv, const ColumnEncodingOptions& options = {});
 
-bool variable_column_dict_beneficial(nano_lance::ColumnValues& cv);
+bool variable_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnEncodingOptions& options = {});
 
 }  // namespace nano_lance::encoding_choice

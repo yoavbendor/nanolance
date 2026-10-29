@@ -13,9 +13,12 @@
 
 #include "nanolance/lz4_block.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -153,7 +156,62 @@ void a_block_must_end_with_literals() {
 
 }  // namespace
 
+/// The compressor's output, decoded by this file's decoder, is the input again. Covers the shapes the
+/// format has special rules for: empty and short inputs (no match possible), all-zero and long runs
+/// (overlapping matches, length extensions), incompressible noise (literal-only blocks), a repeat
+/// farther back than 65535 bytes (must not be emitted as a match), and a 1 MiB mixture.
+void compressor_round_trips() {
+    std::mt19937 rng(20260101);
+    auto noise = [&rng](std::size_t n) {
+        std::vector<std::uint8_t> v(n);
+        for (auto& b : v) {
+            b = static_cast<std::uint8_t>(rng());
+        }
+        return v;
+    };
+    auto round_trip = [](const char* what, const std::vector<std::uint8_t>& input) {
+        std::vector<std::uint8_t> sized;
+        std::string error;
+        require(lz4::compress_sized(input.data(), input.size(), sized, error), std::string(what) + ": " + error);
+        std::vector<std::uint8_t> out;
+        require(lz4::decompress_sized(sized, out, error), std::string(what) + ": decode: " + error);
+        require(out == input, std::string(what) + ": decoded bytes differ");
+        return sized.size();
+    };
+    for (std::size_t n : {0U, 1U, 4U, 5U, 11U, 12U, 13U, 14U, 15U, 16U, 17U, 100U, 269U, 270U, 271U, 4096U}) {
+        round_trip("random", noise(n));
+        round_trip("all-zero", std::vector<std::uint8_t>(n, 0U));
+    }
+    const auto zeros = round_trip("zeros 1 MiB", std::vector<std::uint8_t>(1U << 20U, 0U));
+    // The format spends one length byte per 255 bytes of a match, so 1 MiB of zeros is ~4 KiB.
+    require(zeros < 8192U, "a 1 MiB run of zeros must compress to a few KiB, got " + std::to_string(zeros));
+    const auto noise_1m = noise(1U << 20U);
+    require(round_trip("random 1 MiB", noise_1m) <= noise_1m.size() + noise_1m.size() / 200U + 16U,
+            "random bytes must not expand past the literal-only overhead");
+    // A 64-byte block, then the same block again 100000 bytes later: the second copy is out of
+    // offset range and must be written as literals, and the round trip must still hold.
+    auto far = noise(64);
+    auto filler = noise(100000);
+    std::vector<std::uint8_t> repeat_far = far;
+    repeat_far.insert(repeat_far.end(), filler.begin(), filler.end());
+    repeat_far.insert(repeat_far.end(), far.begin(), far.end());
+    round_trip("repeat beyond 65535", repeat_far);
+    std::vector<std::uint8_t> mixed;
+    while (mixed.size() < (1U << 20U)) {
+        const auto chunk = noise(1U + rng() % 300U);
+        mixed.insert(mixed.end(), chunk.begin(), chunk.end());
+        mixed.insert(mixed.end(), 1U + rng() % 2000U, static_cast<std::uint8_t>(rng() % 4U));
+        // A repeat of the last 40 bytes: short matches close to their source.
+        const std::size_t tail = std::min<std::size_t>(mixed.size(), 40U);
+        const std::vector<std::uint8_t> again(mixed.end() - static_cast<std::ptrdiff_t>(tail), mixed.end());
+        mixed.insert(mixed.end(), again.begin(), again.end());
+    }
+    round_trip("mixed 1 MiB", mixed);
+    std::cout << "compressor round trips passed\n";
+}
+
 int main() {
+    compressor_round_trips();
     reference_vectors_round_trip();
     the_output_buffer_is_replaced_not_appended();
     malformed_blocks_are_refused();
