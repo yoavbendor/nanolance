@@ -17,8 +17,8 @@ These stay as they are until a user asks, or the Lance pin moves:
 
 - **Lance 2.3 (unstable):** `encoding.layout.planar`, `encoding.compression.v2_3`, `encoding.compression.alp`,
   `encoding.compression.axis_delta`, `file.version.2_3`.
-- **Writing legacy formats:** `encoding.v2_0.write`, `file.version.2_0` / `2_1` writes, `file.version.0_1`.
-  The roadmap puts writing data storage versions other than 2.2 last.
+- **Writing legacy formats:** `encoding.v2_0.write` and writing format 2.0 files, `file.version.0_1`. Writing
+  format 2.1 is planned conditionally, as W1n below. See "Datasets in formats 2.0 and 2.1".
 - **Other object stores and external manifest stores:** `io.store.other_schemes`,
   `io.store.external_manifest_store`, `table.transaction.external_manifest_store`, `api.lance_c.object_stores`.
 - **Newer feature flags, each a subsystem:** managed blobs (`file.blob.managed`, `table.blob.managed`),
@@ -34,13 +34,37 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1b | `arrow.types.string_binary` | Accept Utf8View / BinaryView on write and store them as `string` / `binary` | pylance 12 writes `string_view` / `binary_view` as `string` / `binary`, and reads them back as those types | done 2026-10-28 |
 | W1c | `io.store.storage_options` | Every `AmazonS3ConfigKey` alias, and object_store's boolean spellings | object_store 0.12.4 `aws/builder.rs`: see the brief | done 2026-10-28; left: virtual-hosted style and skip_signature (nanos3reader has no switch) |
 | W1d | (test coverage) | Direct C++ tests for the modules in `tools/tests_allow.txt` that can have one | -- | done 2026-10-28: 4 direct tests; found and fixed the projected-column status; the create-mode commit question is open |
-| W1e | `arrow.fields.primary_key`, `table.schema.primary_key` | Unenforced primary key: Arrow metadata to fields 12-15, and back | to measure | next |
+| W1l | `file.version.2_0`, `file.version.2_1` | Test every modification of a 2.0 / 2.1 dataset against pylance, and document what works | measured 2026-10-29, see below | next (first: highest value, lowest risk) |
+| W1e | `arrow.fields.primary_key`, `table.schema.primary_key` | Unenforced primary key: Arrow metadata to fields 12-15, and back | measured, see below | next (restarted: the first session's work was lost in a container restart) |
+| W1m | `file.version.2_0`, `file.version.2_1` | Which older pylance / LanceDB releases read a dataset with nanolance's 2.2 files beside 2.0 / 2.1 ones | to measure | next; decides W1n |
 | W1f | `file.structure.page_priority` | Write each page's priority as Lance does | to measure | next |
 | W1g | `encoding.config` | Honour the `lance-encoding:*` field metadata Lance honours | to measure, per key | next |
 | W1h | `encoding.compression.general.write` | LZ4 | to measure | next |
 | W1i | `encoding.layout.full_zip.write` | Fixed-width full-zip and per-value compression | to measure | later |
 | W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs, read and write | to measure | later |
 | W1k | `arrow.types.fixed_size_list`, `arrow.types.dictionary` | FSL of variable-width elements; dictionaries inside structs and lists | to measure | later |
+| W1n | `file.version.2_1` | Write 2.1 files into a 2.1 dataset, so its writes stay 2.1 | the 2.2-only encodings pylance leaves out for 2.1: to measure | only if W1m finds readers that need it |
+
+## Datasets in formats 2.0 and 2.1 (measured 2026-10-29)
+
+pylance 12 wrote 2.0 and 2.1 datasets (300 rows in 3 fragments: int64, string, an 8-float vector, a list). Each
+operation then ran once with nanolance and once with pylance, and the results were compared value by value.
+pylance then appended to each result.
+
+| operation | result |
+|---|---|
+| append, delete, update, merge_insert, add_columns, compaction | the same values as pylance's result, and pylance appends afterwards |
+| drop_columns, BTREE, INVERTED and IVF_PQ index builds, overwrite | succeed, and pylance reads the result (row counts compared) |
+
+nanolance writes every new data file in format 2.2 and sets the manifest's mixed-version flag, so such a dataset
+holds 2.0 or 2.1 files beside 2.2 ones. pylance itself would keep writing the dataset's own version. pylance 12
+reads the mix. A release that predates the flag would refuse it, and compaction moves the old files to 2.2.
+Only the append case had a test (`test_format_v2_0.py::test_append_to_an_older_format`), which W1l fixes. W1m
+decides whether writing 2.1 itself (W1n) is worth doing. Writing 2.0 needs encoders for the 2.0 page
+encodings, which nanolance only reads, so it stays unscheduled until a user needs it.
+
+Risk: W1l and W1m change no library code. W1n touches the writer's encoding choice behind a version switch,
+so 2.2 output must stay byte-identical (`nl_bench_encoding` / `nlbench_gendata` A/B, as in the refactors).
 
 ## Wave 2 onwards
 
