@@ -122,3 +122,18 @@ def test_multi_page_list_fsl_with_element_nulls(lance_mod, tmp_path):
     expected = _check_equal_to_pylance(lance_mod, path, table)
     idx = [n - 1, 0, 123_456, 299_999, 7]
     assert pa.table(nanolance.take(str(path), idx)).to_pydict() == expected.take(idx).to_pydict()
+
+
+def test_fsl_of_struct_is_refused_by_name_and_other_columns_read(lance_mod, tmp_path):
+    # Not read yet (its elements are child columns). The error names the shape; it used to blame a
+    # dictionary column. Projecting the other columns still works.
+    struct = pa.struct([("x", pa.int64())])
+    table = _with_plain_column(
+        pa.table({"v": pa.array([[{"x": i}, {"x": i + 1}] for i in range(ROWS)], pa.list_(struct, 2))}))
+    path = tmp_path / "fsl_struct.lance"
+    lance_mod.write_dataset(table, str(path), data_storage_version="2.2")
+    for read in (lambda: nanolance.read_table(path), lambda: nanolance.read_table(path, columns=["v"]),
+                 lambda: nanolance.take(str(path), [1, 2])):
+        with pytest.raises(Exception, match=r"column 'v': a fixed_size_list:struct:2 is not read yet"):
+            read()
+    assert pa.table(nanolance.read_table(path, columns=["k"])).column("k").to_pylist() == list(range(ROWS))

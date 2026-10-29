@@ -43,7 +43,9 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1i | `encoding.layout.full_zip.write` | Fixed-width full-zip and per-value compression | measured and done 2026-10-29, see "Result for W1i" | partial (Haiku session, 2026-10-29): the 256-byte rule and `structural-encoding` for fixed-width FSL and fixed_size_binary, element validity included, layout text equal to pylance's for 21 cases. Left: the page split (pylance: one page per input batch), per-value compression of a fixed-width FullZip page, `structural-encoding=fullzip` on variable width, a bool column or a list of lists under fullzip, and a fixed-width FullZip scan that is slower than mini-block (measured) |
 | W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs: read pylance's first, then write them for `lance-encoding:packed` | measured 2026-10-29, see "Measured for W1j" | later, reviewer-led design: reading needs a packed-struct read plan with child fan-out (as `v20_packed_struct_sources` does for 2.0), and the VariablePackedStruct byte layout from Lance's source. Opt-in only, so behind the gaps every dataset meets |
 | W1k1 | `arrow.types.fixed_size_list` (read) | Read what pylance writes: a null element inside a fixed-size list under a list or struct (also W1a's all-null list<fsl>), `fixed_size_list<bool>`, `fixed_size_list<struct>` | measured 2026-10-29, see "Measured for W1k" and "Result for W1k1" | partial 2026-10-29: null elements under a list read (and all-null list<fsl>); stopped: `fixed_size_list<bool>` and `fixed_size_list<struct>` (see "Result for W1k1") |
-| W1k2 | `arrow.types.fixed_size_list`, `arrow.types.dictionary` (write) | Write them too, and dictionary columns inside structs and lists | measured 2026-10-29 | after W1k1 |
+| W1k2 | `arrow.types.fixed_size_list`, `arrow.types.dictionary` (write) | Write them too, and dictionary columns inside structs and lists | measured 2026-10-29 | next (the list<fsl> element nulls and the dictionaries first; fsl<bool> / fsl<struct> only after W1k3 / W1k4) |
+| W1k3 | `arrow.types.fixed_size_list` (read) | `fixed_size_list<bool, N>`: a bit-level item path in the mini-block chunk reader (`FixedSizeList{Nx Flat(1)}`) | "Result for W1k1" | later (rare shape; touches the shared chunk reader) |
+| W1k4 | `arrow.types.fixed_size_list` (read) | `fixed_size_list<struct>`: assemble a struct child of rows x N items from the leaf columns under the fixed-size layer | "Result for W1k1" | later (refused by name now) |
 | W1p | `encoding.config` | Integer and float dictionaries as Lance 12 writes them (files up to 1.9x pylance's size today) | measured 2026-10-29, see "Measured for W1p" and "Result for W1p" | partial 2026-10-29: int64, uint64, timestamp and date64 dictionaries (no nulls) write pylance's layout (all measured cases, see "Result for W1p, second pass"); left: nullable (W1p3), sorted RLE over dictionary indices (W1p2), float64 and 128-bit |
 | W1q | `encoding.compression.rle` | RLE over more than one mini-block chunk: nanolance's RLE holds its runs in one chunk, so a column of 25,000 runs is not RLE-encoded | W1g | later |
 | W1r | `encoding.config` | Dictionary indices under `lance-encoding:compression` (`General{codec,ByteStreamSplit{Flat(32)}}`, or `Flat(32)` for none): the reader's dictionary-index path has to unwrap them before the writer may emit them | W1g, W1h | partial (Haiku session, 2026-10-29): done for string, int64 and float64 dictionaries (reader unwraps General and byte-stream-split per index chunk; writer emits pylance's index layout under lz4 / zstd / none; the dictionary buffer unchanged; `dict-rle` keeps the option erased, not measured). Layout text equal to pylance's, read and take checked, see "W1r measured". Left: `dict-rle` under the option, and integer dictionaries written by nanolance (W1p) |
@@ -446,7 +448,7 @@ pylance 12.0.0 writes, `nanolance.read_table`, `take` and a projection are compa
 | list<fixed_size_list<float32, N>> with null elements inside valid items (MiniBlock, and FullZip for N = 256) | **read**, equal to pylance (read, take, projection; multi-page) |
 | list<fixed_size_list> with all items null, and all rows null | read (already); `list_fsl_all_null` and `struct_fsl_all_null` leave the strict xfail list in `test_fsl_all_null_items.py` |
 | fixed_size_list<bool, 4> | **stopped, not read** (see below) |
-| fixed_size_list<struct<x: int64>, 2> | **stopped, not read**; the message is still the misleading one (see below) |
+| fixed_size_list<struct<x: int64>, 2> | **stopped, not read**; refused by name since the review: "column 'v': a fixed_size_list:struct:2 is not read yet" (other columns of the dataset still read) |
 
 What changed: `decode_nested_fixed_list_validity` (`src/encoding/lance_column_decoder.cpp`) no longer drops or
 refuses a fixed_size_list page's element validity. The bits go into the column's `item_validity` at the element
@@ -468,8 +470,10 @@ fsl_struct2.lance  v.item.x (int64): MiniBlock{values=InlineBitpacking(64),rows=
   layer. The per-row fallback in `src/scan/lance_table_reader.cpp` gives one message for its `Skip`, `FixedSizeList` and
   `Dictionary` plan kinds, and that message is the dictionary one. A working read needs the bulk assembly to build a struct
   child of `rows * N` items under a FixedSizeList. I tried refusing it by name in the plan builder; that branch was never
-  reached for this column (the plan kind is not `FixedSizeList`), so I reverted it. The message stays misleading. Next step:
-  find which plan kind `v` gets for this column and refuse that case by name.
+  reached for this column (the plan kind is not `FixedSizeList`), so I reverted it. Review: `v` has no column of its own
+  (`column_index < 0`), so it took the `Skip` plan; the plan builder now refuses a fixed_size_list without a column by
+  name (`test_fsl_of_struct_is_refused_by_name_and_other_columns_read`).
+- **Correction to "Measured for W1k":** the all-null list<fsl> already read; only a null element inside a valid item failed.
 
 Not started: the W1k2 writer side (both shapes are still refused on write), and C++ unit tests for the nested element
 validity path (the Python tests cover it end to end).
