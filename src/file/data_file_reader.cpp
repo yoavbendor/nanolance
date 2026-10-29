@@ -21,6 +21,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <pthread.h>
+#endif
+
 namespace nano_lance {
 namespace {
 
@@ -107,18 +111,45 @@ std::vector<ThreadOpenFiles*>& registry() {
     return r;
 }
 
+/// Whether this thread's g_thread_files has been constructed (and not destroyed): the fork handler below
+/// must not touch it otherwise, since naming a thread_local constructs it.
+thread_local bool t_thread_files_live = false;
+
 ThreadOpenFiles::ThreadOpenFiles() {
     const std::lock_guard<std::mutex> lock(registry_mutex());
     registry().push_back(this);
+    t_thread_files_live = true;
 }
 
 ThreadOpenFiles::~ThreadOpenFiles() {
     const std::lock_guard<std::mutex> lock(registry_mutex());
     auto& r = registry();
     r.erase(std::remove(r.begin(), r.end(), this), r.end());
+    t_thread_files_live = false;
 }
 
 thread_local ThreadOpenFiles g_thread_files;
+
+#if defined(__unix__) || defined(__APPLE__)
+// A forked child has only the thread that called fork, but inherits the registry's pointers to every
+// other thread's cache. Those threads' stacks and thread-local storage are reused by the child's next
+// threads (a pool of its own, parallel.cpp), so the pointers dangle: close_data_files_under then locked
+// a "mutex" made of whatever the new thread wrote there, and the child hung, aborted in glibc or crashed
+// (tests/test_concurrent_writers.py::test_processes, forking writers). The registry lock is taken across
+// fork so the copy is consistent; the child keeps only the forking thread's cache. The other threads'
+// caches are dropped without closing their handles: their memory is no longer theirs to read.
+void before_fork() { registry_mutex().lock(); }
+void after_fork_in_parent() { registry_mutex().unlock(); }
+void after_fork_in_child() {
+    registry().clear();
+    if (t_thread_files_live) {
+        registry().push_back(&g_thread_files);
+    }
+    registry_mutex().unlock();
+}
+[[maybe_unused]] const bool g_fork_handlers_set =
+    (pthread_atfork(&before_fork, &after_fork_in_parent, &after_fork_in_child), true);
+#endif
 thread_local std::list<std::pair<std::filesystem::path, OpenDataFile>>& g_open_data_files = g_thread_files.files;
 thread_local std::uint64_t g_read_epoch = 0;
 thread_local std::uint64_t g_next_read_epoch = 1;
