@@ -2437,8 +2437,21 @@ bool decode_full_zip_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
         }
         std::size_t r = 0;  // the next item
         const auto shape = params.shape();
+        // Fixed width with no control word, no element validity and no constant items: the page is its rows
+        // back to back (the size check above proved it), so it is copied whole rather than row by row. A
+        // 768-float vector column scanned 33% slower than mini-block before this.
+        const bool whole_page = !variable && params.control_bytes == 0U && params.item_validity_bytes == 0U &&
+                                !params.constant_items && params.length_bytes == 0U;
+        if (whole_page) {
+            if (params.items != 0U) {
+                append_item_validity(out, nullptr, rows * params.items, rows_so_far * params.items);
+            }
+            out.fixed.insert(out.fixed.end(), data.begin(), data.end());
+            r = rows;
+            at = data.size();
+        }
         full_zip::Level lv;
-        for (std::size_t level = 0; level < num_levels; ++level) {
+        for (std::size_t level = 0; !whole_page && level < num_levels; ++level) {
             if (!full_zip::next_level(data, at, shape, lv, error)) {
                 error = "column '" + on_disk_field.name + "': " + error;
                 return false;

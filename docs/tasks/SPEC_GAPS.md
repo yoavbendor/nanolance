@@ -319,7 +319,8 @@ Pylance behaviour found while matching it (not in the rule above):
 
 Page split (not matched): pylance wrote 200,000 rows of FSL<float32,768> as ONE page (614 MB); the same rows in
 20 input batches of 10,000 gave 20 pages of 10,000 rows. Pylance cuts a fixed-width FullZip page at its input
-batch boundaries, with no byte limit measured. nanolance cuts at 8 MiB of row data (about 2,730 rows of 768 floats).
+batch boundaries, with no byte limit measured. nanolance cuts at 1 MiB of row data (341 rows of 768 floats); see
+the reviewer's measurements below for why not 8 MiB.
 Only the layout text is compared, not the page count.
 
 Performance (same machine, alternating base and new, one process per run, 200,000 rows, 1,000 random rows for take;
@@ -332,12 +333,22 @@ base = origin tree, new = this change; all six runs per width listed, so the bes
 | 1536 | base | 0.607, 0.321, 0.341 | 0.112, 0.182, 0.077 |
 | 1536 | new | 0.534, 0.734, 0.715 | 0.026, 0.054, 0.048 |
 
-Take is 3 to 4 times faster on FullZip (one stride per row, no page read). Scan is slower: best of three 0.55 s
-against 0.32 s (1536), and the 768 base scan is noisy, so the 768 figure is not settled. Scan is a finding to
-measure again, not a verdict. The cause is not profiled; the suspect is `decode_full_zip_column`, which walks the
-rows one level at a time (`full_zip::next_level`) for a fixed-width page, where mini-block reads its chunks in bulk.
-A fast path for fixed-width pages with no control word and no item validity (one copy of the page) is the obvious
-next step.
+The first runs were noisy (1.2 GB files, page cache) and are kept above for the record. The reviewer then
+compared both layouts with one build: the same column written as FullZip (the new default) and with
+`structural-encoding=miniblock` (the old layout), 5 alternating rounds, best of 5, on a 15 GB machine.
+
+| change | 768 floats: scan MB / FZ | 1536 floats: scan MB / FZ | take 1,000 rows MB / FZ (768, 1536) |
+|---|---|---|---|
+| W1i as delegated (8 MiB pages, row-by-row decode) | 0.106 / 0.141 (+33%) | 0.648 / 0.200 | 0.026 / 0.007, 0.164 / 0.010 |
+| + whole-page copy in `decode_full_zip_column` | 0.099 / 0.115 (+16%) | 0.574 / 0.198 | 0.026 / 0.006, 0.181 / 0.010 |
+| + 1 MiB pages (`kFullZipFixedPageBytes`) | 0.105 / **0.089** (-15%) | 0.380 / **0.191** | 0.028 / 0.008, 0.187 / 0.012 |
+
+The whole-page copy applies to a fixed-width page with no control word (no nulls, no lists), no element
+validity and no constant items: the page is its rows back to back, so it is copied in one step. The 1 MiB page
+follows the writer's own earlier finding (`data_file_writer.cpp`, the list-page comment): pages of 8 MiB cost
+nanolance's scan up to 2x in page-sized intermediate buffers.
+pylance reads the new files faster too (best of 3, scan / take): 768 floats 0.717 / 0.035 s as mini-block, 0.571 /
+0.020 s as FullZip; 1536 floats 1.675 / 0.043 s, 1.122 / 0.038 s.
 
 Byte-identical check (narrow columns): `nlbench_gendata <out> 50000` data file md5 is equal between the base and
 the new build (84b4dce7912cd80d047e779f01a143fb), and `test_write_encoding_matrix.py` passes unchanged.

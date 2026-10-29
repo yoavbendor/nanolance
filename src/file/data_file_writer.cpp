@@ -2168,7 +2168,7 @@ bool fixed_column_wants_full_zip(const LanceField& field, bool item_validity, bo
 /// its slot (zeros), as Lance's fixed-width FullZip does. Pages hold whole rows, cut at kFullZipFixedPageBytes.
 bool write_full_zip_fixed_column(const ColumnEncodeContext& ctx, std::ostream& out,
                                  std::vector<pb::ColumnMetadata>& columns, std::string& error) {
-    constexpr std::uint64_t kFullZipFixedPageBytes = std::uint64_t{8} << 20U;
+    constexpr std::uint64_t kFullZipFixedPageBytes = std::uint64_t{1} << 20U;
     const auto& field = ctx.field;
     const auto& values = ctx.values;
     const bool nulls = ctx.column_has_nulls;
