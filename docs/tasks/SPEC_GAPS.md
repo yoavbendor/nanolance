@@ -383,3 +383,18 @@ message VariablePackedStruct {       // 2.2: each child value compressed on its 
 ```
 
 So W1j starts with reading: a dataset pylance wrote with a packed struct cannot be read by nanolance today.
+
+## W1j follow-up measurements (2026-10-29, session haiku/w1j-packed)
+
+pylance 12.0.0, data_storage_version 2.2, 20,000 rows, `lance-encoding:packed` = `true`. Layouts from `build/nlance-pagelayout`:
+
+| struct | pylance's writes | layout |
+|---|---|---|
+| struct<int32, float64> | yes | `MiniBlock{values=Unknown(field 12)}` |
+| same, with null rows | yes | `MiniBlock{values=Unknown(field 12), repdef=Bitpacked(16,Flat(1)), nullable}` |
+| struct<int32, string> | yes | `FullZip{values=Unknown(field 13), offset_bits=32, layers=[valid-item]}` |
+| struct<int32, fixed_size_list<float32,4>> | yes | `FullZip{values=Unknown(field 13), offset_bits=32, layers=[valid-item]}` |
+
+Child types pylance accepts in a packed struct (one int32 sibling, each child in turn): int8, uint8, int16, uint16, uint32, int64, uint64, float32, string, fixed_size_list<int8,3>, fixed_size_binary(3). Refused by pylance: bool (writer panics, `TryFromIntError`), list<int32> (`Field with data type List(Int32) cannot be converted to data block`), a struct child (`Packed struct per-value compression should not be used for fixed-width-only struct`), and a nullable child (`Per-value compression not yet supported for block type Nullable`).
+
+Not measured yet: the byte layout of `VariablePackedStruct` (field 13). The Lance 12 `packed.rs` source could not be fetched in this session (the sandbox refused the download, and the GitHub connector does not have `lance-format/lance` configured), so the reader for both forms is still open. W1j reader: not started; writer: not started.
