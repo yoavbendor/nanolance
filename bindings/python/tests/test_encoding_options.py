@@ -234,3 +234,18 @@ def test_nanolance_string_dictionary_indices_match_pylance_layout(tmp_path, code
     assert lance.dataset(str(ours)).to_table() == table
     assert nl_dataset(str(ours)).to_table() == table
     assert nl_dataset(str(theirs)).to_table() == table
+
+
+@pytest.mark.parametrize("codec", ["lz4", "zstd", "none"])
+def test_column_option_survives_the_writer_wide_compression_flag(tmp_path, codec):
+    # The writer-wide compression flag tags every string column zstd. On a dictionary column the caller's own
+    # option must win, so the indices are the option's layout.
+    import nanolance
+
+    lance = require_pylance()
+    table = _table(_strings(1000), {"compression": codec, "dict-divisor": "1", "dict-values-compression": "none"})
+    ours = tmp_path / "ours.lance"
+    nanolance.write_table(table, str(ours), compression=True)
+    assert INDEX_LAYOUT[codec] in _index_layouts(ours)
+    assert lance.dataset(str(ours)).to_table() == table
+    assert nl_dataset(str(ours)).to_table() == table

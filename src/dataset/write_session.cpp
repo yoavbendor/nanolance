@@ -773,11 +773,30 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
                 }
             } else if (cv.kind == ColumnValues::Kind::VariableWidth &&
                        encoding_choice::variable_column_dict_beneficial(cv, enc_options)) {
-                // Scattered low-cardinality strings -> structural dictionary + indices. The indices take
-                // lance-encoding:compression's layout (write_dict_column), so the option is kept.
+                // Scattered low-cardinality strings -> structural dictionary + indices. The indices take the
+                // caller's lance-encoding:compression layout (write_dict_column). The writer-wide compression flag
+                // tagged every string column zstd above; that tag is not the caller's, so it is replaced by the
+                // caller's own option (from the schema as given) or dropped.
+                std::string own_codec;
+                bool has_own_codec = false;
+                for (const auto& original : state->schema_mapping.fields) {
+                    if (original.id == pf->id) {
+                        if (const auto it = original.metadata.find("lance-encoding:compression");
+                            it != original.metadata.end()) {
+                            own_codec = it->second;
+                            has_own_codec = true;
+                        }
+                        break;
+                    }
+                }
                 for (auto& field : disk_schema.fields) {
                     if (field.id == pf->id) {
                         field.metadata["nanolance:packing"] = "dict";
+                        if (has_own_codec) {
+                            field.metadata["lance-encoding:compression"] = own_codec;
+                        } else {
+                            field.metadata.erase("lance-encoding:compression");
+                        }
                         break;
                     }
                 }
