@@ -477,7 +477,10 @@ bool fixed_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnEnco
         return v;
     };
 
-    // The sample: 32 evenly spaced blocks, each a run of consecutive values (none under one block).
+    // The sample: 32 evenly spaced blocks, each a run of consecutive values (none under one block). Its distinct
+    // count also sizes the hash map below: reserving the full threshold (up to 100,001 buckets) for a column of 10
+    // values spread every lookup over a cold table and made the write 2.3x slower than a flat column.
+    std::size_t expected_distinct = std::min<std::size_t>(threshold + 1U, rows);
     if (rows >= kBlockValues) {
         const std::size_t stride = rows / kSampleBlocks;
         const std::size_t per_block = std::min<std::size_t>(kSampleBlockValues, stride);
@@ -493,24 +496,51 @@ bool fixed_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnEnco
         if (ratio >= 0.98 || ratio * static_cast<double>(rows) > static_cast<double>(threshold)) {
             return false;
         }
+        expected_distinct = std::min(expected_distinct, std::max<std::size_t>(2U * seen.size(), 64U));
     }
 
-    // The whole column: distinct values in first-appearance order, and each row's index.
-    std::unordered_map<std::uint64_t, std::uint32_t> index_of;
-    index_of.reserve(std::min<std::size_t>(threshold + 1U, rows));
+    // The whole column: distinct values in first-appearance order, and each row's index. An open-addressing table
+    // (slot = dictionary index + 1, 0 empty; Fibonacci hashing; at most half full) rather than unordered_map, whose
+    // per-node lookups made a 1M-row dictionary column take 2.5x as long to write as a flat one.
     std::vector<std::uint64_t> distinct;
     std::vector<std::uint32_t> indices;
     indices.reserve(rows);
+    unsigned table_bits = 6U;
+    while ((std::size_t{1} << table_bits) < 2U * expected_distinct && table_bits < 31U) {
+        ++table_bits;
+    }
+    std::vector<std::uint32_t> table(std::size_t{1} << table_bits, 0U);
+    const auto slot_of = [&](std::uint64_t v) {
+        return static_cast<std::size_t>((v * 0x9E3779B97F4A7C15ULL) >> (64U - table_bits));
+    };
     for (std::size_t i = 0; i < rows; ++i) {
         const std::uint64_t v = value_at(i);
-        const auto [it, inserted] = index_of.try_emplace(v, static_cast<std::uint32_t>(distinct.size()));
-        if (inserted) {
+        const std::size_t mask = table.size() - 1U;
+        std::size_t slot = slot_of(v);
+        while (table[slot] != 0U && distinct[table[slot] - 1U] != v) {
+            slot = (slot + 1U) & mask;
+        }
+        if (table[slot] == 0U) {
             if (distinct.size() >= threshold) {
                 return false;  // one more entry than the threshold allows
             }
             distinct.push_back(v);
+            table[slot] = static_cast<std::uint32_t>(distinct.size());
+            if (2U * distinct.size() > table.size()) {  // keep it at most half full: double and re-insert
+                ++table_bits;
+                table.assign(std::size_t{1} << table_bits, 0U);
+                for (std::size_t d = 0; d < distinct.size(); ++d) {
+                    std::size_t s2 = slot_of(distinct[d]);
+                    while (table[s2] != 0U) {
+                        s2 = (s2 + 1U) & (table.size() - 1U);
+                    }
+                    table[s2] = static_cast<std::uint32_t>(d + 1U);
+                }
+            }
+            indices.push_back(static_cast<std::uint32_t>(distinct.size() - 1U));
+        } else {
+            indices.push_back(table[slot] - 1U);
         }
-        indices.push_back(it->second);
     }
     if (distinct.size() < 2U) {
         return false;  // a constant column is stored as one value, not a dictionary

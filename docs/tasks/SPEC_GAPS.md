@@ -560,6 +560,17 @@ Sizes (data file, bytes; "before" is the 2,184 / 252,296 flat or the same flat p
 Write time, 1,000,000 rows x 4 int64 columns (cardinalities 10, 100, 5,000, 25,000), best of 3 (`/tmp/w1p/timeit.py`):
 0.131 s now. The before figure needs a second build of the base commit and was not measured in this pass.
 
+Reviewer A/B (1,000,000 rows, int64 columns at 10 / 100 / 5,000 / 25,000 distinct plus a timestamp, best of 3):
+
+| build | write | scan | data size |
+|---|---|---|---|
+| before W1p | 0.069 s | 0.007 s | 25.5 MB |
+| W1p as delivered (`unordered_map` index) | 0.160 s | 0.012 s | 12.4 MB |
+| W1p + open-addressing index (committed) | 0.148 s | 0.011 s | 12.4 MB |
+
+Per column: a rejected column costs 12 ms (the sample); a dictionary column 30-46 ms, against pylance's 34-36 ms for the
+same columns. The write is ~2x a flat write, on par with pylance; the file is half the size (10x for low cardinality).
+
 Byte-identical: `nlbench_gendata` at 50,000 rows writes the same data file (`84b4dce7912cd80d047e779f01a143fb`), so no
 column in that benchmark is a 64-bit pylance dictionary.
 
