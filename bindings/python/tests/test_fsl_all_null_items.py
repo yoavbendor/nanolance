@@ -73,8 +73,6 @@ SHAPES["fsl_of_fsl_all_null"] = lambda: pa.table(
 
 # Shapes pylance writes as Constant that nanolance still refuses. Strict xfail: a fix turns them red.
 _LEFT = {
-    "list_fsl_all_null": "list<fsl> all null: nanolance refuses a null element inside a fixed_size_list item",
-    "struct_fsl_all_null": "small struct<fsl> with null elements: MiniBlock, refused as a null element in fsl",
     "fsl_of_fsl_all_null": "fsl<fsl> all null: unsupported page layout",
     "string_dim2_all_null": "fsl<string> all null: string is an unsupported fixed_size_list element type",
 }
