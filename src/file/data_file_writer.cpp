@@ -1353,6 +1353,42 @@ bool fsst_pays_on_first_page(const fsst::Encoder& encoder, const ColumnValues& v
     return plan_item_fsst(encoder, values, items, packed);
 }
 
+/// The dictionary of an Arrow dictionary leaf under a struct or list (W1k2): every entry of the Arrow
+/// dictionary, in its order, and each item's index into it. The values were recorded against that dictionary
+/// when they were appended (array_accessor: append_dictionary_values), so every item has an entry.
+bool plan_arrow_item_dictionary(const ColumnValues& values, const std::vector<std::uint64_t>& items,
+                                std::vector<std::string_view>& distinct, std::vector<std::uint32_t>& indices) {
+    distinct.clear();
+    indices.clear();
+    if (values.kind != ColumnValues::Kind::VariableWidth || values.dictionary == nullptr) {
+        return false;
+    }
+    std::unordered_map<std::string_view, std::uint32_t> position;
+    for (const auto& entry : *values.dictionary) {
+        position.emplace(std::string_view(entry), static_cast<std::uint32_t>(distinct.size()));
+        distinct.emplace_back(entry);
+    }
+    indices.reserve(items.size());
+    for (const auto item : items) {
+        if (!validity_bit(values.validity, item)) {
+            // A null item holds an empty value, which is no entry: its index is never read (its level says null).
+            indices.push_back(0U);
+            continue;
+        }
+        const auto s = static_cast<std::size_t>(variable_offset(values, item));
+        const auto e = static_cast<std::size_t>(variable_offset(values, item + 1U));
+        const std::string_view value(reinterpret_cast<const char*>(values.variable.data.data()) + s, e - s);
+        const auto found = position.find(value);
+        if (found == position.end()) {
+            distinct.clear();
+            indices.clear();
+            return false;
+        }
+        indices.push_back(found->second);
+    }
+    return true;
+}
+
 bool build_nested_page(const LanceField& field, const ColumnValues& values, const repdef::Serialized& ser,
                        std::uint64_t rows, const fsst::Encoder* fsst_encoder, bool plain, NestedPageBuffers& page,
                        bool& too_big, std::string& error) {
@@ -1371,8 +1407,18 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
     std::vector<std::uint32_t> indices;
     // `plain`: the caller asked for no structural encoding (set_structural_encoding(false)), so the
     // values are written as they are -- no page dictionary here, and no FSST (it passes none).
+    // An Arrow dictionary leaf (W1k2) keeps its own dictionary, in its order and with its unused entries, as
+    // pylance writes it; its items are looked up in that dictionary. Any other leaf may get a page dictionary.
+    const bool arrow_dictionary = !field.dictionary_index_format.empty();
     const bool dictionary =
-        !plain && encoding == ItemEncoding::kVariable && plan_item_dictionary(values, ser.items, distinct, indices);
+        arrow_dictionary ? (values.kind == ColumnValues::Kind::VariableWidth && values.dictionary != nullptr &&
+                            plan_arrow_item_dictionary(values, ser.items, distinct, indices))
+                         : !plain && encoding == ItemEncoding::kVariable &&
+                               plan_item_dictionary(values, ser.items, distinct, indices);
+    if (arrow_dictionary && !dictionary) {
+        error = "dictionary column '" + field.name + "' inside a struct or list has no dictionary to write";
+        return false;
+    }
     // Not repetitive enough for a dictionary: FSST, when it pays. Its chunks are ordinary Variable
     // chunks of the COMPRESSED values, gathered from `fsst_values` in page order.
     ColumnValues fsst_values;
@@ -1551,9 +1597,18 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
         // block the flat string path writes (dictionary::encode_variable).
         const bool large = values.variable.large;
         mini.value_compression = descriptor::inline_bitpacking(32U);
-        mini.dictionary = descriptor::variable(descriptor::flat(offset_bits_token(large)));
         mini.num_dictionary_items = distinct.size();
-        page.dictionary = dictionary::encode_variable(distinct, large);
+        if (arrow_dictionary) {
+            // pylance's shape for a dictionary under a struct or list: the dictionary LZ4-framed as one block.
+            const auto raw = dictionary::encode_variable(distinct, large);
+            if (!general::lz4_frame(raw, page.dictionary, error)) {
+                return false;
+            }
+            mini.dictionary = descriptor::general(descriptor::kLz4, descriptor::variable(descriptor::flat(offset_bits_token(large))));
+        } else {
+            mini.dictionary = descriptor::variable(descriptor::flat(offset_bits_token(large)));
+            page.dictionary = dictionary::encode_variable(distinct, large);
+        }
     } else if (fsst) {
         mini.value_compression =
             descriptor::fsst(fsst_table, item_value_encoding(encoding, field, values.variable.large));
@@ -3239,7 +3294,13 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
         return write_blob_v2_column(ctx, out, columns, error);
     }
 
-    if (values.needs_nested_pages()) {
+    // A leaf under a struct with nulls of its own (or a dictionary, or element nulls) is written with the nested
+    // pages even where the struct adds no layer: the top-level writer's flat levels are not what Lance reads back
+    // under a struct (a pylance read panics on them). A dictionary leaf takes this path always, for pylance's shape
+    // (repdef levels, InlineBitpacking indices, a General dictionary) without nulls too.
+    const bool nested_leaf = field.parent_id >= 0 && (column_has_nulls || !values.item_validity.empty() ||
+                                                      !field.dictionary_index_format.empty());
+    if (values.needs_nested_pages() || nested_leaf) {
         pb::ColumnMetadata column;
         if (!write_nested_column(out, field, values, rows, column, error)) {
             return false;

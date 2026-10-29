@@ -641,6 +641,9 @@ bool walk_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, con
     return true;
 }
 
+bool append_dictionary_values(const ArrowArray& array, const LanceField& field, ColumnValues& out,
+                              std::string& error);
+
 bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, const LanceField& field,
                    ColumnValues& out, std::string& error) {
     const ArrowArray* node = nullptr;
@@ -671,6 +674,10 @@ bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, c
         items_before = width == 0U ? 0U : out.fixed.size() / width;
     }
     append_bits(out.validity, out.null_count, items_before, leaf, at, count);
+    // A dictionary leaf (W1k2): its values are gathered, and its dictionary recorded, as for a top-level one.
+    if (!field.dictionary_index_format.empty()) {
+        return append_dictionary_values(leaf, field, out, error);
+    }
     if (lance_field_is_variable_width(field.logical_type)) {
         return append_variable_width(leaf, field, out, error);
     }
