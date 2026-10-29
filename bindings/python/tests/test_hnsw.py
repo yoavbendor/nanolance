@@ -226,11 +226,19 @@ def test_new_kinds_match_pylance(lance, new_kinds, kind, metric, deleted):
                 ref = theirs.to_table(nearest=nearest, columns=["id"], filter=flt, prefilter=pre)
                 got = ours.to_table(nearest=nearest, columns=["id"], filter=flt, prefilter=pre)
                 rd, gd = ref.column("_distance").to_numpy(), got.column("_distance").to_numpy()
-                assert len(rd) == len(gd), (o, flt, pre)
                 if metric == "dot" and flt is not None:
-                    # A race between partitions in pylance: compare what any run could return.
+                    # A race between partitions in pylance: compare what any run could return. Under a
+                    # post-filter even the row count varies (CI saw k=1 come back empty from pylance while
+                    # nanolance kept its match), so a count is accepted when some pylance run gives it.
+                    for _ in range(20):
+                        if len(rd) == len(gd):
+                            break
+                        rd = theirs.to_table(nearest=nearest, columns=["id"], filter=flt,
+                                             prefilter=pre).column("_distance").to_numpy()
+                    assert len(rd) == len(gd), (o, flt, pre)
                     assert np.all(np.isfinite(gd) == np.isfinite(rd)), (o, flt, pre)
                     continue
+                assert len(rd) == len(gd), (o, flt, pre)
                 # dot: 1 - dot cancels near zero in float32, so the sums' order shows as ~3e-5 absolute.
                 atol = 3e-5 if metric == "dot" else 1e-6
                 assert np.allclose(rd, gd, rtol=1e-5, atol=atol), (o, flt, pre, rd[:5], gd[:5])
