@@ -11,7 +11,8 @@ from 0).
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 import pyarrow as pa
 
@@ -23,10 +24,30 @@ _PK = "lance-schema:unenforced-primary-key"
 _PK_POSITION = "lance-schema:unenforced-primary-key:position"
 _CK_POSITION = "lance-schema:unenforced-clustering-key:position"
 _ENCODINGS = {1: "Plain", 2: "VarBinary", 3: "Dictionary", 4: "RLE"}
+_TRUTHY = ("true", "yes", "on", "1", "y")  # pylance 12, compared without case (measured)
+_U32 = re.compile(r"\+?[0-9]+")
 
 
 def _rust_str(s: str) -> str:
     return json.dumps(s, ensure_ascii=False)
+
+
+def _position(text: Optional[str]) -> Optional[int]:
+    """A position as Rust's ``u32::from_str`` reads it (an optional '+', digits, 32 bits); None if it does not."""
+    if text is None or not _U32.fullmatch(text):
+        return None
+    value = int(text)
+    return value if value <= 0xFFFFFFFF else None
+
+
+def primary_key_of_metadata(meta: Dict[str, str]) -> Tuple[bool, int]:
+    """Whether a field with this Arrow metadata is an unenforced primary key column, and its position (0 when
+    the key is ordered by field id). A position that parses decides it; otherwise a truthy flag makes the
+    field a key at position 0. This is pylance 12's rule, spelling for spelling (measured)."""
+    position = _position(meta.get(_PK_POSITION))
+    if position is not None:
+        return True, position
+    return meta.get(_PK, "").lower() in _TRUTHY, 0
 
 
 class LanceField:
@@ -56,20 +77,16 @@ class LanceField:
         return self._arrow
 
     def unenforced_primary_key_position(self) -> Optional[int]:
-        meta = self._info["metadata"]
-        try:
-            return int(meta[_PK_POSITION])
-        except (KeyError, ValueError):
-            return 0 if meta.get(_PK, "").lower() in ("1", "true", "yes", "on") else None
+        # Lance keeps a position of 0 out of the manifest (proto3), so it reads back as None, as here.
+        is_key, position = primary_key_of_metadata(self._info["metadata"])
+        return position if is_key and position != 0 else None
 
     def is_unenforced_primary_key(self) -> bool:
-        return self.unenforced_primary_key_position() is not None
+        return primary_key_of_metadata(self._info["metadata"])[0]
 
     def unenforced_clustering_key_position(self) -> Optional[int]:
-        try:
-            return int(self._info["metadata"][_CK_POSITION])
-        except (KeyError, ValueError):
-            return None
+        position = _position(self._info["metadata"].get(_CK_POSITION))
+        return position if position else None
 
     def is_unenforced_clustering_key(self) -> bool:
         return self.unenforced_clustering_key_position() is not None
@@ -98,7 +115,7 @@ class LanceField:
                 f"encoding: {'None' if encoding is None else f'Some({encoding})'}, "
                 f"nullable: {'true' if i['nullable'] else 'false'}, "
                 f"children: [{', '.join(repr(c) for c in self._children)}], dictionary: None, "
-                f"unenforced_primary_key_position: {position(self._info['metadata'].get(_PK_POSITION))}, "
+                f"unenforced_primary_key_position: {position(self.unenforced_primary_key_position())}, "
                 f"unenforced_clustering_key_position: {position(self.unenforced_clustering_key_position())} }}")
 
 

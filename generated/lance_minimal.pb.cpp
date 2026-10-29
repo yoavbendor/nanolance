@@ -16,6 +16,7 @@
 // (marked below).
 
 #include "lance_minimal.pb.hpp"
+#include "base/proto_wire.hpp"
 #include "nanolance/roaring_bitmap.hpp"
 
 #include <nanom/formats/lance_protobuf.hpp>
@@ -126,9 +127,73 @@ void from_wire(const std::vector<wire::StringEntry>& entries, std::map<std::stri
 
 // --- Field ------------------------------------------------------------------------------------
 
+namespace {
+
+// Lance's Field fields for the unenforced keys. nanom's Field does not declare them, so they are read
+// from and written to the `unknown` bytes here, beside the fields that are kept as they came.
+constexpr std::uint32_t kFieldUnenforcedPrimaryKey = 12;
+constexpr std::uint32_t kFieldPrimaryKeyPosition = 13;
+constexpr std::uint32_t kFieldClusteringKeyPosition = 15;
+
+bool is_key_field(std::uint32_t number) {
+    return number == kFieldUnenforcedPrimaryKey || number == kFieldPrimaryKeyPosition ||
+           number == kFieldClusteringKeyPosition;
+}
+
+/// `bytes` without the key fields (12, 13, 15).
+std::vector<std::uint8_t> without_key_fields(const std::vector<std::uint8_t>& bytes) {
+    std::vector<std::uint8_t> out;
+    proto_wire::Reader r(bytes.data(), bytes.size());
+    proto_wire::Field x;
+    while (r.next(x)) {
+        if (!is_key_field(x.number)) {
+            out.insert(out.end(), x.begin, x.end);
+        }
+    }
+    return out;
+}
+
+/// The key fields of `bytes`, last one wins as protobuf says. Varints only; a malformed one is ignored.
+void read_key_fields(const std::vector<std::uint8_t>& bytes, Field& f) {
+    proto_wire::Reader r(bytes.data(), bytes.size());
+    proto_wire::Field x;
+    while (r.next(x)) {
+        if (x.wire != 0) {
+            continue;
+        }
+        if (x.number == kFieldUnenforcedPrimaryKey) {
+            f.unenforced_primary_key = x.value != 0;
+        } else if (x.number == kFieldPrimaryKeyPosition) {
+            f.unenforced_primary_key_position = static_cast<std::uint32_t>(x.value);
+        } else if (x.number == kFieldClusteringKeyPosition) {
+            f.unenforced_clustering_key_position = static_cast<std::uint32_t>(x.value);
+        }
+    }
+}
+
+/// `f.unknown` with its key fields replaced by the ones `f` holds (proto3: a false or zero one is left out).
+std::vector<std::uint8_t> wire_unknown_of(const Field& f) {
+    std::vector<std::uint8_t> out = without_key_fields(f.unknown);
+    if (f.unenforced_primary_key) {
+        proto_wire::put_key(out, kFieldUnenforcedPrimaryKey, 0);
+        proto_wire::put_varint(out, 1);
+    }
+    if (f.unenforced_primary_key_position != 0) {
+        proto_wire::put_key(out, kFieldPrimaryKeyPosition, 0);
+        proto_wire::put_varint(out, f.unenforced_primary_key_position);
+    }
+    if (f.unenforced_clustering_key_position != 0) {
+        proto_wire::put_key(out, kFieldClusteringKeyPosition, 0);
+        proto_wire::put_varint(out, f.unenforced_clustering_key_position);
+    }
+    return out;
+}
+
+}  // namespace
+
 wire::Field to_wire(const Field& f) {
     wire::Field w;
-    w.unknown = to_unknown(f.unknown);
+    w.unknown = to_unknown(wire_unknown_of(f));
     w.type = wire::FieldType(f.type);
     w.name = std::string_view(f.name);
     w.id = f.id;
@@ -154,6 +219,8 @@ Field from_wire(const wire::Field& w) {
     f.encoding = std::int32_t(*w.encoding);
     from_wire(*w.metadata, f.metadata);
     f.unknown = from_unknown(*w.unknown);
+    read_key_fields(f.unknown, f);
+    f.unknown = without_key_fields(f.unknown);
     // nanolance: a field cannot be its own parent. That is field 0 with no parent_id on the wire,
     // i.e. the root of a schema whose writer left the zero out; it is a root.
     if (f.parent_id == f.id) {

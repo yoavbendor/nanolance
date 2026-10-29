@@ -49,7 +49,9 @@ fragments two: see "Keeping indexes up to date"), and writes what pylance writes
 | Files | `lance.file`: `LanceFileReader` (`read_all`, `read_range`, `take_rows`, `num_rows`, `metadata`, `file_statistics`, `read_global_buffer`), `LanceFileWriter`, `LanceFileSession` (local), `stable_version` |
 
 Datasets and files are written in format 2.2, which is pylance 12's default. A request to write
-another version (`data_storage_version="2.0"`, `LanceFileWriter(version="2.1")`) raises. Formats 2.0,
+another version (`data_storage_version="2.0"`, `LanceFileWriter(version="2.1")`) raises. Modifying an older dataset works: delete, update, merge_insert,
+add_columns, drop_columns, compaction, overwrite and the BTREE / INVERTED / IVF_PQ builds on a 2.0 or 2.1
+dataset give pylance's results, and pylance appends to the result; the new files are 2.2 (`test_operation_on_an_older_dataset`). A write that would add the first 2.2 file to a 2.0 or 2.1 dataset emits one `nanolance.lance.MixedFormatWarning` before it commits, because only pylance 12 and later can read the result; under `warnings.simplefilter("error", MixedFormatWarning)` the write raises and nothing is committed (`test_mixed_format_warning.py`). Formats 2.0,
 2.1 (the default of earlier pylance releases) and 2.2 are all read:
 `test_pylance_written_shapes_read_back` has pylance write every shape of the encoding matrix and the
 list tests in 2.1 and 2.2, and nanolance must read back what pylance does. `test_format_v2_0.py`

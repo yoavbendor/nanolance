@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -291,6 +292,62 @@ void copy_metadata(const ArrowSchema& schema, std::map<std::string, std::string>
     }
 }
 
+constexpr const char* kPrimaryKeyKey = "lance-schema:unenforced-primary-key";
+constexpr const char* kPrimaryKeyPositionKey = "lance-schema:unenforced-primary-key:position";
+constexpr const char* kClusteringKeyPositionKey = "lance-schema:unenforced-clustering-key:position";
+
+/// Rust's `u32::from_str` as Lance reads a position: an optional '+', then decimal digits, nothing else.
+bool parse_position(const std::string& text, std::uint32_t& out) {
+    std::size_t i = !text.empty() && text[0] == '+' ? 1U : 0U;
+    if (i == text.size()) {
+        return false;
+    }
+    std::uint64_t value = 0;
+    for (; i < text.size(); ++i) {
+        if (text[i] < '0' || text[i] > '9') {
+            return false;
+        }
+        value = value * 10U + static_cast<std::uint64_t>(text[i] - '0');
+        if (value > std::numeric_limits<std::uint32_t>::max()) {
+            return false;
+        }
+    }
+    out = static_cast<std::uint32_t>(value);
+    return true;
+}
+
+/// Lance's truthy spellings of the primary-key flag, compared without case: true, yes, on, 1, y.
+bool is_truthy_key_flag(const std::string& text) {
+    std::string lower;
+    lower.reserve(text.size());
+    for (const char c : text) {
+        lower.push_back(static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c));
+    }
+    return lower == "true" || lower == "yes" || lower == "on" || lower == "1" || lower == "y";
+}
+
+/// The unenforced key a field's Arrow metadata asks for. A position that parses makes the field a key column
+/// at that position, whatever the flag says; otherwise a truthy flag makes it one at position 0. The clustering
+/// position is only read when it parses. Pylance 12 does the same, spelling for spelling.
+void read_key_metadata(LanceField& field) {
+    field.unenforced_primary_key = false;
+    field.unenforced_primary_key_position = 0;
+    field.unenforced_clustering_key_position = 0;
+    const auto position = field.metadata.find(kPrimaryKeyPositionKey);
+    std::uint32_t value = 0;
+    if (position != field.metadata.end() && parse_position(position->second, value)) {
+        field.unenforced_primary_key = true;
+        field.unenforced_primary_key_position = value;
+    } else if (const auto flag = field.metadata.find(kPrimaryKeyKey);
+               flag != field.metadata.end() && is_truthy_key_flag(flag->second)) {
+        field.unenforced_primary_key = true;
+    }
+    const auto clustering = field.metadata.find(kClusteringKeyPositionKey);
+    if (clustering != field.metadata.end() && parse_position(clustering->second, value)) {
+        field.unenforced_clustering_key_position = value;
+    }
+}
+
 /// Arrow fixed_size_list ("+w:N") -> Lance "fixed_size_list:<element>:<N>". Lance stores it as ONE
 /// physical column of N-element rows and keeps no child field in its schema, so the element type
 /// travels inside the logical type string. Only a fixed-width numeric/temporal element is accepted:
@@ -443,6 +500,7 @@ bool map_field(const ArrowSchema& field,
     out.nullable = is_nullable(field);
     out.extension_name = extension_name;
     copy_metadata(field, out.metadata);
+    read_key_metadata(out);
 
     // An Arrow dictionary column was once written as a bare index column with its dictionary VALUES
     // stored nowhere (pa.array(["a","b","a"]).dictionary_encode() read back as [0, 1, 0]), then
@@ -555,6 +613,75 @@ std::vector<const LanceField*> lance_physical_fields(const LanceSchemaMapping& m
     return out;
 }
 
+namespace {
+
+/// Lance's description of a field in its error messages: `Field(id=0, name=l, type=list, children=[...])`.
+std::string describe_field(const LanceSchemaMapping& mapping, const LanceField& field) {
+    std::string out = "Field(id=" + std::to_string(field.id) + ", name=" + field.name +
+                      ", type=" + field.logical_type;
+    std::vector<const LanceField*> children;
+    for (const auto& candidate : mapping.fields) {
+        if (candidate.parent_id == field.id) {
+            children.push_back(&candidate);
+        }
+    }
+    if (!children.empty()) {
+        out += ", children=[";
+        for (const LanceField* child : children) {
+            out += describe_field(mapping, *child) + ", ";
+        }
+        out += "]";
+    }
+    return out + ")";
+}
+
+/// The checks pylance 12 makes on each unenforced primary key column, in its order: a key is a leaf; no
+/// ancestor is nullable (root first), nor the key; no ancestor is a list. Each error names the field that fails.
+bool check_primary_keys(const LanceSchemaMapping& mapping, std::string& error) {
+    const auto parent_of = [&](const LanceField& field) -> const LanceField* {
+        for (const auto& candidate : mapping.fields) {
+            if (candidate.id == field.parent_id) {
+                return &candidate;
+            }
+        }
+        return nullptr;
+    };
+    for (const auto& key : mapping.fields) {
+        if (!key.unenforced_primary_key) {
+            continue;
+        }
+        const bool has_children = std::any_of(mapping.fields.begin(), mapping.fields.end(),
+                                              [&](const LanceField& f) { return f.parent_id == key.id; });
+        if (has_children) {
+            error = "Primary key column must be a leaf: " + describe_field(mapping, key);
+            return false;
+        }
+        std::vector<const LanceField*> ancestors;  // root first
+        for (const LanceField* p = parent_of(key); p != nullptr; p = parent_of(*p)) {
+            ancestors.insert(ancestors.begin(), p);
+        }
+        for (const LanceField* p : ancestors) {
+            if (p->nullable) {
+                error = "Primary key column and all its ancestors must not be nullable: " + describe_field(mapping, *p);
+                return false;
+            }
+        }
+        for (const LanceField* p : ancestors) {
+            if (lance_logical_type_is_list(p->logical_type)) {
+                error = "Primary key column must not be in a list type: " + describe_field(mapping, *p);
+                return false;
+            }
+        }
+        if (key.nullable) {
+            error = "Primary key column and all its ancestors must not be nullable: " + describe_field(mapping, key);
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
 bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, std::string& error,
                       bool /*ignore_nullability*/) {
     mapping.fields.clear();
@@ -573,10 +700,13 @@ bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, st
                 return false;
             }
         }
-        return true;
+        return check_primary_keys(mapping, error);
     }
 
-    return map_field(schema, -1, next_id, next_column, mapping, error);
+    if (!map_field(schema, -1, next_id, next_column, mapping, error)) {
+        return false;
+    }
+    return check_primary_keys(mapping, error);
 }
 
 bool schema_mappings_equivalent(const LanceSchemaMapping& left, const LanceSchemaMapping& right) {
@@ -1032,6 +1162,10 @@ bool lance_schema_mapping_from_manifest(const pb::Manifest& manifest, LanceSchem
         lf.id = pf.id;
         lf.parent_id = pf.parent_id;
         lf.nullable = pf.nullable;
+        // Lance writes the flag with every key position (measured with pylance 12); a position alone is read as a key too.
+        lf.unenforced_primary_key = pf.unenforced_primary_key || pf.unenforced_primary_key_position != 0;
+        lf.unenforced_primary_key_position = pf.unenforced_primary_key_position;
+        lf.unenforced_clustering_key_position = pf.unenforced_clustering_key_position;
         lf.is_dictionary_index = false;
         lf.dictionary_value_logical_type.clear();
         for (const auto& kv : pf.metadata) {
