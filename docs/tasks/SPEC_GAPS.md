@@ -43,7 +43,7 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1i | `encoding.layout.full_zip.write` | Fixed-width full-zip and per-value compression | measured and done 2026-10-29, see "Result for W1i" | partial (Haiku session, 2026-10-29): the 256-byte rule and `structural-encoding` for fixed-width FSL and fixed_size_binary, element validity included, layout text equal to pylance's for 21 cases. Left: the page split (pylance: one page per input batch), per-value compression of a fixed-width FullZip page, `structural-encoding=fullzip` on variable width, a bool column or a list of lists under fullzip, and a fixed-width FullZip scan that is slower than mini-block (measured) |
 | W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs: read pylance's first, then write them for `lance-encoding:packed` | measured 2026-10-29, see "Measured for W1j" | later, reviewer-led design: reading needs a packed-struct read plan with child fan-out (as `v20_packed_struct_sources` does for 2.0), and the VariablePackedStruct byte layout from Lance's source. Opt-in only, so behind the gaps every dataset meets |
 | W1k1 | `arrow.types.fixed_size_list` (read) | Read what pylance writes: a null element inside a fixed-size list under a list or struct (also W1a's all-null list<fsl>), `fixed_size_list<bool>`, `fixed_size_list<struct>` | measured 2026-10-29, see "Measured for W1k" and "Result for W1k1" | partial 2026-10-29: null elements under a list read (and all-null list<fsl>); stopped: `fixed_size_list<bool>` and `fixed_size_list<struct>` (see "Result for W1k1") |
-| W1k2 | `arrow.types.fixed_size_list`, `arrow.types.dictionary` (write) | Write them too, and dictionary columns inside structs and lists | measured 2026-10-29 | next (the list<fsl> element nulls and the dictionaries first; fsl<bool> / fsl<struct> only after W1k3 / W1k4) |
+| W1k2 | `arrow.types.fixed_size_list`, `arrow.types.dictionary` (write) | Write them too, and dictionary columns inside structs and lists | measured 2026-10-29 | partial 2026-10-29: dictionaries under a struct or list written (int32 indices, string / binary values); list<fsl> and struct<fsl> element nulls written for rows under 256 bytes; the 256-byte-and-wider shapes stopped (nested FullZip writer missing), see "Result for W1k2"; fsl<bool> / fsl<struct> refused until W1k3 / W1k4 |
 | W1k3 | `arrow.types.fixed_size_list` (read) | `fixed_size_list<bool, N>`: a bit-level item path in the mini-block chunk reader (`FixedSizeList{Nx Flat(1)}`) | "Result for W1k1" | later (rare shape; touches the shared chunk reader) |
 | W1k4 | `arrow.types.fixed_size_list` (read) | `fixed_size_list<struct>`: assemble a struct child of rows x N items from the leaf columns under the fixed-size layer | "Result for W1k1" | later (refused by name now) |
 | W1p | `encoding.config` | Integer and float dictionaries as Lance 12 writes them (files up to 1.9x pylance's size today) | measured 2026-10-29, see "Measured for W1p" and "Result for W1p" | partial 2026-10-29: int64, uint64, timestamp and date64 dictionaries (no nulls) write pylance's layout (all measured cases, see "Result for W1p, second pass"); left: nullable (W1p3), sorted RLE over dictionary indices (W1p2), float64 and 128-bit |
@@ -477,6 +477,71 @@ fsl_struct2.lance  v.item.x (int64): MiniBlock{values=InlineBitpacking(64),rows=
 
 Not started: the W1k2 writer side (both shapes are still refused on write), and C++ unit tests for the nested element
 validity path (the Python tests cover it end to end).
+
+## Result for W1k2 (2026-10-29, pylance 12.0.0, written and read back both ways)
+
+`bindings/python/tests/test_nested_write_shapes.py` (22 tests): nanolance writes, nanolance and pylance read equal (take
+included), the layout text equals pylance's (`nlance-pagelayout` on both files), and an append by nanolance to a
+pylance-written dataset reads back in pylance. 3,000 and 300,000 rows.
+
+| shape | result |
+|---|---|
+| `struct<k: dictionary<int32, string>, v: int64>` (10 and 1,000 distinct, with and without nulls) | **written**, layout equal |
+| `list<dictionary<int32, string>>` (10 and 1,000 distinct, with and without nulls) | **written**, layout equal |
+| `list<fixed_size_list<float32, 2>>` with null elements | **written**, layout equal (list and struct, 3,000 and 300,000 rows) |
+| `struct<fixed_size_list<float32, 2>>` with null elements | **written**, layout equal |
+| `list<fixed_size_list<float32, 256>>` and `struct<...256>` with null elements | **stopped**: refused by name (FullZip; see below) |
+| `fixed_size_list<bool>`, `fixed_size_list<struct>` | refused, as before (W1k3 / W1k4) |
+
+Layouts (pylance 12.0.0 measured; nanolance's output is equal in every row written; the leaf column is shown,
+`rows=` dropped):
+
+| case | pylance |
+|---|---|
+| struct<dict> no nulls | `s.k (dict:string:int32:false): MiniBlock{values=InlineBitpacking(32),dict=General{LZ4,Variable{offsets=Flat(32)}}x10}` |
+| struct<dict> with nulls | `s.k ...: MiniBlock{values=InlineBitpacking(32),repdef=Bitpacked(16,Flat(1)),nullable,dict=General{LZ4,Variable{offsets=Flat(32)}}x10}` |
+| list<dict> no nulls | `l.item (dict:string:int32:false): MiniBlock{values=InlineBitpacking(32),rep=Bitpacked(16,Flat(1)),dict=General{LZ4,...}x10,layers=[valid-item,valid-list]}` |
+| list<dict> with nulls | `l.item ...: MiniBlock{values=InlineBitpacking(32),rep=Bitpacked(16,Flat(1)),repdef=Bitpacked(16,Flat(1)),nullable,dict=General{LZ4,...}x10,layers=[nullable-item,valid-list]}` |
+| 1,000 distinct | as above, `x1000` |
+| list<fsl2>, element nulls | `l.item (fixed_size_list:float:2): MiniBlock{values=FixedSizeList{2xFlat(32),validity},rep=Bitpacked(16,Flat(1)),layers=[valid-item,valid-list],buffers=2}` |
+| struct<fsl2>, element nulls | `s.f (fixed_size_list:float:2): MiniBlock{values=FixedSizeList{2xFlat(32),validity},buffers=2}` |
+| list<fsl256>, element nulls | `l.item (fixed_size_list:float:256): FullZip{values=FixedSizeList{256xFlat(32),validity},value_bits=8448,rep_bits=1,layers=[valid-item,valid-list]}` (not written) |
+| struct<fsl256>, element nulls | `s.f ...: FullZip{values=FixedSizeList{256xFlat(32),validity},value_bits=8448,layers=[valid-item,valid-item]}` (not written) |
+
+What changed:
+
+- **Dictionary under a struct or list.** The refusal in `schema_mapper.cpp` is lifted for int32 indices over string or
+  binary values. A nested dictionary leaf takes `write_nested_column` and `build_nested_page`: indices as
+  InlineBitpacking(32), the Arrow dictionary's own entries (order and unused ones kept, as the top-level writer does)
+  LZ4-framed as `General{LZ4, Variable}`. The values come from `append_dictionary_values`, the top-level dictionary
+  appender. Other index types there keep the refusal.
+- **Element validity under a list or struct.** `build_nested_page` writes two buffers per chunk (the element bits, then
+  the values) and `FixedSizeList{N x Flat, validity}` for rows under 256 bytes. The same bits and layout as
+  `write_fixed_size_list_column` uses at the top level.
+- **A struct child with nulls is written nested (a fix found on the way).** Before, a struct with a nullable child and no
+  struct-level nulls went to the top-level writer with flat levels. pylance's reader panics on that file ("index out of
+  bounds" in `repdef.rs`), for `struct<int64>` as well as for a dictionary. Such a child now takes the nested pages.
+  No other column changes.
+
+Stopped: **FullZip under a list or struct.** pylance writes a fixed_size_list row of 256 bytes or more as FullZip
+(with or without element nulls); nanolance writes FullZip for fixed-width values at the top level only
+(`write_full_zip_fixed_column`), and has no nested FullZip writer (the rep and def bits per row slot). That is a new
+writer, not a change to the chunk path, so the shapes keep a refusal ("...FullZip pages, which nanolance does not write
+under a list or struct yet"). Measured, not fixed: `list<fixed_size_list<float32, 256>>` without nulls is FullZip in
+pylance and MiniBlock in nanolance (`layers=[valid-item,valid-list]`, `rows` per page differ); `struct<fsl256>`
+without nulls has `layers=[valid-item,valid-item]` in pylance and `[valid-item]` in nanolance, and nanolance's pages hold
+1,024 rows where pylance's single page holds 3,000.
+
+Also measured, not changed (top-level, so other columns): a top-level `dictionary<int32, string>` column is
+`MiniBlock{values=Flat(32),dict=Variable{offsets=Flat(32)}x10}` in nanolance and
+`MiniBlock{values=InlineBitpacking(32),dict=General{LZ4,Variable{offsets=Flat(32)}}x10}` in pylance (3,000 rows, 10 and 1,000
+distinct). The nested dictionary above follows pylance; the top-level one is a separate gap.
+
+nlbench check: `nlbench_gendata <dir> 50000` data file md5 `84b4dce7912cd80d047e779f01a143fb` on the base commit
+(9d2b3f9) and after each of the two commits. Unchanged.
+
+Not done: the W1k3 and W1k4 reads; nested FullZip (both fixed-size list widths, above); nested dictionaries with index
+types other than int32 and with fixed-width values.
 
 ## Measured for W1p (integer and float dictionaries, 2026-10-29)
 
