@@ -3419,9 +3419,16 @@ class MergeInsertBuilder:
 
     def __init__(self, dataset: LanceDataset, on):
         if on is None:
-            # The schema's (unenforced) primary key, as Lance does it.
-            on = [f.name for f in dataset._data_schema
-                  if (f.metadata or {}).get(b"lance-schema:unenforced-primary-key", b"").lower() == b"true"]
+            # The schema's (unenforced) primary key, as Lance does it: the columns that are keys, by position
+            # (a field with no position is ordered by its place in the schema).
+            from nanolance.lance.schema import primary_key_of_metadata
+            keyed = []
+            for index, f in enumerate(dataset._data_schema):
+                meta = {k.decode("utf-8", "replace"): v.decode("utf-8", "replace") for k, v in (f.metadata or {}).items()}
+                is_key, position = primary_key_of_metadata(meta)
+                if is_key:
+                    keyed.append(((0, position, index) if position else (1, 0, index), f.name))
+            on = [name for _, name in sorted(keyed)]
             if not on:
                 raise ValueError(
                     "Invalid user input: A merge insert operation requires join keys: specify `on` columns "
