@@ -161,3 +161,76 @@ def test_dictionary_buffer_is_plain_without_the_option(tmp_path):
     nl_write_dataset(table, str(ours))
     assert any("dict=Variable" in line for line in _layout(ours))
     assert require_pylance().dataset(str(ours)).to_table() == table
+
+
+# W1r: dictionary indices under lance-encoding:compression. pylance writes them as
+# General{codec, ByteStreamSplit{Flat(32)}} for lz4 / zstd and Flat(32) for none (SPEC_GAPS.md, "W1h measured again");
+# the dictionary buffer follows dict-values-compression, as before. Integer dictionaries are W1p; the int64 and float64
+# cases here read pylance's dictionaries and assert the indices' encoding only.
+INDEX_LAYOUT = {
+    "lz4": "General{LZ4,ByteStreamSplit{Flat(32)}}",
+    "zstd": "General{ZSTD,ByteStreamSplit{Flat(32)}}",
+    "none": "Flat(32)",
+}
+
+
+def _index_layouts(path) -> str:
+    return " ".join(_layout(path))
+
+
+@pytest.mark.parametrize("codec", ["lz4", "zstd", "none"])
+def test_pylance_string_dictionary_indices_read_and_take(tmp_path, codec):
+    lance = require_pylance()
+    table = _table(_strings(1000), {"compression": codec, "dict-divisor": "1"})
+    path = tmp_path / "theirs.lance"
+    lance.write_dataset(table, str(path))
+    assert INDEX_LAYOUT[codec] in _index_layouts(path)
+    ours = nl_dataset(str(path))
+    assert ours.to_table() == table
+    rows = [0, 49_999, 12_345, 7, 7]
+    assert ours.take(rows).to_pylist() == table.take(rows).to_pylist()
+
+
+@pytest.mark.parametrize("codec", ["lz4", "zstd", "none"])
+def test_pylance_int64_dictionary_indices_read_and_take(tmp_path, codec):
+    lance = require_pylance()
+    values = RNG.integers(0, 1 << 40, 1000, dtype=np.int64)
+    table = _table(pa.array(values[RNG.integers(0, 1000, ROWS)]), {"compression": codec})
+    path = tmp_path / "theirs.lance"
+    lance.write_dataset(table, str(path))
+    assert INDEX_LAYOUT[codec] in _index_layouts(path)
+    ours = nl_dataset(str(path))
+    assert ours.to_table() == table
+    rows = [0, 49_999, 12_345]
+    assert ours.take(rows).to_pylist() == table.take(rows).to_pylist()
+
+
+@pytest.mark.parametrize("codec", ["lz4", "zstd", "none"])
+def test_pylance_float64_dictionary_indices_read_and_take(tmp_path, codec):
+    lance = require_pylance()
+    values = RNG.random(1000)
+    table = _table(pa.array(values[RNG.integers(0, 1000, ROWS)]), {"compression": codec})
+    path = tmp_path / "theirs.lance"
+    lance.write_dataset(table, str(path))
+    assert INDEX_LAYOUT[codec] in _index_layouts(path)
+    ours = nl_dataset(str(path))
+    assert ours.to_table() == table
+    rows = [0, 49_999, 12_345]
+    assert ours.take(rows).to_pylist() == table.take(rows).to_pylist()
+
+
+@pytest.mark.parametrize("codec", ["lz4", "zstd", "none"])
+def test_nanolance_string_dictionary_indices_match_pylance_layout(tmp_path, codec):
+    lance = require_pylance()
+    # dict-values-compression=none: pylance's default wraps the dictionary in LZ4, which nanolance does not adopt
+    # (W1g); with the plain buffer on both sides the layouts are equal.
+    table = _table(_strings(1000), {"compression": codec, "dict-divisor": "1", "dict-values-compression": "none"})
+    ours = tmp_path / "ours.lance"
+    theirs = tmp_path / "theirs.lance"
+    nl_write_dataset(table, str(ours))
+    lance.write_dataset(table, str(theirs))
+    assert INDEX_LAYOUT[codec] in _index_layouts(ours)
+    assert _layout(ours) == _layout(theirs)
+    assert lance.dataset(str(ours)).to_table() == table
+    assert nl_dataset(str(ours)).to_table() == table
+    assert nl_dataset(str(theirs)).to_table() == table

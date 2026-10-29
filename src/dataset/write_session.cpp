@@ -773,11 +773,11 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
                 }
             } else if (cv.kind == ColumnValues::Kind::VariableWidth &&
                        encoding_choice::variable_column_dict_beneficial(cv, enc_options)) {
-                // Scattered low-cardinality strings -> structural dictionary + flat indices.
+                // Scattered low-cardinality strings -> structural dictionary + indices. The indices take
+                // lance-encoding:compression's layout (write_dict_column), so the option is kept.
                 for (auto& field : disk_schema.fields) {
                     if (field.id == pf->id) {
                         field.metadata["nanolance:packing"] = "dict";
-                        field.metadata.erase("lance-encoding:compression");
                         break;
                     }
                 }

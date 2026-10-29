@@ -555,10 +555,27 @@ std::uint8_t offset_bits_token(bool large) {
 // words are u32 to match -- see control_buffer_for).
 // `dict_scheme` 0 is the plain dictionary buffer; descriptor::kZstd / kLz4 wrap it in General (pylance's
 // lance-encoding:dict-values-compression).
+// `index_layout` is the indices' encoding: bit-packed (the default), Flat(32) under compression=none, or
+// General{index_scheme, ByteStreamSplit{Flat(32)}} under compression=lz4|zstd (pylance's shape, W1r).
+enum class DictIndexLayout { kBitpacked, kFlat, kGeneral };
+
 std::vector<std::uint8_t> page_layout_bytes_dict(std::uint32_t num_distinct, std::uint64_t num_items, bool large,
-                                                 std::uint64_t dict_scheme = 0U) {
+                                                 std::uint64_t dict_scheme = 0U,
+                                                 DictIndexLayout index_layout = DictIndexLayout::kBitpacked,
+                                                 std::uint64_t index_scheme = descriptor::kZstd) {
     descriptor::MiniBlock m;
-    m.value_compression = descriptor::inline_bitpacking(32U);
+    switch (index_layout) {
+        case DictIndexLayout::kBitpacked:
+            m.value_compression = descriptor::inline_bitpacking(32U);
+            break;
+        case DictIndexLayout::kFlat:
+            m.value_compression = descriptor::flat(32U);
+            break;
+        case DictIndexLayout::kGeneral:
+            m.value_compression =
+                descriptor::general(index_scheme, descriptor::byte_stream_split(descriptor::flat(32U)));
+            break;
+    }
     const auto plain = descriptor::variable(descriptor::flat(offset_bits_token(large)));
     m.dictionary = dict_scheme == 0U ? plain : descriptor::general(dict_scheme, plain);
     m.num_dictionary_items = num_distinct;
@@ -2560,13 +2577,37 @@ bool write_dict_column(const ColumnEncodeContext& ctx, std::ostream& out, std::v
         have_plan ? values.structural_dict_plan.distinct : local_distinct;
     const std::vector<std::uint32_t>& indices =
         have_plan ? values.structural_dict_plan.indices : local_indices;
+    // The indices' layout follows lance-encoding:compression, as pylance's does for a dictionary column
+    // (measured on 12.0.0): none -> Flat(32); lz4 / zstd -> General{codec, ByteStreamSplit{Flat(32)}}, each
+    // chunk byte-split then framed. Absent keeps the bit-packed indices nanolance has always written.
+    const DictIndexLayout index_layout = ctx.codec == ColumnCodec::kUncompressed ? DictIndexLayout::kFlat
+                                         : (ctx.codec == ColumnCodec::kLz4 || ctx.codec == ColumnCodec::kZstd)
+                                             ? DictIndexLayout::kGeneral
+                                             : DictIndexLayout::kBitpacked;
+    const std::uint64_t index_scheme = ctx.codec == ColumnCodec::kLz4 ? descriptor::kLz4 : descriptor::kZstd;
     std::vector<MiniblockChunk> index_chunks;
+    std::vector<std::uint8_t> planes;  // kGeneral: one chunk's byte-split indices, before framing
     for (std::size_t off = 0; off < indices.size(); off += 1024U) {
         const auto count = std::min<std::size_t>(1024U, indices.size() - off);
         MiniblockChunk chunk;
         chunk.value_count = count;
-        bitpack::encode_block(reinterpret_cast<const std::uint8_t*>(indices.data() + off), count, 4U,
-                              chunk.bytes);
+        const auto* raw = reinterpret_cast<const std::uint8_t*>(indices.data() + off);
+        if (index_layout == DictIndexLayout::kBitpacked) {
+            bitpack::encode_block(raw, count, 4U, chunk.bytes);
+        } else if (index_layout == DictIndexLayout::kFlat) {
+            chunk.bytes.assign(raw, raw + count * 4U);
+        } else {
+            planes.resize(count * 4U);
+            (void)byte_stream_split::encode(std::as_bytes(std::span(raw, count * 4U)), 4U,
+                                            std::as_writable_bytes(std::span(planes)));
+            std::string error;
+            const bool framed_ok = index_scheme == descriptor::kLz4
+                                       ? general::lz4_frame(planes, chunk.bytes, error)
+                                       : general::zstd_frame(planes, ctx.compression_level, chunk.bytes, error);
+            if (!framed_ok) {
+                return false;
+            }
+        }
         index_chunks.push_back(std::move(chunk));
     }
     const auto payload = miniblock_payload(index_chunks);
@@ -2625,7 +2666,8 @@ bool write_dict_column(const ColumnEncodeContext& ctx, std::ostream& out, std::v
     page.length = rows;
     page.priority = 0;
     page.encoding =
-        page_layout_bytes_dict(static_cast<std::uint32_t>(distinct.size()), rows, values.variable.large, dict_scheme);
+        page_layout_bytes_dict(static_cast<std::uint32_t>(distinct.size()), rows, values.variable.large, dict_scheme,
+                               index_layout, index_scheme);
     column.pages.push_back(std::move(page));
     columns.push_back(std::move(column));
     return true;
@@ -3112,8 +3154,12 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
     const bool codec_lays_out_values =
         codec == ColumnCodec::kUncompressed ||
         ((codec == ColumnCodec::kLz4 || codec == ColumnCodec::kZstd) && wide_integer);
+    // A structural dictionary keeps its tag under any codec: its indices take the codec's layout in write_dict_column.
+    const auto tag_it = field.metadata.find("nanolance:packing");
+    const bool dict_tagged = tag_it != field.metadata.end() && tag_it->second == "dict" &&
+                             values.kind == ColumnValues::Kind::VariableWidth;
     const auto packing_it =
-        codec_lays_out_values ? field.metadata.end() : field.metadata.find("nanolance:packing");
+        codec_lays_out_values && !dict_tagged ? field.metadata.end() : tag_it;
     const ColumnEncodeContext ctx{field,           values,      rows,          compression_level,
                                   compress,        zstd_requested, compress_column, column_has_nulls,
                                   packing_it,      codec};
