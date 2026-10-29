@@ -215,3 +215,22 @@ pylance 12.0.0, one table of 50,000 rows, each column with one option (`build/nl
 So the options that change the layout are `compression` (lz4 / zstd / none), `rle-threshold`, `dict-divisor`,
 `dict-values-compression` and `structural-encoding`. `compression-level` changes only the codec level. nanolance
 honours `compression=zstd` only, and has no LZ4 encoder (`nanolance/lz4_block.hpp` decodes only).
+
+### W1h measured again (2026-10-29, same pylance 12.0.0, 50,000 rows, one column per dataset)
+
+The table above does not reproduce for every type: its string rows used a dictionary that the 5,000-value string columns here do not get, and the option is ignored for 8/16/32-bit ints and for float32/float64 under lz4. Measured shapes (`compression=` lz4 / zstd / none):
+
+| column | lz4 | zstd | none |
+|---|---|---|---|
+| int64 random (40-bit) | `General{LZ4,ByteStreamSplit{Flat(64)}}` | `General{ZSTD,ByteStreamSplit{Flat(64)}}` | `Flat(64)` |
+| int64 full range | `Flat(64)` | `Flat(64)` | `Flat(64)` |
+| int64 in 1,000 values (dictionary) | dict indices `General{LZ4,BSS{Flat(32)}}` | same, ZSTD | dict indices `Flat(32)` |
+| int32 / int16 / int8 random | `InlineBitpacking` (ignored) | ignored | `Flat(N)` |
+| float32 random | ignored | ignored | `Flat(32)` |
+| float64 random | ignored | `General{ZSTD,InlineBitpacking(64)}` | `Flat(64)` |
+| string, 50,000 unique values (`unique-NNNNNNNN-` plus up to 6 x) | `General{LZ4,Variable}` | `General{ZSTD,Variable}` | `Variable` (no FSST) |
+| string, 12-letter values from 5,000 (random letters) | `Variable` (LZ4 does not shrink it) | `General{ZSTD,Variable}` | `Variable` |
+| bool | `Flat(1)` | `Flat(1)` | `Flat(1)` |
+| FixedSizeList<f32,4>, list<int32> | ignored | ignored | ignored |
+
+Unknown values: `brotli` and `LZ4` are refused on int, float, bool and string columns (`Unknown compression scheme`), accepted and ignored on fixed-size-list and list. `compression-level` alone changes nothing; with `compression=zstd` a number is the level (`30` is accepted), and a non-number is accepted and ignored (default level). lz4 ignores the level.
