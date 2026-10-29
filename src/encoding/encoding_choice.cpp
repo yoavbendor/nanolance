@@ -178,6 +178,23 @@ bool rle_runs_beneficial(const std::uint8_t* data, std::size_t n, std::size_t bp
     if (!dispatch_rle_scan(data, n, bpv, reject_at, split_runs, nullptr)) {
         return false;
     }
+    // Lance takes RLE only when it also beats InlineBitpacking's estimate (compression.rs,
+    // rle_beats_raw_and_bitpacking): one word per 1,024 values plus each block's values at its own bit width,
+    // counted only when that is below the raw size. A sorted column of small values bitpacks smaller than its
+    // runs, and pylance writes it bitpacked.
+    if (bpv == 1U || bpv == 2U || bpv == 4U || bpv == 8U) {
+        constexpr std::size_t kBitpackBlock = 1024U;
+        const std::size_t bits = bpv * 8U;
+        std::size_t words = 0;
+        for (std::size_t at = 0; at < n; at += kBitpackBlock) {
+            const std::size_t count = std::min<std::size_t>(kBitpackBlock, n - at);
+            words += 1U + kBitpackBlock * bitpack::bit_width(data + at * bpv, count, bpv) / bits;
+        }
+        const std::size_t bitpack_bytes = words * bpv;
+        if (bitpack_bytes < n * bpv && bitpack_bytes < split_runs * (bpv + 1U)) {
+            return false;
+        }
+    }
     std::vector<std::pair<std::size_t, std::uint64_t>> runs;
     std::size_t split_runs_again = 0;
     if (!dispatch_rle_scan(data, n, bpv, n + 1U, split_runs_again, &runs)) {
@@ -559,6 +576,15 @@ bool fixed_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnEnco
         return false;  // a constant column is stored as one value, not a dictionary
     }
 
+    // Size budget, as Lance's dictionary_encode measures it (lance-encoding logical/primitive/dict.rs): the RAW
+    // dictionary (8 bytes an entry) plus u32 indices must not exceed dict-size-ratio of the column's raw bytes,
+    // truncated. Not the encoded sizes: at 50,000 rows pylance takes a sorted column of 14,485 distinct values
+    // (315,880 <= 320,000 bytes) and refuses 18,353 (346,824), and refuses runs of 2 (400,000).
+    const auto max_encoded = static_cast<std::uint64_t>(static_cast<double>(rows * 8U) * options.dict_size_ratio);
+    if (static_cast<std::uint64_t>(distinct.size()) * 8U + static_cast<std::uint64_t>(rows) * 4U > max_encoded) {
+        return false;
+    }
+
     // The dictionary's values: bitpacked when one block of the width is smaller than the raw values
     // (and always out of line above one block); otherwise the general codec.
     const std::size_t count = distinct.size();
@@ -595,16 +621,6 @@ bool fixed_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnEnco
         return false;  // zstd and other codecs are not handled for fixed-width dictionaries yet
     }
 
-    // Size budget: the indices (InlineBitpacking(32): 4 + 128 x width bytes per 1,024 rows) and the dictionary
-    // block must stay below dict-size-ratio of the flat size.
-    const unsigned index_width = bitpack::bit_width(reinterpret_cast<const std::uint8_t*>(indices.data()),
-                                                    indices.size(), 4U);
-    const std::size_t index_chunks = (rows + kBlockValues - 1U) / kBlockValues;
-    const std::size_t index_bytes = index_chunks * (4U + 128U * static_cast<std::size_t>(index_width));
-    const std::size_t encoded = index_bytes + block.size();
-    if (static_cast<double>(encoded) >= static_cast<double>(rows * 8U) * options.dict_size_ratio) {
-        return false;
-    }
     // The indices are RLE'd when they have runs (W1p2: a sorted or run-heavy column). pylance decides this after the
     // dictionary, with the same size model as a column's RLE at 4-byte values (runs * 5 < rows * 4).
     plan.index_rle = rle_runs_beneficial(reinterpret_cast<const std::uint8_t*>(indices.data()), indices.size(), 4U,

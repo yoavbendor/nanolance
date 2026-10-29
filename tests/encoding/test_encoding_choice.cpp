@@ -122,10 +122,11 @@ void test_bitpack() {
 }
 
 // `runs` runs of `len` values alternating 0/1.
+// Full-width bytes (0x80 / 0xFF), so InlineBitpacking cannot beat the runs (Lance compares RLE with it).
 std::vector<std::uint8_t> alternating_runs(std::size_t runs, std::size_t len) {
     std::vector<std::uint8_t> out;
     for (std::size_t r = 0; r < runs; ++r) {
-        out.insert(out.end(), len, static_cast<std::uint8_t>(r % 2U));
+        out.insert(out.end(), len, static_cast<std::uint8_t>(r % 2U == 0U ? 0x80U : 0xFFU));
     }
     return out;
 }
@@ -167,9 +168,15 @@ void test_fixed_rle() {
     require(!ec::fixed_column_rle_plan(cv, 0), "bpv 0");
     require(!ec::fixed_column_rle_plan(cv, 4), "size not a multiple of bpv");
     require(!ec::fixed_column_rle_plan(cv, 3), "bpv 3 is not a bitpackable width");
+    // Lance's rule: RLE only when it also beats InlineBitpacking's estimate. All zeros pack to one word a block.
     cv = fixed_column(std::vector<std::uint8_t>(10, 0));
+    require(!ec::fixed_column_rle_plan(cv, 1) && !ec::fixed_column_rle_plan(cv, 2),
+            "all-zero buffer bitpacks smaller than its runs");
+    // Two runs of full-width bytes: a 1,024-value block would be larger than the 10 raw bytes, so no bitpacking
+    // estimate, and the runs (4 bytes at 1 byte, 6 at 2) beat raw.
+    cv = fixed_column(std::vector<std::uint8_t>{255, 255, 255, 255, 255, 128, 128, 128, 128, 128});
     require(ec::fixed_column_rle_plan(cv, 1) && ec::fixed_column_rle_plan(cv, 2),
-            "all-zero buffer is RLE at 1 and 2 bytes");
+            "two runs of full-width values are RLE at 1 and 2 bytes");
 
     // A run over 255 counts as ceil(L/255) split runs but is recorded whole.
     cv = fixed_column(std::vector<std::uint64_t>(1000, 5));

@@ -1,7 +1,7 @@
 """64-bit dictionaries whose indices are run-length encoded (W1p2): a sorted or run-heavy int64 column is written as
 `Rle{Flat(32),Flat(8)}` over the u32 indices plus the dictionary, as pylance 12 writes it. The measured cases below
-match pylance's layout text. Two cases at 50,000 rows do not (see the xfail marks): pylance refuses the dictionary
-there and nanolance does not yet (SPEC_GAPS, "Measured for W1p2/W1p3")."""
+match pylance's layout text, including the cutoff cases at 50,000 rows where pylance refuses the dictionary (Lance's
+raw-size budget: 8 bytes an entry plus 4 an index, at most dict-size-ratio of the raw column)."""
 
 from __future__ import annotations
 
@@ -42,11 +42,6 @@ def _layout(path: Path) -> list[str]:
     lines = [line.split("  ", 1)[1] for line in out.splitlines() if "  " in line]
     return sorted({re.sub(r",rows=\d+", "", line) for line in lines})
 
-
-XFAIL_CUTOFF = pytest.mark.xfail(
-    strict=True,
-    reason="pylance refuses the dictionary here; nanolance's sample rule takes it (SPEC_GAPS, W1p2 cutoff)",
-)
 
 # (name, values, expect RLE over a dictionary): the measured cases.
 CASES = [
@@ -127,7 +122,7 @@ def test_append_to_pylance_written_rle_dictionary(tmp_path, name, make, expect):
     assert nl_dataset(str(theirs)).to_table().column("x").to_pylist() == expected
 
 
-@pytest.mark.parametrize("name,make,expect", [pytest.param(c[0], c[1], c[2], marks=XFAIL_CUTOFF, id=c[0])
+@pytest.mark.parametrize("name,make,expect", [pytest.param(c[0], c[1], c[2], id=c[0])
                                               for c in CUTOFF_CASES])
 def test_cutoff_layout_matches_pylance(tmp_path, name, make, expect):
     lance = require_pylance()

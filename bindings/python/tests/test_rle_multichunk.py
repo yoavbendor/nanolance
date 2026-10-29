@@ -116,11 +116,11 @@ def _packed(buf) -> list[int]:
 
 
 def _check_pair(lance, tmp_path, table: pa.Table) -> None:
-    """nanolance writes ours; pylance writes its 2.1 file (the format the measured RLE layouts are from)."""
+    """nanolance and pylance each write the table, both in format 2.2 (nanolance's; pylance's default)."""
     ours = tmp_path / "ours.lance"
     theirs = tmp_path / "theirs.lance"
     nl_write_dataset(table, str(ours))
-    lance.write_dataset(table, str(theirs), data_storage_version="2.1")
+    lance.write_dataset(table, str(theirs))
     assert lance.dataset(str(ours)).to_table() == table
     assert nl_dataset(str(ours)).to_table() == table
     assert nl_dataset(str(theirs)).to_table() == table  # pylance-written pages read in nanolance
@@ -152,11 +152,8 @@ def test_multichunk_rle_matches_pylance(tmp_path, name, dtype, run, rows, option
     _check_pair(lance, tmp_path, table)
     assert any("Rle{" in line for line in _layout(ours)), _layout(ours)
     assert _layout(ours) == _layout(theirs)
-    # Same chunks: the same values per chunk and the same bytes, except nanolance's u32 buffer-size header, which
-    # is 8 bytes larger per chunk than pylance's u16 one.
-    ours_chunks, theirs_chunks = _chunks(ours, "I"), _chunks(theirs, "H")
-    assert [[v for _, v in page] for page in ours_chunks] == [[v for _, v in page] for page in theirs_chunks]
-    assert [[b - 8 for b, _ in page] for page in ours_chunks] == [[b for b, _ in page] for page in theirs_chunks]
+    # Same chunks: the same values and the same bytes per chunk (both 2.2 files: u32 control words).
+    assert _chunks(ours, "I") == _chunks(theirs, "I")
     assert all(len(chunks) > 1 for chunks in _chunks(ours, "I"))  # every page spans more than one chunk
     # take() from nanolance's file and from pylance's file gives the same rows.
     picks = [0, 1, rows // 2, rows - 1, rows // 3]
