@@ -60,7 +60,8 @@ std::uint64_t chunk_bytes(std::uint64_t pieces, std::size_t value_bytes) {
 
 }  // namespace
 
-std::vector<std::size_t> chunk_rows(std::span<const std::uint64_t> run_lengths, std::size_t value_bytes) {
+std::vector<std::size_t> chunk_rows(std::span<const std::uint64_t> run_lengths, std::size_t value_bytes,
+                                    std::size_t max_rows) {
     std::vector<std::size_t> out;
     std::uint64_t remaining = 0;
     for (const auto length : run_lengths) {
@@ -72,7 +73,7 @@ std::vector<std::size_t> chunk_rows(std::span<const std::uint64_t> run_lengths, 
         // The candidates, smallest first: 1, 2, 4, ... below `remaining`, then min(remaining, 4096). A chunk's
         // size only grows with its rows, so one walk from the chunk's start finds the largest that fits, and
         // stops at the first that does not (pylance's choice; at least one row always goes).
-        const std::uint64_t last = std::min<std::uint64_t>(remaining, kChunkMaxRows);
+        const std::uint64_t last = std::min<std::uint64_t>(remaining, std::min<std::size_t>(kChunkMaxRows, max_rows));
         std::uint64_t target = 1U;
         std::uint64_t chosen = 1U;
         std::uint64_t rows = 0;    // rows walked from the chunk's start

@@ -380,9 +380,25 @@ void test_fixed_dict() {
     cv = fixed_column(shuffled_64(1000000, 1000));
     require(!ec::fixed_column_dict_beneficial(cv), "1,000,000 rows, 1,000 distinct: projected past 100,000");
 
-    cv = fixed_column(shuffled_64(50000, 1000));
-    cv.null_count = 1;
-    require(!ec::fixed_column_dict_beneficial(cv), "a column with nulls is not dictionary-encoded here (W1p3)");
+    // Nulls (W1p3): every slot's raw value is hashed, as Lance does, so a value under the nulls that no valid row
+    // holds is one more entry, and one that a valid row holds adds none.
+    auto with_nulls = shuffled_64(50000, 1000);
+    for (std::size_t i = 0; i < with_nulls.size(); i += 19U) {
+        with_nulls[i] = 0xFFFFFFFFFFFFULL;  // 48 bits: not among the 40-bit shuffled values
+    }
+    cv = fixed_column(with_nulls);
+    cv.null_count = (with_nulls.size() + 18U) / 19U;
+    require(ec::fixed_column_dict_beneficial(cv) && cv.structural_dict_plan.fixed_distinct.size() == 1001U,
+            "nulls over a fresh value: 1,000 values plus the one under the nulls");
+    with_nulls = shuffled_64(50000, 1000);
+    const auto existing = with_nulls[1];
+    for (std::size_t i = 0; i < with_nulls.size(); i += 19U) {
+        with_nulls[i] = existing;
+    }
+    cv = fixed_column(with_nulls);
+    cv.null_count = (with_nulls.size() + 18U) / 19U;
+    require(ec::fixed_column_dict_beneficial(cv) && cv.structural_dict_plan.fixed_distinct.size() == 1000U,
+            "nulls over an existing value: no extra entry");
 
     cv = fixed_column(shuffled_64(50000, 1));
     require(!ec::fixed_column_dict_beneficial(cv), "a constant column is not a dictionary");

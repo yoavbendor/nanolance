@@ -2459,19 +2459,23 @@ struct RleChunks {
     std::vector<miniblock::ChunkMeta> metas;
 };
 
+/// `validity`, when given, adds each chunk's definition levels (a nullable dictionary's indices, W1p3).
 RleChunks encode_rle_chunks(const std::uint8_t* data, std::size_t bpv,
-                            const std::vector<std::pair<std::size_t, std::uint64_t>>& runs) {
+                            const std::vector<std::pair<std::size_t, std::uint64_t>>& runs,
+                            const std::vector<std::uint8_t>* validity = nullptr) {
     // A run that a chunk ends inside is cut there, and each chunk carries its own run values and run lengths.
     std::vector<std::uint64_t> run_lengths_in_rows;
     run_lengths_in_rows.reserve(runs.size());
     for (const auto& run : runs) {
         run_lengths_in_rows.push_back(run.second);
     }
-    const auto rows_per_chunk = rle::chunk_rows(run_lengths_in_rows, bpv);
+    // Definition levels pack in one FastLanes block, so a chunk that carries them holds at most 1,024 rows.
+    const auto rows_per_chunk = rle::chunk_rows(run_lengths_in_rows, bpv, validity != nullptr ? 1024U : 4096U);
     RleChunks out;
     out.metas.reserve(rows_per_chunk.size());
     std::size_t run_index = 0;
     std::uint64_t run_offset = 0;
+    std::size_t chunk_start = 0;
     for (const std::size_t chunk_rows_count : rows_per_chunk) {
         std::vector<std::uint8_t> run_values;
         std::vector<std::uint8_t> run_lengths;  // Lance requires 8-bit run lengths
@@ -2491,8 +2495,14 @@ RleChunks encode_rle_chunks(const std::uint8_t* data, std::size_t bpv,
         }
         const std::span<const std::uint8_t> run_buffers[2] = {run_values, run_lengths};
         const std::size_t before = out.bytes.size();
-        miniblock::append_chunk(out.bytes, 0U, {}, run_buffers);
+        if (validity != nullptr) {
+            const auto def = pack_definition_levels(*validity, chunk_start, chunk_rows_count);
+            miniblock::append_chunk(out.bytes, chunk_rows_count, def, run_buffers);
+        } else {
+            miniblock::append_chunk(out.bytes, 0U, {}, run_buffers);
+        }
         out.metas.push_back({out.bytes.size() - before, chunk_rows_count});
+        chunk_start += chunk_rows_count;
     }
     return out;
 }
@@ -2817,13 +2827,19 @@ bool write_dict_fixed_column(const ColumnEncodeContext& ctx, std::ostream& out, 
     // chunks, as pylance writes a sorted or run-heavy dictionary column (`Rle{Flat(32),Flat(8)}`).
     std::vector<MiniblockChunk> index_chunks;
     RleChunks index_rle;
+    // A nullable column (W1p3) carries each chunk's definition levels, as pylance's repdef=Bitpacked(16,Flat(1)).
+    const bool nullable = ctx.column_has_nulls;
     if (plan.index_rle) {
-        index_rle = encode_rle_chunks(reinterpret_cast<const std::uint8_t*>(indices.data()), 4U, plan.index_runs);
+        index_rle = encode_rle_chunks(reinterpret_cast<const std::uint8_t*>(indices.data()), 4U, plan.index_runs,
+                                      nullable ? &ctx.values.validity : nullptr);
     } else {
         for (std::size_t off = 0; off < indices.size(); off += 1024U) {
             const auto count = std::min<std::size_t>(1024U, indices.size() - off);
             MiniblockChunk chunk;
             chunk.value_count = count;
+            if (nullable) {
+                chunk.repdef = pack_definition_levels(ctx.values.validity, off, count);
+            }
             bitpack::encode_block(reinterpret_cast<const std::uint8_t*>(indices.data() + off), count, 4U, chunk.bytes);
             index_chunks.push_back(std::move(chunk));
         }
@@ -2875,7 +2891,10 @@ bool write_dict_fixed_column(const ColumnEncodeContext& ctx, std::ostream& out, 
                                          : descriptor::inline_bitpacking(32U);
     m.dictionary = dict_desc;
     m.num_dictionary_items = static_cast<std::uint32_t>(plan.fixed_distinct.size());
-    miniblock_tail(m, rows, plan.index_rle ? 2U : 1U);  // RLE: run values and run lengths are two buffers
+    if (nullable) {
+        m.def_compression = repdef_encoding_bytes();
+    }
+    mini_block_tail(m, rows, plan.index_rle ? 2U : 1U, nullable);  // RLE: run values and run lengths are two buffers
     page.encoding = descriptor::page_encoding(m);
     column.pages.push_back(std::move(page));
     columns.push_back(std::move(column));
@@ -3478,7 +3497,7 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
     }
     // A 64-bit fixed-width dictionary (W1p): the decision (encoding_choice::fixed_column_dict_beneficial) stored it.
     // A slice drops the plan (column_slice.cpp); without one the column is written flat, which is correct.
-    if (!column_has_nulls && packing_it != field.metadata.end() && packing_it->second == "dict" &&
+    if (packing_it != field.metadata.end() && packing_it->second == "dict" &&
         values.kind == ColumnValues::Kind::FixedWidth && values.structural_dict_plan.computed) {
         return write_dict_fixed_column(ctx, out, columns);
     }

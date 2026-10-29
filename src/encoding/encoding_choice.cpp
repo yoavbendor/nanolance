@@ -491,7 +491,9 @@ bool fixed_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnEnco
     using FixedDictValues = StructuralDictPlan::FixedDictValues;
 
     cv.structural_dict_plan = {};
-    if (cv.kind != ColumnValues::Kind::FixedWidth || cv.null_count != 0U || cv.fixed_size() % 8U != 0U) {
+    // Nulls take part as Lance's dictionary_encode has them (W1p3): every slot's raw value is hashed, a null slot's
+    // too, so what lies under the nulls is an entry when no valid row holds it (pylance's x11 for 10 values).
+    if (cv.kind != ColumnValues::Kind::FixedWidth || cv.fixed_size() % 8U != 0U) {
         return false;
     }
     const std::size_t rows = cv.fixed_size() / 8U;

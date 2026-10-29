@@ -32,7 +32,8 @@ void append_index_run(std::uint32_t index, std::uint64_t length, std::vector<std
 /// header plus one (value, length) pair per run piece (a run longer than 255 is `ceil(length / 255)` pieces),
 /// padded to 8. The last chunk takes the rows that remain. `run_lengths` are the column's runs in order (each
 /// at least 1); `value_bytes` is the width of one run value. The returned counts sum to the total rows.
-std::vector<std::size_t> chunk_rows(std::span<const std::uint64_t> run_lengths, std::size_t value_bytes);
+std::vector<std::size_t> chunk_rows(std::span<const std::uint64_t> run_lengths, std::size_t value_bytes,
+                                    std::size_t max_rows = 4096U);
 
 /// Expands the runs (`values`: one `width`-byte value per run; `lengths`: one u8 length per run) onto the end
 /// of `out`. False, with `error`, when `width` is 0 or `values` is not a whole number of values, when the
