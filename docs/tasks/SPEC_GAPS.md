@@ -40,7 +40,7 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1f | `file.structure.page_priority` | Write each page's priority as Lance does | measured 2026-10-29, see "Measured for W1f (page priority)" | done 2026-10-29: every page's `priority` is the top-level row of its first row, as pylance writes it (int64, list, string, FSL128 measured); single-page columns keep 0 |
 | W1g | `encoding.config` | Honour the `lance-encoding:*` field metadata Lance honours | partial (Haiku session, 2026-10-29): done `rle-threshold`, `dict-divisor`, `dict-size-ratio` (refused by name outside (0, 1]), `dict-values-compression` (+ level); reader General over InlineBitpacking. Left: `dict` columns under `compression` (indices as General{codec,BSS{Flat(32)}}: needs the reader's dictionary-index path to unwrap General, then the writer), integer dictionaries (pylance dictionary-encodes low-cardinality ints; nanolance has none), `bss`, `structural-encoding`, multi-chunk RLE, the C++ tests for the refusal and the decode | next |
 | W1h | `encoding.compression.general.write` | LZ4 | done for the value layouts measured (LZ4 writer; `compression=lz4` on 64-bit ints and variable-width). Left: General over dictionaries under the option, float zstd layout | done |
-| W1i | `encoding.layout.full_zip.write` | Fixed-width full-zip and per-value compression | to measure | later |
+| W1i | `encoding.layout.full_zip.write` | Fixed-width full-zip and per-value compression | measured and done 2026-10-29, see "Result for W1i" | partial (Haiku session, 2026-10-29): the 256-byte rule and `structural-encoding` for fixed-width FSL and fixed_size_binary, element validity included, layout text equal to pylance's for 21 cases. Left: the page split (pylance: one page per input batch), per-value compression of a fixed-width FullZip page, `structural-encoding=fullzip` on variable width, a bool column or a list of lists under fullzip, and a fixed-width FullZip scan that is slower than mini-block (measured) |
 | W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs, read and write | to measure | later |
 | W1k | `arrow.types.fixed_size_list`, `arrow.types.dictionary` | FSL of variable-width elements; dictionaries inside structs and lists | to measure | later |
 | W1p | `encoding.config` | Integer dictionaries: pylance dictionary-encodes int64 / float64 columns with 1,000-10,000 distinct values (`dict=InlineBitpacking(64)` / `General{LZ4,Flat(64)}`); nanolance has no such encoding | W1g, W1h | later |
@@ -295,3 +295,49 @@ pylance 12.0.0, 2,000 rows each:
 
 Embeddings of 768 to 4,096 floats are therefore written very differently. nanolance's mini-block pages shrink
 with the value width, down to one row per page.
+
+## Result for W1i (2026-10-29, pylance 12.0.0, nanolance written and read)
+
+Layouts (`nlance-pagelayout`, the first page of each column), pylance = nanolance for every case in
+`bindings/python/tests/test_fullzip_fixed.py`: FSL<float32> 63 (mini-block), 64, 64 with row or item nulls,
+768 (with row nulls, with item nulls), 1536, 4096; FSL<int8, 768>; fixed_size_binary 255 (mini-block), 256 (with
+and without nulls), 4096; FSL<float32, 16> under `structural-encoding=fullzip` and `miniblock`; int64 under
+`fullzip` (FullZip{Flat(64)}) and `miniblock`; fixed_size_binary(100) under `fullzip`.
+
+Pylance behaviour found while matching it (not in the rule above):
+- an item-validity FSL is FullZip when its values are 256 bytes (`FixedSizeList{64xFlat(32),validity}`, value_bits
+  2112); 63 values with validity stay mini-block: the validity bits are not in the width;
+- `structural-encoding=fullzip` on a dictionary column is ignored (MiniBlock dictionary), on a constant int64
+  it is ignored (Constant); on a bool column it writes `FullZip{Flat(8)}`; on a list of two strings it crashes
+  pylance 12 (`compute_stat should only be called once`, a pylance bug, nothing written);
+- a fixed_size_list of bools with fullzip: `Full-zip fixed-width values must be byte aligned, got 2 bits per value`;
+- a fixed_size_list of fixed_size_list with fullzip: `FullZip{FixedSizeList{2xFixedSizeList{4xFlat(32)}}}`
+  (accepted; nanolance refuses it for now);
+- an unknown `structural-encoding` value: `Invalid user input: Cannot determine structural encoding for field c.
+  This typically indicates an invalid value of the field metadata key lance-encoding:structural-encoding`
+  (nanolance uses this message).
+
+Page split (not matched): pylance wrote 200,000 rows of FSL<float32,768> as ONE page (614 MB); the same rows in
+20 input batches of 10,000 gave 20 pages of 10,000 rows. Pylance cuts a fixed-width FullZip page at its input
+batch boundaries, with no byte limit measured. nanolance cuts at 8 MiB of row data (about 2,730 rows of 768 floats).
+Only the layout text is compared, not the page count.
+
+Performance (same machine, alternating base and new, one process per run, 200,000 rows, 1,000 random rows for take;
+base = origin tree, new = this change; all six runs per width listed, so the best of three is visible):
+
+| width | side | scan, seconds (3 runs) | take 1,000 rows, seconds (3 runs) |
+|---|---|---|---|
+| 768 | base | 0.163 (first, a warm-cache outlier), 0.746, 0.700 | 0.059, 0.216, 0.210 |
+| 768 | new | 0.548, 0.657, 0.823 | 0.015, 0.018, 0.064 |
+| 1536 | base | 0.607, 0.321, 0.341 | 0.112, 0.182, 0.077 |
+| 1536 | new | 0.534, 0.734, 0.715 | 0.026, 0.054, 0.048 |
+
+Take is 3 to 4 times faster on FullZip (one stride per row, no page read). Scan is slower: best of three 0.55 s
+against 0.32 s (1536), and the 768 base scan is noisy, so the 768 figure is not settled. Scan is a finding to
+measure again, not a verdict. The cause is not profiled; the suspect is `decode_full_zip_column`, which walks the
+rows one level at a time (`full_zip::next_level`) for a fixed-width page, where mini-block reads its chunks in bulk.
+A fast path for fixed-width pages with no control word and no item validity (one copy of the page) is the obvious
+next step.
+
+Byte-identical check (narrow columns): `nlbench_gendata <out> 50000` data file md5 is equal between the base and
+the new build (84b4dce7912cd80d047e779f01a143fb), and `test_write_encoding_matrix.py` passes unchanged.
