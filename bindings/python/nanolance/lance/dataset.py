@@ -15,6 +15,7 @@ import dataclasses
 import logging
 import os
 import re
+import threading
 import uuid
 import warnings
 from datetime import datetime, timedelta, timezone
@@ -149,16 +150,16 @@ class MixedFormatWarning(UserWarning):
     ``warnings.simplefilter("error", MixedFormatWarning)`` the write raises before it commits."""
 
 
-_MIXED_CHECK_QUIET = [0]  # > 0 inside a write that is already checked (a UDF's per-fragment writes)
+_MIXED_CHECK_QUIET = threading.local()  # depth > 0 inside a write already checked (a UDF's per-fragment writes)
 
 
 @contextlib.contextmanager
 def _mixed_check_quiet():
-    _MIXED_CHECK_QUIET[0] += 1
+    _MIXED_CHECK_QUIET.depth = getattr(_MIXED_CHECK_QUIET, "depth", 0) + 1
     try:
         yield
     finally:
-        _MIXED_CHECK_QUIET[0] -= 1
+        _MIXED_CHECK_QUIET.depth -= 1
 
 
 def _target_file_version(dataset_info: dict) -> str:
@@ -179,7 +180,7 @@ def _warn_mixed_format(dataset_info: Optional[dict], uri) -> None:
     """Called before a write's commit (its data files may already be staged; nothing is committed): warns
     once when the write would add the first file of the target version beside the dataset's 2.0 or 2.1
     files. A new dataset, a dataset already mixed and one of a single current version do not warn."""
-    if dataset_info is None or _MIXED_CHECK_QUIET[0]:
+    if dataset_info is None or getattr(_MIXED_CHECK_QUIET, "depth", 0):
         return
     found = {f"{f['major_version']}.{f['minor_version']}"
              for fragment in dataset_info["fragments"] for f in fragment["files"]}
