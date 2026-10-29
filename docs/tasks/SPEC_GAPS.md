@@ -18,7 +18,7 @@ These stay as they are until a user asks, or the Lance pin moves:
 - **Lance 2.3 (unstable):** `encoding.layout.planar`, `encoding.compression.v2_3`, `encoding.compression.alp`,
   `encoding.compression.axis_delta`, `file.version.2_3`.
 - **Writing legacy formats:** `encoding.v2_0.write` and writing format 2.0 files, `file.version.0_1`. Writing
-  format 2.1 is planned conditionally, as W1n below. See "Datasets in formats 2.0 and 2.1".
+  format 2.1 is planned as W1n below. See "Datasets in formats 2.0 and 2.1".
 - **Other object stores and external manifest stores:** `io.store.other_schemes`,
   `io.store.external_manifest_store`, `table.transaction.external_manifest_store`, `api.lance_c.object_stores`.
 - **Newer feature flags, each a subsystem:** managed blobs (`file.blob.managed`, `table.blob.managed`),
@@ -43,7 +43,8 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1i | `encoding.layout.full_zip.write` | Fixed-width full-zip and per-value compression | to measure | later |
 | W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs, read and write | to measure | later |
 | W1k | `arrow.types.fixed_size_list`, `arrow.types.dictionary` | FSL of variable-width elements; dictionaries inside structs and lists | to measure | later |
-| W1n | `file.version.2_1` | Write 2.1 files into a 2.1 dataset, so its writes stay 2.1 | the 2.2-only encodings pylance leaves out for 2.1: to measure | needed (W1m); waits on the decision below |
+| W1o | `file.version.2_0`, `file.version.2_1` | Warn when a write adds the first 2.2 file to a 2.0 / 2.1 dataset, naming the readers it cuts off | W1m table | next (decided 2026-10-29) |
+| W1n | `file.version.2_1` | Write 2.1 files into a 2.1 dataset, so its writes stay 2.1 | the 2.2-only encodings pylance leaves out for 2.1: to measure | next after W1o (decided 2026-10-29) |
 
 ## Datasets in formats 2.0 and 2.1 (measured 2026-10-29)
 
@@ -91,6 +92,9 @@ Options, cheapest first. They can be combined:
 4. Refuse to write into a 2.0 / 2.1 dataset unless the caller opts in (for example `allow_mixed_versions=True`).
    Small, but it changes behaviour that works today with pylance 12+.
 
+Decided 2026-10-29: options 1 and 2, as W1o and W1n. The 2.0 writer (option 3) stays unscheduled until a user
+needs older readers to keep reading a 2.0 dataset that nanolance modified.
+
 ## Wave 2 onwards
 
 Waves 2 to 7 cover table, expr, scan, index, dataset and api, in that order. They are briefed when wave 1 is
@@ -127,3 +131,17 @@ reviewed, from the rows the README tables list at that point.
     that is nullable, root first (`must be nullable`, naming the nullable ancestor, even when the key is nullable too); a
     list ancestor (`must not be in a list type`, naming the list); the key itself nullable (`must be nullable`, naming the
     key). The message's Field lists its children: `Field(id=0, name=s, type=struct, children=[Field(id=1, name=id, type=int64), ])`.
+
+## Measured for W1n (2.1 versus 2.2, what pylance writes)
+
+pylance 12.0.0 wrote one 20,000-row table in 2.1 and in 2.2 (`build/nlance-pagelayout` on each). Encodings
+only 2.2 used:
+
+- a non-null constant column: 2.2 `Constant{inline 8B}` (ConstantLayout with an inline value); 2.1
+  `MiniBlock{values=Rle{values=Flat(64),lengths=Flat(8)}}`. An all-null column is ConstantLayout in both.
+- dictionaries compressed with General: 2.2 `dict=General{LZ4,Variable{...}}`; 2.1 `dict=Variable{...}` (plain).
+- dictionaries of fixed-width values: 2.2 `i64_small` -> `InlineBitpacking(32),dict=General{LZ4,Flat(64)}x100`;
+  2.1 `InlineBitpacking(64)` (no dictionary). The same for runs of int64 (2.2 RLE over a dictionary, 2.1 plain RLE).
+
+The same in both: bitpacking, RLE, FSST, plain and string dictionaries, nulls, lists, structs, fixed-size-list
+vectors, bool, dates. The reference for "valid 2.1": pylance 0.39 to 11.0 read pure 2.1 but nothing of 2.2.
