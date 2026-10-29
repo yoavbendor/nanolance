@@ -44,7 +44,7 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs, read and write | to measure | later |
 | W1k | `arrow.types.fixed_size_list`, `arrow.types.dictionary` | FSL of variable-width elements; dictionaries inside structs and lists | to measure | later |
 | W1o | `file.version.2_0`, `file.version.2_1` | Warn when a write adds the first 2.2 file to a 2.0 / 2.1 dataset, naming the readers it cuts off | W1m table | done 2026-10-29: `MixedFormatWarning` before the commit of each write that adds the first 2.2 file to a 2.0 / 2.1 dataset (write_dataset append, update, merge_insert, add_columns, compaction, fragment writes); `error` filter aborts it; `_target_file_version` is the one line W1n changes |
-| W1n | `file.version.2_1` | Write 2.1 files into a 2.1 dataset, so its writes stay 2.1 | the 2.2-only encodings pylance leaves out for 2.1: to measure | next after W1o (decided 2026-10-29) |
+| W1n | `file.version.2_1` | Write 2.1 files into a 2.1 dataset, so its writes stay 2.1 | measured 2026-10-29, see "W1n: what writing 2.1 needs" | blocked on a decision: needs a 2.1 mini-block writer (medium) |
 
 ## Datasets in formats 2.0 and 2.1 (measured 2026-10-29)
 
@@ -145,3 +145,27 @@ only 2.2 used:
 
 The same in both: bitpacking, RLE, FSST, plain and string dictionaries, nulls, lists, structs, fixed-size-list
 vectors, bool, dates. The reference for "valid 2.1": pylance 0.39 to 11.0 read pure 2.1 but nothing of 2.2.
+
+## W1n: what writing 2.1 needs (found 2026-10-29)
+
+Turning off the 2.2-only encodings is not enough. Every mini-block page nanolance writes uses the 2.2 chunk
+grammar (`has_large_chunk`: u32 buffer sizes and u32 chunk words). pylance 12 refuses such a page in a 2.1 file:
+"Large miniblock chunks are not part of the Lance v2.1 grammar" (`rust/lance-file/src/versions/v2_1/reader.rs:108`).
+pylance 1.0.4 panics and 0.39.0 aborts on it. The 2.1 grammar has u16 buffer sizes and u16 chunk words
+`(chunk_bytes / 8 - 1) << 4 | log2(values)`, so a chunk holds at most 32 KiB and a buffer at most 64 KiB.
+nanolance reads that grammar (`src/encoding/layout/miniblock.cpp`) but writes only the large one.
+
+Writing 2.1 therefore needs:
+
+1. The u16 header and chunk words in `miniblock::` (small).
+2. Chunk sizing under those caps, for every mini-block encoder (bitpacked, flat, FSST, dictionary and RLE values,
+   variable width, fixed-size lists). A value too wide for a 32 KiB chunk has to go to FullZip, as Lance does.
+   For fixed-width values that is W1i, which nanolance cannot write yet (medium).
+3. Then the 2.2-only encodings off for 2.1, measured with old readers: ConstantLayout with a value (done in the
+   W1n branch), General-compressed dictionaries (`write_dict_rle_column` always zstd-frames its dictionary),
+   fixed-width dictionaries, and the rest of the list in "Measured for W1n".
+
+A first implementation is on the local branch `haiku/w1n-finish` (commit e5da80e): the version switch,
+`keep_dataset_format` for staged writes, the ConstantLayout gate, a 2.2 fallback for blob v2 columns, and a
+28-column test matrix against pylance 12 and old readers. It is not merged: with item 1 missing, its 2.1 files are
+unreadable.
