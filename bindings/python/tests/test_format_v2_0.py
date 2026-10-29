@@ -10,6 +10,8 @@ struct's and a list's too -- has a column of its own. pylance 12 still writes it
 from __future__ import annotations
 
 import glob
+import os
+import struct
 
 import numpy as np
 import pyarrow as pa
@@ -218,3 +220,120 @@ def test_append_to_an_older_format(lance, tmp_path, version):
     assert ds.count_rows() == 450
     assert ds.to_table().equals(pa.concat_tables([first, more]))
     assert nl.dataset(path).to_table().equals(ds.to_table())
+
+
+N_ROWS = 300
+MODIFY_OPS = ["append", "delete", "update", "merge_insert", "add_columns", "drop_columns", "compact", "overwrite"]
+INDEX_OPS = ["btree", "inverted", "ivf_pq"]
+FOOTER_OF = {(2, 0): (0, 3)}
+
+
+def _rows(ids, tag: str = "row") -> pa.Table:
+    """int64 id, a string, an 8-float vector (deterministic in the id) and a list<int64>."""
+    ids = np.asarray(ids, dtype=np.int64)
+    vec = np.sin(np.outer(ids, np.arange(1, 9)) * 0.37).astype(np.float32).ravel()
+    return pa.table({
+        "id": pa.array(ids),
+        "s": pa.array([f"{tag} {i} word{i % 7}" for i in ids.tolist()]),
+        "vec": pa.FixedSizeListArray.from_arrays(pa.array(vec), 8),
+        "tags": pa.array([[i] * (i % 3) for i in ids.tolist()], pa.list_(pa.int64())),
+    })
+
+
+def _apply(lib, path: str, op: str) -> None:
+    """One operation, run by `lib` (nanolance or pylance) on the dataset at `path`."""
+    if op == "append":
+        lib.write_dataset(_rows(range(N_ROWS, N_ROWS + 60), "late"), path, mode="append")
+    elif op == "delete":
+        lib.dataset(path).delete("id % 5 = 0")
+    elif op == "update":
+        lib.dataset(path).update({"s": "'updated'"}, where="id < 40")
+    elif op == "merge_insert":
+        (lib.dataset(path).merge_insert("id").when_matched_update_all().when_not_matched_insert_all()
+         .execute(_rows(range(250, 350), "merged")))
+    elif op == "add_columns":
+        lib.dataset(path).add_columns({"extra": "id * 2"})
+    elif op == "drop_columns":
+        lib.dataset(path).drop_columns(["tags"])
+    elif op == "compact":
+        lib.dataset(path).delete("id % 5 = 0")
+        lib.dataset(path).optimize.compact_files()
+    elif op == "overwrite":
+        lib.write_dataset(_rows(range(1_000, 1_200), "new"), path, mode="overwrite")
+    elif op == "btree":
+        lib.dataset(path).create_scalar_index("id", index_type="BTREE")
+    elif op == "inverted":
+        lib.dataset(path).create_scalar_index("s", index_type="INVERTED")
+    elif op == "ivf_pq":
+        lib.dataset(path).create_index("vec", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=4)
+    else:
+        raise ValueError(op)
+
+
+def _footer_version(path: str) -> tuple:
+    with open(path, "rb") as fh:
+        fh.seek(-8, 2)
+        return struct.unpack("<HH", fh.read(4))
+
+
+def _manifest_files(ds) -> dict:
+    """{data file name: (major, minor)} for the data files the dataset's current version references."""
+    out = {}
+    for frag in ds.get_fragments():
+        for f in frag.data_files():
+            out[os.path.basename(f.path)] = (f.file_major_version, f.file_minor_version)
+    return out
+
+
+def _query_ids(lib, path: str, op: str) -> list:
+    ds = lib.dataset(path)
+    if op == "btree":
+        return sorted(ds.to_table(filter="id >= 40 and id < 90", columns=["id"]).column("id").to_pylist())
+    if op == "inverted":
+        return sorted(ds.to_table(full_text_query="word3", columns=["id"]).column("id").to_pylist())
+    q = _rows([17]).column("vec")[0].as_py()
+    return ds.to_table(nearest={"column": "vec", "q": q, "k": 10, "nprobes": 4},
+                       columns=["id"]).column("id").to_pylist()
+
+
+@pytest.mark.parametrize("version", ["2.0", "2.1"])
+@pytest.mark.parametrize("op", MODIFY_OPS + INDEX_OPS)
+def test_operation_on_an_older_dataset(lance, tmp_path, version, op):
+    """Every modification of a 2.0 / 2.1 dataset: nanolance and pylance each run it on their own copy.
+    Results are compared (values sorted by id; for index builds, query results from both readers),
+    then pylance appends to each copy. Files nanolance writes are 2.2; files it leaves keep theirs."""
+    paths = {"nl": str(tmp_path / "nl.lance"), "pl": str(tmp_path / "pl.lance")}
+    for path in paths.values():
+        lance.write_dataset(_rows(range(N_ROWS)), path, data_storage_version=version, max_rows_per_file=100)
+    before = {k: _manifest_files(lance.dataset(p)) for k, p in paths.items()}
+    _apply(nl, paths["nl"], op)
+    _apply(lance, paths["pl"], op)
+
+    ours = lance.dataset(paths["nl"])
+    assert ours.data_storage_version == ("2.2" if op == "overwrite" else version)
+
+    after = _manifest_files(ours)
+    for name, ver in after.items():
+        if name in before["nl"]:
+            assert ver == before["nl"][name], f"{name} changed version"
+        else:
+            assert ver == (2, 2), f"new data file {name} is {ver}, not 2.2"
+    if op in ("append", "update", "merge_insert", "add_columns", "compact", "overwrite"):
+        assert set(after) - set(before["nl"]), "this operation writes data files"
+    for name in after:  # the footer spells format 2.0 as 0.3 (the manifest says 2.0)
+        assert _footer_version(os.path.join(paths["nl"], "data", name)) == FOOTER_OF.get(after[name], after[name])
+
+    if op in INDEX_OPS:
+        for key in paths:
+            assert lance.dataset(paths[key]).describe_indices(), f"no index on the {key} copy"
+            assert _query_ids(lance, paths[key], op)
+            assert _query_ids(nl, paths[key], op) == _query_ids(lance, paths[key], op), key
+    else:
+        assert ours.to_table().sort_by("id").equals(lance.dataset(paths["pl"]).to_table().sort_by("id"))
+
+    # pylance appends to each copy, using the schema the result now has
+    extra = lance.dataset(paths["pl"]).to_table().slice(0, 20)
+    extra = extra.set_column(extra.schema.get_field_index("id"), "id", pa.array(range(10_000, 10_020), pa.int64()))
+    for path in paths.values():
+        lance.write_dataset(extra, path, mode="append")
+    assert lance.dataset(paths["nl"]).count_rows() == lance.dataset(paths["pl"]).count_rows()
