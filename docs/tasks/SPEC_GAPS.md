@@ -42,7 +42,8 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1h | `encoding.compression.general.write` | LZ4 | done for the value layouts measured (LZ4 writer; `compression=lz4` on 64-bit ints and variable-width). Left: General over dictionaries under the option, float zstd layout | done |
 | W1i | `encoding.layout.full_zip.write` | Fixed-width full-zip and per-value compression | measured and done 2026-10-29, see "Result for W1i" | partial (Haiku session, 2026-10-29): the 256-byte rule and `structural-encoding` for fixed-width FSL and fixed_size_binary, element validity included, layout text equal to pylance's for 21 cases. Left: the page split (pylance: one page per input batch), per-value compression of a fixed-width FullZip page, `structural-encoding=fullzip` on variable width, a bool column or a list of lists under fullzip, and a fixed-width FullZip scan that is slower than mini-block (measured) |
 | W1j | `encoding.semi_structural.packed_struct`, `variable_packed_struct` | Packed structs: read pylance's first, then write them for `lance-encoding:packed` | measured 2026-10-29, see "Measured for W1j" | later, reviewer-led design: reading needs a packed-struct read plan with child fan-out (as `v20_packed_struct_sources` does for 2.0), and the VariablePackedStruct byte layout from Lance's source. Opt-in only, so behind the gaps every dataset meets |
-| W1k | `arrow.types.fixed_size_list`, `arrow.types.dictionary` | FSL of variable-width elements; dictionaries inside structs and lists | to measure | later |
+| W1k1 | `arrow.types.fixed_size_list` (read) | Read what pylance writes: a null element inside a fixed-size list under a list or struct (also W1a's all-null list<fsl>), `fixed_size_list<bool>`, `fixed_size_list<struct>` | measured 2026-10-29, see "Measured for W1k" | next |
+| W1k2 | `arrow.types.fixed_size_list`, `arrow.types.dictionary` (write) | Write them too, and dictionary columns inside structs and lists | measured 2026-10-29 | after W1k1 |
 | W1p | `encoding.config` | Integer dictionaries: pylance dictionary-encodes int64 / float64 columns with 1,000-10,000 distinct values (`dict=InlineBitpacking(64)` / `General{LZ4,Flat(64)}`); nanolance has no such encoding | W1g, W1h | later |
 | W1q | `encoding.compression.rle` | RLE over more than one mini-block chunk: nanolance's RLE holds its runs in one chunk, so a column of 25,000 runs is not RLE-encoded | W1g | later |
 | W1r | `encoding.config` | Dictionary indices under `lance-encoding:compression` (`General{codec,ByteStreamSplit{Flat(32)}}`, or `Flat(32)` for none): the reader's dictionary-index path has to unwrap them before the writer may emit them | W1g, W1h | partial (Haiku session, 2026-10-29): done for string, int64 and float64 dictionaries (reader unwraps General and byte-stream-split per index chunk; writer emits pylance's index layout under lz4 / zstd / none; the dictionary buffer unchanged; `dict-rle` keeps the option erased, not measured). Layout text equal to pylance's, read and take checked, see "W1r measured". Left: `dict-rle` under the option, and integer dictionaries written by nanolance (W1p) |
@@ -418,3 +419,19 @@ pylance 12.0.0, data_storage_version 2.2, 20,000 rows, `lance-encoding:packed` =
 Child types pylance accepts in a packed struct (one int32 sibling, each child in turn): int8, uint8, int16, uint16, uint32, int64, uint64, float32, string, fixed_size_list<int8,3>, fixed_size_binary(3). Refused by pylance: bool (writer panics, `TryFromIntError`), list<int32> (`Field with data type List(Int32) cannot be converted to data block`), a struct child (`Packed struct per-value compression should not be used for fixed-width-only struct`), and a nullable child (`Per-value compression not yet supported for block type Nullable`).
 
 Not measured yet: the byte layout of `VariablePackedStruct` (field 13). The Lance 12 `packed.rs` source could not be fetched in this session (the sandbox refused the download, and the GitHub connector does not have `lance-format/lance` configured), so the reader for both forms is still open. W1j reader: not started; writer: not started.
+
+## Measured for W1k (2026-10-29)
+
+3,000 rows each. pylance 12.0.0 writes, then nanolance reads pylance's dataset, and writes the same table itself:
+
+| column | pylance | nanolance reads pylance's | nanolance writes |
+|---|---|---|---|
+| struct<k: dictionary<string>, v: int64> | writes, reads back the dictionary | equal | refused: "dictionary-encoded column 'k' inside a struct or list is not supported yet; cast it to its value type" |
+| list<dictionary<string>> | writes, reads back the dictionary | equal | refused, the same |
+| fixed_size_list<bool, 4> | writes | **fails**: "unsupported fixed_size_list element type ... fixed_size_list:bool:4" | refused: element must be a fixed-width number |
+| fixed_size_list<struct<x: int64>, 2> | writes | **fails**, with a misleading message ("a dictionary-encoded column cannot be read in the same batch as a skipped logical field") | refused |
+| list<fixed_size_list<float32, 2>> with null elements | writes | **fails**: "a null element inside a fixed_size_list item is not read yet" | refused: "has a null element inside a row under a list or struct" |
+| fixed_size_list<list<int64>, 2> | refuses ("Unsupported data type") | -- | -- |
+| fixed_size_list<string, N> | panics (found in W1i) | -- | -- |
+
+So W1k starts with reading (W1k1): three shapes pylance writes that nanolance cannot read.
