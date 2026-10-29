@@ -2452,6 +2452,51 @@ bool write_constant_column(const ColumnEncodeContext& ctx, std::ostream& out, st
     return true;
 }
 
+/// The mini-block chunks of a run-length encoded column (W1q, and the indices of a dictionary, W1p2): one chunk per
+/// rle::chunk_rows entry, each with its run values (`bpv` bytes each, read from `data`) and 8-bit run lengths.
+struct RleChunks {
+    std::vector<std::uint8_t> bytes;
+    std::vector<miniblock::ChunkMeta> metas;
+};
+
+RleChunks encode_rle_chunks(const std::uint8_t* data, std::size_t bpv,
+                            const std::vector<std::pair<std::size_t, std::uint64_t>>& runs) {
+    // A run that a chunk ends inside is cut there, and each chunk carries its own run values and run lengths.
+    std::vector<std::uint64_t> run_lengths_in_rows;
+    run_lengths_in_rows.reserve(runs.size());
+    for (const auto& run : runs) {
+        run_lengths_in_rows.push_back(run.second);
+    }
+    const auto rows_per_chunk = rle::chunk_rows(run_lengths_in_rows, bpv);
+    RleChunks out;
+    out.metas.reserve(rows_per_chunk.size());
+    std::size_t run_index = 0;
+    std::uint64_t run_offset = 0;
+    for (const std::size_t chunk_rows_count : rows_per_chunk) {
+        std::vector<std::uint8_t> run_values;
+        std::vector<std::uint8_t> run_lengths;  // Lance requires 8-bit run lengths
+        std::uint64_t left = chunk_rows_count;
+        while (left > 0U) {
+            const std::size_t row = runs[run_index].first;
+            const std::uint64_t run_len = runs[run_index].second;
+            const std::uint64_t take = std::min(run_len - run_offset, left);
+            rle::append_run(std::span<const std::uint8_t>(data + (row + run_offset) * bpv, bpv), take, run_values,
+                            run_lengths);
+            left -= take;
+            run_offset += take;
+            if (run_offset == run_len) {
+                ++run_index;
+                run_offset = 0U;
+            }
+        }
+        const std::span<const std::uint8_t> run_buffers[2] = {run_values, run_lengths};
+        const std::size_t before = out.bytes.size();
+        miniblock::append_chunk(out.bytes, 0U, {}, run_buffers);
+        out.metas.push_back({out.bytes.size() - before, chunk_rows_count});
+    }
+    return out;
+}
+
 /// Writes a run-length encoded fixed-width column: one chunk of run values and run lengths.
 /// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
 bool write_rle_column(const ColumnEncodeContext& ctx, std::ostream& out, std::vector<pb::ColumnMetadata>& columns) {
@@ -2477,53 +2522,20 @@ bool write_rle_column(const ColumnEncodeContext& ctx, std::ostream& out, std::ve
             i += run;
         }
     }
-    // One mini-block chunk per rle::chunk_rows entry, as pylance writes them (W1q): a run that a chunk ends
-    // inside is cut there, and each chunk carries its own run values and run lengths.
-    std::vector<std::uint64_t> run_lengths_in_rows;
-    run_lengths_in_rows.reserve(runs.size());
-    for (const auto& run : runs) {
-        run_lengths_in_rows.push_back(run.second);
-    }
-    const auto rows_per_chunk = rle::chunk_rows(run_lengths_in_rows, bpv);
+    // One mini-block chunk per rle::chunk_rows entry, as pylance writes them (W1q).
     const std::size_t length_bytes = 1U;
-    std::vector<std::uint8_t> chunk_bytes;
-    std::vector<miniblock::ChunkMeta> metas;
-    metas.reserve(rows_per_chunk.size());
-    std::size_t run_index = 0;
-    std::uint64_t run_offset = 0;
-    for (const std::size_t chunk_rows_count : rows_per_chunk) {
-        std::vector<std::uint8_t> run_values;
-        std::vector<std::uint8_t> run_lengths;  // Lance requires 8-bit run lengths
-        std::uint64_t left = chunk_rows_count;
-        while (left > 0U) {
-            const std::size_t row = runs[run_index].first;
-            const std::uint64_t run_len = runs[run_index].second;
-            const std::uint64_t take = std::min(run_len - run_offset, left);
-            rle::append_run(std::span<const std::uint8_t>(values.fixed_data() + (row + run_offset) * bpv, bpv),
-                            take, run_values, run_lengths);
-            left -= take;
-            run_offset += take;
-            if (run_offset == run_len) {
-                ++run_index;
-                run_offset = 0U;
-            }
-        }
-        const std::span<const std::uint8_t> run_buffers[2] = {run_values, run_lengths};
-        const std::size_t before = chunk_bytes.size();
-        miniblock::append_chunk(chunk_bytes, 0U, {}, run_buffers);
-        metas.push_back({chunk_bytes.size() - before, chunk_rows_count});
-    }
+    const auto chunks = encode_rle_chunks(values.fixed_data(), bpv, runs);
     // u32 metadata words, has_large_chunk as every nanolance mini-block page: nanolance writes data storage
     // version 2.2, whose validator refuses u16 words (control_buffer_for). Pylance 12 writes u16 words in 2.1
     // files; the chunk sizes and values are the same.
-    const auto control = miniblock::control_buffer(metas);
+    const auto control = miniblock::control_buffer(chunks.metas);
 
     align64(out);
     const auto control_offset = pos(out);
     out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
     align64(out);
     const auto data_offset = pos(out);
-    out.write(reinterpret_cast<const char*>(chunk_bytes.data()), static_cast<std::streamsize>(chunk_bytes.size()));
+    out.write(reinterpret_cast<const char*>(chunks.bytes.data()), static_cast<std::streamsize>(chunks.bytes.size()));
 
     pb::ColumnMetadata column;
     column.encoding = column_encoding_bytes();
@@ -2531,7 +2543,7 @@ bool write_rle_column(const ColumnEncodeContext& ctx, std::ostream& out, std::ve
     page.buffer_offsets.push_back(control_offset);
     page.buffer_offsets.push_back(data_offset);
     page.buffer_sizes.push_back(control.size());
-    page.buffer_sizes.push_back(chunk_bytes.size());
+    page.buffer_sizes.push_back(chunks.bytes.size());
     page.length = rows;
     page.priority = 0;
     page.encoding = page_layout_bytes_rle(static_cast<std::uint8_t>(bpv * 8U),
@@ -2801,16 +2813,23 @@ bool write_dict_fixed_column(const ColumnEncodeContext& ctx, std::ostream& out, 
     const auto& plan = ctx.values.structural_dict_plan;
     const auto rows = ctx.rows;
     const auto& indices = plan.indices;
+    // The indices: InlineBitpacking(32) chunks, or (W1p2, when the decision found runs) RLE'd u32 values in the W1q
+    // chunks, as pylance writes a sorted or run-heavy dictionary column (`Rle{Flat(32),Flat(8)}`).
     std::vector<MiniblockChunk> index_chunks;
-    for (std::size_t off = 0; off < indices.size(); off += 1024U) {
-        const auto count = std::min<std::size_t>(1024U, indices.size() - off);
-        MiniblockChunk chunk;
-        chunk.value_count = count;
-        bitpack::encode_block(reinterpret_cast<const std::uint8_t*>(indices.data() + off), count, 4U, chunk.bytes);
-        index_chunks.push_back(std::move(chunk));
+    RleChunks index_rle;
+    if (plan.index_rle) {
+        index_rle = encode_rle_chunks(reinterpret_cast<const std::uint8_t*>(indices.data()), 4U, plan.index_runs);
+    } else {
+        for (std::size_t off = 0; off < indices.size(); off += 1024U) {
+            const auto count = std::min<std::size_t>(1024U, indices.size() - off);
+            MiniblockChunk chunk;
+            chunk.value_count = count;
+            bitpack::encode_block(reinterpret_cast<const std::uint8_t*>(indices.data() + off), count, 4U, chunk.bytes);
+            index_chunks.push_back(std::move(chunk));
+        }
     }
-    const auto payload = miniblock_payload(index_chunks);
-    const auto control = control_buffer_for(index_chunks);
+    const auto control = plan.index_rle ? miniblock::control_buffer(index_rle.metas) : control_buffer_for(index_chunks);
+    const auto payload = plan.index_rle ? std::move(index_rle.bytes) : miniblock_payload(index_chunks);
 
     using FixedDictValues = StructuralDictPlan::FixedDictValues;
     descriptor::Bytes dict_desc;
@@ -2852,10 +2871,11 @@ bool write_dict_fixed_column(const ColumnEncodeContext& ctx, std::ostream& out, 
     page.length = rows;
     page.priority = 0;
     descriptor::MiniBlock m;
-    m.value_compression = descriptor::inline_bitpacking(32U);
+    m.value_compression = plan.index_rle ? descriptor::rle(descriptor::flat(32U), descriptor::flat(8U))
+                                         : descriptor::inline_bitpacking(32U);
     m.dictionary = dict_desc;
     m.num_dictionary_items = static_cast<std::uint32_t>(plan.fixed_distinct.size());
-    miniblock_tail(m, rows, 1U);
+    miniblock_tail(m, rows, plan.index_rle ? 2U : 1U);  // RLE: run values and run lengths are two buffers
     page.encoding = descriptor::page_encoding(m);
     column.pages.push_back(std::move(page));
     columns.push_back(std::move(column));

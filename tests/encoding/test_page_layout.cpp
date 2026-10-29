@@ -330,7 +330,9 @@ void check_dataset(const std::filesystem::path& dataset, const std::string& labe
             // untagged shape -- plain Variable, or zstd when the column asked for it.
             const bool fsst_ok = packing == "fsst" && (got == "Fsst(Variable)" || got == "Variable" ||
                                                        got == expected_shape("", true, compress));
-            check(got == want || fsst_ok, where + ": descriptor says " + got + " but nanolance:packing='" +
+            // A dictionary whose indices have runs is RLE'd (W1p2): its descriptor is Rle, with the dictionary (checked below).
+            const bool dict_rle_ok = packing == "dict" && got == "Rle";
+            check(got == want || fsst_ok || dict_rle_ok, where + ": descriptor says " + got + " but nanolance:packing='" +
                                               packing + "' implies " + want + " (" + pl::describe(parsed) + ")");
 
             // (4) Dictionary pages must carry their dictionary in the descriptor too.

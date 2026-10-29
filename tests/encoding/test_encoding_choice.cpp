@@ -9,6 +9,7 @@
 
 #include "encoding/encoding_choice.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -380,6 +381,27 @@ void test_fixed_dict() {
     require(!ec::fixed_column_dict_beneficial(cv), "a constant column is not a dictionary");
 }
 
+/// W1p2: the indices of a dictionary are RLE'd when they have runs (u32 values, runs * 5 < rows * 4), and bitpacked
+/// otherwise. A sorted column of 1,000 values is runs of 50; a shuffled one has no runs.
+void test_dict_index_rle() {
+    auto sorted = shuffled_64(1000000, 1000);
+    std::sort(sorted.begin(), sorted.end());
+    auto cv = fixed_column(sorted);
+    require(ec::fixed_column_dict_beneficial(cv), "sorted 1,000,000 rows, 1,000 distinct: a dictionary");
+    require(cv.structural_dict_plan.index_rle, "sorted: the indices are RLE'd");
+    require(cv.structural_dict_plan.index_runs.size() == 1000U, "one run per distinct value");
+    std::uint64_t covered = 0;
+    for (const auto& run : cv.structural_dict_plan.index_runs) {
+        covered += run.second;
+    }
+    require(covered == 1000000U, "the runs cover every row");
+
+    cv = fixed_column(shuffled_64(50000, 1000));
+    require(ec::fixed_column_dict_beneficial(cv), "shuffled 50,000 rows, 1,000 distinct: a dictionary");
+    require(!cv.structural_dict_plan.index_rle && cv.structural_dict_plan.index_runs.empty(),
+            "shuffled: the indices are bitpacked, no runs");
+}
+
 int main() {
     test_bitpack();
     test_fixed_rle();
@@ -387,6 +409,7 @@ int main() {
     test_dict_rle();
     test_dict();
     test_fixed_dict();
+    test_dict_index_rle();
     std::cout << "encoding_choice: ok\n";
     return 0;
 }

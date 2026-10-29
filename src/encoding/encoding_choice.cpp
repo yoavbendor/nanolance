@@ -132,16 +132,17 @@ bool bitpack_beats_flat(const nano_lance::ColumnValues& cv, std::size_t bpv) {
 // and zero allocation -- the common case is a scattered column that fails, and the previous version
 // recorded ~n/2 (row, run) pairs into a vector before bailing, all thrown away. Pass 2 records the
 // runs for the encoder's plan and only runs for genuinely beneficial columns.
-bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv, const ColumnEncodingOptions& options) {
-    cv.fixed_rle_plan = {};
-    if (bpv == 0U || cv.fixed_size() == 0U || cv.fixed_size() % bpv != 0U) {
+// The RLE decision for `n` values of `bpv` bytes at `data` (the body of fixed_column_rle_plan, shared with the
+// RLE of a dictionary's indices, W1p2). On success `runs_out` holds the (row, length) runs.
+bool rle_runs_beneficial(const std::uint8_t* data, std::size_t n, std::size_t bpv, const ColumnEncodingOptions& options,
+                         std::vector<std::pair<std::size_t, std::uint64_t>>& runs_out) {
+    if (bpv == 0U || n == 0U) {
         return false;
     }
     // `lance-encoding:rle-threshold=0`: RLE is off for this column (pylance takes RLE only below the threshold).
     if (options.rle_set && options.rle_threshold <= 0.0) {
         return false;
     }
-    const std::size_t n = cv.fixed_size() / bpv;
     // The run cutoff. Without rle-threshold, pylance's size model: a run costs its value plus a one-byte
     // length, so RLE is taken only when split_runs * (bpv + 1) < n * bpv, that is split_runs < ceil(n * bpv /
     // (bpv + 1)). For u8 that is one half; for int64 it is 8/9 (measured for W1q: pylance takes RLE at run
@@ -168,22 +169,34 @@ bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv, const 
                                                    static_cast<double>(kSampleRows) *
                                                    static_cast<double>(bpv) / static_cast<double>(bpv + 1U) * 1.5)));
         std::size_t sample_split_runs = 0;
-        if (!dispatch_rle_scan(cv.fixed_data(), kSampleRows, bpv, sample_reject, sample_split_runs, nullptr)) {
+        if (!dispatch_rle_scan(data, kSampleRows, bpv, sample_reject, sample_split_runs, nullptr)) {
             return false;
         }
     }
     std::size_t split_runs = 0;
     // reject_at == ceil(n/2) is exactly the previous `split_runs * 2 >= n` cutoff.
-    if (!dispatch_rle_scan(cv.fixed_data(), n, bpv, reject_at, split_runs, nullptr)) {
+    if (!dispatch_rle_scan(data, n, bpv, reject_at, split_runs, nullptr)) {
         return false;
     }
     std::vector<std::pair<std::size_t, std::uint64_t>> runs;
     std::size_t split_runs_again = 0;
-    if (!dispatch_rle_scan(cv.fixed_data(), n, bpv, n + 1U, split_runs_again, &runs)) {
+    if (!dispatch_rle_scan(data, n, bpv, n + 1U, split_runs_again, &runs)) {
+        return false;
+    }
+    runs_out = std::move(runs);
+    return true;
+}
+
+bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv, const ColumnEncodingOptions& options) {
+    cv.fixed_rle_plan = {};
+    if (bpv == 0U || cv.fixed_size() == 0U || cv.fixed_size() % bpv != 0U) {
+        return false;
+    }
+    if (!rle_runs_beneficial(cv.fixed_data(), cv.fixed_size() / bpv, bpv, options, cv.fixed_rle_plan.runs)) {
+        cv.fixed_rle_plan.runs.clear();
         return false;
     }
     cv.fixed_rle_plan.computed = true;
-    cv.fixed_rle_plan.runs = std::move(runs);
     return true;
 }
 
@@ -592,6 +605,10 @@ bool fixed_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnEnco
     if (static_cast<double>(encoded) >= static_cast<double>(rows * 8U) * options.dict_size_ratio) {
         return false;
     }
+    // The indices are RLE'd when they have runs (W1p2: a sorted or run-heavy column). pylance decides this after the
+    // dictionary, with the same size model as a column's RLE at 4-byte values (runs * 5 < rows * 4).
+    plan.index_rle = rle_runs_beneficial(reinterpret_cast<const std::uint8_t*>(indices.data()), indices.size(), 4U,
+                                         options, plan.index_runs);
     plan.computed = true;
     plan.fixed = true;
     plan.fixed_distinct = std::move(distinct);

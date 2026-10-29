@@ -747,8 +747,10 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
             if (cv.kind == ColumnValues::Kind::FixedWidth &&
                 lance_logical_type_is_bitpackable_integer(pf->logical_type)) {
                 const auto bpv = lance_logical_type_value_bytes(pf->logical_type);
-                // A 64-bit dictionary (W1p) is decided after RLE, as pylance does. A column with its own
-                // lance-encoding:compression keeps its layout (the dictionary is not written under a codec yet).
+                // A 64-bit dictionary (W1p) is decided before RLE, as pylance does: a dictionary column's indices are
+                // RLE'd when they have runs (W1p2, in fixed_column_dict_beneficial), and a column without a dictionary
+                // is RLE'd or not as before. A column with its own lance-encoding:compression keeps its layout (the
+                // dictionary is not written under a codec yet).
                 bool own_codec = false;
                 for (const auto& original : state->schema_mapping.fields) {
                     if (original.id == pf->id) {
@@ -756,18 +758,18 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
                         break;
                     }
                 }
-                if (encoding_choice::fixed_column_rle_plan(cv, bpv, enc_options)) {
-                    for (auto& field : disk_schema.fields) {
-                        if (field.id == pf->id) {
-                            field.metadata["nanolance:packing"] = "rle";
-                            break;
-                        }
-                    }
-                } else if (bpv == 8U && !own_codec && encoding_choice::fixed_column_dict_beneficial(cv, enc_options)) {
+                if (bpv == 8U && !own_codec && encoding_choice::fixed_column_dict_beneficial(cv, enc_options)) {
                     for (auto& field : disk_schema.fields) {
                         if (field.id == pf->id) {
                             field.metadata["nanolance:packing"] = "dict";
                             field.metadata.erase("lance-encoding:compression");
+                            break;
+                        }
+                    }
+                } else if (encoding_choice::fixed_column_rle_plan(cv, bpv, enc_options)) {
+                    for (auto& field : disk_schema.fields) {
+                        if (field.id == pf->id) {
+                            field.metadata["nanolance:packing"] = "rle";
                             break;
                         }
                     }

@@ -55,6 +55,11 @@ struct StructuralDictPlan {
     enum class FixedDictValues : std::uint8_t { kInlineBitpacking, kOutOfLineBitpacking, kFlat, kLz4 };
     FixedDictValues fixed_values = FixedDictValues::kFlat;
     unsigned fixed_width = 0;  // kOutOfLineBitpacking: the one width every block is packed at
+    /// Run-length encoding of the indices (W1p2), as pylance writes a sorted or run-heavy dictionary column:
+    /// `Rle{Flat(32),Flat(8)}` over the u32 indices. `index_runs` holds (row, length) per run of `indices`, as
+    /// FixedRlePlan does; the indices are then not bitpacked.
+    bool index_rle = false;
+    std::vector<std::pair<std::size_t, std::uint64_t>> index_runs;
 };
 
 /// Dictionary+RLE plan for a run-length-friendly variable-width column, computed once by the write-side
