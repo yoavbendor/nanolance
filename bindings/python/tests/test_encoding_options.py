@@ -142,6 +142,18 @@ def test_unknown_dict_values_compression_is_refused_by_name(tmp_path):
         nl_write_dataset(table, str(tmp_path / "bad.lance"))
 
 
+def test_unknown_dict_values_compression_is_ignored_off_dictionaries(tmp_path):
+    # pylance accepts any dict-values-compression on a column it does not dictionary-encode, and ignores it.
+    lance = require_pylance()
+    rng = np.random.default_rng(3)
+    for arr in (pa.array(rng.integers(0, 2**40, ROWS)), pa.array([f"u{i}" for i in range(ROWS)])):
+        table = _table(arr, {"dict-values-compression": "brotli"})
+        ours, theirs = tmp_path / "ours.lance", tmp_path / "theirs.lance"
+        nl_write_dataset(table, str(ours), mode="overwrite")
+        lance.write_dataset(table, str(theirs), mode="overwrite")
+        assert lance.dataset(str(ours)).to_table() == lance.dataset(str(theirs)).to_table() == table
+
+
 def test_dictionary_buffer_is_plain_without_the_option(tmp_path):
     # Without the option nanolance keeps its plain dictionary buffer (pylance's LZ4 default is not adopted).
     table = _table(_strings(5000), {"dict-divisor": "1"})

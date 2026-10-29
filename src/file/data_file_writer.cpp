@@ -2909,9 +2909,15 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
         return false;
     }
     // lance-encoding:dict-values-compression names the dictionary buffer's codec; refused here, by name, so no
-    // page is written before the value is known to be one the writer can frame.
+    // page is written before the value is known to be one the writer can frame. Only a column written as a
+    // dictionary is checked: pylance accepts (and ignores) any value on a column it does not dictionary-encode.
+    const auto dict_packing = field.metadata.find("nanolance:packing");
+    const bool dictionary_column = !field.dictionary_index_format.empty() ||
+                                   (dict_packing != field.metadata.end() &&
+                                    (dict_packing->second == "dict" || dict_packing->second == "dict-rle"));
     if (const auto dv = field.metadata.find("lance-encoding:dict-values-compression");
-        dv != field.metadata.end() && dv->second != "none" && dv->second != "lz4" && dv->second != "zstd") {
+        dictionary_column && dv != field.metadata.end() && dv->second != "none" && dv->second != "lz4" &&
+        dv->second != "zstd") {
         error = "unknown lance-encoding:dict-values-compression '" + dv->second + "' on column '" + field.name +
                 "' (expected lz4, zstd or none)";
         return false;
