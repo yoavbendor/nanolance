@@ -289,6 +289,9 @@ pb::Field manifest_field(const LanceField& mapped_field) {
     field.type = 2;
     field.encoding = mapped_field.dictionary_index_format.empty() ? lance_on_disk_field_encoding(mapped_field.logical_type) : 3;
     field.nullable = mapped_field.nullable;
+    field.unenforced_primary_key = mapped_field.unenforced_primary_key;
+    field.unenforced_primary_key_position = mapped_field.unenforced_primary_key_position;
+    field.unenforced_clustering_key_position = mapped_field.unenforced_clustering_key_position;
     for (const auto& kv : mapped_field.metadata) {
         // Per-file encoding choices live in each data file's own schema; the dataset's is logical.
         if (kv.first == "nanolance:packing" || kv.first == "nanolance:const-value") {

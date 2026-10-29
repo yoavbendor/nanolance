@@ -23,6 +23,12 @@ struct Field {
     std::int32_t encoding = 1;
     /// Protobuf map<string, bytes> metadata (field number 10 in Lance `file.Field`).
     std::map<std::string, std::vector<std::uint8_t>> metadata;
+    /// Lance's unenforced primary key (field 12), its 1-based position (field 13; 0 with the key set means
+    /// "in the key, ordered by field id") and the clustering key's position (field 15; 0 is not in it).
+    /// These travel as `unknown` bytes on the wire (see lance_minimal.pb.cpp).
+    bool unenforced_primary_key = false;
+    std::uint32_t unenforced_primary_key_position = 0;
+    std::uint32_t unenforced_clustering_key_position = 0;
     /// Wire bytes of the fields this codec does not model (dictionary, storage class, ...), kept so a
     /// schema read from another writer's manifest is written back unchanged.
     std::vector<std::uint8_t> unknown;

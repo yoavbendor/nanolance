@@ -34,6 +34,13 @@ struct LanceField {
     /// so the column decodes, filters and encodes as its values; only the Arrow form differs.
     std::string dictionary_index_format;
     bool dictionary_ordered = false;
+    /// Lance's unenforced primary key (the Field's bool, which Lance sets for every key column), its
+    /// position (1-based; 0 is "in the key, ordered by field id") and the clustering position (0 is not in
+    /// it). Written from the `lance-schema:unenforced-*` Arrow metadata, and read back from Field fields 12,
+    /// 13 and 15 of a manifest.
+    bool unenforced_primary_key = false;
+    std::uint32_t unenforced_primary_key_position = 0;
+    std::uint32_t unenforced_clustering_key_position = 0;
 };
 
 struct LanceSchemaMapping {
