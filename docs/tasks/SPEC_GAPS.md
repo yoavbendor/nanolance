@@ -1102,3 +1102,7 @@ acceptable (the same trade as W1s's float write time).
 
 Left: the 1,024-row chunks against pylance's 4,096 (W1p4); the write time above; nullable RLE of float32 and of
 variable-width values was not measured.
+
+Review (2026-10-30): accepted pylance's layout for nullable runs of 2 (31-33 ms against 17 ms flat for 1M rows at
+5% nulls; pylance takes 50 ms), as for the non-null shapes. Full suite after review: 4,774 passed, 173 skipped, 5
+xfailed; ctest 156/156; `nlbench_gendata` md5 unchanged.
