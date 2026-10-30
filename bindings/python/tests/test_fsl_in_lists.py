@@ -49,9 +49,15 @@ def test_round_trip_both_ways(lance_mod, tmp_path, writer):
     assert pa.table(nanolance.take(path, idx)).to_pydict() == table.take(pa.array(idx)).to_pydict()
 
 
-def test_a_null_element_inside_a_valid_item_is_refused(tmp_path):
+def test_a_null_element_inside_a_valid_item_is_written(tmp_path):
+    """Written since W1k2 (test_nested_write_shapes.py has the layout check): both readers return the nulls."""
+    lance = require_pylance()
     values = pa.array([1.0, None, 3.0, 4.0], pa.float32())
     boxes = pa.FixedSizeListArray.from_arrays(values, 4)
     table = pa.table({"boxes": pa.ListArray.from_arrays(pa.array([0, 1], pa.int32()), boxes)})
-    with pytest.raises(Exception, match="null element"):
-        nanolance.write_table(table, tmp_path / "bad.lance")
+    path = tmp_path / "nulls.lance"
+    nanolance.write_table(table, path)
+    from nanolance.lance.dataset import dataset as nl_dataset
+
+    assert nl_dataset(str(path)).to_table().to_pylist() == table.to_pylist()
+    assert lance.dataset(str(path)).to_table().to_pylist() == table.to_pylist()

@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 /// Whether a structural encoding pays for a column the writer buffered: each check scans the column's
@@ -39,6 +40,9 @@ struct ColumnEncodingOptions {
     /// `lance-encoding:dict-size-ratio` (pylance default 0.8, valid in (0, 1]): a dictionary is kept
     /// only when its encoded size is below this fraction of the flat size.
     double dict_size_ratio = 0.8;
+    /// `lance-encoding:dict-values-compression`: empty (pylance's default, lz4), "none" or "lz4". Other values
+    /// are not handled for fixed-width dictionaries, which then stay as they were.
+    std::string dict_values_compression;
 };
 
 bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv,
@@ -49,5 +53,13 @@ bool variable_column_constant_value(const nano_lance::ColumnValues& cv, std::vec
 bool variable_column_dict_rle_beneficial(nano_lance::ColumnValues& cv, const ColumnEncodingOptions& options = {});
 
 bool variable_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnEncodingOptions& options = {});
+
+/// Lance's should_dictionary_encode for a 64-bit fixed-width column (W1p): a 4,096-value sample in 32 blocks
+/// (a unique ratio of 0.98 or more rejects it, and the projected cardinality must stay within rows / divisor,
+/// capped at 100,000), then the distinct values within that threshold and the size budget (dict-size-ratio
+/// of the flat size). On success `cv.structural_dict_plan` holds the dictionary as pylance stores its values:
+/// InlineBitpacking when one 1,024-value block is smaller than the raw block, else OutOfLineBitpacking above
+/// 1,024 entries, else the general codec (lz4 by default, none for Flat).
+bool fixed_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnEncodingOptions& options = {});
 
 }  // namespace nano_lance::encoding_choice

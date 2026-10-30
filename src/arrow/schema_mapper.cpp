@@ -512,10 +512,26 @@ bool map_field(const ArrowSchema& field,
         const ArrowSchema& values = *field.dictionary;
         auto value_type = parse_format(values.format == nullptr ? "" : values.format);
         const std::string index_format = format;
-        if (parent_id >= 0) {
+        // Under a struct or list (W1k2) only int32 indices over string or binary values are written: the
+        // shape pylance 12 writes (InlineBitpacking(32) indices, a General{LZ4} dictionary). Other
+        // nested dictionaries keep the refusal.
+        const bool nested_shape = parent_id >= 0 && index_format == "i" && value_type.supported &&
+                                  (value_type.logical_type == "utf8" || value_type.logical_type == "large_utf8" ||
+                                   value_type.logical_type == "binary" || value_type.logical_type == "large_binary") &&
+                                  values.dictionary == nullptr;
+        if (parent_id >= 0 && !nested_shape) {
             error = "dictionary-encoded column '" + out.name +
                     "' inside a struct or list is not supported yet; cast it to its value type first";
             return false;
+        }
+        if (nested_shape) {
+            out.logical_type = value_type.logical_type;
+            out.arrow_format = values.format;
+            out.dictionary_index_format = index_format;
+            out.dictionary_ordered = (field.flags & ARROW_FLAG_DICTIONARY_ORDERED) != 0;
+            out.column_index = next_column++;
+            mapping.fields.push_back(out);
+            return true;
         }
         if (value_type.supported && !lance_logical_type_is_list(value_type.logical_type) &&
             value_type.logical_type != "struct" && value_type.logical_type != "null" &&

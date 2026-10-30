@@ -151,7 +151,10 @@ def test_dictionary_file_round_trip(tmp_path):
 
 
 def test_dictionary_refusals(tmp_path):
-    nested = pa.table({"s": pa.StructArray.from_arrays([pa.array(["a"]).dictionary_encode()], ["d"])})
+    # An int32-indexed string dictionary under a struct is written (test_nested_write_shapes); other index
+    # types under a struct or list are still refused by name.
+    index8 = pa.DictionaryArray.from_arrays(pa.array([0], pa.int8()), pa.array(["a"]))
+    nested = pa.table({"s": pa.StructArray.from_arrays([index8], ["d"])})
     with pytest.raises(NotImplementedError, match="inside a struct or list is not supported yet"):
         nl.write_dataset(nested, str(tmp_path / "nested"))
 

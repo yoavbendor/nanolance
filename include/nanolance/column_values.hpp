@@ -46,6 +46,20 @@ struct StructuralDictPlan {
     bool computed = false;
     std::vector<std::string_view> distinct;  // distinct values in first-appearance order (id == index)
     std::vector<std::uint32_t> indices;      // per-row dictionary index into `distinct`
+    /// A fixed-width (64-bit) dictionary, when `fixed` is set (`distinct` is then empty): the entries' bit
+    /// patterns, and the dictionary buffer as stored, with its shape (see FixedDictValues).
+    bool fixed = false;
+    std::vector<std::uint64_t> fixed_distinct;
+    std::vector<std::uint8_t> fixed_block;
+    /// How the dictionary block is stored: the bitpacking Lance chose, or the general codec when it did not.
+    enum class FixedDictValues : std::uint8_t { kInlineBitpacking, kOutOfLineBitpacking, kFlat, kLz4 };
+    FixedDictValues fixed_values = FixedDictValues::kFlat;
+    unsigned fixed_width = 0;  // kOutOfLineBitpacking: the one width every block is packed at
+    /// Run-length encoding of the indices (W1p2), as pylance writes a sorted or run-heavy dictionary column:
+    /// `Rle{Flat(32),Flat(8)}` over the u32 indices. `index_runs` holds (row, length) per run of `indices`, as
+    /// FixedRlePlan does; the indices are then not bitpacked.
+    bool index_rle = false;
+    std::vector<std::pair<std::size_t, std::uint64_t>> index_runs;
 };
 
 /// Dictionary+RLE plan for a run-length-friendly variable-width column, computed once by the write-side

@@ -10,6 +10,7 @@
 
 #include "encoding/values/rle.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -248,9 +249,94 @@ void test_level_refusals() {
             "too few levels message: " + error);
 }
 
+// The encoded bytes of the rows [start, start + rows), counted from the run list by the rule chunk_rows
+// documents, independently of chunk_rows: 8-byte header, one (value, length) pair per run piece of at most
+// 255 rows, padded to 8.
+std::size_t window_bytes_by_hand(const std::vector<std::uint64_t>& lengths, std::size_t value_bytes,
+                                 std::size_t start, std::size_t rows) {
+    std::size_t pieces = 0;
+    std::size_t pos = 0;
+    for (const auto length : lengths) {
+        const std::size_t a = std::max(pos, start);
+        const std::size_t b = std::min<std::size_t>(pos + length, start + rows);
+        if (a < b) {
+            pieces += (b - a + 254U) / 255U;
+        }
+        pos += length;
+    }
+    const std::size_t raw = 8U + pieces * (value_bytes + 1U);
+    return (raw + 7U) / 8U * 8U;
+}
+
+void test_chunk_rows() {
+    using nano_lance::rle::chunk_rows;
+    require(chunk_rows({}, 8).empty(), "no runs, no chunks");
+
+    // The shapes pylance 12 writes for a 50,000-row int64 column (measured, W1q): runs of 2 take 1,024 rows
+    // per chunk, runs of 50 take 4,096, and the last chunk takes what is left.
+    const std::vector<std::uint64_t> two(25000, 2);
+    auto rows = chunk_rows(two, 8);
+    require(rows.size() == 49U && rows[0] == 1024U && rows[47] == 1024U && rows[48] == 848U,
+            "runs of 2 chunk as pylance's 1,024 rows, last 848");
+    const std::vector<std::uint64_t> fifty(1000, 50);
+    rows = chunk_rows(fifty, 8);
+    require(rows.size() == 13U && rows[0] == 4096U && rows[11] == 4096U && rows[12] == 848U,
+            "runs of 50 chunk as pylance's 4,096 rows, last 848");
+    // The 8192-byte limit at the edge: int64 runs of 4 take 2,048 rows (4,096 rows would encode to 9,224
+    // bytes), runs of 5 take 4,096 (7,392 bytes). int32 runs of 3 take 4,096 (6,840 bytes), runs of 2 take 2,048.
+    rows = chunk_rows(std::vector<std::uint64_t>(12500, 4), 8);
+    require(rows[0] == 2048U, "int64 runs of 4 take 2,048 rows per chunk");
+    rows = chunk_rows(std::vector<std::uint64_t>(10000, 5), 8);
+    require(rows[0] == 4096U && rows[11] == 4096U, "int64 runs of 5 take 4,096 rows per chunk");
+    rows = chunk_rows(std::vector<std::uint64_t>(16667, 3), 4);
+    require(rows[0] == 4096U, "int32 runs of 3 take 4,096 rows per chunk");
+    rows = chunk_rows(std::vector<std::uint64_t>(25000, 2), 4);
+    require(rows[0] == 2048U, "int32 runs of 2 take 2,048 rows per chunk");
+    // A run of 1,000 rows is split into 255s in its chunk: one chunk of 1,000 rows, exact count.
+    rows = chunk_rows(std::vector<std::uint64_t>{1000U}, 1);
+    require(rows.size() == 1U && rows[0] == 1000U, "one long run is one chunk of its rows");
+
+    // Random run lengths and widths: every non-last chunk is a power of two up to 4096 that fits 8192 bytes,
+    // and doubling it (capped at what is left) would not fit or would pass 4096. The rows add up.
+    std::mt19937 gen(20260501U);
+    std::uniform_int_distribution<std::uint64_t> len_dist(1U, 8U);
+    for (const std::size_t vb : {std::size_t{1}, std::size_t{4}, std::size_t{8}, std::size_t{16}}) {
+        std::vector<std::uint64_t> lengths;
+        std::uint64_t total = 0;
+        while (total < 60000U) {
+            const auto l = len_dist(gen);
+            lengths.push_back(l);
+            total += l;
+        }
+        // A few long runs too, so pieces of 255 are exercised.
+        lengths.push_back(700U);
+        lengths.push_back(255U);
+        total += 955U;
+        const auto chunks = chunk_rows(lengths, vb);
+        std::size_t start = 0;
+        std::uint64_t sum = 0;
+        for (std::size_t i = 0; i < chunks.size(); ++i) {
+            const std::size_t p = chunks[i];
+            sum += p;
+            const bool last = i + 1U == chunks.size();
+            require(window_bytes_by_hand(lengths, vb, start, p) <= 8192U, "a chunk fits 8192 bytes");
+            if (!last) {
+                require(p <= 4096U && (p & (p - 1U)) == 0U, "a non-last chunk is a power of two up to 4096");
+                const std::size_t remaining = static_cast<std::size_t>(total) - start;
+                const std::size_t doubled = std::min<std::size_t>(2U * p, remaining);
+                require(p == 4096U || window_bytes_by_hand(lengths, vb, start, doubled) > 8192U,
+                        "a chunk is the largest power of two that fits");
+            }
+            start += p;
+        }
+        require(sum == total && start == total, "the chunks add up to the rows");
+    }
+}
+
 }  // namespace
 
 int main() {
+    test_chunk_rows();
     test_round_trip_widths();
     test_split_runs();
     test_many_random_runs();

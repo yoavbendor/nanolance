@@ -3672,32 +3672,26 @@ bool decode_nested_page_values(NestedDecodeState& st, const pb::ColumnPage& page
     return true;
 }
 
-/// Checks and drops the element validity of a fixed_size_list page's items. One step of
-/// decode_nested_column.
-bool decode_nested_fixed_list_validity(ColumnValues& page_values,
-                                       const std::vector<repdef::UnraveledLayer>& unraveled,
-                                       std::uint64_t page_items, const std::string& where, std::string& error) {
-    // fixed_size_list items (bounding boxes, embeddings): Lance marks every element of a null item
-    // null as well. Those element bits say nothing the item's own validity does not, so they are
-    // dropped; a null element inside a VALID item is not something this reader can carry.
-    if (!page_values.item_validity.empty()) {
-        const auto per_item = page_values.items_per_row;
-        const auto& item_bits = unraveled[0].validity;
-        for (std::uint64_t k = 0; k < page_items && per_item != 0U; ++k) {
-            if (!item_bits.empty() && ((item_bits[static_cast<std::size_t>(k >> 3U)] >> (k & 7U)) & 1U) == 0U) {
-                continue;
-            }
-            for (std::uint64_t e = k * per_item; e < (k + 1U) * per_item; ++e) {
-                if (static_cast<std::size_t>(e >> 3U) < page_values.item_validity.size() &&
-                    ((page_values.item_validity[static_cast<std::size_t>(e >> 3U)] >> (e & 7U)) & 1U) == 0U) {
-                    error = where + "a null element inside a fixed_size_list item is not read yet";
-                    return false;
-                }
-            }
-        }
-        page_values.item_validity.clear();
-        page_values.item_null_count = 0;
+/// Carries a fixed_size_list page's element validity into the column's output, at the element offset
+/// of the page's first item. One step of decode_nested_column. Lance marks every element of a null
+/// item null as well; those bits are kept with the rest, because the Arrow child they land in must
+/// carry a null element inside a valid item exactly where pylance wrote one.
+bool decode_nested_fixed_list_validity(ColumnValues& page_values, ColumnValues& out, std::uint64_t items_before,
+                                       std::uint64_t per_item, std::uint64_t page_items, const std::string& where,
+                                       std::string& error) {
+    if (per_item == 0U) {
+        return true;  // not a fixed_size_list column
     }
+    const std::uint64_t count = page_items * per_item;
+    if (!page_values.item_validity.empty() && page_values.item_validity.size() < (count + 7U) / 8U) {
+        error = where + "fixed_size_list element validity covers fewer elements than the page has";
+        return false;
+    }
+    out.items_per_row = per_item;
+    append_item_validity(out, page_values.item_validity.empty() ? nullptr : page_values.item_validity.data(), count,
+                         items_before * per_item);
+    page_values.item_validity.clear();
+    page_values.item_null_count = 0;
     return true;
 }
 
@@ -3758,6 +3752,12 @@ bool decode_nested_column(const EncodingsIo& io, const pb::Field& on_disk_field,
     auto& rep = rep_scratch.get();
     auto& def = def_scratch.get();
     NestedDecodeState st{io, on_disk_field, variable, value_bytes, control, payload, chunks, rep, def};
+    // Elements per item when the leaf items are fixed_size_list rows (0 otherwise).
+    std::string fsl_element;
+    std::uint64_t fsl_items = 0;
+    if (!lance_fixed_size_list_parts(on_disk_field.logical_type, fsl_element, fsl_items)) {
+        fsl_items = 0;
+    }
     std::uint64_t rows_total = 0;
     for (const auto& page : column_metadata.pages) {
         rows_total += page.length;  // only guides reserve_projected; overflow would just skip it
@@ -3817,7 +3817,8 @@ bool decode_nested_column(const EncodingsIo& io, const pb::Field& on_disk_field,
         if (!decode_nested_page_values(st, page, layout, page_state, unraveled, out, where, error)) {
             return false;
         }
-        if (!decode_nested_fixed_list_validity(page_state.page_values, unraveled, page_items, where, error)) {
+        if (!decode_nested_fixed_list_validity(page_state.page_values, out, st.items_total, fsl_items, page_items,
+                                               where, error)) {
             return false;
         }
         if (!append_leaf_values(out, page_state.page_values, error)) {

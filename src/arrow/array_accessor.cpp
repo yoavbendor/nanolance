@@ -641,6 +641,9 @@ bool walk_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, con
     return true;
 }
 
+bool append_dictionary_values(const ArrowArray& array, const LanceField& field, ColumnValues& out,
+                              std::string& error);
+
 bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, const LanceField& field,
                    ColumnValues& out, std::string& error) {
     const ArrowArray* node = nullptr;
@@ -671,6 +674,10 @@ bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, c
         items_before = width == 0U ? 0U : out.fixed.size() / width;
     }
     append_bits(out.validity, out.null_count, items_before, leaf, at, count);
+    // A dictionary leaf (W1k2): its values are gathered, and its dictionary recorded, as for a top-level one.
+    if (!field.dictionary_index_format.empty()) {
+        return append_dictionary_values(leaf, field, out, error);
+    }
     if (lance_field_is_variable_width(field.logical_type)) {
         return append_variable_width(leaf, field, out, error);
     }
@@ -931,12 +938,17 @@ bool append_batch_column_values(const ArrowArray& batch,
                 return false;
             }
             if (!columns[i].item_validity.empty()) {
-                // Element validity is written for a top-level fixed_size_list only; under a list or a
-                // struct the nested page writer has no place for it.
-                error = "fixed_size_list column '" + field.name +
-                        "' has a null element inside a row under a list or struct; whole-row nulls are "
-                        "supported there, null elements are not yet";
-                return false;
+                // Under a list or a struct, element validity is written as mini-block chunks (W1k2). A row of 256
+                // bytes or more is FullZip in pylance, and nanolance has no nested FullZip writer yet: refused.
+                std::string element;
+                std::uint64_t items = 0;
+                if (lance_fixed_size_list_parts(field.logical_type, element, items) &&
+                    lance_logical_type_value_bytes(element) * items >= 256U) {
+                    error = "fixed_size_list column '" + field.name +
+                            "' has null elements under a list or struct and rows of 256 bytes or more; pylance writes "
+                            "those as FullZip pages, which nanolance does not write under a list or struct yet";
+                    return false;
+                }
             }
             columns[i].rows += static_cast<std::uint64_t>(top_view.length);
             continue;

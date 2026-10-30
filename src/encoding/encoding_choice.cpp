@@ -5,6 +5,10 @@
 // dictionary + RLE): scans of the buffered values that decide whether an encoding pays.
 
 #include "encoding/encoding_choice.hpp"
+#include "encoding/values/bitpack.hpp"
+#include "encoding/values/general.hpp"
+
+#include <nanom/fastlanes.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -128,21 +132,25 @@ bool bitpack_beats_flat(const nano_lance::ColumnValues& cv, std::size_t bpv) {
 // and zero allocation -- the common case is a scattered column that fails, and the previous version
 // recorded ~n/2 (row, run) pairs into a vector before bailing, all thrown away. Pass 2 records the
 // runs for the encoder's plan and only runs for genuinely beneficial columns.
-bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv, const ColumnEncodingOptions& options) {
-    cv.fixed_rle_plan = {};
-    if (bpv == 0U || cv.fixed_size() == 0U || cv.fixed_size() % bpv != 0U) {
+// The RLE decision for `n` values of `bpv` bytes at `data` (the body of fixed_column_rle_plan, shared with the
+// RLE of a dictionary's indices, W1p2). On success `runs_out` holds the (row, length) runs.
+bool rle_runs_beneficial(const std::uint8_t* data, std::size_t n, std::size_t bpv, const ColumnEncodingOptions& options,
+                         std::vector<std::pair<std::size_t, std::uint64_t>>& runs_out) {
+    if (bpv == 0U || n == 0U) {
         return false;
     }
     // `lance-encoding:rle-threshold=0`: RLE is off for this column (pylance takes RLE only below the threshold).
     if (options.rle_set && options.rle_threshold <= 0.0) {
         return false;
     }
-    const std::size_t n = cv.fixed_size() / bpv;
-    // The run cutoff: nanolance's default is ceil(n/2) (a run ratio below one half). An explicit
-    // rle-threshold t takes RLE only when split_runs < n * t, pylance's guard, so the cutoff is ceil(n * t).
+    // The run cutoff. Without rle-threshold, pylance's size model: a run costs its value plus a one-byte
+    // length, so RLE is taken only when split_runs * (bpv + 1) < n * bpv, that is split_runs < ceil(n * bpv /
+    // (bpv + 1)). For u8 that is one half; for int64 it is 8/9 (measured for W1q: pylance takes RLE at run
+    // ratios 0.885 and below, and not at 0.895). An explicit rle-threshold t takes RLE only when
+    // split_runs < n * t, pylance's guard, so the cutoff is ceil(n * t).
     const std::size_t reject_at =
         options.rle_set ? static_cast<std::size_t>(std::ceil(static_cast<double>(n) * options.rle_threshold))
-                        : (n + 1U) / 2U;
+                        : (n * bpv + bpv) / (bpv + 1U);
     // Prefix-sample pre-check (same pattern as variable_column_dict_beneficial's sampling): even with
     // the reject-early exit, a scattered column scans ~n/2 rows before failing (split_runs grows one
     // per row, crossing n/2 halfway through). A 4096-row prefix predicts that verdict at ~1/25 the
@@ -156,30 +164,56 @@ bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv, const 
             options.rle_set ? std::min<std::size_t>(
                                   kSampleRows, static_cast<std::size_t>(std::ceil(
                                                    static_cast<double>(kSampleRows) * options.rle_threshold * 1.5)))
-                            : kSampleRows * 3U / 4U;
+                            : std::min<std::size_t>(
+                                  kSampleRows, static_cast<std::size_t>(std::ceil(
+                                                   static_cast<double>(kSampleRows) *
+                                                   static_cast<double>(bpv) / static_cast<double>(bpv + 1U) * 1.5)));
         std::size_t sample_split_runs = 0;
-        if (!dispatch_rle_scan(cv.fixed_data(), kSampleRows, bpv, sample_reject, sample_split_runs, nullptr)) {
+        if (!dispatch_rle_scan(data, kSampleRows, bpv, sample_reject, sample_split_runs, nullptr)) {
             return false;
         }
     }
     std::size_t split_runs = 0;
     // reject_at == ceil(n/2) is exactly the previous `split_runs * 2 >= n` cutoff.
-    if (!dispatch_rle_scan(cv.fixed_data(), n, bpv, reject_at, split_runs, nullptr)) {
+    if (!dispatch_rle_scan(data, n, bpv, reject_at, split_runs, nullptr)) {
         return false;
     }
-    // One chunk for the whole column: run buffers must fit the miniblock (12-bit word => 32760 bytes).
-    const std::size_t values_size = split_runs * bpv;
-    const std::size_t lengths_size = split_runs;  // 1 byte each
-    if ((values_size + lengths_size + 32U) > 32760U) {
-        return false;
+    // Lance takes RLE only when it also beats InlineBitpacking's estimate (compression.rs,
+    // rle_beats_raw_and_bitpacking): one word per 1,024 values plus each block's values at its own bit width,
+    // counted only when that is below the raw size. A sorted column of small values bitpacks smaller than its
+    // runs, and pylance writes it bitpacked.
+    if (bpv == 1U || bpv == 2U || bpv == 4U || bpv == 8U) {
+        constexpr std::size_t kBitpackBlock = 1024U;
+        const std::size_t bits = bpv * 8U;
+        std::size_t words = 0;
+        for (std::size_t at = 0; at < n; at += kBitpackBlock) {
+            const std::size_t count = std::min<std::size_t>(kBitpackBlock, n - at);
+            words += 1U + kBitpackBlock * bitpack::bit_width(data + at * bpv, count, bpv) / bits;
+        }
+        const std::size_t bitpack_bytes = words * bpv;
+        if (bitpack_bytes < n * bpv && bitpack_bytes < split_runs * (bpv + 1U)) {
+            return false;
+        }
     }
     std::vector<std::pair<std::size_t, std::uint64_t>> runs;
     std::size_t split_runs_again = 0;
-    if (!dispatch_rle_scan(cv.fixed_data(), n, bpv, n + 1U, split_runs_again, &runs)) {
+    if (!dispatch_rle_scan(data, n, bpv, n + 1U, split_runs_again, &runs)) {
+        return false;
+    }
+    runs_out = std::move(runs);
+    return true;
+}
+
+bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv, const ColumnEncodingOptions& options) {
+    cv.fixed_rle_plan = {};
+    if (bpv == 0U || cv.fixed_size() == 0U || cv.fixed_size() % bpv != 0U) {
+        return false;
+    }
+    if (!rle_runs_beneficial(cv.fixed_data(), cv.fixed_size() / bpv, bpv, options, cv.fixed_rle_plan.runs)) {
+        cv.fixed_rle_plan.runs.clear();
         return false;
     }
     cv.fixed_rle_plan.computed = true;
-    cv.fixed_rle_plan.runs = std::move(runs);
     return true;
 }
 
@@ -442,6 +476,162 @@ bool variable_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnE
     cv.structural_dict_plan.computed = true;
     cv.structural_dict_plan.distinct = std::move(distinct);
     cv.structural_dict_plan.indices = std::move(indices);
+    return true;
+}
+
+// Lance's should_dictionary_encode for a 64-bit fixed-width column (W1p). Mirrors the rule in SPEC_GAPS.md,
+// checked against pylance 12 on every measured shuffled case: a 32-block sample of up to 4,096 values
+// (none under 1,024 samples), unique ratio >= 0.98 rejects, projected = ratio x rows against the threshold.
+bool fixed_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnEncodingOptions& options) {
+    constexpr std::size_t kMinRows = 100U;
+    constexpr std::size_t kMaxCardinality = 100000U;
+    constexpr std::size_t kBlockValues = 1024U;  // one FastLanes block
+    constexpr std::size_t kSampleBlocks = 32U;
+    constexpr std::size_t kSampleBlockValues = 128U;  // 32 x 128 = 4,096 sampled values
+    using FixedDictValues = StructuralDictPlan::FixedDictValues;
+
+    cv.structural_dict_plan = {};
+    // Nulls take part as Lance's dictionary_encode has them (W1p3): every slot's raw value is hashed, a null slot's
+    // too, so what lies under the nulls is an entry when no valid row holds it (pylance's x11 for 10 values).
+    if (cv.kind != ColumnValues::Kind::FixedWidth || cv.fixed_size() % 8U != 0U) {
+        return false;
+    }
+    const std::size_t rows = cv.fixed_size() / 8U;
+    if (rows < kMinRows) {
+        return false;
+    }
+    const std::size_t divisor = std::max<std::size_t>(options.dict_divisor, 1U);
+    const std::size_t threshold = std::min<std::size_t>(rows / divisor, kMaxCardinality);
+    const std::uint8_t* base = cv.fixed_data();
+    auto value_at = [&](std::size_t i) {
+        std::uint64_t v = 0;
+        std::memcpy(&v, base + i * 8U, 8U);
+        return v;
+    };
+
+    // The sample: 32 evenly spaced blocks, each a run of consecutive values (none under one block). Its distinct
+    // count also sizes the hash map below: reserving the full threshold (up to 100,001 buckets) for a column of 10
+    // values spread every lookup over a cold table and made the write 2.3x slower than a flat column.
+    std::size_t expected_distinct = std::min<std::size_t>(threshold + 1U, rows);
+    if (rows >= kBlockValues) {
+        const std::size_t stride = rows / kSampleBlocks;
+        const std::size_t per_block = std::min<std::size_t>(kSampleBlockValues, stride);
+        std::vector<std::uint64_t> sample;
+        sample.reserve(kSampleBlocks * per_block);
+        for (std::size_t b = 0; b < kSampleBlocks; ++b) {
+            for (std::size_t j = 0; j < per_block; ++j) {
+                sample.push_back(value_at(b * stride + j));
+            }
+        }
+        std::unordered_set<std::uint64_t> seen(sample.begin(), sample.end());
+        const double ratio = static_cast<double>(seen.size()) / static_cast<double>(sample.size());
+        if (ratio >= 0.98 || ratio * static_cast<double>(rows) > static_cast<double>(threshold)) {
+            return false;
+        }
+        expected_distinct = std::min(expected_distinct, std::max<std::size_t>(2U * seen.size(), 64U));
+    }
+
+    // The whole column: distinct values in first-appearance order, and each row's index. An open-addressing table
+    // (slot = dictionary index + 1, 0 empty; Fibonacci hashing; at most half full) rather than unordered_map, whose
+    // per-node lookups made a 1M-row dictionary column take 2.5x as long to write as a flat one.
+    std::vector<std::uint64_t> distinct;
+    std::vector<std::uint32_t> indices;
+    indices.reserve(rows);
+    unsigned table_bits = 6U;
+    while ((std::size_t{1} << table_bits) < 2U * expected_distinct && table_bits < 31U) {
+        ++table_bits;
+    }
+    std::vector<std::uint32_t> table(std::size_t{1} << table_bits, 0U);
+    const auto slot_of = [&](std::uint64_t v) {
+        return static_cast<std::size_t>((v * 0x9E3779B97F4A7C15ULL) >> (64U - table_bits));
+    };
+    for (std::size_t i = 0; i < rows; ++i) {
+        const std::uint64_t v = value_at(i);
+        const std::size_t mask = table.size() - 1U;
+        std::size_t slot = slot_of(v);
+        while (table[slot] != 0U && distinct[table[slot] - 1U] != v) {
+            slot = (slot + 1U) & mask;
+        }
+        if (table[slot] == 0U) {
+            if (distinct.size() >= threshold) {
+                return false;  // one more entry than the threshold allows
+            }
+            distinct.push_back(v);
+            table[slot] = static_cast<std::uint32_t>(distinct.size());
+            if (2U * distinct.size() > table.size()) {  // keep it at most half full: double and re-insert
+                ++table_bits;
+                table.assign(std::size_t{1} << table_bits, 0U);
+                for (std::size_t d = 0; d < distinct.size(); ++d) {
+                    std::size_t s2 = slot_of(distinct[d]);
+                    while (table[s2] != 0U) {
+                        s2 = (s2 + 1U) & (table.size() - 1U);
+                    }
+                    table[s2] = static_cast<std::uint32_t>(d + 1U);
+                }
+            }
+            indices.push_back(static_cast<std::uint32_t>(distinct.size() - 1U));
+        } else {
+            indices.push_back(table[slot] - 1U);
+        }
+    }
+    if (distinct.size() < 2U) {
+        return false;  // a constant column is stored as one value, not a dictionary
+    }
+
+    // Size budget, as Lance's dictionary_encode measures it (lance-encoding logical/primitive/dict.rs): the RAW
+    // dictionary (8 bytes an entry) plus u32 indices must not exceed dict-size-ratio of the column's raw bytes,
+    // truncated. Not the encoded sizes: at 50,000 rows pylance takes a sorted column of 14,485 distinct values
+    // (315,880 <= 320,000 bytes) and refuses 18,353 (346,824), and refuses runs of 2 (400,000).
+    const auto max_encoded = static_cast<std::uint64_t>(static_cast<double>(rows * 8U) * options.dict_size_ratio);
+    if (static_cast<std::uint64_t>(distinct.size()) * 8U + static_cast<std::uint64_t>(rows) * 4U > max_encoded) {
+        return false;
+    }
+
+    // The dictionary's values: bitpacked when one block of the width is smaller than the raw values
+    // (and always out of line above one block); otherwise the general codec.
+    const std::size_t count = distinct.size();
+    std::vector<std::uint8_t> raw(count * 8U);
+    std::memcpy(raw.data(), distinct.data(), raw.size());
+    const unsigned width = bitpack::bit_width(raw.data(), count, 8U);
+    if (width == 0U) {
+        return false;
+    }
+    auto& plan = cv.structural_dict_plan;
+    std::vector<std::uint8_t> block;
+    if (count > kBlockValues) {
+        // The reader's out-of-line tail is ambiguous when its packed size equals its raw size; refuse that case.
+        const std::size_t tail = count % kBlockValues;
+        if (tail != 0U && tail == ::nanom::columnar::fastlanes::packed_words_1024<std::uint64_t>(width)) {
+            return false;
+        }
+        bitpack::encode_out_of_line(raw.data(), count, width, 8U, block);
+        plan.fixed_values = FixedDictValues::kOutOfLineBitpacking;
+        plan.fixed_width = width;
+    } else if (kBlockValues * width / 8U < raw.size()) {
+        bitpack::encode_block(raw.data(), count, 8U, block);
+        plan.fixed_values = FixedDictValues::kInlineBitpacking;
+    } else if (options.dict_values_compression == "none") {
+        block = raw;
+        plan.fixed_values = FixedDictValues::kFlat;
+    } else if (options.dict_values_compression.empty() || options.dict_values_compression == "lz4") {
+        std::string error;
+        if (!general::lz4_frame(raw, block, error)) {
+            return false;
+        }
+        plan.fixed_values = FixedDictValues::kLz4;
+    } else {
+        return false;  // zstd and other codecs are not handled for fixed-width dictionaries yet
+    }
+
+    // The indices are RLE'd when they have runs (W1p2: a sorted or run-heavy column). pylance decides this after the
+    // dictionary, with the same size model as a column's RLE at 4-byte values (runs * 5 < rows * 4).
+    plan.index_rle = rle_runs_beneficial(reinterpret_cast<const std::uint8_t*>(indices.data()), indices.size(), 4U,
+                                         options, plan.index_runs);
+    plan.computed = true;
+    plan.fixed = true;
+    plan.fixed_distinct = std::move(distinct);
+    plan.fixed_block = std::move(block);
+    plan.indices = std::move(indices);
     return true;
 }
 

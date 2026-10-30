@@ -197,6 +197,33 @@ void test_out_of_line() {
             "16-byte values have no FastLanes kernel");
 }
 
+/// encode_out_of_line is the inverse of decode_out_of_line: the same values come back, at each width.
+void test_encode_out_of_line() {
+    const struct {
+        std::size_t width_bytes;
+        unsigned width;
+        std::size_t count;
+    } cases[] = {{8, 40, 3000}, {8, 63, 2500}, {8, 1, 1100}, {4, 17, 1500}, {2, 9, 2500}, {1, 3, 700}, {8, 40, 1024}};
+    for (const auto& c : cases) {
+        const auto in = values(c.count, c.width_bytes, c.width, c.width * 11U + c.count);
+        std::vector<std::uint8_t> buffer;
+        nano_lance::bitpack::encode_out_of_line(in.data(), c.count, c.width, c.width_bytes, buffer);
+        std::vector<std::uint8_t> out(in.size());
+        std::string error;
+        const auto what = name(c.width_bytes, c.width, c.count);
+        require(nano_lance::bitpack::decode_out_of_line(buffer, c.count, c.width, c.width_bytes, out.data(), "dict",
+                                                        error),
+                "decode after encode, " + what + ": " + error);
+        require(out == in, "encode_out_of_line round trip, " + what);
+    }
+    // One width for every block: no per-block header, so the size is blocks x packed words.
+    std::vector<std::uint8_t> buffer;
+    const auto in = values(2500, 8, 40, 7U);
+    nano_lance::bitpack::encode_out_of_line(in.data(), 2500, 40, 8, buffer);
+    require(buffer.size() == 3U * ::nanom::columnar::fastlanes::packed_words_1024<std::uint64_t>(40) * 8U,
+            "three blocks of 40-bit values, no headers");
+}
+
 }  // namespace
 
 int main() {
@@ -205,6 +232,7 @@ int main() {
     test_block_refuses_malformed();
     test_series();
     test_out_of_line();
+    test_encode_out_of_line();
     std::cout << "encoding/values/bitpack: every block, series and out-of-line case round-trips\n";
     return 0;
 }

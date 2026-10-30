@@ -219,12 +219,45 @@ template <class T>
 }  // namespace
 
 // Bit width (0..bits) needed to represent the largest of `count` little-endian values of `width_bytes`.
+namespace {
+
+/// The OR of `count` values of type T: one typed loop the compiler vectorizes (a memcpy of a runtime width per
+/// value did not, and this runs over every bitpacked column, once to decide and once per block to write).
+template <typename T>
+std::uint64_t or_all(const std::uint8_t* src, std::size_t count) {
+    T acc = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        T v;
+        std::memcpy(&v, src + i * sizeof(T), sizeof(T));
+        acc |= v;
+    }
+    return acc;
+}
+
+}  // namespace
+
 unsigned bit_width(const std::uint8_t* src, std::size_t count, std::size_t width_bytes) {
     std::uint64_t max_value = 0;
-    for (std::size_t i = 0; i < count; ++i) {
-        std::uint64_t v = 0;
-        std::memcpy(&v, src + i * width_bytes, width_bytes);
-        max_value |= v;
+    switch (width_bytes) {
+        case 1U:
+            max_value = or_all<std::uint8_t>(src, count);
+            break;
+        case 2U:
+            max_value = or_all<std::uint16_t>(src, count);
+            break;
+        case 4U:
+            max_value = or_all<std::uint32_t>(src, count);
+            break;
+        case 8U:
+            max_value = or_all<std::uint64_t>(src, count);
+            break;
+        default:
+            for (std::size_t i = 0; i < count; ++i) {
+                std::uint64_t v = 0;
+                std::memcpy(&v, src + i * width_bytes, width_bytes);
+                max_value |= v;
+            }
+            break;
     }
     unsigned bits = 0;
     while (max_value != 0U) {
@@ -304,6 +337,45 @@ bool decode_block(const std::vector<std::uint8_t>& chunk, std::uint64_t num_valu
             error = "inline-bitpacked dictionary entries are " + std::to_string(bytes_per_value) +
                     " bytes, which has no FastLanes kernel";
             return false;
+    }
+}
+
+// The inverse of decode_out_of_line_typed: whole 1,024-value blocks, each packed at `width` bits with
+// no per-block header, then the final partial block packed too (zero-padded). The decoder's own
+// rule for a tail whose packed size equals its raw size is ambiguous, so the caller must refuse
+// that case (see fixed_dictionary_out_of_line_ambiguous in encoding_choice.cpp).
+template <class T>
+void encode_out_of_line_typed(const std::uint8_t* src, std::size_t count, unsigned width,
+                              std::vector<std::uint8_t>& out) {
+    const auto packed_words = ::nanom::columnar::fastlanes::packed_words_1024<T>(width);
+    const std::size_t blocks = (count + 1023U) / 1024U;
+    out.assign(blocks * packed_words * sizeof(T), 0);
+    thread_local std::vector<T> packed;
+    packed.resize(packed_words != 0U ? packed_words : 1U);
+    T in[1024];
+    for (std::size_t b = 0; b < blocks; ++b) {
+        const std::size_t first = b * 1024U;
+        const std::size_t n = std::min<std::size_t>(1024U, count - first);
+        std::memset(in, 0, sizeof(in));
+        std::memcpy(in, src + first * sizeof(T), n * sizeof(T));
+        ::nanom::columnar::fastlanes::pack_1024_unchecked<T>(width, in, packed.data());
+        if (packed_words != 0U) {
+            std::memcpy(out.data() + b * packed_words * sizeof(T), packed.data(), packed_words * sizeof(T));
+        }
+    }
+}
+
+void encode_out_of_line(const std::uint8_t* src, std::size_t count, unsigned width, std::size_t width_bytes,
+                        std::vector<std::uint8_t>& out) {
+    switch (width_bytes) {
+        case 1U:
+            return encode_out_of_line_typed<std::uint8_t>(src, count, width, out);
+        case 2U:
+            return encode_out_of_line_typed<std::uint16_t>(src, count, width, out);
+        case 4U:
+            return encode_out_of_line_typed<std::uint32_t>(src, count, width, out);
+        default:
+            return encode_out_of_line_typed<std::uint64_t>(src, count, width, out);
     }
 }
 

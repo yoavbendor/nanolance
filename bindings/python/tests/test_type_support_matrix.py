@@ -106,18 +106,13 @@ ROUNDTRIPS = {
 ROUNDTRIPS["dictionary"] = pa.table({"c": pa.array([f"d{i % 5}" for i in range(N)]).dictionary_encode()})
 ROUNDTRIPS["fixed_size_list_item_nulls"] = _t(pa.list_(pa.float32(), 2),
                                               [[None, 1.0] if i % 5 == 0 else [1.0, 2.0] for i in range(N)])
+# Null elements of a fixed_size_list under a list are written too (W1k2, pylance's layout for rows under 256 bytes).
+ROUNDTRIPS["fixed_size_list_item_nulls_in_a_list"] = pa.table({"c": pa.ListArray.from_arrays(
+    pa.array([0, 1], pa.int32()), pa.FixedSizeListArray.from_arrays(pa.array([1.0, None, 3.0, 4.0], pa.float32()), 4))})
 
 # Refused at write_batch, each with a message naming the column. The fragment is what the refusal has
 # to keep saying; a change that makes any of these WRITE must come here and justify itself.
 REFUSED_ON_WRITE = {
-    # Element validity is written for a top-level fixed_size_list; under a list the nested page
-    # writer has no place for it (it used to write the null as 0.0).
-    "fixed_size_list_item_nulls_in_a_list": (
-        pa.table({"c": pa.ListArray.from_arrays(
-            pa.array([0, 1], pa.int32()),
-            pa.FixedSizeListArray.from_arrays(pa.array([1.0, None, 3.0, 4.0], pa.float32()), 4))}),
-        "null element inside a row",
-    ),
 }
 
 

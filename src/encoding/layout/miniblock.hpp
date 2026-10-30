@@ -85,7 +85,6 @@ struct ChunkMeta {
 
 /// The metadata buffer (u32 words) for `chunks`, in order; the last one's word has log2 0.
 std::vector<std::uint8_t> control_buffer(std::span<const ChunkMeta> chunks);
-
 // ---- Reading (any shape; the input is untrusted) ----
 
 struct ControlWord {

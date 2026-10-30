@@ -100,6 +100,11 @@ inline bool lance_logical_type_is_temporal(const std::string& logical_type) {
            logical_type.rfind("time64:", 0) == 0 || logical_type.rfind("duration:", 0) == 0;
 }
 
+/// Float logical types (float32 "float", float64 "double"). They take the integer layouts on their raw bits (W1s).
+inline bool lance_logical_type_is_float(const std::string& logical_type) {
+    return logical_type == "float" || logical_type == "double";
+}
+
 /// Integer logical types (8/16/32/64-bit) eligible for Lance InlineBitpacking. Excludes bool/float.
 inline bool lance_logical_type_is_bitpackable_integer(const std::string& logical_type) {
     // Temporal types are included deliberately: they are integers on the wire, they are usually

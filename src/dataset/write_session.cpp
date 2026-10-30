@@ -140,6 +140,9 @@ bool read_encoding_options(const LanceField& field, encoding_choice::ColumnEncod
             out.dict_size_ratio = value;
         }
     }
+    if (const auto it = field.metadata.find("lance-encoding:dict-values-compression"); it != field.metadata.end()) {
+        out.dict_values_compression = it->second;
+    }
     return true;
 }
 
@@ -741,14 +744,61 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
             }
             // Run-length encoding for repetitive fixed-width integer columns (beats bitpacking when
             // there are long runs, e.g. dictionary indices later).
+            // Floats take the same decisions on their raw bits (W1s: pylance dictionary-encodes, RLEs and bitpacks
+            // float columns with the integer rules); a float with its own codec or the writer-wide bss-zstd keeps that layout.
             if (cv.kind == ColumnValues::Kind::FixedWidth &&
-                lance_logical_type_is_bitpackable_integer(pf->logical_type)) {
+                (lance_logical_type_is_bitpackable_integer(pf->logical_type) ||
+                 lance_logical_type_is_float(pf->logical_type))) {
                 const auto bpv = lance_logical_type_value_bytes(pf->logical_type);
-                if (encoding_choice::fixed_column_rle_plan(cv, bpv, enc_options)) {
+                const bool is_float = lance_logical_type_is_float(pf->logical_type);
+                // A 64-bit dictionary (W1p) is decided before RLE, as pylance does: a dictionary column's indices are
+                // RLE'd when they have runs (W1p2, in fixed_column_dict_beneficial), and a column without a dictionary
+                // is RLE'd or not as before. A column with its own lance-encoding:compression keeps its layout (the
+                // dictionary is not written under a codec yet).
+                bool own_codec = false;
+                for (const auto& original : state->schema_mapping.fields) {
+                    if (original.id == pf->id) {
+                        own_codec = original.metadata.find("lance-encoding:compression") != original.metadata.end();
+                        break;
+                    }
+                }
+                if (is_float) {
+                    bool bss_tagged = false;
+                    for (const auto& field : disk_schema.fields) {
+                        if (field.id == pf->id) {
+                            const auto tag_it = field.metadata.find("nanolance:packing");
+                            bss_tagged = tag_it != field.metadata.end() && tag_it->second == "bss-zstd";
+                            break;
+                        }
+                    }
+                    if (own_codec || bss_tagged) {
+                        continue;
+                    }
+                }
+                if (bpv == 8U && !own_codec && encoding_choice::fixed_column_dict_beneficial(cv, enc_options)) {
+                    for (auto& field : disk_schema.fields) {
+                        if (field.id == pf->id) {
+                            field.metadata["nanolance:packing"] = "dict";
+                            field.metadata.erase("lance-encoding:compression");
+                            break;
+                        }
+                    }
+                } else if (encoding_choice::fixed_column_rle_plan(cv, bpv, enc_options)) {
                     for (auto& field : disk_schema.fields) {
                         if (field.id == pf->id) {
                             field.metadata["nanolance:packing"] = "rle";
                             break;
+                        }
+                    }
+                } else if (is_float) {
+                    // A float is bitpacked only where the integer estimate beats raw (sign bit clear: uniform
+                    // [0, 1) values, 63 bits); signed floats stay flat, as in Lance's estimate.
+                    if (encoding_choice::bitpack_beats_flat(cv, bpv)) {
+                        for (auto& field : disk_schema.fields) {
+                            if (field.id == pf->id) {
+                                field.metadata["nanolance:packing"] = "bitpack";
+                                break;
+                            }
                         }
                     }
                 } else if (!encoding_choice::bitpack_beats_flat(cv, bpv)) {

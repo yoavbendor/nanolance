@@ -10,6 +10,7 @@
 #include <mutex>
 #include <random>
 #include <utility>
+#include <vector>
 
 #if defined(NANO_LANCE_HAS_S3_BYTE_SOURCE)
 #include "io/s3_byte_sink.hpp"
@@ -55,6 +56,10 @@ public:
     LocalOutput() : OutputFile(&buf_) {}
     bool open(const std::filesystem::path& path) {
         path_ = path;
+        // A 256 KiB buffer, set before open: with the default 8 KiB one, every mini-block chunk of 8 KiB or more
+        // (a bitpacked 1,024-value chunk) went to the file as its own write call, half the time of a 1M-row write.
+        storage_.resize(kBufferBytes);
+        buf_.pubsetbuf(storage_.data(), static_cast<std::streamsize>(storage_.size()));
         return buf_.open(path, std::ios::binary | std::ios::out | std::ios::trunc) != nullptr;
     }
     bool commit(std::string& error) override {
@@ -67,6 +72,8 @@ public:
     }
 
 private:
+    static constexpr std::size_t kBufferBytes = 256U * 1024U;
+    std::vector<char> storage_;  // declared before buf_: destroyed after it, which flushes into it on close
     std::filebuf buf_;
     std::filesystem::path path_;
 };

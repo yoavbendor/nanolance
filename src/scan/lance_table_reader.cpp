@@ -1232,6 +1232,11 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
             collect_error = "column '" + field->name + "': a list of " + field->logical_type + " is not read yet";
             return false;
         }
+        if (is_fsl && field->column_index < 0) {
+            // Its elements live in child columns (fixed_size_list<struct>): this reader has no path for them.
+            collect_error = "column '" + field->name + "': a " + field->logical_type + " is not read yet";
+            return false;
+        }
         if (!is_blob && field->column_index < 0) {
             plan.kind = ColumnPlan::Kind::Skip;
             plans.push_back(plan);

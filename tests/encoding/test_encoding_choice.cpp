@@ -9,6 +9,7 @@
 
 #include "encoding/encoding_choice.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -121,10 +122,11 @@ void test_bitpack() {
 }
 
 // `runs` runs of `len` values alternating 0/1.
+// Full-width bytes (0x80 / 0xFF), so InlineBitpacking cannot beat the runs (Lance compares RLE with it).
 std::vector<std::uint8_t> alternating_runs(std::size_t runs, std::size_t len) {
     std::vector<std::uint8_t> out;
     for (std::size_t r = 0; r < runs; ++r) {
-        out.insert(out.end(), len, static_cast<std::uint8_t>(r % 2U));
+        out.insert(out.end(), len, static_cast<std::uint8_t>(r % 2U == 0U ? 0x80U : 0xFFU));
     }
     return out;
 }
@@ -137,7 +139,11 @@ void test_fixed_rle() {
     require(cv.fixed_rle_plan.runs[0].first == 0U && cv.fixed_rle_plan.runs[0].second == 4U, "run is (0, 4)");
 
     cv = fixed_column(std::vector<std::uint32_t>{1, 1, 2, 2});
-    require(!ec::fixed_column_rle_plan(cv, 4), "2 runs in 4 rows: 2 >= 2 rejects");
+    // Pylance's size model (W1q): a 4-byte value and its length cost 5 bytes a run, so 2 runs (10 bytes) beat
+    // 4 rows of 4 bytes (16); 4 runs (20 bytes) do not.
+    require(ec::fixed_column_rle_plan(cv, 4), "2 runs in 4 rows: 10 < 16 bytes is RLE");
+    cv = fixed_column(std::vector<std::uint32_t>{1, 2, 3, 4});
+    require(!ec::fixed_column_rle_plan(cv, 4), "4 runs in 4 rows: 20 >= 16 bytes rejects");
     require(!cv.fixed_rle_plan.computed && cv.fixed_rle_plan.runs.empty(), "rejected plan is empty");
 
     cv = fixed_column(std::vector<std::uint32_t>{1, 1, 1, 2, 2});
@@ -162,9 +168,15 @@ void test_fixed_rle() {
     require(!ec::fixed_column_rle_plan(cv, 0), "bpv 0");
     require(!ec::fixed_column_rle_plan(cv, 4), "size not a multiple of bpv");
     require(!ec::fixed_column_rle_plan(cv, 3), "bpv 3 is not a bitpackable width");
+    // Lance's rule: RLE only when it also beats InlineBitpacking's estimate. All zeros pack to one word a block.
     cv = fixed_column(std::vector<std::uint8_t>(10, 0));
+    require(!ec::fixed_column_rle_plan(cv, 1) && !ec::fixed_column_rle_plan(cv, 2),
+            "all-zero buffer bitpacks smaller than its runs");
+    // Two runs of full-width bytes: a 1,024-value block would be larger than the 10 raw bytes, so no bitpacking
+    // estimate, and the runs (4 bytes at 1 byte, 6 at 2) beat raw.
+    cv = fixed_column(std::vector<std::uint8_t>{255, 255, 255, 255, 255, 128, 128, 128, 128, 128});
     require(ec::fixed_column_rle_plan(cv, 1) && ec::fixed_column_rle_plan(cv, 2),
-            "all-zero buffer is RLE at 1 and 2 bytes");
+            "two runs of full-width values are RLE at 1 and 2 bytes");
 
     // A run over 255 counts as ceil(L/255) split runs but is recorded whole.
     cv = fixed_column(std::vector<std::uint64_t>(1000, 5));
@@ -173,11 +185,12 @@ void test_fixed_rle() {
     cv = fixed_column(alternating_runs(2, 256));
     require(ec::fixed_column_rle_plan(cv, 1), "2 runs of 256");
 
-    // One-chunk run buffer: split * (bpv + 1) + 32 must stay within 32760, so 16364 runs of a u8 pass, 16365 do not.
-    cv = fixed_column(alternating_runs(16364, 3));
-    require(ec::fixed_column_rle_plan(cv, 1), "16364 u8 runs fit the chunk");
+    // Runs no longer have to fit one chunk (W1q): the writer splits them. The size model still applies, so
+    // 16365 u8 runs of 3 (2 bytes a run against 3 bytes a row) are RLE, and runs of 1 are not.
     cv = fixed_column(alternating_runs(16365, 3));
-    require(!ec::fixed_column_rle_plan(cv, 1), "16365 u8 runs overflow the chunk");
+    require(ec::fixed_column_rle_plan(cv, 1), "16365 u8 runs of 3 are RLE across chunks");
+    cv = fixed_column(alternating_runs(16365, 1));
+    require(!ec::fixed_column_rle_plan(cv, 1), "u8 runs of 1 are not RLE");
 
     // A big scattered column fails (through the prefix sample); a big run column passes.
     std::vector<std::uint32_t> scattered(20000);
@@ -322,12 +335,104 @@ void test_dict() {
 
 }  // namespace
 
+/// `rows` 64-bit values from `distinct` 40-bit values, in a scrambled order (a shuffled column).
+std::vector<std::uint64_t> shuffled_64(std::size_t rows, std::size_t distinct) {
+    std::vector<std::uint64_t> out(rows);
+    for (std::size_t i = 0; i < rows; ++i) {
+        const std::uint64_t k = (static_cast<std::uint64_t>(i) * 2654435761ULL) % distinct;
+        out[i] = (k * 0x9E3779B97F4A7C15ULL) >> 24;  // 40-bit values
+    }
+    return out;
+}
+
+/// Lance's should_dictionary_encode and its dictionary-values choice (W1p), at the cases pylance 12 was measured on.
+void test_fixed_dict() {
+    using FixedDictValues = nano_lance::StructuralDictPlan::FixedDictValues;
+    auto cv = fixed_column(shuffled_64(99, 2));
+    require(!ec::fixed_column_dict_beneficial(cv), "99 rows");
+
+    cv = fixed_column(shuffled_64(100, 2));
+    require(ec::fixed_column_dict_beneficial(cv), "100 rows, 2 distinct");
+    require(cv.structural_dict_plan.fixed && cv.structural_dict_plan.fixed_distinct.size() == 2U,
+            "plan holds 2 values");
+    require(cv.structural_dict_plan.fixed_values == FixedDictValues::kLz4,
+            "100 rows of 2 values: a 1,024-value block is larger than the raw block, so LZ4");
+
+    cv = fixed_column(shuffled_64(50000, 10));
+    require(ec::fixed_column_dict_beneficial(cv) && cv.structural_dict_plan.fixed_distinct.size() == 10U,
+            "50,000 rows, 10 distinct");
+    require(cv.structural_dict_plan.fixed_values == FixedDictValues::kLz4, "10 values: LZ4");
+
+    cv = fixed_column(shuffled_64(50000, 1000));
+    require(ec::fixed_column_dict_beneficial(cv), "50,000 rows, 1,000 distinct");
+    require(cv.structural_dict_plan.fixed_values == FixedDictValues::kInlineBitpacking,
+            "1,000 x 40-bit: 5,120 bytes of blocks against 8,000 raw, so InlineBitpacking");
+
+    cv = fixed_column(shuffled_64(50000, 2000));
+    require(ec::fixed_column_dict_beneficial(cv), "50,000 rows, 2,000 distinct");
+    require(cv.structural_dict_plan.fixed_values == FixedDictValues::kOutOfLineBitpacking &&
+                cv.structural_dict_plan.fixed_width == 40U,
+            "more than one block: OutOfLineBitpacking at the 40-bit width");
+
+    cv = fixed_column(shuffled_64(50000, 5000));
+    require(!ec::fixed_column_dict_beneficial(cv), "5,000 distinct: the sample projects past rows / 2");
+
+    cv = fixed_column(shuffled_64(1000000, 1000));
+    require(!ec::fixed_column_dict_beneficial(cv), "1,000,000 rows, 1,000 distinct: projected past 100,000");
+
+    // Nulls (W1p3): every slot's raw value is hashed, as Lance does, so a value under the nulls that no valid row
+    // holds is one more entry, and one that a valid row holds adds none.
+    auto with_nulls = shuffled_64(50000, 1000);
+    for (std::size_t i = 0; i < with_nulls.size(); i += 19U) {
+        with_nulls[i] = 0xFFFFFFFFFFFFULL;  // 48 bits: not among the 40-bit shuffled values
+    }
+    cv = fixed_column(with_nulls);
+    cv.null_count = (with_nulls.size() + 18U) / 19U;
+    require(ec::fixed_column_dict_beneficial(cv) && cv.structural_dict_plan.fixed_distinct.size() == 1001U,
+            "nulls over a fresh value: 1,000 values plus the one under the nulls");
+    with_nulls = shuffled_64(50000, 1000);
+    const auto existing = with_nulls[1];
+    for (std::size_t i = 0; i < with_nulls.size(); i += 19U) {
+        with_nulls[i] = existing;
+    }
+    cv = fixed_column(with_nulls);
+    cv.null_count = (with_nulls.size() + 18U) / 19U;
+    require(ec::fixed_column_dict_beneficial(cv) && cv.structural_dict_plan.fixed_distinct.size() == 1000U,
+            "nulls over an existing value: no extra entry");
+
+    cv = fixed_column(shuffled_64(50000, 1));
+    require(!ec::fixed_column_dict_beneficial(cv), "a constant column is not a dictionary");
+}
+
+/// W1p2: the indices of a dictionary are RLE'd when they have runs (u32 values, runs * 5 < rows * 4), and bitpacked
+/// otherwise. A sorted column of 1,000 values is runs of 50; a shuffled one has no runs.
+void test_dict_index_rle() {
+    auto sorted = shuffled_64(1000000, 1000);
+    std::sort(sorted.begin(), sorted.end());
+    auto cv = fixed_column(sorted);
+    require(ec::fixed_column_dict_beneficial(cv), "sorted 1,000,000 rows, 1,000 distinct: a dictionary");
+    require(cv.structural_dict_plan.index_rle, "sorted: the indices are RLE'd");
+    require(cv.structural_dict_plan.index_runs.size() == 1000U, "one run per distinct value");
+    std::uint64_t covered = 0;
+    for (const auto& run : cv.structural_dict_plan.index_runs) {
+        covered += run.second;
+    }
+    require(covered == 1000000U, "the runs cover every row");
+
+    cv = fixed_column(shuffled_64(50000, 1000));
+    require(ec::fixed_column_dict_beneficial(cv), "shuffled 50,000 rows, 1,000 distinct: a dictionary");
+    require(!cv.structural_dict_plan.index_rle && cv.structural_dict_plan.index_runs.empty(),
+            "shuffled: the indices are bitpacked, no runs");
+}
+
 int main() {
     test_bitpack();
     test_fixed_rle();
     test_constant();
     test_dict_rle();
     test_dict();
+    test_fixed_dict();
+    test_dict_index_rle();
     std::cout << "encoding_choice: ok\n";
     return 0;
 }
