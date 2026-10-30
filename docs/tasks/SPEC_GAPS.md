@@ -962,6 +962,31 @@ Derived rule for the implementation: a float64 column takes the int64 decisions,
 values, then bitpacking, then flat), on its raw 8-byte values; a float32 column takes the RLE and bitpacking decisions
 on its raw 4-byte values. Under `lance-encoding:compression` the float keeps its own layout (as the int path does).
 
+## W1s review (2026-10-30)
+
+Decided: pylance's layout (InlineBitpacking for floats with a clear sign bit), as for the integer shapes. Profiled
+the random-float write (1M rows): the time went to the file writes (the default 8 KiB `filebuf` sent every 8 KiB
+mini-block chunk to the file as its own call), `bitpack::bit_width` (a runtime-width memcpy per value, not
+vectorized) and the dictionary sample. The local sink now has a 256 KiB buffer and `bit_width` a typed loop per
+width (every bitpacked column, integers too). Best of 7, 1M rows, nanolance [pylance 12]:
+
+| column | before W1s | W1s as delivered | after review | size |
+|---|---|---|---|---|
+| float64 random [0, 1) | 3.9 ms | 10.0 ms | 9.7 ms [15.9] | 7.78 MB (8.0 flat) |
+| float64 1,000 distinct | 3.9 ms | 12.1 ms | 10.1 ms [14.0] | 7.78 MB |
+| float64 runs of 50 | 4.0 ms | 11.6 ms | 9.9 ms [20.4] | 0.27 MB (8.0 flat) |
+| float64 smooth | 3.5 ms | 9.4 ms | 8.6 ms [15.2] | 7.91 MB |
+| float64 signed (stays flat) | -- | -- | 5.6 ms | 8.0 MB |
+
+A random float column costs about 2.4x its flat write for a 1.5% smaller file; that is the price of pylance's
+layout, and nanolance stays faster than pylance. Dropping float bitpacking is one branch (`else if (is_float)` in
+`write_session.cpp`) if that trade is ever wrong for a user.
+
+**W1q2 (left):** nullable plain RLE (no dictionary): pylance writes `Rle{Flat(64),Flat(8)}` + repdef for a column with
+nulls and short runs (runs of 2 at 50,000 and 1,000,000 rows, runs of 5 at 1,000,000); nanolance writes it flat.
+Shared by int64 and float64 (strict xfails in `test_float_dict_rle.py`). `encode_rle_chunks` already takes the
+validity (W1p3); `write_rle_column` and the decision need the same.
+
 ## Result for W1s (2026-10-30, float64 and float32 layouts; performance conflict open)
 
 Written: float columns take the integer decisions on their raw bits. `write_session.cpp`: the dictionary, RLE and bitpack

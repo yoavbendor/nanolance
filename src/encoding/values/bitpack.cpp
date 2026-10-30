@@ -219,12 +219,45 @@ template <class T>
 }  // namespace
 
 // Bit width (0..bits) needed to represent the largest of `count` little-endian values of `width_bytes`.
+namespace {
+
+/// The OR of `count` values of type T: one typed loop the compiler vectorizes (a memcpy of a runtime width per
+/// value did not, and this runs over every bitpacked column, once to decide and once per block to write).
+template <typename T>
+std::uint64_t or_all(const std::uint8_t* src, std::size_t count) {
+    T acc = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        T v;
+        std::memcpy(&v, src + i * sizeof(T), sizeof(T));
+        acc |= v;
+    }
+    return acc;
+}
+
+}  // namespace
+
 unsigned bit_width(const std::uint8_t* src, std::size_t count, std::size_t width_bytes) {
     std::uint64_t max_value = 0;
-    for (std::size_t i = 0; i < count; ++i) {
-        std::uint64_t v = 0;
-        std::memcpy(&v, src + i * width_bytes, width_bytes);
-        max_value |= v;
+    switch (width_bytes) {
+        case 1U:
+            max_value = or_all<std::uint8_t>(src, count);
+            break;
+        case 2U:
+            max_value = or_all<std::uint16_t>(src, count);
+            break;
+        case 4U:
+            max_value = or_all<std::uint32_t>(src, count);
+            break;
+        case 8U:
+            max_value = or_all<std::uint64_t>(src, count);
+            break;
+        default:
+            for (std::size_t i = 0; i < count; ++i) {
+                std::uint64_t v = 0;
+                std::memcpy(&v, src + i * width_bytes, width_bytes);
+                max_value |= v;
+            }
+            break;
     }
     unsigned bits = 0;
     while (max_value != 0U) {
