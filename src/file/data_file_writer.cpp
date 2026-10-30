@@ -3181,7 +3181,8 @@ bool write_fixed_width_column(const ColumnEncodeContext& ctx, std::ostream& out,
     // zstd `compress` flag, which now gates only the variable-width zstd path below).
     const bool bitpack = !is_variable && packing_it != field.metadata.end() &&
                          packing_it->second == "bitpack" &&
-                         lance_logical_type_is_bitpackable_integer(field.logical_type);
+                         (lance_logical_type_is_bitpackable_integer(field.logical_type) ||
+                          lance_logical_type_is_float(field.logical_type));
     // Byte-stream-split + General: float/double, tagged when set_compression(true) (writer.cpp), or any
     // 32/64-bit column with `lance-encoding:compression=lz4|zstd` (pylance's layout for that option).
     const bool codec_general = !is_variable && (ctx.codec == ColumnCodec::kLz4 || ctx.codec == ColumnCodec::kZstd) &&

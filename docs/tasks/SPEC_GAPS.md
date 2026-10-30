@@ -53,6 +53,7 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1p | `encoding.config` | Integer and float dictionaries as Lance 12 writes them (files up to 1.9x pylance's size today) | measured 2026-10-29, see "Measured for W1p" and "Result for W1p" | partial 2026-10-29: int64, uint64, timestamp and date64 dictionaries (no nulls) write pylance's layout (all measured cases, see "Result for W1p, second pass"); W1p2 (partial, 2026-10-29): RLE over the u32 indices when the dictionary has runs (`Rle{Flat(32),Flat(8)}`, see "Result for W1p2/W1p3"), matching pylance in every measured run and sorted case, the 50,000-row cutoff included after review (Lance's raw-size budget, and RLE only when it beats bitpacking: see "W1p2 review"). W1p3 (done 2026-10-29): nullable columns, see "Result for W1p3". left: W1p4 (4,096-row RLE chunks with definition levels), float64 and 128-bit |
 | W1q | `encoding.compression.rle` | RLE over more than one mini-block chunk: nanolance's RLE holds its runs in one chunk, so a column of 25,000 runs is not RLE-encoded | W1g | partial (Haiku session, 2026-10-29): plain RLE splits across mini-block chunks as pylance 12 splits them (same chunk values and bytes; read back both ways; take checked; see "Measured for W1q" and "Result for W1q"). The default cutoff is pylance's size model. Left: float64 runs (still flat), u32 control words where pylance 2.1 writes u16 (nanolance's 2.2 files), W1p2 (sorted RLE over dictionary indices) |
 | W1r | `encoding.config` | Dictionary indices under `lance-encoding:compression` (`General{codec,ByteStreamSplit{Flat(32)}}`, or `Flat(32)` for none): the reader's dictionary-index path has to unwrap them before the writer may emit them | W1g, W1h | partial (Haiku session, 2026-10-29): done for string, int64 and float64 dictionaries (reader unwraps General and byte-stream-split per index chunk; writer emits pylance's index layout under lz4 / zstd / none; the dictionary buffer unchanged; `dict-rle` keeps the option erased, not measured). Layout text equal to pylance's, read and take checked, see "W1r measured". Left: `dict-rle` under the option, and integer dictionaries written by nanolance (W1p) |
+| W1s | `encoding.config` | float64 and float32 columns as Lance 12 writes them: the 64-bit dictionary, RLE over values and indices, and InlineBitpacking for values with a clear sign bit | W1p, W1p2, W1p3, W1q | partial (Haiku session, 2026-10-30): float64 and float32 layouts equal pylance in every measured case (see "Measured for W1s" and "Result for W1s"), except nullable plain RLE without a dictionary (3 cases, strict xfail). Open: the write time of random and smooth floats is about 2.5x the flat write, over the 10% rule (the owner decides, see "Result for W1s") | next |
 | W1o | `file.version.2_0`, `file.version.2_1` | Warn when a write adds the first 2.2 file to a 2.0 / 2.1 dataset, naming the readers it cuts off | W1m table | done 2026-10-29: `MixedFormatWarning` before the commit of each write that adds the first 2.2 file to a 2.0 / 2.1 dataset (write_dataset append, update, merge_insert, add_columns, compaction, fragment writes); `error` filter aborts it; `_target_file_version` is the one line W1n changes |
 | W1n | `file.version.2_1` | Write 2.1 files into a 2.1 dataset, so its writes stay 2.1 | measured 2026-10-29, see "W1n: what writing 2.1 needs" | deferred (decided 2026-10-29): after W1i, and only if a user needs older readers for 2.1 datasets |
 
@@ -899,3 +900,112 @@ as a dictionary entry (`x11`, `x1001`; a null slot holding 0 or a fresh value ad
 with `repdef=Bitpacked(16,Flat(1))` and `nullable`. The position of that entry in the dictionary (first appearance,
 as for every value) is assumed, not byte-checked. Not implemented: the decision refuses nulls, and the nullable
 dictionary path needs the definition-level layer over the dictionary indices (a new combined page).
+
+## Measured for W1s (2026-10-30, float64 and float32 layouts, pylance 12.0.0 at 2.2, `build/nlance-pagelayout`)
+
+Before this change. Scripts in scratch (`measure.py`, one pylance and one nanolance dataset per case). Values: `random` =
+uniform in [0, 1); `distinctN` = N random values, drawn at random; `runsN` = runs of N; `sortedN` = sorted draws of N
+distinct values. 5% nulls where marked. Layout text, `MiniBlock` and the buffer count removed.
+
+**Rule, from the saved Lance 12 source.** The float path is the int64 path on raw bits. Nothing in the dictionary or RLE
+decisions tests for a float type; only byte-stream-split does, and it needs `lance-encoding:compression` (see below).
+
+1. **Dictionary, float64 only.** `primitive.rs` `should_dictionary_encode` (6066-6130): a 64-bit fixed-width block is a
+   candidate, floats included; 32-bit is excluded (`bits_per_value != 64 && != 128` returns None, 6078-6087). The 2.2
+   dense path uses `Include64Bit` (`DenseU32PrimitiveEncoding`, 6995-7025). Entries are raw u64 bits
+   (`primitive_dict.rs` 296-304, `fixed_width_data_block.data.borrow_to_typed_slice::<u64>()`), so NaN and -0.0 are
+   distinct entries. The sample rule (`sample_unique_ratio`, 6191-) and the budget (`dictionary_encode` raw sum, W1p2
+   review) are type-free. Dictionary values take the int64 path: `InlineBitpacking(64)` when the bit width is below 64,
+   `General{LZ4,Flat(64)}` for 10 values, `Bitpacked(64,Flat(62))` for 5,000 or more.
+2. **RLE over values, float64 and float32.** `rle_is_applicable` (compression.rs 174-197) accepts any 8/16/32/64-bit
+   FixedWidth block; `rle_beats_raw_and_bitpacking` (200-218) decides. Float32 is RLE'd (`Rle{Flat(32),Flat(8)}`), not
+   dictionary-encoded.
+3. **RLE over dictionary indices.** As int64 (W1p2): `Rle{Flat(32),Flat(8)}` over u32 indices when the dictionary's
+   indices have runs, with the W1p2 budget.
+4. **Bitpacking of values (the rule that makes random floats bitpacked).** `try_bitpack_for_mini_block` (372-385) returns
+   `InlineBitpacking(bits)` when `estimate_inline_bitpacking_bytes` (388-420) is below the raw size. That estimate uses the
+   bit width of the raw bits: uniform [0, 1) floats have a zero sign bit, so their width is 63 and bitpacking wins
+   (`InlineBitpacking(64)`). Signed floats (sign bit used) need 64 bits and stay `Flat(64)` (measured below).
+5. **Byte-stream-split.** `try_bss_for_mini_block` (154-171) only when a compression is set (`lance-encoding:compression`
+   or the writer's compression flag). Not part of the plain layout.
+
+Measured, pylance 12 (nanolance = before W1s, all flat):
+
+| case | rows | pylance layout (float64 unless marked) |
+|---|---|---|
+| random | 50,000 / 1,000,000 | `InlineBitpacking(64)` |
+| random, 5% nulls | 50,000 / 1,000,000 | `InlineBitpacking(64)`, `repdef=Bitpacked(16,Flat(1)),nullable` |
+| signed normal (sign bit used) | 50,000 / 1,000,000 | `Flat(64)` |
+| 10 distinct | 50,000 / 1,000,000 | `InlineBitpacking(32)` + `dict=General{LZ4,Flat(64)}x10` |
+| 10 distinct, 5% nulls | 50,000 / 1,000,000 | same + `repdef`, `nullable` |
+| 1,000 distinct | 50,000 | `InlineBitpacking(32)` + `dict=InlineBitpacking(64)x1000` |
+| 1,000 distinct | 1,000,000 | `InlineBitpacking(64)`, no dict (sample projects above the cap, as for int64) |
+| 1,000 distinct, 5% nulls | 50,000 / 1,000,000 | `InlineBitpacking(32)` + dict x1000 / `InlineBitpacking(64)`, no dict; `repdef` |
+| 5,000 distinct | 50,000 / 1,000,000 | `InlineBitpacking(64)`, no dict |
+| 5,000 distinct, 5% nulls | 50,000 / 1,000,000 | same + `repdef`, `nullable` |
+| runs of 2 | 50,000 / 1,000,000 | `Rle{Flat(64),Flat(8)}`, no dict (also with nulls) |
+| runs of 5 | 50,000 | `Rle{Flat(32),Flat(8)}` + `dict=Bitpacked(64,Flat(62))x10000` |
+| runs of 5 | 1,000,000 | `Rle{Flat(64),Flat(8)}`, no dict |
+| runs of 50 | 50,000 / 1,000,000 | `Rle{Flat(32),Flat(8)}` + `dict=InlineBitpacking(64)x1000` / `Bitpacked(64,Flat(62))x20000` |
+| runs of 50, 5% nulls | 50,000 / 1,000,000 | same + `repdef`, `nullable` |
+| sorted 1,000 distinct | 50,000 / 1,000,000 | `Rle{Flat(32),Flat(8)}` + `dict=InlineBitpacking(64)x1000` |
+| sorted 1,000 distinct, 5% nulls | 50,000 / 1,000,000 | same + `repdef`, `nullable` |
+| sorted 5,000 distinct | 50,000 / 1,000,000 | `Rle{Flat(32),Flat(8)}` + `dict=Bitpacked(64,Flat(62))x4999 / x5000` |
+| sorted 5,000 distinct, 5% nulls | 50,000 / 1,000,000 | same + `repdef`, `nullable` |
+| float32 random | 50,000 / 1,000,000 | `InlineBitpacking(32)` (no dictionary: 32-bit) |
+| float32 runs of 2 | 50,000 / 1,000,000 | `Rle{Flat(32),Flat(8)}` |
+| float32 runs of 50 | 50,000 / 1,000,000 | `Rle{Flat(32),Flat(8)}` |
+
+Nanolance before W1s: every float64 and float32 case above is `Flat(64)` / `Flat(32)`.
+
+Derived rule for the implementation: a float64 column takes the int64 decisions, in order (dictionary, then RLE over
+values, then bitpacking, then flat), on its raw 8-byte values; a float32 column takes the RLE and bitpacking decisions
+on its raw 4-byte values. Under `lance-encoding:compression` the float keeps its own layout (as the int path does).
+
+## Result for W1s (2026-10-30, float64 and float32 layouts; performance conflict open)
+
+Written: float columns take the integer decisions on their raw bits. `write_session.cpp`: the dictionary, RLE and bitpack
+branches run for `double` (8 bytes) and `float` (4 bytes); the dictionary only at 8 bytes (as Lance's 64/128-bit rule).
+A float with its own `lance-encoding:compression`, or with the writer-wide `bss-zstd` tag, keeps its layout. Bitpacking
+for floats is `bitpack_beats_flat` on the raw bits (as Lance's estimate). `data_file_writer.cpp`: the `bitpack` flag
+accepts floats. `schema_mapper.hpp`: `lance_logical_type_is_float`. No `encoding_choice` decision changed (they already
+take bytes), so no C++ decision test was added; the new behavior is covered by the Python tests below.
+
+Layouts against pylance 12 (2.2 files, `measure.py` in scratch, after the change): float64 dense 18 of 18 SAME; float64
+with 5% nulls 15 of 18 SAME; float32 random, runs of 2 and 50 at 50,000 and 1,000,000 rows, 6 of 6 SAME. The three nulls
+misses are plain RLE over nullable values without a dictionary (float64 runs of 2 at 50,000 and 1,000,000 rows, runs of 5
+at 1,000,000): pylance writes `Rle{Flat(64),Flat(8)}` with `repdef`, nanolance writes flat. The same gap exists for int64
+(checked: int64 runs of 2 with nulls, not implemented; `write_rle_column` is gated on `!column_has_nulls`). It needs the
+RLE writer to take definition levels, as the dictionary writer does (W1p3). Strict xfail in
+`bindings/python/tests/test_float_dict_rle.py`.
+
+Reads: `test_float_dict_rle.py` reads every case back with nanolance and pylance, bit for bit (NaN payloads, signed zeros
+via an int64 view of the raw bits), `take` of 200 rows, and an append to a pylance-written dataset (four shapes). A
+float64 column with `lance-encoding:compression=none` stays flat. Float32 runs read back bit-exact (int32 view).
+Test result: `test_float_dict_rle.py` 79 passed, 3 xfailed. Full Python suite (`-m "not bench" -n 4`): 4623 passed,
+173 skipped, 8 xfailed. C++ `ctest`: 156 tests, all passed in `build/Testing/Temporary/LastTest.log`.
+
+Byte-identical elsewhere: `nlbench_gendata 50000` data file md5 `84b4dce7912cd80d047e779f01a143fb`, unchanged (no float
+column in that dataset changed).
+
+Write time, 1,000,000 rows float64, best of 5, nanolance before (HEAD, built from `git archive`), nanolance now, pylance 12:
+
+| column | nanolance before | nanolance now | pylance 12 | data before / now / pylance (B) |
+|---|---|---|---|---|
+| random in [0, 1) | 3.9 ms | 10.0 ms | 15.9 ms | 8,007,496 / 7,775,880 / 7,773,346 |
+| 1,000 distinct, random order | 3.9 ms | 12.1 ms | 14.0 ms | 8,007,496 / 7,775,880 / 7,773,346 |
+| runs of 50 | 4.0 ms | 11.6 ms | 20.4 ms | 8,007,496 / 267,336 / 263,681 |
+| smooth (cumulative sum of noise) | 3.5 ms | 9.4 ms | 15.2 ms | 8,007,496 / 7,891,080 / 7,888,418 |
+
+**Performance conflict (open, not resolved here).** The brief's rule says a random or smooth float column must not get
+slower by more than 10%. It does: 2.5x on random, 2.7x on smooth. The cause is that pylance writes those columns
+`InlineBitpacking(64)` (the sign bit is clear, so the estimate beats raw), and the layout has to match pylance. The
+extra cost is the bitpack pass and its encode, plus the RLE scan that runs first; the split between them was not
+profiled within this session's budget. Nanolance's new write is still faster than pylance on these columns. The
+owner decides: keep the pylance layout (and the cost), or drop the float bitpacking (the `else if (is_float)` branch in
+`write_session.cpp`: floats then stay flat on random data, which matches the old layout and the old time, but not
+pylance's). The dictionary sample cost on random floats is the same early-out as int64 (unique ratio >= 0.98 at the
+first sample), not measured separately.
+
+Left: nullable plain RLE (the three strict xfails above, shared with int64); the C++ decision tests (none needed, see
+above); the performance decision.
