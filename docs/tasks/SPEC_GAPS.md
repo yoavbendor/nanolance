@@ -52,8 +52,9 @@ These stay as they are until a user asks, or the Lance pin moves:
 | W1k4 | `arrow.types.fixed_size_list` (read) | `fixed_size_list<struct>`: assemble a struct child of rows x N items from the leaf columns under the fixed-size layer | "Result for W1k1" | later (refused by name now) |
 | W1p | `encoding.config` | Integer and float dictionaries as Lance 12 writes them (files up to 1.9x pylance's size today) | measured 2026-10-29, see "Measured for W1p" and "Result for W1p" | partial 2026-10-29: int64, uint64, timestamp and date64 dictionaries (no nulls) write pylance's layout (all measured cases, see "Result for W1p, second pass"); W1p2 (partial, 2026-10-29): RLE over the u32 indices when the dictionary has runs (`Rle{Flat(32),Flat(8)}`, see "Result for W1p2/W1p3"), matching pylance in every measured run and sorted case, the 50,000-row cutoff included after review (Lance's raw-size budget, and RLE only when it beats bitpacking: see "W1p2 review"). W1p3 (done 2026-10-29): nullable columns, see "Result for W1p3". left: W1p4 (4,096-row RLE chunks with definition levels), float64 and 128-bit |
 | W1q | `encoding.compression.rle` | RLE over more than one mini-block chunk: nanolance's RLE holds its runs in one chunk, so a column of 25,000 runs is not RLE-encoded | W1g | partial (Haiku session, 2026-10-29): plain RLE splits across mini-block chunks as pylance 12 splits them (same chunk values and bytes; read back both ways; take checked; see "Measured for W1q" and "Result for W1q"). The default cutoff is pylance's size model. Left: float64 runs (still flat), u32 control words where pylance 2.1 writes u16 (nanolance's 2.2 files), W1p2 (sorted RLE over dictionary indices) |
+| W1q2 | `encoding.compression.rle` | Nullable plain RLE (no dictionary): `Rle{Flat(bpv*8),Flat(8)}` + repdef for a fixed-width column with nulls and short runs, as pylance 12 writes it (runs over the raw values of every slot, null slots included) | W1q, W1p3 | done (Haiku session, 2026-10-30): layouts equal pylance in every measured case (int64, float64, int32, uint8; runs 1, 2, 5, 50; 5% and 50% nulls; null slots 0 or holding their run value; 50,000 and 1,000,000 rows; see "Measured for W1q2" and "Result for W1q2"). The three strict xfails are removed. Left: the chunk split (1,024 rows per chunk with levels, pylance 4,096: W1p4), and the write time of runs of 2 with nulls (about 1.8x the flat write) |
 | W1r | `encoding.config` | Dictionary indices under `lance-encoding:compression` (`General{codec,ByteStreamSplit{Flat(32)}}`, or `Flat(32)` for none): the reader's dictionary-index path has to unwrap them before the writer may emit them | W1g, W1h | partial (Haiku session, 2026-10-29): done for string, int64 and float64 dictionaries (reader unwraps General and byte-stream-split per index chunk; writer emits pylance's index layout under lz4 / zstd / none; the dictionary buffer unchanged; `dict-rle` keeps the option erased, not measured). Layout text equal to pylance's, read and take checked, see "W1r measured". Left: `dict-rle` under the option, and integer dictionaries written by nanolance (W1p) |
-| W1s | `encoding.config` | float64 and float32 columns as Lance 12 writes them: the 64-bit dictionary, RLE over values and indices, and InlineBitpacking for values with a clear sign bit | W1p, W1p2, W1p3, W1q | partial (Haiku session, 2026-10-30): float64 and float32 layouts equal pylance in every measured case (see "Measured for W1s" and "Result for W1s"), except nullable plain RLE without a dictionary (3 cases, strict xfail). Open: the write time of random and smooth floats is about 2.5x the flat write, over the 10% rule (the owner decides, see "Result for W1s") | next |
+| W1s | `encoding.config` | float64 and float32 columns as Lance 12 writes them: the 64-bit dictionary, RLE over values and indices, and InlineBitpacking for values with a clear sign bit | W1p, W1p2, W1p3, W1q | partial (Haiku session, 2026-10-30): float64 and float32 layouts equal pylance in every measured case (see "Measured for W1s" and "Result for W1s"), except nullable plain RLE without a dictionary (3 cases, strict xfail; fixed by W1q2). Open: the write time of random and smooth floats is about 2.5x the flat write, over the 10% rule (the owner decides, see "Result for W1s") | next |
 | W1o | `file.version.2_0`, `file.version.2_1` | Warn when a write adds the first 2.2 file to a 2.0 / 2.1 dataset, naming the readers it cuts off | W1m table | done 2026-10-29: `MixedFormatWarning` before the commit of each write that adds the first 2.2 file to a 2.0 / 2.1 dataset (write_dataset append, update, merge_insert, add_columns, compaction, fragment writes); `error` filter aborts it; `_target_file_version` is the one line W1n changes |
 | W1n | `file.version.2_1` | Write 2.1 files into a 2.1 dataset, so its writes stay 2.1 | measured 2026-10-29, see "W1n: what writing 2.1 needs" | deferred (decided 2026-10-29): after W1i, and only if a user needs older readers for 2.1 datasets |
 
@@ -982,10 +983,8 @@ A random float column costs about 2.4x its flat write for a 1.5% smaller file; t
 layout, and nanolance stays faster than pylance. Dropping float bitpacking is one branch (`else if (is_float)` in
 `write_session.cpp`) if that trade is ever wrong for a user.
 
-**W1q2 (left):** nullable plain RLE (no dictionary): pylance writes `Rle{Flat(64),Flat(8)}` + repdef for a column with
-nulls and short runs (runs of 2 at 50,000 and 1,000,000 rows, runs of 5 at 1,000,000); nanolance writes it flat.
-Shared by int64 and float64 (strict xfails in `test_float_dict_rle.py`). `encode_rle_chunks` already takes the
-validity (W1p3); `write_rle_column` and the decision need the same.
+**W1q2 (done, see "Result for W1q2"):** nullable plain RLE (no dictionary): pylance writes `Rle{Flat(64),Flat(8)}` + repdef
+for a column with nulls and short runs; nanolance now writes the same (strict xfails removed from `test_float_dict_rle.py`).
 
 ## Result for W1s (2026-10-30, float64 and float32 layouts; performance conflict open)
 
@@ -1034,3 +1033,72 @@ first sample), not measured separately.
 
 Left: nullable plain RLE (the three strict xfails above, shared with int64); the C++ decision tests (none needed, see
 above); the performance decision.
+
+## Measured for W1q2 (2026-10-30, pylance 12.0.0 at data storage 2.2, `build/nlance-pagelayout`)
+
+Harness: `scratchpad/w1q2/measure.py`. Values are random per run; a null slot is either `0` (underlying value 0, which
+breaks the run it sits in) or keeps its run's value (`hidden`, the run goes on through it). The run-1 rows are the probe:
+at run 1 the raw values decide the RLE choice alone.
+
+Before (nanolance at 2b745d4, int64 only; "=" means the layouts are equal, DIFF means nanolance flat and pylance RLE):
+
+| rows | nulls | underlying | run 1 | run 2 | run 5 | run 50 |
+|---|---|---|---|---|---|---|
+| 50,000 | 5% | 0 | = | DIFF | = | = |
+| 50,000 | 5% | run value | = | DIFF | = | = |
+| 50,000 | 50% | 0 | DIFF | DIFF | = | = |
+| 50,000 | 50% | run value | = | DIFF | = | = |
+| 1,000,000 | 5% | 0 | not run | DIFF | DIFF | = |
+| 1,000,000 | 5% | run value | not run | DIFF | DIFF | = |
+| 1,000,000 | 50% | 0 | not run | DIFF | DIFF | = |
+| 1,000,000 | 50% | run value | not run | DIFF | DIFF | = |
+
+The run-1, 50% row is the discriminator: pylance writes RLE there only when the nulls hold 0. So the null slots' raw
+bytes count, as in Lance's `rle_is_applicable` (`compression.rs`).
+
+After (the same matrix, this change): all 128 cases equal pylance, for int64, float64, int32 and uint8, at 50,000 and
+1,000,000 rows, runs 1, 2, 5 and 50, 5% and 50% nulls, both underlying values. Full output:
+`scratchpad/w1q2/matrix_after.txt`.
+
+Layouts (pylance = nanolance, after), runs of 2 with 5% nulls at 1,000,000 rows, int64:
+`MiniBlock{values=Rle{values=Flat(64),lengths=Flat(8)},repdef=Bitpacked(16,Flat(1)),nullable,buffers=2}`.
+
+Chunks: pylance holds 4,096 rows per chunk with levels, nanolance 1,024 (W1p4, accepted). Only the layout text is compared.
+
+## Result for W1q2 (2026-10-30)
+
+Rule: a nullable fixed-width column with the RLE tag (the decision in `encoding_choice::fixed_column_rle_plan` already ran
+over the raw values of every slot, so it was unchanged) writes `write_rle_column` with the validity: `encode_rle_chunks`
+carries each chunk's definition levels, and the page descriptor is `Rle{Flat(bpv*8),Flat(8)}` + `repdef_encoding_bytes()`
+with `mini_block_tail(m, rows, 2, true)`, as `write_dict_fixed_column` does for nullable indices. The gate
+`!column_has_nulls` at the RLE branch of `encode_column` is gone. The non-null path is byte-identical (same
+`page_layout_bytes_rle` call).
+
+Commit: the W1q2 commit on `claude/nanolance-optimization-review-h3rxi7` (local, not pushed). Files: `src/file/data_file_writer.cpp`
+(write_rle_column, encode_column), `bindings/python/tests/test_float_dict_rle.py` (xfails removed),
+`bindings/python/tests/test_rle_nulls.py` (new, 80 cases), `docs/tasks/SPEC_GAPS.md`.
+
+No decision change, so no C++ test was added to `tests/encoding/`.
+
+Checks:
+
+- `nlbench_gendata <dir> 50000` data-file md5: `84b4dce7912cd80d047e779f01a143fb` (unchanged).
+- ctest: 156 of 156 pass.
+- Python, subset: `test_rle_nulls.py`, `test_float_dict_rle.py`, `test_dict_64bit*.py`, `test_rle_multichunk.py`,
+  `test_writer_tail.py`, `test_fsl_all_null_items.py`, `test_column_codec.py`, `test_lance_read_matrix.py`: 628 passed, 4
+  xfailed (the remaining FSL xfails, unrelated). The full Python suite was NOT run: the volume filled up (1.7 GB free
+  after the other sessions' scratch folders), so it could not be run without deleting other work. To run it, free space.
+
+Timing, 1,000,000-row int64 with 5% nulls, best of 5 (`scratchpad/w1q2/timing.py`), seconds:
+
+| column | nanolance before | nanolance after | pylance 12 |
+|---|---|---|---|
+| random, 5% nulls | 0.0092 | 0.0095 and 0.0096 | 0.0325 |
+| runs of 2, 5% nulls | 0.0172 (flat) | 0.0307 and 0.0333 (RLE + levels) | 0.0498 |
+
+The random column is within the 10% rule (+3% to +4%, noise-level). The runs-of-2 column is written as RLE now, so it
+costs about 1.8x the flat write. That is the cost of matching pylance's layout; the owner should decide if it is
+acceptable (the same trade as W1s's float write time).
+
+Left: the 1,024-row chunks against pylance's 4,096 (W1p4); the write time above; nullable RLE of float32 and of
+variable-width values was not measured.

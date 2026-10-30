@@ -2532,9 +2532,11 @@ bool write_rle_column(const ColumnEncodeContext& ctx, std::ostream& out, std::ve
             i += run;
         }
     }
-    // One mini-block chunk per rle::chunk_rows entry, as pylance writes them (W1q).
+    // One mini-block chunk per rle::chunk_rows entry, as pylance writes them (W1q). A nullable column (W1q2)
+    // carries each chunk's definition levels, as pylance's `Rle{..}` + repdef=Bitpacked(16,Flat(1)).
     const std::size_t length_bytes = 1U;
-    const auto chunks = encode_rle_chunks(values.fixed_data(), bpv, runs);
+    const bool nullable = ctx.column_has_nulls;
+    const auto chunks = encode_rle_chunks(values.fixed_data(), bpv, runs, nullable ? &values.validity : nullptr);
     // u32 metadata words, has_large_chunk as every nanolance mini-block page: nanolance writes data storage
     // version 2.2, whose validator refuses u16 words (control_buffer_for). Pylance 12 writes u16 words in 2.1
     // files; the chunk sizes and values are the same.
@@ -2556,8 +2558,17 @@ bool write_rle_column(const ColumnEncodeContext& ctx, std::ostream& out, std::ve
     page.buffer_sizes.push_back(chunks.bytes.size());
     page.length = rows;
     page.priority = 0;
-    page.encoding = page_layout_bytes_rle(static_cast<std::uint8_t>(bpv * 8U),
-                                          static_cast<std::uint8_t>(length_bytes * 8U), rows);
+    if (nullable) {
+        descriptor::MiniBlock m;
+        m.value_compression = descriptor::rle(descriptor::flat(static_cast<std::uint32_t>(bpv * 8U)),
+                                              descriptor::flat(static_cast<std::uint32_t>(length_bytes * 8U)));
+        m.def_compression = repdef_encoding_bytes();
+        mini_block_tail(m, rows, 2U, true);  // run values and run lengths are two buffers
+        page.encoding = descriptor::page_encoding(m);
+    } else {
+        page.encoding = page_layout_bytes_rle(static_cast<std::uint8_t>(bpv * 8U),
+                                              static_cast<std::uint8_t>(length_bytes * 8U), rows);
+    }
     column.pages.push_back(std::move(page));
     columns.push_back(std::move(column));
     return true;
@@ -3478,7 +3489,9 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
 
     // Run-length encoded fixed-width column (tagged by the writer): one chunk with two buffers
     // (run values + run lengths) -> Rle PageLayout.
-    if (!column_has_nulls && packing_it != field.metadata.end() && packing_it->second == "rle" &&
+    // A nullable column takes it too (W1q2): its definition levels ride in each chunk, and the runs are over the
+    // raw values of every slot, null slots included (as Lance's RLE scan does).
+    if (packing_it != field.metadata.end() && packing_it->second == "rle" &&
         values.kind == ColumnValues::Kind::FixedWidth) {
         return write_rle_column(ctx, out, columns);
     }

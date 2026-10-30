@@ -59,21 +59,14 @@ _F64 = [
     ("sorted1000", lambda n: _sorted(n, 1_000)),
     ("sorted5000", lambda n: _sorted(n, 5_000)),
 ]
-# Nullable RLE without a dictionary (runs of 2 and 5 at 1,000,000 rows, and 50,000 rows): pylance writes
-# `Rle{..}` + repdef; nanolance writes flat (nullable plain RLE is not implemented, as for int64). Strict xfail.
-_NULLABLE_RLE_GAP = {("runs2", 50_000), ("runs2", 1_000_000), ("runs5", 1_000_000)}
-
 PLAIN = []  # (name, make, rows, nulls) for the read and take checks: every case reads back
-CASES = []  # the same with the layout xfails for the gap above
+CASES = []  # the same for the layout check (nullable plain RLE matches pylance since W1q2)
 for name, make in _F64:
     for rows in (50_000, 1_000_000):
         for nulls in (False, True):
             case_id = f"{name}-{rows}-{'nulls' if nulls else 'dense'}"
             PLAIN.append(pytest.param(name, make, rows, nulls, id=case_id))
-            marks = []
-            if nulls and (name, rows) in _NULLABLE_RLE_GAP:
-                marks = [pytest.mark.xfail(strict=True, reason="nullable plain RLE (no dictionary) not implemented")]
-            CASES.append(pytest.param(name, make, rows, nulls, id=case_id, marks=marks))
+            CASES.append(pytest.param(name, make, rows, nulls, id=case_id))
 
 
 def _table(make, rows: int, nulls: bool) -> pa.Table:
