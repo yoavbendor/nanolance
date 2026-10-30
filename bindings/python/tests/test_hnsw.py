@@ -227,14 +227,20 @@ def test_new_kinds_match_pylance(lance, new_kinds, kind, metric, deleted):
                 got = ours.to_table(nearest=nearest, columns=["id"], filter=flt, prefilter=pre)
                 rd, gd = ref.column("_distance").to_numpy(), got.column("_distance").to_numpy()
                 if metric == "dot" and flt is not None:
-                    # A race between partitions in pylance: compare what any run could return. Under a
-                    # post-filter even the row count varies (CI saw k=1 come back empty from pylance while
-                    # nanolance kept its match), so a count is accepted when some pylance run gives it.
-                    for _ in range(20):
-                        if len(rd) == len(gd):
-                            break
-                        rd = theirs.to_table(nearest=nearest, columns=["id"], filter=flt,
-                                             prefilter=pre).column("_distance").to_numpy()
+                    # A race between partitions in pylance: compare what any run could return.
+                    if len(rd) != len(gd) and not pre:
+                        # Under a post-filter the count can differ only when the k-th row is a tie: duplicate
+                        # vectors (rows 629 and 630 at k=1 in CI) cut either way, and the filter then keeps or
+                        # drops the one that made it. Both engines must agree on the unfiltered distances, and
+                        # pylance's k-th and (k+1)-th must be equal.
+                        k = nearest["k"]
+                        wide = {**nearest, "k": k + 1}
+                        ru = theirs.to_table(nearest=wide, columns=["id"]).column("_distance").to_numpy()
+                        gu = ours.to_table(nearest=wide, columns=["id"]).column("_distance").to_numpy()
+                        assert np.allclose(ru, gu, rtol=1e-5, atol=3e-5), (o, flt, pre, ru, gu)
+                        assert len(ru) > k and np.isclose(ru[k - 1], ru[k], rtol=1e-5, atol=1e-6), \
+                            (o, flt, pre, ru)
+                        continue
                     assert len(rd) == len(gd), (o, flt, pre)
                     assert np.all(np.isfinite(gd) == np.isfinite(rd)), (o, flt, pre)
                     continue
