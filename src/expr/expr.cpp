@@ -3549,6 +3549,87 @@ void set_nulls(const ArrowArrayView& v, int64_t n, std::vector<std::uint8_t>& st
     }
 }
 
+/// An integer literal as int64: Int, or UInt that fits. False otherwise.
+bool fast_int_literal(const Value& v, std::int64_t& out) {
+    if (v.kind == Kind::Int) {
+        out = v.i;
+        return true;
+    }
+    if (v.kind == Kind::UInt && v.u <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+        out = static_cast<std::int64_t>(v.u);
+        return true;
+    }
+    return false;
+}
+
+/// `(column op literal) cmp literal` (or the literal first on either side) over an integer column, as eval()
+/// computes it row by row: int64, wrapping + - *, truncating / and %. False -- the per-row path -- for anything
+/// else: a float or decimal, a uint64 column, a zero or -1 divisor (an error, or MIN / -1), a column divisor. A
+/// filter such as `id % 100 = 0` took 7x pylance's time in the per-row path.
+bool fast_arith_compare(const Node& n, const ArrowArrayView& batch, int64_t length, std::vector<std::uint8_t>& out) {
+    const bool arith_left = n.args[0]->op != Op::Literal && n.args[1]->op == Op::Literal;
+    const bool arith_right = n.args[1]->op != Op::Literal && n.args[0]->op == Op::Literal;
+    if (!arith_left && !arith_right) {
+        return false;
+    }
+    const Node& a = arith_left ? *n.args[0] : *n.args[1];
+    std::int64_t c = 0;
+    if (!fast_int_literal((arith_left ? n.args[1] : n.args[0])->literal, c)) {
+        return false;
+    }
+    if (a.op != Op::Add && a.op != Op::Sub && a.op != Op::Mul && a.op != Op::Div && a.op != Op::Mod) {
+        return false;
+    }
+    const bool col_first = a.args[0]->op == Op::Column && a.args[1]->op == Op::Literal;
+    const bool col_second = a.args[1]->op == Op::Column && a.args[0]->op == Op::Literal;
+    if (!col_first && !col_second) {
+        return false;
+    }
+    const Node& col = col_first ? *a.args[0] : *a.args[1];
+    std::int64_t k = 0;
+    if (!fast_int_literal((col_first ? a.args[1] : a.args[0])->literal, k)) {
+        return false;
+    }
+    switch (col.column.type) {
+        case NANOARROW_TYPE_INT8:
+        case NANOARROW_TYPE_INT16:
+        case NANOARROW_TYPE_INT32:
+        case NANOARROW_TYPE_INT64:
+        case NANOARROW_TYPE_UINT8:
+        case NANOARROW_TYPE_UINT16:
+        case NANOARROW_TYPE_UINT32:
+            break;
+        default:
+            return false;
+    }
+    if ((a.op == Op::Div || a.op == Op::Mod) && (!col_first || k == 0 || k == -1)) {
+        return false;
+    }
+    const auto* v = fast_column(col, batch);
+    if (v == nullptr) {
+        return false;
+    }
+    const Op op = arith_left ? n.op : flip(n.op);
+    const auto rows = static_cast<std::size_t>(length);
+    out.resize(rows);
+    for (std::size_t r = 0; r < rows; ++r) {
+        const std::int64_t x = ArrowArrayViewGetIntUnsafe(v, static_cast<int64_t>(r));
+        const auto ux = static_cast<std::uint64_t>(x);
+        const auto uk = static_cast<std::uint64_t>(k);
+        std::int64_t y = 0;
+        switch (a.op) {
+            case Op::Add: y = static_cast<std::int64_t>(ux + uk); break;
+            case Op::Sub: y = static_cast<std::int64_t>(col_first ? ux - uk : uk - ux); break;
+            case Op::Mul: y = static_cast<std::int64_t>(ux * uk); break;
+            case Op::Div: y = x / k; break;
+            default: y = x % k; break;
+        }
+        out[r] = wanted(op, y < c ? -1 : (y > c ? 1 : 0)) ? kTrue : kFalse;
+    }
+    set_nulls(*v, length, out);
+    return true;
+}
+
 bool fast_eval(const Node& n, const ArrowArrayView& batch, int64_t length, std::vector<std::uint8_t>& out) {
     const auto rows = static_cast<std::size_t>(length);
     switch (n.op) {
@@ -3601,7 +3682,7 @@ bool fast_eval(const Node& n, const ArrowArrayView& batch, int64_t length, std::
             const bool left = n.args[0]->op == Op::Column && n.args[1]->op == Op::Literal;
             const bool right = n.args[1]->op == Op::Column && n.args[0]->op == Op::Literal;
             if (!left && !right) {
-                return false;
+                return fast_arith_compare(n, batch, length, out);
             }
             const Node& col = left ? *n.args[0] : *n.args[1];
             const Value& lit = (left ? n.args[1] : n.args[0])->literal;
