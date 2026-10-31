@@ -944,19 +944,6 @@ bool append_batch_column_values(const ArrowArray& batch,
             if (!append_nested(batch, mapping, field, columns[i], error)) {
                 return false;
             }
-            if (!columns[i].item_validity.empty()) {
-                // Under a list or a struct, element validity is written as mini-block chunks (W1k2). A row of 256
-                // bytes or more is FullZip in pylance, and nanolance has no nested FullZip writer yet: refused.
-                std::string element;
-                std::uint64_t items = 0;
-                if (lance_fixed_size_list_parts(field.logical_type, element, items) &&
-                    lance_logical_type_value_bytes(element) * items >= 256U) {
-                    error = "fixed_size_list column '" + field.name +
-                            "' has null elements under a list or struct and rows of 256 bytes or more; pylance writes "
-                            "those as FullZip pages, which nanolance does not write under a list or struct yet";
-                    return false;
-                }
-            }
             columns[i].rows += static_cast<std::uint64_t>(top_view.length);
             continue;
         }

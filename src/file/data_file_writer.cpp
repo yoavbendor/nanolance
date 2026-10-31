@@ -1903,6 +1903,126 @@ bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& value
     return true;
 }
 
+/// A fixed_size_list leaf under a list or a struct whose rows are 256 bytes or more, as pylance writes one (Lance's
+/// is_narrow rule puts such a value on FullZip): one page whose levels are each a control word
+/// (`rep << bits_def | def`) and, for a level that owns an item (a null item too), the item's slot -- its element
+/// validity bytes when it has them, then its values, zeros for a null item. An empty or null list is the control
+/// word alone. With lists, a repetition index gives each row's start, as for a variable-width FullZip page.
+bool write_nested_full_zip_fixed_column(std::ostream& out, const LanceField& field, const ColumnValues& values,
+                                        std::uint64_t rows, pb::ColumnMetadata& column, std::string& error) {
+    std::string element;
+    std::uint64_t items = 0;
+    if (!lance_fixed_size_list_parts(field.logical_type, element, items) || items == 0U) {
+        error = "column '" + field.name + "': nested FullZip is written for fixed_size_list leaves only";
+        return false;
+    }
+    const auto element_bytes = lance_logical_type_value_bytes(element);
+    const auto row_bytes = static_cast<std::size_t>(element_bytes * items);
+    const bool element_validity = !values.item_validity.empty();
+    const std::size_t validity_bytes = element_validity ? static_cast<std::size_t>((items + 7U) / 8U) : 0U;
+    std::vector<repdef::SerializeLayer> layers;
+    for (const auto& layer : values.layers) {
+        layers.push_back({layer.is_list, &layer.offsets, &layer.validity});
+    }
+    repdef::Serialized ser;
+    if (!repdef::serialize(layers, values.validity, 0, rows, ser, error)) {
+        error = "column '" + field.name + "': " + error;
+        return false;
+    }
+    // Control word widths, from the deepest level the layers can express (Lance's choice).
+    std::uint32_t max_def = 0;
+    std::uint32_t max_rep = 0;
+    for (const auto layer : ser.layers) {
+        max_def += layer == repdef::kAllValidItem || layer == repdef::kAllValidList ? 0U
+                   : layer == repdef::kNullAndEmptyList                             ? 2U
+                                                                                     : 1U;
+        max_rep += repdef::is_list_layer(layer) ? 1U : 0U;
+    }
+    const auto bits_for = [](std::uint32_t v) {
+        std::uint32_t bits = 0;
+        while (v != 0U) {
+            ++bits;
+            v >>= 1U;
+        }
+        return bits;
+    };
+    const auto bits_def = ser.has_def ? bits_for(max_def) : 0U;
+    const auto bits_rep = ser.has_rep ? bits_for(max_rep) : 0U;
+    const std::size_t control = full_zip::control_bytes(bits_rep, bits_def);
+    const auto levels = ser.has_rep || ser.has_def ? std::max(ser.rep.size(), ser.def.size()) : ser.items.size();
+    const std::size_t slot_bytes = validity_bytes + row_bytes;
+    const auto* fixed = values.fixed_borrowed != nullptr ? values.fixed_borrowed : values.fixed.data();
+    const auto fixed_size = values.fixed_borrowed != nullptr ? values.fixed_borrowed_size : values.fixed.size();
+
+    std::vector<std::uint8_t> data;
+    data.reserve(levels * control + ser.items.size() * slot_bytes);
+    std::vector<std::uint64_t> starts;
+    std::vector<std::uint8_t> slot(slot_bytes, 0U);
+    std::size_t next = 0;
+    for (std::size_t level = 0; level < levels; ++level) {
+        const std::uint32_t rep = ser.has_rep ? ser.rep[level] : 0U;
+        const std::uint32_t def = ser.has_def ? ser.def[level] : 0U;
+        if (level == 0U || (ser.has_rep && rep == max_rep) || !ser.has_rep) {
+            starts.push_back(data.size());  // a new row starts
+        }
+        const bool has_slot = ser.is_slot.empty() || ser.is_slot[level] != 0U;
+        if (!has_slot) {
+            full_zip::append_level(data, control, (rep << bits_def) | def, nullptr, 0U, 0U);  // an empty or null list
+            continue;
+        }
+        const auto item = static_cast<std::size_t>(ser.items[next++]);
+        std::fill(slot.begin(), slot.end(), std::uint8_t{0});
+        if (def == 0U) {
+            if ((item + 1U) * row_bytes > fixed_size) {
+                error = "column '" + field.name + "': list items run past the column's values";
+                return false;
+            }
+            for (std::size_t e = 0; e < validity_bytes * 8U && e < items; ++e) {
+                const auto at = static_cast<std::uint64_t>(item) * items + e;
+                if ((values.item_validity[static_cast<std::size_t>(at >> 3U)] >> (at & 7U)) & 1U) {
+                    slot[e >> 3U] |= static_cast<std::uint8_t>(1U << (e & 7U));
+                }
+            }
+            std::memcpy(slot.data() + validity_bytes, fixed + item * row_bytes, row_bytes);
+        }
+        full_zip::append_level(data, control, (rep << bits_def) | def, slot.data(), slot_bytes, 0U);
+    }
+    if (!ser.has_rep) {
+        starts.clear();  // without lists the slots are a fixed stride: no index
+    } else {
+        starts.push_back(data.size());
+        if (starts.size() != rows + 1U) {
+            error = "column '" + field.name + "': its levels make " + std::to_string(starts.size() - 1U) +
+                    " rows, not " + std::to_string(rows);
+            return false;
+        }
+    }
+    descriptor::FullZip layout;
+    layout.bits_rep = bits_rep;
+    layout.bits_def = bits_def;
+    layout.bits_per_value = static_cast<std::uint64_t>(slot_bytes) * 8U;
+    layout.num_items = levels;
+    layout.num_visible_items = next;
+    layout.value_compression =
+        descriptor::fixed_size_list(items, descriptor::flat(static_cast<std::uint64_t>(element_bytes) * 8U),
+                                    element_validity);
+    layout.layers = std::vector<std::uint8_t>(ser.layers.begin(), ser.layers.end());
+    column.encoding = column_encoding_bytes();
+    pb::ColumnPage page;
+    page.buffer_offsets.push_back(write_buffer(out, data));
+    page.buffer_sizes.push_back(data.size());
+    if (!starts.empty()) {
+        const auto index = full_zip::repetition_index(starts);
+        page.buffer_offsets.push_back(write_buffer(out, index));
+        page.buffer_sizes.push_back(index.size());
+    }
+    page.length = rows;
+    page.priority = 0;
+    page.encoding = descriptor::page_encoding(layout);
+    column.pages.push_back(std::move(page));
+    return true;
+}
+
 /// A Blob v2 column inside structs or lists, as Lance writes one: a FullZip page of the packed
 /// descriptors, each level's control word (`rep << bits_def | def`) followed -- for a valid item --
 /// by the item's descriptor (its u32 length, then kind..uri); a null item, and an empty or null list,
@@ -3465,6 +3585,22 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
     // (repdef levels, InlineBitpacking indices, a General dictionary) without nulls too.
     const bool nested_leaf = field.parent_id >= 0 && (column_has_nulls || !values.item_validity.empty() ||
                                                       !field.dictionary_index_format.empty());
+    // A fixed_size_list leaf under a list or struct with rows of 256 bytes or more is FullZip in pylance (Lance's
+    // is_narrow rule), nulls or not, with the struct and list layers in its page.
+    if (std::string fsl_element; field.parent_id >= 0 && !values.layers.empty() &&
+                                 values.kind == ColumnValues::Kind::FixedWidth) {
+        std::uint64_t fsl_items = 0;
+        if (lance_fixed_size_list_parts(field.logical_type, fsl_element, fsl_items) && fsl_element != "bool" &&
+            fsl_element.rfind("fixed_size_list", 0) != 0 &&
+            lance_logical_type_value_bytes(fsl_element) * fsl_items >= kFullZipMinFixedRowBytes) {
+            pb::ColumnMetadata column;
+            if (!write_nested_full_zip_fixed_column(out, field, values, rows, column, error)) {
+                return false;
+            }
+            columns.push_back(std::move(column));
+            return true;
+        }
+    }
     if (values.needs_nested_pages() || nested_leaf) {
         pb::ColumnMetadata column;
         if (!write_nested_column(out, field, values, rows, column, error)) {
