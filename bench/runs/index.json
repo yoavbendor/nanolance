@@ -1,5 +1,18 @@
 [
  {
+  "id": "20261031-072600-448957e",
+  "date": "2026-10-31 07:26 UTC",
+  "branch": "main",
+  "commit": "448957e",
+  "gate": "pass",
+  "record": "runs/20261031-072600-448957e.json",
+  "run_url": "https://github.com/yoavbendor/nanolance/actions/runs/41177794184",
+  "matrix_read_cpp_mt": 3.102435830905251,
+  "scalar_query": 3.7162455077633143,
+  "vector_search": 3.330450995265047,
+  "fts_search": 12.159567928108883
+ },
+ {
   "id": "20261031-065821-fb26d41",
   "date": "2026-10-31 06:58 UTC",
   "branch": "main",
