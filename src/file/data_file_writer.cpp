@@ -3056,10 +3056,13 @@ bool write_dict_fixed_column(const ColumnEncodeContext& ctx, std::ostream& out, 
             dict_desc = descriptor::out_of_line_bitpacking(64U, descriptor::flat(plan.fixed_width));
             break;
         case FixedDictValues::kFlat:
-            dict_desc = descriptor::flat(64U);
+            dict_desc = descriptor::flat(8U * plan.fixed_bytes);
             break;
         case FixedDictValues::kLz4:
-            dict_desc = descriptor::general(descriptor::kLz4, descriptor::flat(64U));
+            dict_desc = descriptor::general(descriptor::kLz4, descriptor::flat(8U * plan.fixed_bytes));
+            break;
+        case FixedDictValues::kZstd:
+            dict_desc = descriptor::general(descriptor::kZstd, descriptor::flat(8U * plan.fixed_bytes));
             break;
     }
 
@@ -3092,7 +3095,7 @@ bool write_dict_fixed_column(const ColumnEncodeContext& ctx, std::ostream& out, 
             ? descriptor::general(index_scheme, descriptor::byte_stream_split(descriptor::flat(32U)))
             : descriptor::inline_bitpacking(32U);
     m.dictionary = dict_desc;
-    m.num_dictionary_items = static_cast<std::uint32_t>(plan.fixed_distinct.size());
+    m.num_dictionary_items = static_cast<std::uint32_t>(plan.fixed_distinct.size() / (plan.fixed_bytes / 8U));
     if (nullable) {
         m.def_compression = repdef_encoding_bytes();
     }

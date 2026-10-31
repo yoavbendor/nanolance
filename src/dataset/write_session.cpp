@@ -143,6 +143,13 @@ bool read_encoding_options(const LanceField& field, encoding_choice::ColumnEncod
     if (const auto it = field.metadata.find("lance-encoding:dict-values-compression"); it != field.metadata.end()) {
         out.dict_values_compression = it->second;
     }
+    if (const auto it = field.metadata.find("lance-encoding:dict-values-compression-level"); it != field.metadata.end()) {
+        int level = 0;
+        const auto [end, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), level);
+        if (ec == std::errc{} && end == it->second.data() + it->second.size()) {
+            out.dict_values_level = level;  // a non-number is accepted and ignored, as pylance does
+        }
+    }
     return true;
 }
 
@@ -747,6 +754,28 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
                         field.metadata["nanolance:packing"] = "constant";
                         field.metadata["nanolance:const-value"] = std::string(value.begin(), value.end());
                         break;
+                    }
+                }
+                continue;
+            }
+            // A 128-bit column -- decimal128, fixed_size_binary(16) -- is dictionary-encoded as Lance 12 does it (its
+            // dictionary_encode takes 64- and 128-bit values): the same decision at 16 bytes an entry, the dictionary
+            // stored by the general codec (W1p, 128-bit). Its own lance-encoding:compression keeps the codec's layout.
+            if (cv.kind == ColumnValues::Kind::FixedWidth && lance_logical_type_value_bytes(pf->logical_type) == 16U &&
+                (pf->logical_type.rfind("decimal:128:", 0) == 0 || pf->logical_type == "fixed_size_binary:16")) {
+                const bool own_codec = column_has_own_codec(pf->id);
+                if (own_codec && cv.null_count != 0U) {
+                    continue;  // under its own codec only without nulls, as the 64-bit columns (W1r)
+                }
+                if (encoding_choice::fixed_column_dict_beneficial(cv, enc_options, 16U)) {
+                    for (auto& field : disk_schema.fields) {
+                        if (field.id == pf->id) {
+                            field.metadata["nanolance:packing"] = "dict";
+                            if (!own_codec) {
+                                field.metadata.erase("lance-encoding:compression");
+                            }
+                            break;
+                        }
                     }
                 }
                 continue;

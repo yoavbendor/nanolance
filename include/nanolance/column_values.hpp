@@ -52,9 +52,10 @@ struct StructuralDictPlan {
     std::vector<std::uint64_t> fixed_distinct;
     std::vector<std::uint8_t> fixed_block;
     /// How the dictionary block is stored: the bitpacking Lance chose, or the general codec when it did not.
-    enum class FixedDictValues : std::uint8_t { kInlineBitpacking, kOutOfLineBitpacking, kFlat, kLz4 };
+    enum class FixedDictValues : std::uint8_t { kInlineBitpacking, kOutOfLineBitpacking, kFlat, kLz4, kZstd };
     FixedDictValues fixed_values = FixedDictValues::kFlat;
     unsigned fixed_width = 0;  // kOutOfLineBitpacking: the one width every block is packed at
+    unsigned fixed_bytes = 8;  // a value's bytes: 8, or 16 for a 128-bit dictionary (`fixed_distinct` then 2 words an entry)
     /// Run-length encoding of the indices (W1p2), as pylance writes a sorted or run-heavy dictionary column:
     /// `Rle{Flat(32),Flat(8)}` over the u32 indices. `index_runs` holds (row, length) per run of `indices`, as
     /// FixedRlePlan does; the indices are then not bitpacked.
