@@ -136,6 +136,20 @@ bool slice_leaf(ColumnValues& values, std::uint64_t first, std::uint64_t count, 
             values.item_validity.clear();
         }
     }
+    if (values.outer_items_per_row != 0U && !values.outer_item_validity.empty()) {
+        // fixed_size_list<fixed_size_list> (W1a): the outer level, outer_items_per_row bits a row.
+        const auto per_row = values.outer_items_per_row;
+        if (values.outer_item_validity.size() < bitmap_bytes(total * per_row)) {
+            error = "outer element validity bitmap covers fewer elements than the column claims";
+            return false;
+        }
+        std::uint64_t outer_nulls = 0;
+        values.outer_item_validity = slice_bitmap(values.outer_item_validity, first * per_row, count * per_row, outer_nulls);
+        values.outer_item_null_count = outer_nulls;
+        if (outer_nulls == 0U) {
+            values.outer_item_validity.clear();
+        }
+    }
 
     if (!values.validity.empty()) {
         std::uint64_t nulls = 0;
@@ -364,6 +378,23 @@ bool compact_leaf_runs(ColumnValues& values, const RowRuns& runs, std::uint64_t 
         }
         values.item_null_count = item_nulls;
         values.item_validity = item_nulls == 0U ? std::vector<std::uint8_t>{} : std::move(bitmap);
+    }
+    if (values.outer_items_per_row != 0U && !values.outer_item_validity.empty()) {
+        // fixed_size_list<fixed_size_list> (W1a): the outer level, by runs as above.
+        const auto per_row = values.outer_items_per_row;
+        if (values.outer_item_validity.size() < bitmap_bytes(total * per_row)) {
+            error = "outer element validity bitmap covers fewer elements than the column claims";
+            return false;
+        }
+        std::vector<std::uint8_t> bitmap(bitmap_bytes(count * per_row), 0U);
+        std::uint64_t outer_nulls = 0;
+        std::uint64_t dst = 0;
+        for (const auto& [b, e] : runs) {
+            outer_nulls += copy_bits(values.outer_item_validity, b * per_row, (e - b) * per_row, bitmap, dst);
+            dst += (e - b) * per_row;
+        }
+        values.outer_item_null_count = outer_nulls;
+        values.outer_item_validity = outer_nulls == 0U ? std::vector<std::uint8_t>{} : std::move(bitmap);
     }
 
     if (!values.validity.empty()) {
