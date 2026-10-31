@@ -125,19 +125,66 @@ def test_multi_page_list_fsl_with_element_nulls(lance_mod, tmp_path):
     assert pa.table(nanolance.take(str(path), idx)).to_pydict() == expected.take(idx).to_pydict()
 
 
-def test_fsl_of_struct_is_refused_by_name_and_other_columns_read(lance_mod, tmp_path):
-    # Not read yet (its elements are child columns). The error names the shape; it used to blame a
-    # dictionary column. Projecting the other columns still works.
-    struct = pa.struct([("x", pa.int64())])
-    table = _with_plain_column(
-        pa.table({"v": pa.array([[{"x": i}, {"x": i + 1}] for i in range(ROWS)], pa.list_(struct, 2))}))
-    path = tmp_path / "fsl_struct.lance"
+def _fsl_struct_rows(n, null_row=0, null_struct=0, null_x=0):
+    out = []
+    for i in range(n):
+        if null_row and i % null_row == 0:
+            out.append(None)
+            continue
+        items = []
+        for j in range(2):
+            k = 2 * i + j
+            items.append(None if null_struct and k % null_struct == 0 else
+                         {"x": None if null_x and k % null_x == 0 else k, "s": f"s{k}"})
+        out.append(items)
+    return out
+
+
+_ITEM = pa.struct([("x", pa.int64()), ("s", pa.string())])
+FSL_STRUCT_SHAPES = {
+    # fixed_size_list<struct> (W1k4): the elements are the struct's leaf columns (rows x N items), under a layer
+    # with no repetition; nulls at the row, the struct and the field are definition levels.
+    "plain": lambda n: _fsl_struct_rows(n),
+    "null_rows": lambda n: _fsl_struct_rows(n, null_row=7),
+    "null_structs": lambda n: _fsl_struct_rows(n, null_struct=5),
+    "null_fields": lambda n: _fsl_struct_rows(n, null_x=3),
+    "all_nulls": lambda n: _fsl_struct_rows(n, 7, 5, 3),
+}
+
+
+@pytest.mark.parametrize("rows", [ROWS, 300_000])
+@pytest.mark.parametrize("name", sorted(FSL_STRUCT_SHAPES))
+def test_fsl_of_struct_reads_as_pylance(lance_mod, tmp_path, name, rows):
+    table = pa.table({"id": pa.array(range(rows), pa.int64()),
+                      "v": pa.array(FSL_STRUCT_SHAPES[name](rows), pa.list_(_ITEM, 2))})
+    path = tmp_path / f"{name}.lance"
     lance_mod.write_dataset(table, str(path), data_storage_version="2.2")
-    for read in (lambda: nanolance.read_table(path), lambda: nanolance.read_table(path, columns=["v"]),
-                 lambda: nanolance.take(str(path), [1, 2])):
-        with pytest.raises(Exception, match=r"column 'v': a fixed_size_list:struct:2 is not read yet"):
-            read()
-    assert pa.table(nanolance.read_table(path, columns=["k"])).column("k").to_pylist() == list(range(ROWS))
+    # pylance 12 refuses to read these columns beside another one when they hold nulls ("cannot read columns
+    # of differing lengths together"), so its own read of the column alone is the reference.
+    expected = lance_mod.dataset(str(path)).to_table(columns=["v"])
+    assert expected.column("v").to_pylist() == table.column("v").to_pylist()
+    got = pa.table(nanolance.read_table(path))
+    got.validate(full=True)
+    assert got.column("v").to_pylist() == table.column("v").to_pylist()
+    assert got.column("id").to_pylist() == table.column("id").to_pylist()
+    idx = [rows - 1, 0, 7, rows // 2, 3]
+    taken = pa.table(nanolance.take(str(path), idx))
+    assert taken.column("v").to_pylist() == [table.column("v")[i].as_py() for i in idx]
+    part = pa.table(nanolance.read_table(path, columns=["v"], offset=rows // 3, length=50))
+    assert part.column("v").to_pylist() == table.column("v").to_pylist()[rows // 3: rows // 3 + 50]
+
+
+def test_fsl_of_struct_nested_shapes_read_as_pylance(lance_mod, tmp_path):
+    inner = pa.table({"v": pa.array([[{"e": [float(i), 2.0]}, {"e": [3.0, float(-i)]}] for i in range(ROWS)],
+                                    pa.list_(pa.struct([("e", pa.list_(pa.float32(), 2))]), 2))})
+    outer = pa.table({"o": pa.array([{"v": [{"x": i}, {"x": i + 1}]} for i in range(ROWS)],
+                                    pa.struct([("v", pa.list_(pa.struct([("x", pa.int64())]), 2))]))})
+    for name, table in (("inner_fsl", inner), ("struct_fsl_struct", outer)):
+        path = tmp_path / f"{name}.lance"
+        lance_mod.write_dataset(table, str(path), data_storage_version="2.2")
+        _check_equal_to_pylance(lance_mod, path, table)
+        idx = [ROWS - 1, 0, 7]
+        assert pa.table(nanolance.take(str(path), idx)).to_pydict() == lance_mod.dataset(str(path)).take(idx).to_pydict()
 
 
 def _bool_rows(n, rows, null_every=0, seed=0):
