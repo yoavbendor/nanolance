@@ -884,8 +884,8 @@ bool infer_arrow_format_from_internal(const std::string& logical_type, std::stri
         std::uint64_t items = 0;
         if (lance_fixed_size_list_parts(logical_type, element, items)) {
             std::string element_format;
-            if (lance_field_is_variable_width(element) || element == "bool" ||
-                !infer_arrow_format_from_internal(element, element_format, error)) {
+            // bool elements are read (W1k3: FixedSizeList{N, Flat(1)}, unpacked to a byte an element).
+            if (lance_field_is_variable_width(element) || !infer_arrow_format_from_internal(element, element_format, error)) {
                 error = "unsupported fixed_size_list element type in logical type: " + logical_type;
                 return false;
             }
