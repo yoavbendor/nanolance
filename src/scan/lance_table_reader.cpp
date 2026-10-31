@@ -2355,16 +2355,51 @@ bool apply_fragment_overlays(const FragmentOverlays& overlays, const std::vector
         const auto& layers = it->second;
         std::vector<RowPick> picks(static_cast<std::size_t>(rows));
         bool any = false;
-        for (std::uint64_t r = 0; r < rows; ++r) {
-            const auto p = physical(r);
-            for (std::size_t l = 0; l < layers.size(); ++l) {
+        // The rows a read decodes are in ascending physical order (a morsel's range, a take's sorted rows): then
+        // each overlay's sorted offsets are merged with them once, oldest overlay first so the newest wins (layer
+        // 0). One binary search per row and overlay made a scan of a 1M-row fragment with 10 overlays 5x slower
+        // than pylance's.
+        bool ascending = true;
+        for (std::uint64_t r = 1; r < rows && ascending; ++r) {
+            ascending = physical(r - 1U) < physical(r);
+        }
+        if (ascending && rows != 0U) {
+            const auto first = physical(0);
+            const auto last = physical(rows - 1U);
+            const bool dense = last - first == rows - 1U;  // one physical range: a row is its offset's distance
+            for (std::size_t l = layers.size(); l-- > 0;) {
                 const auto& offsets = *layers[l].offsets;
-                const auto found = std::lower_bound(offsets.begin(), offsets.end(), p);
-                if (found != offsets.end() && *found == p) {
-                    picks[static_cast<std::size_t>(r)] = {static_cast<std::int32_t>(l),
-                                                          static_cast<std::uint64_t>(found - offsets.begin())};
-                    any = true;
-                    break;
+                auto at = std::lower_bound(offsets.begin(), offsets.end(), first);
+                const auto end = std::upper_bound(at, offsets.end(), last);
+                std::uint64_t r = 0;
+                for (; at != end; ++at) {
+                    // The next row at or past this offset: a jump when the rows are one physical range.
+                    if (dense) {
+                        r = *at - first;
+                    } else {
+                        while (r < rows && physical(r) < *at) {
+                            ++r;
+                        }
+                    }
+                    if (r < rows && physical(r) == *at) {
+                        picks[static_cast<std::size_t>(r)] = {static_cast<std::int32_t>(l),
+                                                              static_cast<std::uint64_t>(at - offsets.begin())};
+                        any = true;
+                    }
+                }
+            }
+        } else {
+            for (std::uint64_t r = 0; r < rows; ++r) {
+                const auto p = physical(r);
+                for (std::size_t l = 0; l < layers.size(); ++l) {
+                    const auto& offsets = *layers[l].offsets;
+                    const auto found = std::lower_bound(offsets.begin(), offsets.end(), p);
+                    if (found != offsets.end() && *found == p) {
+                        picks[static_cast<std::size_t>(r)] = {static_cast<std::int32_t>(l),
+                                                              static_cast<std::uint64_t>(found - offsets.begin())};
+                        any = true;
+                        break;
+                    }
                 }
             }
         }
