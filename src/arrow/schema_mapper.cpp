@@ -373,8 +373,9 @@ ParsedFormat parse_fixed_size_list(const ArrowSchema& field) {
         return out;
     }
     const auto element = parse_format(field.children[0]->format);
-    if (!element.supported || element.logical_type == "struct" || element.logical_type == "bool" ||
-        element.logical_type == "null" || lance_field_is_variable_width(element.logical_type)) {
+    // bool elements are written bit-packed, FixedSizeList{N x Flat(1)}, as pylance writes them.
+    if (!element.supported || element.logical_type == "struct" || element.logical_type == "null" ||
+        lance_field_is_variable_width(element.logical_type)) {
         out.rejection = std::string("fixed_size_list of '") +
                         (field.children[0]->format == nullptr ? "?" : field.children[0]->format) +
                         "' is not supported; the element must be a fixed-width number, decimal or temporal type";

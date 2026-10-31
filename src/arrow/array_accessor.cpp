@@ -353,17 +353,13 @@ bool append_fixed_size_list(const ArrowArray& array, const LanceField& field, co
     const auto count = static_cast<std::uint64_t>(array.length) * items;
     const std::uint64_t held = element_bytes == 0U ? 0U : out.fixed.size() / element_bytes;  // elements so far
     if (child->null_count != 0 && child->buffers[0] != nullptr) {
-        // A null element of a VALID row is kept as Lance keeps it: element validity next to the
-        // values. pyarrow marks every element of a null row null as well (pa.array([None, [1, 2]],
-        // pa.list_(t, 2)) does); those are masked by the row, so they alone need no element bits.
+        // Null elements are kept as Lance keeps them: element validity next to the values, whenever the
+        // child holds a null in these rows -- a null of a valid row, and also those pyarrow puts under a null
+        // row (pa.array([None, [1, 2]], pa.list_(t, 2)) does). pylance writes FixedSizeList{..., validity}
+        // for both (measured: a list whose child has no nulls, only a row mask, gets none).
         const auto* bits = static_cast<const std::uint8_t*>(child->buffers[0]);
-        const auto* rows = static_cast<const std::uint8_t*>(array.buffers != nullptr ? array.buffers[0] : nullptr);
         bool inner_nulls = !out.item_validity.empty();
         for (std::uint64_t k = first; k < first + count && !inner_nulls; ++k) {
-            const auto row = static_cast<std::uint64_t>(array.offset) + (k - first) / items;
-            if (rows != nullptr && ((rows[row >> 3U] >> (row & 7U)) & 1U) == 0U) {
-                continue;
-            }
             inner_nulls = ((bits[k >> 3U] >> (k & 7U)) & 1U) == 0U;
         }
         if (inner_nulls && out.item_validity.empty()) {
@@ -391,6 +387,17 @@ bool append_fixed_size_list(const ArrowArray& array, const LanceField& field, co
         }
     }
     out.kind = ColumnValues::Kind::FixedWidth;
+    if (element == "bool") {
+        // Arrow's bools are bits; nanolance holds a byte an element (the writer packs them again).
+        const auto* bits = static_cast<const std::uint8_t*>(child->buffers[1]);
+        const auto base = out.fixed.size();
+        out.fixed.resize(base + static_cast<std::size_t>(count));
+        for (std::uint64_t k = 0; k < count; ++k) {
+            const auto at = first + k;
+            out.fixed[base + static_cast<std::size_t>(k)] = static_cast<std::uint8_t>((bits[at >> 3U] >> (at & 7U)) & 1U);
+        }
+        return true;
+    }
     const auto* bytes = static_cast<const std::uint8_t*>(child->buffers[1]) + first * element_bytes;
     out.fixed.insert(out.fixed.end(), bytes, bytes + count * element_bytes);
     return true;

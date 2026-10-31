@@ -819,7 +819,8 @@ std::uint64_t write_buffer(std::ostream& out, const std::vector<std::uint8_t>& b
 
 /// How a nested page's item values are encoded -- chosen once per page, since the descriptor declares
 /// one value encoding for all of its chunks.
-enum class ItemEncoding { kFlat, kBool, kBitpacked, kVariable };
+/// kBoolList: a fixed_size_list<bool, N> item, its N bools bit-packed (FixedSizeList{N x Flat(1)}).
+enum class ItemEncoding { kFlat, kBool, kBoolList, kBitpacked, kVariable };
 
 ItemEncoding item_encoding_for(const LanceField& field, const ColumnValues& values) {
     if (values.kind == ColumnValues::Kind::VariableWidth) {
@@ -827,6 +828,11 @@ ItemEncoding item_encoding_for(const LanceField& field, const ColumnValues& valu
     }
     if (field.logical_type == "bool") {
         return ItemEncoding::kBool;
+    }
+    std::string element;
+    std::uint64_t items = 0;
+    if (lance_fixed_size_list_parts(field.logical_type, element, items) && element == "bool") {
+        return ItemEncoding::kBoolList;
     }
     const auto width = lance_logical_type_value_bytes(field.logical_type);
     if (lance_logical_type_is_bitpackable_integer(field.logical_type) &&
@@ -843,6 +849,12 @@ std::vector<std::uint8_t> item_value_encoding(ItemEncoding encoding, const Lance
             return descriptor::variable(descriptor::flat(offset_bits_token(large)));
         case ItemEncoding::kBitpacked:
             return descriptor::inline_bitpacking(lance_logical_type_value_bytes(field.logical_type) * 8U);
+        case ItemEncoding::kBoolList: {
+            std::string element;
+            std::uint64_t items = 0;
+            (void)lance_fixed_size_list_parts(field.logical_type, element, items);
+            return descriptor::fixed_size_list(items, descriptor::flat(1U));
+        }
         case ItemEncoding::kBool:
         case ItemEncoding::kFlat: {
             // A fixed_size_list item, as Lance describes it: FixedSizeList{ items_per_value, values =
@@ -954,6 +966,20 @@ bool gather_chunk_values(const LanceField& field, const ColumnValues& values, It
             error = "list items run past the column's values";
             return false;
         }
+    }
+    if (encoding == ItemEncoding::kBoolList) {
+        // FixedSizeList{N x Flat(1)}: each item's N bools (a byte apiece in the column), packed LSB first.
+        const auto bits = count * width;
+        out.resize(base + (bits + 7U) / 8U, 0U);
+        for (std::size_t k = 0; k < count; ++k) {
+            for (std::size_t e = 0; e < width; ++e) {
+                if (data[items[first + k] * width + e] != 0U) {
+                    const auto at = k * width + e;
+                    out[base + (at >> 3U)] |= static_cast<std::uint8_t>(1U << (at & 7U));
+                }
+            }
+        }
+        return true;
     }
     if (encoding == ItemEncoding::kBool) {
         // Flat(1): the items' bits, LSB first -- the same packing a flat bool page uses.
@@ -1651,7 +1677,7 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
             descriptor::fsst(fsst_table, item_value_encoding(encoding, field, values.variable.large));
     } else if (element_validity) {
         mini.value_compression =
-            descriptor::fixed_size_list(fsl_items, descriptor::flat(static_cast<std::uint32_t>(lance_logical_type_value_bytes(fsl_element) * 8U)), true);
+            descriptor::fixed_size_list(fsl_items, descriptor::flat(fsl_element == "bool" ? 1U : static_cast<std::uint32_t>(lance_logical_type_value_bytes(fsl_element) * 8U)), true);
     } else {
         mini.value_compression = item_value_encoding(encoding, field, values.variable.large);
     }
@@ -2016,6 +2042,8 @@ struct FixedWidthChoice {
     bool bss_general;  // byte-stream-split, then General(general_scheme) per chunk
     std::uint64_t general_scheme;  // descriptor::kZstd or descriptor::kLz4 (bss_general only)
     std::size_t bytes_per_value;
+    /// bool_pack: the bools a row, N for a fixed_size_list<bool, N> (FixedSizeList{N x Flat(1)}), 1 for a bool.
+    std::uint64_t bools_per_row = 1;
 };
 
 /// Writes a blob-v2 column: a nested blob column with its layers, or packed blob descriptions.
@@ -2371,6 +2399,9 @@ bool write_fixed_size_list_column(const ColumnEncodeContext& ctx, std::ostream& 
     const auto element_bytes = lance_logical_type_value_bytes(element);
     const auto row_bytes = element_bytes * items;
     const auto total = values.fixed_size() / row_bytes;
+    // fixed_size_list<bool>: the values go bit-packed, FixedSizeList{N x Flat(1), validity}, as pylance writes them.
+    const bool bools = element == "bool";
+    std::vector<std::uint8_t> packed;
     const auto by_bytes = max_values_per_uncompressed_chunk(row_bytes + (items + 7U) / 8U + 1U);
     const auto multi = multichunk_values(column_has_nulls ? std::min<std::size_t>(1024U, by_bytes) : by_bytes);
     const auto max_chunk_rows = multi != 0U ? multi : std::size_t{1};
@@ -2392,8 +2423,12 @@ bool write_fixed_size_list_column(const ColumnEncodeContext& ctx, std::ostream& 
         const auto def = column_has_nulls ? pack_definition_levels(values.validity, off, count)
                                           : std::vector<std::uint8_t>{};
         page_writer.begin_chunk();
-        const auto footprint = stream_miniblock_chunk(
-            out, count, def, {{bits.data(), bits.size()}, {values.fixed_data() + off * row_bytes, count * row_bytes}});
+        std::pair<const std::uint8_t*, std::size_t> chunk_values{values.fixed_data() + off * row_bytes, count * row_bytes};
+        if (bools) {
+            boolpack::pack_lsb_first(values.fixed_data() + off * row_bytes, count * row_bytes, packed);
+            chunk_values = {packed.data(), packed.size()};
+        }
+        const auto footprint = stream_miniblock_chunk(out, count, def, {{bits.data(), bits.size()}, chunk_values});
         page_writer.end_chunk(footprint, count);
         off += count;
         if (off < total && multi != 0U && page_writer.payload_bytes() < kTargetMiniblockPageBytes) {
@@ -2404,7 +2439,8 @@ bool write_fixed_size_list_column(const ColumnEncodeContext& ctx, std::ostream& 
         page_writer.finish(page);
         descriptor::MiniBlock m;
         m.value_compression =
-            descriptor::fixed_size_list(items, descriptor::flat(static_cast<std::uint32_t>(element_bytes * 8U)), true);
+            descriptor::fixed_size_list(items, descriptor::flat(bools ? 1U : static_cast<std::uint32_t>(element_bytes * 8U)),
+                                        true);
         if (column_has_nulls) {
             m.def_compression = repdef_encoding_bytes();
         }
@@ -2987,9 +3023,10 @@ bool write_packed_fixed_column(const ColumnEncodeContext& ctx, const FixedWidthC
 
     pb::ColumnMetadata column;
     column.encoding = column_encoding_bytes();
-    const auto total = bool_pack ? values.fixed_size() : values.fixed_size() / fixed_bytes_per_value;
+    const auto bools_per_row = static_cast<std::size_t>(fixed.bools_per_row);
+    const auto total = bool_pack ? values.fixed_size() / bools_per_row : values.fixed_size() / fixed_bytes_per_value;
     std::size_t step = bitpack      ? 1024U  // one FastLanes block per chunk
-                       : bool_pack ? kMaxBoolValuesPerChunk
+                       : bool_pack ? std::max<std::size_t>(kMaxBoolValuesPerChunk / bools_per_row, 1U)
                                    : max_values_per_uncompressed_chunk(fixed_bytes_per_value);
     if (column_has_nulls) {
         step = std::min<std::size_t>(step, 1024U);  // see pack_definition_levels
@@ -3004,6 +3041,11 @@ bool write_packed_fixed_column(const ColumnEncodeContext& ctx, const FixedWidthC
         if (bitpack) {
             return page_layout_bytes_inline_bitpacking(
                 static_cast<std::uint8_t>(fixed_bytes_per_value * 8U), count, column_has_nulls);
+        }
+        if (bool_pack && bools_per_row > 1U) {
+            // FixedSizeList{N x Flat(1)}: N bits a row.
+            return page_layout_bytes_flat(static_cast<std::uint32_t>(bools_per_row), count, column_has_nulls,
+                                          bools_per_row);
         }
         if (bool_pack) {
             // Plain Flat{bits_per_value:1} -- no CompressiveEncoding wrapper, matching stock Lance.
@@ -3025,7 +3067,7 @@ bool write_packed_fixed_column(const ColumnEncodeContext& ctx, const FixedWidthC
         } else if (bool_pack) {
             // Bit-pack LSB-first, ceil(count/8) bytes; no zstd on top (stock Lance doesn't
             // compress 1-bit-packed bool either). values.fixed is one byte per value here.
-            boolpack::pack_lsb_first(values.fixed_data() + off, count, scratch);
+            boolpack::pack_lsb_first(values.fixed_data() + off * bools_per_row, count * bools_per_row, scratch);
         } else {
             // Byte-transpose (mantissa/exponent bytes grouped) so the zstd frame compresses
             // meaningfully, then frame it: bytes become [u64 raw size][zstd].
@@ -3207,9 +3249,15 @@ bool write_fixed_width_column(const ColumnEncodeContext& ctx, std::ostream& out,
     const std::uint64_t general_scheme = ctx.codec == ColumnCodec::kLz4 ? descriptor::kLz4 : descriptor::kZstd;
     // bool is always stored bit-packed (1 bit/value, LSB-first) on disk, matching stock Lance's own
     // Flat{bits_per_value:1} representation (verified empirically) -- not gated by any opt-in flag.
-    const bool bool_pack = !is_variable && field.logical_type == "bool";
+    // A fixed_size_list<bool, N> is N of them a row, bit-packed across the chunk as pylance writes it.
+    std::string fsl_element;
+    std::uint64_t fsl_bools = 0;
+    const bool fsl_bool = !is_variable && lance_fixed_size_list_parts(field.logical_type, fsl_element, fsl_bools) &&
+                          fsl_element == "bool" && fsl_bools != 0U;
+    const bool bool_pack = !is_variable && (field.logical_type == "bool" || fsl_bool);
     const auto fixed_bytes_per_value = value_width_bytes(field);
-    const FixedWidthChoice fixed{bitpack, bool_pack, bss_general, general_scheme, fixed_bytes_per_value};
+    const FixedWidthChoice fixed{bitpack,       bool_pack, bss_general, general_scheme, fixed_bytes_per_value,
+                                 fsl_bool ? fsl_bools : 1U};
 
     if (!is_variable) {
         if (values.fixed_size() % fixed_bytes_per_value != 0U) {
