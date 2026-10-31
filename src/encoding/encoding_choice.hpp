@@ -43,6 +43,8 @@ struct ColumnEncodingOptions {
     /// `lance-encoding:dict-values-compression`: empty (pylance's default, lz4), "none" or "lz4". Other values
     /// are not handled for fixed-width dictionaries, which then stay as they were.
     std::string dict_values_compression;
+    /// `lance-encoding:dict-values-compression-level` for zstd (Lance's default 3).
+    int dict_values_level = 3;
 };
 
 bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv,
@@ -59,7 +61,9 @@ bool variable_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnE
 /// capped at 100,000), then the distinct values within that threshold and the size budget (dict-size-ratio
 /// of the flat size). On success `cv.structural_dict_plan` holds the dictionary as pylance stores its values:
 /// InlineBitpacking when one 1,024-value block is smaller than the raw block, else OutOfLineBitpacking above
-/// 1,024 entries, else the general codec (lz4 by default, none for Flat).
-bool fixed_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnEncodingOptions& options = {});
+/// 1,024 entries, else the general codec (lz4 by default, none for Flat). `value_bytes` 16 is a 128-bit column
+/// (decimal128, fixed_size_binary(16)), as Lance 12 dictionary-encodes it: never bitpacked, the codec stores it.
+bool fixed_column_dict_beneficial(nano_lance::ColumnValues& cv, const ColumnEncodingOptions& options = {},
+                                  std::size_t value_bytes = 8U);
 
 }  // namespace nano_lance::encoding_choice

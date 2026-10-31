@@ -73,7 +73,6 @@ SHAPES["fsl_of_fsl_all_null"] = lambda: pa.table(
 
 # Shapes pylance writes as Constant that nanolance still refuses. Strict xfail: a fix turns them red.
 _LEFT = {
-    "fsl_of_fsl_all_null": "fsl<fsl> all null: unsupported page layout",
     "string_dim2_all_null": "fsl<string> all null: string is an unsupported fixed_size_list element type",
 }
 

@@ -373,8 +373,12 @@ ParsedFormat parse_fixed_size_list(const ArrowSchema& field) {
         return out;
     }
     const auto element = parse_format(field.children[0]->format);
-    if (!element.supported || element.logical_type == "struct" || element.logical_type == "bool" ||
-        element.logical_type == "null" || lance_field_is_variable_width(element.logical_type)) {
+    // bool elements are written bit-packed, FixedSizeList{N x Flat(1)}, as pylance writes them.
+    // A struct element (fixed_size_list<struct>, W1k4) is written as pylance writes it: the struct's leaves, rows x N
+    // elements each; the struct needs fields.
+    const bool struct_element = element.supported && element.logical_type == "struct" && field.children[0]->n_children > 0;
+    if (!element.supported || (element.logical_type == "struct" && !struct_element) || element.logical_type == "null" ||
+        lance_field_is_variable_width(element.logical_type)) {
         out.rejection = std::string("fixed_size_list of '") +
                         (field.children[0]->format == nullptr ? "?" : field.children[0]->format) +
                         "' is not supported; the element must be a fixed-width number, decimal or temporal type";
@@ -483,7 +487,9 @@ bool map_field(const ArrowSchema& field,
     // A struct with no fields at all is a column of its own, as in Lance: one constant page, the
     // struct valid in every row.
     const bool empty_struct = parsed.logical_type == "struct" && field.n_children == 0;
-    const bool is_struct = (parsed.logical_type == "struct" && !empty_struct) || is_list;
+    // fixed_size_list<struct>: like a list of structs, a field with no column of its own over its "item" struct.
+    const bool fsl_struct = parsed.logical_type.rfind("fixed_size_list:struct:", 0) == 0;
+    const bool is_struct = (parsed.logical_type == "struct" && !empty_struct) || is_list || fsl_struct;
     const bool is_dictionary = field.dictionary != nullptr;
 
     LanceField out;
@@ -570,8 +576,27 @@ bool map_field(const ArrowSchema& field,
 
     mapping.fields.push_back(out);
 
-    if (is_struct) {
-        return map_struct_children(field, out.id, next_id, next_column, mapping, error);
+    if (fsl_struct && parent_id >= 0) {
+        // The leaves count rows x N entries, which the layers above (a struct's rows, a list's offsets) do not
+        // scale to yet; neither reader reads that shape back from pylance's files either.
+        error = "column '" + out.name + "': a fixed_size_list of structs inside a struct or list is not written yet";
+        return false;
+    }
+    if (is_struct && !map_struct_children(field, out.id, next_id, next_column, mapping, error)) {
+        return false;
+    }
+    if (fsl_struct) {
+        // Lance 12 cannot read a list under a fixed_size_list ("Not yet supported FSL<...List<...>>"), so it is
+        // refused rather than written.
+        const auto first_child = std::find_if(mapping.fields.begin(), mapping.fields.end(),
+                                              [&](const LanceField& f) { return f.id == out.id; });
+        for (auto it = first_child; it != mapping.fields.end(); ++it) {
+            if (it->id != out.id && lance_logical_type_is_list(it->logical_type)) {
+                error = "column '" + out.name + "': a list or map under a fixed_size_list (field '" + it->name +
+                        "') cannot be read by Lance 12 and is not written";
+                return false;
+            }
+        }
     }
     return true;
 }

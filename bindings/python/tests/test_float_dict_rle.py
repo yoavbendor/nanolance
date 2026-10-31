@@ -143,16 +143,21 @@ def test_float64_dictionary_keeps_nan_payloads_and_signed_zeros(tmp_path):
     _assert_bit_equal(lance.dataset(str(ours)).to_table(), table)
 
 
-def test_float64_with_own_codec_keeps_flat_layout(tmp_path):
-    """A float column with its own lance-encoding:compression keeps its layout (no dictionary, RLE or bitpacking)."""
+def test_float64_with_own_codec_as_pylance(tmp_path):
+    """A float column with its own lance-encoding:compression: a dictionary where one pays, its indices laid out by the
+    codec (Flat(32) under none: no RLE, no bitpacking), as pylance 12 writes it (W1r; before, nanolance kept it flat)."""
+    lance = require_pylance()
     values = _runs(50_000, 50)
     field = pa.field("x", pa.float64(), metadata={"lance-encoding:compression": "none"})
     table = pa.table({"x": pa.array(values)}, schema=pa.schema([field]))
-    ours = tmp_path / "ours.lance"
+    ours, theirs = tmp_path / "ours.lance", tmp_path / "theirs.lance"
     nl_write_dataset(table, str(ours))
+    lance.write_dataset(table, str(theirs), data_storage_version="2.2")
     layout = _layout(ours)
-    assert not any("dict=" in line or "Rle" in line or "InlineBitpacking" in line for line in layout), layout
+    assert layout == _layout(theirs)
+    assert all("values=Flat(32),dict=" in line for line in layout), layout  # indices flat under none, not RLE
     _assert_bit_equal(nl_dataset(str(ours)).to_table(), table)
+    _assert_bit_equal(lance.dataset(str(ours)).to_table(), table)
 
 
 @pytest.mark.parametrize("rows", [50_000, 1_000_000], ids=["50k", "1M"])

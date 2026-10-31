@@ -353,17 +353,13 @@ bool append_fixed_size_list(const ArrowArray& array, const LanceField& field, co
     const auto count = static_cast<std::uint64_t>(array.length) * items;
     const std::uint64_t held = element_bytes == 0U ? 0U : out.fixed.size() / element_bytes;  // elements so far
     if (child->null_count != 0 && child->buffers[0] != nullptr) {
-        // A null element of a VALID row is kept as Lance keeps it: element validity next to the
-        // values. pyarrow marks every element of a null row null as well (pa.array([None, [1, 2]],
-        // pa.list_(t, 2)) does); those are masked by the row, so they alone need no element bits.
+        // Null elements are kept as Lance keeps them: element validity next to the values, whenever the
+        // child holds a null in these rows -- a null of a valid row, and also those pyarrow puts under a null
+        // row (pa.array([None, [1, 2]], pa.list_(t, 2)) does). pylance writes FixedSizeList{..., validity}
+        // for both (measured: a list whose child has no nulls, only a row mask, gets none).
         const auto* bits = static_cast<const std::uint8_t*>(child->buffers[0]);
-        const auto* rows = static_cast<const std::uint8_t*>(array.buffers != nullptr ? array.buffers[0] : nullptr);
         bool inner_nulls = !out.item_validity.empty();
         for (std::uint64_t k = first; k < first + count && !inner_nulls; ++k) {
-            const auto row = static_cast<std::uint64_t>(array.offset) + (k - first) / items;
-            if (rows != nullptr && ((rows[row >> 3U] >> (row & 7U)) & 1U) == 0U) {
-                continue;
-            }
             inner_nulls = ((bits[k >> 3U] >> (k & 7U)) & 1U) == 0U;
         }
         if (inner_nulls && out.item_validity.empty()) {
@@ -391,6 +387,17 @@ bool append_fixed_size_list(const ArrowArray& array, const LanceField& field, co
         }
     }
     out.kind = ColumnValues::Kind::FixedWidth;
+    if (element == "bool") {
+        // Arrow's bools are bits; nanolance holds a byte an element (the writer packs them again).
+        const auto* bits = static_cast<const std::uint8_t*>(child->buffers[1]);
+        const auto base = out.fixed.size();
+        out.fixed.resize(base + static_cast<std::size_t>(count));
+        for (std::uint64_t k = 0; k < count; ++k) {
+            const auto at = first + k;
+            out.fixed[base + static_cast<std::size_t>(k)] = static_cast<std::uint8_t>((bits[at >> 3U] >> (at & 7U)) & 1U);
+        }
+        return true;
+    }
     const auto* bytes = static_cast<const std::uint8_t*>(child->buffers[1]) + first * element_bytes;
     out.fixed.insert(out.fixed.end(), bytes, bytes + count * element_bytes);
     return true;
@@ -527,6 +534,50 @@ void append_bits(std::vector<std::uint8_t>& bits, std::uint64_t& nulls, std::uin
     }
 }
 
+/// Lance's struct null pushdown (W1t): a struct with nulls passes them to its children (`pushdown_nulls()` in
+/// Lance's struct encoder), so a child is null wherever its struct is. Clears bit `have + i` of a lazily
+/// materialized bitmap for every `pushed[i]`, counting the nulls it adds.
+void apply_pushed_nulls(std::vector<std::uint8_t>& bits, std::uint64_t& nulls, std::uint64_t have,
+                        const std::vector<std::uint8_t>& pushed) {
+    const auto end = have + static_cast<std::uint64_t>(pushed.size());
+    for (std::size_t i = 0; i < pushed.size(); ++i) {
+        if (pushed[i] == 0U) {
+            continue;
+        }
+        if (bits.empty()) {  // all valid so far
+            bits.assign(static_cast<std::size_t>((end + 7U) / 8U), 0U);
+            for (std::uint64_t j = 0; j < end; ++j) {
+                bits[static_cast<std::size_t>(j >> 3U)] |= static_cast<std::uint8_t>(1U << (j & 7U));
+            }
+        }
+        const auto b = have + i;
+        auto& byte = bits[static_cast<std::size_t>(b >> 3U)];
+        const auto mask = static_cast<std::uint8_t>(1U << (b & 7U));
+        if ((byte & mask) != 0U) {
+            byte = static_cast<std::uint8_t>(byte & ~mask);
+            ++nulls;
+        }
+    }
+}
+
+/// Positions `[have, have + count)` of a lazily materialized bitmap that are null, as a 0/1 vector; empty when none is.
+std::vector<std::uint8_t> nulls_in(const std::vector<std::uint8_t>& bits, std::uint64_t have, std::int64_t count) {
+    std::vector<std::uint8_t> out;
+    if (bits.empty()) {
+        return out;
+    }
+    for (std::int64_t i = 0; i < count; ++i) {
+        const auto b = have + static_cast<std::uint64_t>(i);
+        if (((bits[static_cast<std::size_t>(b >> 3U)] >> (b & 7U)) & 1U) == 0U) {
+            if (out.empty()) {
+                out.assign(static_cast<std::size_t>(count), 0U);
+            }
+            out[static_cast<std::size_t>(i)] = 1U;
+        }
+    }
+    return out;
+}
+
 /// A leaf under one or more lists (or a map). Walks its path from the top-level column down, one
 /// layer per list or struct, recording each layer's offsets and validity for this batch's rows and
 /// narrowing to the children those rows cover; then appends the leaf values those children span.
@@ -535,7 +586,8 @@ void append_bits(std::vector<std::uint8_t>& bits, std::uint64_t& nulls, std::uin
 /// offset + the struct's physical index).
 bool walk_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, const LanceField& field, ColumnValues& out,
                  const ArrowArray*& leaf_node, std::int64_t& leaf_at, std::int64_t& leaf_count,
-                 std::vector<std::uint8_t>* ancestor_null, std::string& error) {
+                 std::vector<std::uint8_t>* ancestor_null, std::string& error,
+                 std::vector<std::uint8_t>* leaf_pushed = nullptr) {
     std::vector<const LanceField*> path;
     for (const LanceField* f = &field; f != nullptr;
          f = f->parent_id < 0 ? nullptr : find_field_by_id(mapping, f->parent_id)) {
@@ -551,6 +603,11 @@ bool walk_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, con
         out.layers.resize(path.size() - 1U);
         for (std::size_t k = 0; k + 1U < path.size(); ++k) {
             out.layers[k].is_list = lance_logical_type_is_list(path[k]->logical_type);
+            std::string element;
+            if (!lance_fixed_size_list_parts(path[k]->logical_type, element, out.layers[k].fsl_items) ||
+                element != "struct") {
+                out.layers[k].fsl_items = 0;
+            }
             if (out.layers[k].is_list) {
                 out.layers[k].offsets.push_back(0);
             }
@@ -578,9 +635,73 @@ bool walk_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, con
             masked[static_cast<std::size_t>(i)] |= ((bits[p / 8] >> (p % 8)) & 1U) == 0U ? 1U : 0U;
         }
     };
+    // Per position of the current node: whether a struct above it pushes a null down to it (W1t; only when
+    // `leaf_pushed` is asked for). Empty = none.
+    std::vector<std::uint8_t> pushed;
     for (std::size_t k = 0; k + 1U < path.size(); ++k) {
         auto& layer = out.layers[k];
+        std::string fsl_element;
+        std::uint64_t fsl_items = 0;
+        if (lance_fixed_size_list_parts(path[k]->logical_type, fsl_element, fsl_items) && fsl_element == "struct") {
+            // fixed_size_list<struct> (W1k4): a layer with no repetition that counts elements, as pylance writes it --
+            // each row's validity bit stands for its `fsl_items` elements -- over the struct child's entries.
+            if (node->n_children != 1 || node->children == nullptr || node->children[0] == nullptr || fsl_items == 0U) {
+                error = "fixed_size_list array for '" + path[k]->name + "' has no child";
+                return false;
+            }
+            const auto* rows = node->n_buffers >= 1 && node->buffers != nullptr && node->null_count != 0
+                                   ? static_cast<const std::uint8_t*>(node->buffers[0])
+                                   : nullptr;
+            const auto elements = static_cast<std::uint64_t>(count) * fsl_items;
+            const bool any_pushed = std::find(pushed.begin(), pushed.end(), std::uint8_t{1}) != pushed.end();
+            if ((rows != nullptr || any_pushed) && layer.validity.empty()) {  // the first null: all so far valid
+                layer.validity.assign(static_cast<std::size_t>((layer.length + elements + 7U) / 8U), 0U);
+                for (std::uint64_t e = 0; e < layer.length; ++e) {
+                    layer.validity[static_cast<std::size_t>(e >> 3U)] |= static_cast<std::uint8_t>(1U << (e & 7U));
+                }
+            }
+            if (!layer.validity.empty()) {
+                layer.validity.resize(static_cast<std::size_t>((layer.length + elements + 7U) / 8U), 0U);
+                for (std::int64_t i = 0; i < count; ++i) {
+                    const auto r = at + i;
+                    const bool valid = (rows == nullptr || ((rows[r / 8] >> (r % 8)) & 1U) != 0U) &&
+                                       (pushed.empty() || pushed[static_cast<std::size_t>(i)] == 0U);
+                    for (std::uint64_t e = 0; e < fsl_items; ++e) {
+                        const auto pos = layer.length + static_cast<std::uint64_t>(i) * fsl_items + e;
+                        if (valid) {
+                            layer.validity[static_cast<std::size_t>(pos >> 3U)] |= static_cast<std::uint8_t>(1U << (pos & 7U));
+                        } else {
+                            ++layer.null_count;
+                        }
+                    }
+                }
+            }
+            mask_own_nulls(*node);
+            pushed.clear();  // a fixed_size_list does not push its nulls down (Lance's fixed_size_list.rs)
+            layer.length += elements;
+            const auto* child = node->children[0];
+            if (ancestor_null != nullptr) {
+                std::vector<std::uint8_t> spread(static_cast<std::size_t>(elements), 0U);
+                for (std::size_t e = 0; e < spread.size(); ++e) {
+                    spread[e] = masked[e / static_cast<std::size_t>(fsl_items)];
+                }
+                masked = std::move(spread);
+            }
+            at = child->offset + at * static_cast<std::int64_t>(fsl_items);
+            count = static_cast<std::int64_t>(elements);
+            node = child;
+            if (at < 0 || at + count > node->offset + node->length) {
+                error = "column '" + field.name + "': a fixed_size_list points past the end of its child array";
+                return false;
+            }
+            continue;
+        }
         append_bits(layer.validity, layer.null_count, layer.length, *node, at, count);
+        if (leaf_pushed != nullptr) {
+            apply_pushed_nulls(layer.validity, layer.null_count, layer.length, pushed);
+            // A struct passes all its nulls on; a list passes none.
+            pushed = layer.is_list ? std::vector<std::uint8_t>{} : nulls_in(layer.validity, layer.length, count);
+        }
         mask_own_nulls(*node);
         layer.length += static_cast<std::uint64_t>(count);
         if (layer.is_list) {
@@ -635,6 +756,9 @@ bool walk_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, con
     leaf_node = node;
     leaf_at = at;
     leaf_count = count;
+    if (leaf_pushed != nullptr) {
+        *leaf_pushed = std::move(pushed);
+    }
     if (ancestor_null != nullptr) {
         *ancestor_null = std::move(masked);
     }
@@ -649,7 +773,8 @@ bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, c
     const ArrowArray* node = nullptr;
     std::int64_t at = 0;
     std::int64_t count = 0;
-    if (!walk_nested(batch, mapping, field, out, node, at, count, nullptr, error)) {
+    std::vector<std::uint8_t> pushed;
+    if (!walk_nested(batch, mapping, field, out, node, at, count, nullptr, error, &pushed)) {
         return false;
     }
     std::string element;
@@ -674,6 +799,7 @@ bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, c
         items_before = width == 0U ? 0U : out.fixed.size() / width;
     }
     append_bits(out.validity, out.null_count, items_before, leaf, at, count);
+    apply_pushed_nulls(out.validity, out.null_count, items_before, pushed);
     // A dictionary leaf (W1k2): its values are gathered, and its dictionary recorded, as for a top-level one.
     if (!field.dictionary_index_format.empty()) {
         return append_dictionary_values(leaf, field, out, error);
@@ -936,19 +1062,6 @@ bool append_batch_column_values(const ArrowArray& batch,
             }
             if (!append_nested(batch, mapping, field, columns[i], error)) {
                 return false;
-            }
-            if (!columns[i].item_validity.empty()) {
-                // Under a list or a struct, element validity is written as mini-block chunks (W1k2). A row of 256
-                // bytes or more is FullZip in pylance, and nanolance has no nested FullZip writer yet: refused.
-                std::string element;
-                std::uint64_t items = 0;
-                if (lance_fixed_size_list_parts(field.logical_type, element, items) &&
-                    lance_logical_type_value_bytes(element) * items >= 256U) {
-                    error = "fixed_size_list column '" + field.name +
-                            "' has null elements under a list or struct and rows of 256 bytes or more; pylance writes "
-                            "those as FullZip pages, which nanolance does not write under a list or struct yet";
-                    return false;
-                }
             }
             columns[i].rows += static_cast<std::uint64_t>(top_view.length);
             continue;

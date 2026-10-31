@@ -272,6 +272,11 @@ name**, never misread.
 
 ---
 
+## Examples
+
+- `examples/data_overlay.py`: patch a few cells of a fragment with a DataOverlay and read them back with both
+  engines (`docs/OVERLAY_BENCHMARK.md` for what it costs against `update()`, measured by `tools/bench_overlay.py`).
+
 ## Benchmarks vs pylance
 
 Numbers below are from **Ubuntu CI** (clang Release, 200k rows, best-of-5 writes / best-of-7 reads). Source: [`bench/linux-ci-results.md`](../../bench/linux-ci-results.md) (auto-updated on every push). Reproduce C++ baselines with `python tools/bench.py` from the repo root.

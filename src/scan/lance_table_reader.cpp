@@ -242,6 +242,47 @@ bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& m
             entries->flags &= ~ARROW_FLAG_NULLABLE;
             entries->children[0]->flags &= ~ARROW_FLAG_NULLABLE;
         }
+    } else if (std::string element; lance_fixed_size_list_parts(field.logical_type, element, fsl_items) &&
+                                    element == "struct") {
+        // fixed_size_list<struct> (W1k4): this one does have a child field, the struct ("item"), whose fields
+        // are the leaf columns.
+        const LanceField* child = nullptr;
+        for (const auto& candidate : mapping.fields) {
+            if (candidate.parent_id == field.id) {
+                child = &candidate;
+                break;
+            }
+        }
+        if (child == nullptr || fsl_items > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()) ||
+            ArrowSchemaSetTypeFixedSize(&schema, NANOARROW_TYPE_FIXED_SIZE_LIST, static_cast<std::int32_t>(fsl_items)) !=
+                NANOARROW_OK) {
+            error = "failed to build the fixed_size_list schema for " + field.name;
+            return false;
+        }
+        ArrowSchemaRelease(schema.children[0]);
+        if (!init_schema_from_field(*child, mapping, *schema.children[0], error, blob)) {
+            return false;
+        }
+    } else if (std::string element; lance_fixed_size_list_parts(field.logical_type, element, fsl_items) &&
+                                    element.rfind("fixed_size_list:", 0) == 0) {
+        // fixed_size_list<fixed_size_list<T, a>, b> (W1a): the outer list's child is the inner list, made from
+        // the element's logical type the same way as this one (its own child is T).
+        std::uint64_t inner_items = 0;
+        std::string inner_element;
+        if (fsl_items > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()) ||
+            !lance_fixed_size_list_parts(element, inner_element, inner_items) ||
+            ArrowSchemaSetTypeFixedSize(&schema, NANOARROW_TYPE_FIXED_SIZE_LIST, static_cast<std::int32_t>(fsl_items)) !=
+                NANOARROW_OK) {
+            error = "failed to build the fixed_size_list schema for " + field.name;
+            return false;
+        }
+        ArrowSchemaRelease(schema.children[0]);
+        LanceField inner = field;
+        inner.logical_type = element;
+        inner.name = "item";
+        if (!init_schema_from_field(inner, mapping, *schema.children[0], error, blob)) {
+            return false;
+        }
     } else if (std::string element; lance_fixed_size_list_parts(field.logical_type, element, fsl_items)) {
         // Lance's schema has no child field for a fixed_size_list -- the element type lives in the
         // logical type string -- so the Arrow child is made up here, named "item" as Arrow and
@@ -768,13 +809,17 @@ struct ColumnPlan {
     const std::vector<std::string>* dict = nullptr;
     BlobHandling blob_shape = BlobHandling::Ingest;  // Blob: the shape the batch schema asks for
     std::size_t width = 0;                   // Fixed
+    std::size_t inner_width = 0;             // FixedSizeList of FixedSizeList (W1a): the inner list's size
     FixedFmt fmt = FixedFmt::kUnsupported;   // Fixed
     /// The struct and list arrays from the top-level field down to the leaf `array`, outermost
     /// first. When the decoded column carries `layers` (a list above it, or a struct that can be
     /// null), those fill these nodes one to one.
     struct Node {
-        enum class Kind { Struct, List, LargeList } kind;
+        /// FixedSizeList (W1k4): a fixed_size_list of structs, `items` elements a row. Its elements are the
+        /// struct's leaf columns; its layer has no repetition and counts elements, so a row is `items` of them.
+        enum class Kind { Struct, List, LargeList, FixedSizeList } kind;
         ArrowArray* array;
+        std::uint64_t items = 0;
     };
     std::vector<Node> nodes;
     bool under_list() const {
@@ -874,6 +919,41 @@ bool fill_nested_nodes(ColumnPlan& plan, std::int64_t rows, std::map<ArrowArray*
                        std::string& error) {
     auto& layers = plan.values->layers;
     const auto& name = plan.field->name;
+    // A fixed_size_list node's layer counts its elements (every row's `items`): it becomes one entry a row, valid
+    // when the row's first element says so (Lance marks a null row's elements all null at that layer). Each layer
+    // above it counts elements too, so it shrinks by the same factor.
+    if (layers.size() == plan.nodes.size()) {
+        for (std::size_t k = layers.size(); k-- > 0;) {
+            const auto& node = plan.nodes[k];
+            if (node.kind != ColumnPlan::Node::Kind::FixedSizeList) {
+                continue;
+            }
+            for (std::size_t up = 0; up <= k; ++up) {
+                auto& layer = layers[up];
+                if (layer.is_list || node.items == 0U || layer.length % node.items != 0U) {
+                    error = "nested column '" + name + "': a fixed_size_list layer of " + std::to_string(layer.length) +
+                            " elements is not whole rows of " + std::to_string(node.items);
+                    return false;
+                }
+                const auto row_count = layer.length / node.items;
+                if (!layer.validity.empty()) {
+                    std::vector<std::uint8_t> bits(static_cast<std::size_t>((row_count + 7U) / 8U), 0U);
+                    std::uint64_t nulls = 0;
+                    for (std::uint64_t r = 0; r < row_count; ++r) {
+                        const auto e = r * node.items;
+                        if (((layer.validity[static_cast<std::size_t>(e >> 3U)] >> (e & 7U)) & 1U) != 0U) {
+                            bits[static_cast<std::size_t>(r >> 3U)] |= static_cast<std::uint8_t>(1U << (r & 7U));
+                        } else {
+                            ++nulls;
+                        }
+                    }
+                    layer.validity = std::move(bits);
+                    layer.null_count = nulls;
+                }
+                layer.length = row_count;
+            }
+        }
+    }
     if (layers.size() != plan.nodes.size() || layers.empty() ||
         layers.front().length != static_cast<std::uint64_t>(rows)) {
         error = "nested column '" + name + "' decoded to a different shape than its schema (" +
@@ -883,7 +963,8 @@ bool fill_nested_nodes(ColumnPlan& plan, std::int64_t rows, std::map<ArrowArray*
     for (std::size_t k = 0; k < layers.size(); ++k) {
         auto& layer = layers[k];
         const auto& node = plan.nodes[k];
-        const bool is_list = node.kind != ColumnPlan::Node::Kind::Struct;
+        const bool is_fsl = node.kind == ColumnPlan::Node::Kind::FixedSizeList;
+        const bool is_list = node.kind != ColumnPlan::Node::Kind::Struct && !is_fsl;
         if (layer.is_list != is_list || (is_list && layer.offsets.size() != layer.length + 1U)) {
             error = "nested column '" + name + "': layer " + std::to_string(k) + " does not match its schema";
             return false;
@@ -1233,9 +1314,15 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
             return false;
         }
         if (is_fsl && field->column_index < 0) {
-            // Its elements live in child columns (fixed_size_list<struct>): this reader has no path for them.
-            collect_error = "column '" + field->name + "': a " + field->logical_type + " is not read yet";
-            return false;
+            // fixed_size_list<struct> (W1k4): the elements live in the struct's leaf columns, under a layer with
+            // no repetition that counts elements; the list node is sized and made valid from it.
+            if (fsl_element != "struct" || node_schema->n_children != 1 || node_array->n_children != 1 ||
+                node_schema->children[0] == nullptr || node_array->children[0] == nullptr) {
+                collect_error = "column '" + field->name + "': a " + field->logical_type + " is not read yet";
+                return false;
+            }
+            path.push_back({ColumnPlan::Node::Kind::FixedSizeList, node_array, fsl_items});
+            return self(self, node_schema->children[0], node_array->children[0], field->id, std::move(path));
         }
         if (!is_blob && field->column_index < 0) {
             plan.kind = ColumnPlan::Kind::Skip;
@@ -1271,6 +1358,19 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
             plan.fmt = fixed_fmt_code(node_schema->children != nullptr && node_schema->n_children == 1
                                           ? node_schema->children[0]->format
                                           : "");
+            std::string inner_element;
+            std::uint64_t inner_items = 0;
+            if (fsl_element.rfind("fixed_size_list:", 0) == 0) {
+                // fixed_size_list<fixed_size_list<T, a>, b> (W1a): the values are the inner list's child.
+                if (!lance_fixed_size_list_parts(fsl_element, inner_element, inner_items) ||
+                    node_schema->n_children != 1 || node_schema->children[0]->n_children != 1 ||
+                    node_schema->children[0]->children[0] == nullptr) {
+                    collect_error = "column '" + field->name + "': a " + field->logical_type + " is not read yet";
+                    return false;
+                }
+                plan.inner_width = static_cast<std::size_t>(inner_items);
+                plan.fmt = fixed_fmt_code(node_schema->children[0]->children[0]->format);
+            }
         } else if (lance_field_is_variable_width(field->logical_type)) {
             plan.kind = ColumnPlan::Kind::Variable;
         } else {
@@ -1307,6 +1407,31 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         for (auto& plan : plans) {
             // A nested column's leaf holds ITEMS: as many as its innermost layer has children.
             std::int64_t leaf_length = length;
+            // A leaf under fixed_size_lists and structs alone, none of them ever null (W1k4): the decoder gives it
+            // no layers, so each node gets an all-valid one of the leaf's element count (fill_nested_nodes sizes
+            // the lists).
+            const bool fsl_only = !plan.nodes.empty() &&
+                                  std::all_of(plan.nodes.begin(), plan.nodes.end(), [](const ColumnPlan::Node& n) {
+                                      return n.kind == ColumnPlan::Node::Kind::Struct ||
+                                             n.kind == ColumnPlan::Node::Kind::FixedSizeList;
+                                  }) &&
+                                  std::any_of(plan.nodes.begin(), plan.nodes.end(), [](const ColumnPlan::Node& n) {
+                                      return n.kind == ColumnPlan::Node::Kind::FixedSizeList;
+                                  });
+            if (fsl_only && plan.values->layers.empty()) {
+                // Every layer counts the leaf's elements: the batch's rows times each fixed_size_list's size.
+                std::uint64_t elements = static_cast<std::uint64_t>(length);
+                for (const auto& node : plan.nodes) {
+                    if (node.kind == ColumnPlan::Node::Kind::FixedSizeList) {
+                        elements *= node.items;
+                    }
+                }
+                plan.values->layers.resize(plan.nodes.size());
+                for (auto& layer : plan.values->layers) {
+                    layer.is_list = false;
+                    layer.length = elements;
+                }
+            }
             if (!plan.values->layers.empty()) {
                 const auto& inner = plan.values->layers.back();
                 leaf_length = static_cast<std::int64_t>(inner.is_list ? static_cast<std::uint64_t>(inner.offsets.back())
@@ -1332,7 +1457,52 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
             // Validity first: nanoarrow expects buffer 0 filled before the data buffers it sizes
             // against, and both fill_* helpers set child->length/null_count at the end.
             bool ok = fill_validity(plan.array, *plan.values, leaf_length, error);
-            if (ok && plan.kind == ColumnPlan::Kind::FixedSizeList) {
+            if (ok && plan.kind == ColumnPlan::Kind::FixedSizeList && plan.inner_width != 0U) {
+                // fixed_size_list<fixed_size_list<T, a>, b> (W1a): the outer child is the inner list array, whose
+                // child holds the a*b values a row. Each level's validity is its own bitmap.
+                ArrowArray* outer = plan.array->n_children == 1 ? plan.array->children[0] : nullptr;
+                ArrowArray* leaf = outer != nullptr && outer->n_children == 1 ? outer->children[0] : nullptr;
+                std::uint64_t outer_length = 0;
+                std::uint64_t leaf_count = 0;
+                if (leaf == nullptr || !checked_mul(static_cast<std::uint64_t>(leaf_length),
+                                                    static_cast<std::uint64_t>(plan.width), outer_length) ||
+                    !checked_mul(outer_length, static_cast<std::uint64_t>(plan.inner_width), leaf_count) ||
+                    leaf_count > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+                    error = "nested fixed_size_list column has no child arrays or too many elements";
+                    ok = false;
+                } else {
+                    auto& outer_bits = plan.values->outer_item_validity;
+                    outer->null_count = 0;
+                    if (!outer_bits.empty()) {
+                        const auto expected = static_cast<std::size_t>((outer_length + 7U) / 8U);
+                        if (outer_bits.size() < expected) {
+                            error = "nested fixed_size_list outer validity covers fewer elements than the column has";
+                            ok = false;
+                        } else {
+                            outer_bits.resize(expected);
+                            ok = adopt_into_buffer(std::move(outer_bits), ArrowArrayBuffer(outer, 0), error);
+                            outer->null_count = static_cast<std::int64_t>(plan.values->outer_item_null_count);
+                        }
+                    }
+                    auto& bits = plan.values->item_validity;
+                    leaf->null_count = 0;
+                    if (ok && !bits.empty()) {
+                        const auto expected = static_cast<std::size_t>((leaf_count + 7U) / 8U);
+                        if (bits.size() < expected) {
+                            error = "nested fixed_size_list element validity covers fewer elements than the column has";
+                            ok = false;
+                        } else {
+                            bits.resize(expected);
+                            ok = adopt_into_buffer(std::move(bits), ArrowArrayBuffer(leaf, 0), error);
+                            leaf->null_count = static_cast<std::int64_t>(plan.values->item_null_count);
+                        }
+                    }
+                    ok = ok && fill_fixed_child(leaf, std::move(plan.values->fixed), static_cast<std::int64_t>(leaf_count),
+                                                plan.fmt, error);
+                    outer->length = static_cast<std::int64_t>(outer_length);
+                    plan.array->length = leaf_length;
+                }
+            } else if (ok && plan.kind == ColumnPlan::Kind::FixedSizeList) {
                 // Row-level validity sits on the list; the child carries every row's N elements,
                 // including a null row's, which is what Arrow's fixed_size_list layout requires.
                 ArrowArray* child = plan.array->n_children == 1 ? plan.array->children[0] : nullptr;
@@ -1589,7 +1759,29 @@ struct ColumnSource {
     /// Format 2.0, a leaf below a list (or a string stored as list<uint8>): the columns it needs
     /// besides its own. Null otherwise.
     std::shared_ptr<const v20::LeafContext> v20;
+    /// A leaf under fixed_size_list<struct>s and structs alone (W1k4): its elements a row, the product of the
+    /// lists' sizes. A take picks those elements for each row; 1 otherwise.
+    std::uint64_t elements_per_row = 1;
 };
+
+/// The elements a row of `field` holds when every ancestor is a struct or a fixed_size_list (their sizes
+/// multiplied); 1 when there is none, or a list above makes the count vary by row.
+std::uint64_t fixed_elements_per_row(const LanceSchemaMapping& mapping, const LanceField& field) {
+    std::uint64_t per_row = 1;
+    for (auto parent = field.parent_id; parent >= 0;) {
+        const auto* up = find_mapping_field(mapping, parent);
+        if (up == nullptr || lance_logical_type_is_list(up->logical_type)) {
+            return 1;
+        }
+        std::string element;
+        std::uint64_t items = 0;
+        if (lance_fixed_size_list_parts(up->logical_type, element, items)) {
+            per_row *= items;
+        }
+        parent = up->parent_id;
+    }
+    return per_row;
+}
 
 /// Format 2.0 gives every field a column of its own -- a struct's (which holds nothing: 2.0 structs
 /// are never null) and a list's (its offsets) as well as each leaf's. nanolance reads leaves, so
@@ -2242,16 +2434,51 @@ bool apply_fragment_overlays(const FragmentOverlays& overlays, const std::vector
         const auto& layers = it->second;
         std::vector<RowPick> picks(static_cast<std::size_t>(rows));
         bool any = false;
-        for (std::uint64_t r = 0; r < rows; ++r) {
-            const auto p = physical(r);
-            for (std::size_t l = 0; l < layers.size(); ++l) {
+        // The rows a read decodes are in ascending physical order (a morsel's range, a take's sorted rows): then
+        // each overlay's sorted offsets are merged with them once, oldest overlay first so the newest wins (layer
+        // 0). One binary search per row and overlay made a scan of a 1M-row fragment with 10 overlays 5x slower
+        // than pylance's.
+        bool ascending = true;
+        for (std::uint64_t r = 1; r < rows && ascending; ++r) {
+            ascending = physical(r - 1U) < physical(r);
+        }
+        if (ascending && rows != 0U) {
+            const auto first = physical(0);
+            const auto last = physical(rows - 1U);
+            const bool dense = last - first == rows - 1U;  // one physical range: a row is its offset's distance
+            for (std::size_t l = layers.size(); l-- > 0;) {
                 const auto& offsets = *layers[l].offsets;
-                const auto found = std::lower_bound(offsets.begin(), offsets.end(), p);
-                if (found != offsets.end() && *found == p) {
-                    picks[static_cast<std::size_t>(r)] = {static_cast<std::int32_t>(l),
-                                                          static_cast<std::uint64_t>(found - offsets.begin())};
-                    any = true;
-                    break;
+                auto at = std::lower_bound(offsets.begin(), offsets.end(), first);
+                const auto end = std::upper_bound(at, offsets.end(), last);
+                std::uint64_t r = 0;
+                for (; at != end; ++at) {
+                    // The next row at or past this offset: a jump when the rows are one physical range.
+                    if (dense) {
+                        r = *at - first;
+                    } else {
+                        while (r < rows && physical(r) < *at) {
+                            ++r;
+                        }
+                    }
+                    if (r < rows && physical(r) == *at) {
+                        picks[static_cast<std::size_t>(r)] = {static_cast<std::int32_t>(l),
+                                                              static_cast<std::uint64_t>(at - offsets.begin())};
+                        any = true;
+                    }
+                }
+            }
+        } else {
+            for (std::uint64_t r = 0; r < rows; ++r) {
+                const auto p = physical(r);
+                for (std::size_t l = 0; l < layers.size(); ++l) {
+                    const auto& offsets = *layers[l].offsets;
+                    const auto found = std::lower_bound(offsets.begin(), offsets.end(), p);
+                    if (found != offsets.end() && *found == p) {
+                        picks[static_cast<std::size_t>(r)] = {static_cast<std::int32_t>(l),
+                                                              static_cast<std::uint64_t>(found - offsets.begin())};
+                        any = true;
+                        break;
+                    }
                 }
             }
         }
@@ -2406,6 +2633,9 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
                 !v20_leaf_context(mapping, *field, column_of, open.columns, column_index, source.v20, error)) {
                 return false;
             }
+            if (!v20_file && field != nullptr) {
+                source.elements_per_row = fixed_elements_per_row(mapping, *field);
+            }
             for (const auto& page : source.metadata->pages) {
                 for (const auto size : page.buffer_sizes) {
                     source.encoded_bytes += size;
@@ -2509,8 +2739,10 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
         } else if (whole) {
             decode_lance_physical_column(io, *c.on_disk, *c.metadata, decoded[t], errors[t]);
         } else {
-            decode_lance_physical_column_range(io, *c.on_disk, *c.metadata, morsel.first,
-                                               morsel.second - morsel.first, c.value_bytes, decoded[t], errors[t]);
+            // A leaf under fixed_size_list<struct>s holds elements_per_row elements a row (W1k4).
+            decode_lance_physical_column_range(io, *c.on_disk, *c.metadata, morsel.first * c.elements_per_row,
+                                               (morsel.second - morsel.first) * c.elements_per_row, c.value_bytes,
+                                               decoded[t], errors[t]);
         }
     });
     for (const auto& e : errors) {
@@ -2798,6 +3030,9 @@ bool decode_data_file_rows(const std::filesystem::path& dataset_path, const Plan
                 !v20_leaf_context(mapping, *field, column_of, column_metadatas, column_index, source.v20, error)) {
                 return false;
             }
+            if (!v20_file && field != nullptr) {
+                source.elements_per_row = fixed_elements_per_row(mapping, *field);
+            }
             columns.push_back(std::move(source));
         }
     }
@@ -2809,6 +3044,17 @@ bool decode_data_file_rows(const std::filesystem::path& dataset_path, const Plan
         if (source.v20 != nullptr) {
             v20::decode_column_rows(io, *source.on_disk, *source.metadata, source.v20.get(), physical,
                                     source.value_bytes, decoded[c], errors[c]);
+        } else if (source.elements_per_row > 1U) {
+            // Each picked row is its elements in the leaf column (W1k4).
+            std::vector<std::uint64_t> elements;
+            elements.reserve(physical.size() * source.elements_per_row);
+            for (const auto row : physical) {
+                for (std::uint64_t e = 0; e < source.elements_per_row; ++e) {
+                    elements.push_back(row * source.elements_per_row + e);
+                }
+            }
+            decode_lance_physical_column_rows(io, *source.on_disk, *source.metadata, elements,
+                                              source.value_bytes, decoded[c], errors[c]);
         } else {
             decode_lance_physical_column_rows(io, *source.on_disk, *source.metadata, physical,
                                               source.value_bytes, decoded[c], errors[c]);

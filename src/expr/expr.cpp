@@ -3549,6 +3549,87 @@ void set_nulls(const ArrowArrayView& v, int64_t n, std::vector<std::uint8_t>& st
     }
 }
 
+/// An integer literal as int64: Int, or UInt that fits. False otherwise.
+bool fast_int_literal(const Value& v, std::int64_t& out) {
+    if (v.kind == Kind::Int) {
+        out = v.i;
+        return true;
+    }
+    if (v.kind == Kind::UInt && v.u <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+        out = static_cast<std::int64_t>(v.u);
+        return true;
+    }
+    return false;
+}
+
+/// `(column op literal) cmp literal` (or the literal first on either side) over an integer column, as eval()
+/// computes it row by row: int64, wrapping + - *, truncating / and %. False -- the per-row path -- for anything
+/// else: a float or decimal, a uint64 column, a zero or -1 divisor (an error, or MIN / -1), a column divisor. A
+/// filter such as `id % 100 = 0` took 7x pylance's time in the per-row path.
+bool fast_arith_compare(const Node& n, const ArrowArrayView& batch, int64_t length, std::vector<std::uint8_t>& out) {
+    const bool arith_left = n.args[0]->op != Op::Literal && n.args[1]->op == Op::Literal;
+    const bool arith_right = n.args[1]->op != Op::Literal && n.args[0]->op == Op::Literal;
+    if (!arith_left && !arith_right) {
+        return false;
+    }
+    const Node& a = arith_left ? *n.args[0] : *n.args[1];
+    std::int64_t c = 0;
+    if (!fast_int_literal((arith_left ? n.args[1] : n.args[0])->literal, c)) {
+        return false;
+    }
+    if (a.op != Op::Add && a.op != Op::Sub && a.op != Op::Mul && a.op != Op::Div && a.op != Op::Mod) {
+        return false;
+    }
+    const bool col_first = a.args[0]->op == Op::Column && a.args[1]->op == Op::Literal;
+    const bool col_second = a.args[1]->op == Op::Column && a.args[0]->op == Op::Literal;
+    if (!col_first && !col_second) {
+        return false;
+    }
+    const Node& col = col_first ? *a.args[0] : *a.args[1];
+    std::int64_t k = 0;
+    if (!fast_int_literal((col_first ? a.args[1] : a.args[0])->literal, k)) {
+        return false;
+    }
+    switch (col.column.type) {
+        case NANOARROW_TYPE_INT8:
+        case NANOARROW_TYPE_INT16:
+        case NANOARROW_TYPE_INT32:
+        case NANOARROW_TYPE_INT64:
+        case NANOARROW_TYPE_UINT8:
+        case NANOARROW_TYPE_UINT16:
+        case NANOARROW_TYPE_UINT32:
+            break;
+        default:
+            return false;
+    }
+    if ((a.op == Op::Div || a.op == Op::Mod) && (!col_first || k == 0 || k == -1)) {
+        return false;
+    }
+    const auto* v = fast_column(col, batch);
+    if (v == nullptr) {
+        return false;
+    }
+    const Op op = arith_left ? n.op : flip(n.op);
+    const auto rows = static_cast<std::size_t>(length);
+    out.resize(rows);
+    for (std::size_t r = 0; r < rows; ++r) {
+        const std::int64_t x = ArrowArrayViewGetIntUnsafe(v, static_cast<int64_t>(r));
+        const auto ux = static_cast<std::uint64_t>(x);
+        const auto uk = static_cast<std::uint64_t>(k);
+        std::int64_t y = 0;
+        switch (a.op) {
+            case Op::Add: y = static_cast<std::int64_t>(ux + uk); break;
+            case Op::Sub: y = static_cast<std::int64_t>(col_first ? ux - uk : uk - ux); break;
+            case Op::Mul: y = static_cast<std::int64_t>(ux * uk); break;
+            case Op::Div: y = x / k; break;
+            default: y = x % k; break;
+        }
+        out[r] = wanted(op, y < c ? -1 : (y > c ? 1 : 0)) ? kTrue : kFalse;
+    }
+    set_nulls(*v, length, out);
+    return true;
+}
+
 bool fast_eval(const Node& n, const ArrowArrayView& batch, int64_t length, std::vector<std::uint8_t>& out) {
     const auto rows = static_cast<std::size_t>(length);
     switch (n.op) {
@@ -3601,7 +3682,7 @@ bool fast_eval(const Node& n, const ArrowArrayView& batch, int64_t length, std::
             const bool left = n.args[0]->op == Op::Column && n.args[1]->op == Op::Literal;
             const bool right = n.args[1]->op == Op::Column && n.args[0]->op == Op::Literal;
             if (!left && !right) {
-                return false;
+                return fast_arith_compare(n, batch, length, out);
             }
             const Node& col = left ? *n.args[0] : *n.args[1];
             const Value& lit = (left ? n.args[1] : n.args[0])->literal;
@@ -4221,9 +4302,9 @@ bool decimal_operand(const TypedNode& n, const TypedNode& other, DecType& out) {
         out = DecType{n.dp, n.ds};
         return true;
     }
-    // An integer column, or an integer literal that did not take a decimal's type: decimal(p, 0).
-    if ((n.shape != TypedNode::Shape::Column && n.shape != TypedNode::Shape::Constant &&
-         n.shape != TypedNode::Shape::Cast) || !num_is_int(n.type)) {
+    // Any integer operand -- a column, a literal that did not take a decimal's type, a cast, or an integer expression
+    // (`dec + i32 * 2`) -- is DataFusion's decimal(p, 0) for its type.
+    if (n.dbl || !num_is_int(n.type)) {
         return false;
     }
     out = DecType{int_precision(n.type), 0};
@@ -4288,8 +4369,71 @@ bool cast_num_target(const std::string& name, NumType& t) {
     return false;
 }
 
-bool build_operand(const Node& n, const Node& other, bool narrow, TypedPtr& out, std::string& error) {
+/// Lance's `resolve_expr` (lance-datafusion logical_expr.rs), run once over a projection before DataFusion types it:
+/// in `a op b` (AND / OR recurse into both sides) with `a` a column, a literal `b` takes a's type, and so does every
+/// literal of a binary `b`, at any depth (`coerce_expr`); with `b` a column, a literal `a` takes b's type. Nothing
+/// else is resolved: every other literal keeps DataFusion's own type (Int64, UInt64, Float64), so
+/// `dec + i32 * 2` types the 2 as dec's decimal while `(dec + 1) * 2` types both as Int64 (measured on pylance 12).
+/// Maps each resolved literal to the column whose type it takes.
+using LiteralTargets = std::unordered_map<const Node*, const Node*>;
+
+bool is_binary(const Node& n) {
+    switch (n.op) {
+        case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+        case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
+            return n.args.size() == 2;
+        default:
+            return false;
+    }
+}
+
+void coerce_literals_to(const Node& n, const Node& column, LiteralTargets& targets) {
+    if (n.op == Op::Literal) {
+        targets[&n] = &column;
+    } else if (is_binary(n)) {
+        coerce_literals_to(*n.args[0], column, targets);
+        coerce_literals_to(*n.args[1], column, targets);
+    }
+}
+
+void resolve_literals(const Node& n, LiteralTargets& targets) {
+    if ((n.op == Op::And || n.op == Op::Or) && n.args.size() == 2) {
+        resolve_literals(*n.args[0], targets);
+        resolve_literals(*n.args[1], targets);
+        return;
+    }
+    if (!is_binary(n)) {
+        return;
+    }
+    const Node& left = *n.args[0];
+    const Node& right = *n.args[1];
+    if (left.op == Op::Column) {
+        if (right.op == Op::Literal) {
+            targets[&right] = &left;
+        } else if (is_binary(right)) {
+            coerce_literals_to(*right.args[0], left, targets);
+            coerce_literals_to(*right.args[1], left, targets);
+        }
+    } else if (right.op == Op::Column && left.op == Op::Literal) {
+        targets[&left] = &right;
+    }
+}
+
+/// The projection being typed: its resolved literals (set by build_projection for the duration of the build).
+thread_local const LiteralTargets* t_literal_targets = nullptr;
+
+bool build_operand(const Node& n, const Node& /*other*/, bool /*narrow*/, TypedPtr& out, std::string& error) {
     if (n.op == Op::Literal && n.literal.kind != Kind::Decimal) {
+        const Node* target = nullptr;
+        if (t_literal_targets != nullptr) {
+            if (const auto it = t_literal_targets->find(&n); it != t_literal_targets->end()) {
+                target = it->second;
+            }
+        }
+        if (target == nullptr) {
+            return build_literal(n, std::nullopt, out, error);  // DataFusion's own literal type
+        }
+        const Node& other = *target;
         DecType dt{};
         if (decimal_of(other, dt) && other.op == Op::Column) {
             if (n.literal.kind == Kind::Double) {
@@ -4300,7 +4444,7 @@ bool build_operand(const Node& n, const Node& other, bool narrow, TypedPtr& out,
             }
             return build_decimal_literal(n, dt, out, error);
         }
-        return build_literal(n, narrow ? numeric_column(other) : std::nullopt, out, error);
+        return build_literal(n, numeric_column(other), out, error);
     }
     return build_typed(n, out, error);
 }
@@ -4352,9 +4496,7 @@ bool build_typed(const Node& n, TypedPtr& out, std::string& error, bool root) {
             bool decimal = false;
             const NumType t = common_num(a->type, b->type, decimal);
             if (decimal) {
-                if (!root) {
-                    return false;  // a nested u64 with a signed int keeps the caller's typing
-                }
+                // A u64 with a signed int is decimal at any depth (`u + (i8 + 1)` is decimal(22, 0) in pylance 12).
                 return build_decimal_arith(n.op, a, b, out, error);
             }
             out = std::make_unique<TypedNode>();
@@ -4508,7 +4650,12 @@ bool build_projection(const Node& root, TypedPtr& typed, std::string& error) {
     if (!numeric_root) {
         return false;
     }
-    if (!build_typed(root, typed, error, true)) {
+    LiteralTargets targets;
+    resolve_literals(root, targets);
+    t_literal_targets = &targets;
+    const bool built = build_typed(root, typed, error, true);
+    t_literal_targets = nullptr;
+    if (!built) {
         typed.reset();
         return false;
     }

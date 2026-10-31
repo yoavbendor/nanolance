@@ -126,3 +126,17 @@ def test_compaction_keeps_the_overlaid_values(lance, tmp_path):
     before = ds.to_table().to_pydict()
     ds.optimize.compact_files(target_rows_per_fragment=100)
     assert ds.to_table().to_pydict() == before == lance.dataset(path).to_table().to_pydict()
+
+
+def test_example_runs(lance, tmp_path):
+    """examples/data_overlay.py: patches three cells with an overlay and both engines read them back."""
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "data_overlay_example", Path(__file__).resolve().parents[1] / "examples" / "data_overlay.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    path = str(tmp_path / "demo.lance")
+    module.main(path)
+    assert lance.dataset(path).to_table().column("price").to_pylist() == [0, 10, 999, 30, 40, 555, 60, 777, 80, 90]
