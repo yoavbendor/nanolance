@@ -4302,9 +4302,9 @@ bool decimal_operand(const TypedNode& n, const TypedNode& other, DecType& out) {
         out = DecType{n.dp, n.ds};
         return true;
     }
-    // An integer column, or an integer literal that did not take a decimal's type: decimal(p, 0).
-    if ((n.shape != TypedNode::Shape::Column && n.shape != TypedNode::Shape::Constant &&
-         n.shape != TypedNode::Shape::Cast) || !num_is_int(n.type)) {
+    // Any integer operand -- a column, a literal that did not take a decimal's type, a cast, or an integer expression
+    // (`dec + i32 * 2`) -- is DataFusion's decimal(p, 0) for its type.
+    if (n.dbl || !num_is_int(n.type)) {
         return false;
     }
     out = DecType{int_precision(n.type), 0};
@@ -4369,8 +4369,71 @@ bool cast_num_target(const std::string& name, NumType& t) {
     return false;
 }
 
-bool build_operand(const Node& n, const Node& other, bool narrow, TypedPtr& out, std::string& error) {
+/// Lance's `resolve_expr` (lance-datafusion logical_expr.rs), run once over a projection before DataFusion types it:
+/// in `a op b` (AND / OR recurse into both sides) with `a` a column, a literal `b` takes a's type, and so does every
+/// literal of a binary `b`, at any depth (`coerce_expr`); with `b` a column, a literal `a` takes b's type. Nothing
+/// else is resolved: every other literal keeps DataFusion's own type (Int64, UInt64, Float64), so
+/// `dec + i32 * 2` types the 2 as dec's decimal while `(dec + 1) * 2` types both as Int64 (measured on pylance 12).
+/// Maps each resolved literal to the column whose type it takes.
+using LiteralTargets = std::unordered_map<const Node*, const Node*>;
+
+bool is_binary(const Node& n) {
+    switch (n.op) {
+        case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+        case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge:
+            return n.args.size() == 2;
+        default:
+            return false;
+    }
+}
+
+void coerce_literals_to(const Node& n, const Node& column, LiteralTargets& targets) {
+    if (n.op == Op::Literal) {
+        targets[&n] = &column;
+    } else if (is_binary(n)) {
+        coerce_literals_to(*n.args[0], column, targets);
+        coerce_literals_to(*n.args[1], column, targets);
+    }
+}
+
+void resolve_literals(const Node& n, LiteralTargets& targets) {
+    if ((n.op == Op::And || n.op == Op::Or) && n.args.size() == 2) {
+        resolve_literals(*n.args[0], targets);
+        resolve_literals(*n.args[1], targets);
+        return;
+    }
+    if (!is_binary(n)) {
+        return;
+    }
+    const Node& left = *n.args[0];
+    const Node& right = *n.args[1];
+    if (left.op == Op::Column) {
+        if (right.op == Op::Literal) {
+            targets[&right] = &left;
+        } else if (is_binary(right)) {
+            coerce_literals_to(*right.args[0], left, targets);
+            coerce_literals_to(*right.args[1], left, targets);
+        }
+    } else if (right.op == Op::Column && left.op == Op::Literal) {
+        targets[&left] = &right;
+    }
+}
+
+/// The projection being typed: its resolved literals (set by build_projection for the duration of the build).
+thread_local const LiteralTargets* t_literal_targets = nullptr;
+
+bool build_operand(const Node& n, const Node& /*other*/, bool /*narrow*/, TypedPtr& out, std::string& error) {
     if (n.op == Op::Literal && n.literal.kind != Kind::Decimal) {
+        const Node* target = nullptr;
+        if (t_literal_targets != nullptr) {
+            if (const auto it = t_literal_targets->find(&n); it != t_literal_targets->end()) {
+                target = it->second;
+            }
+        }
+        if (target == nullptr) {
+            return build_literal(n, std::nullopt, out, error);  // DataFusion's own literal type
+        }
+        const Node& other = *target;
         DecType dt{};
         if (decimal_of(other, dt) && other.op == Op::Column) {
             if (n.literal.kind == Kind::Double) {
@@ -4381,7 +4444,7 @@ bool build_operand(const Node& n, const Node& other, bool narrow, TypedPtr& out,
             }
             return build_decimal_literal(n, dt, out, error);
         }
-        return build_literal(n, narrow ? numeric_column(other) : std::nullopt, out, error);
+        return build_literal(n, numeric_column(other), out, error);
     }
     return build_typed(n, out, error);
 }
@@ -4433,9 +4496,7 @@ bool build_typed(const Node& n, TypedPtr& out, std::string& error, bool root) {
             bool decimal = false;
             const NumType t = common_num(a->type, b->type, decimal);
             if (decimal) {
-                if (!root) {
-                    return false;  // a nested u64 with a signed int keeps the caller's typing
-                }
+                // A u64 with a signed int is decimal at any depth (`u + (i8 + 1)` is decimal(22, 0) in pylance 12).
                 return build_decimal_arith(n.op, a, b, out, error);
             }
             out = std::make_unique<TypedNode>();
@@ -4589,7 +4650,12 @@ bool build_projection(const Node& root, TypedPtr& typed, std::string& error) {
     if (!numeric_root) {
         return false;
     }
-    if (!build_typed(root, typed, error, true)) {
+    LiteralTargets targets;
+    resolve_literals(root, targets);
+    t_literal_targets = &targets;
+    const bool built = build_typed(root, typed, error, true);
+    t_literal_targets = nullptr;
+    if (!built) {
         typed.reset();
         return false;
     }

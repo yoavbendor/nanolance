@@ -201,8 +201,11 @@ unit), ts +/- dur, d32 - d32 (int64 days), and pylance's texts for d32 +/- dur, 
 Mixed-unit duration arithmetic refused (decision 3). Phase C is done; C1's two xfails pass. Left:
 `ts - arrow_cast(ts, 'Timestamp(Millisecond)')` (the parser drops the unit), arrow_cast of a column
 to Duration, `coalesce(ts, ts_ms)` (pylance: the coarser unit), `d32 - ts`, duration overflow not
-measured, float-to-decimal rounding goes through `%.15f` text (matched every measured case), and
-C2's `dec + i32 * 1`. A filter with `arrow_cast(column, 'Decimal128(..)')` is still refused, now on
+measured, and float-to-decimal rounding goes through `%.15f` text (matched every measured case).
+C2's `dec + i32 * 1` is done (2026-10-31): projections resolve literals as Lance's `resolve_expr` does --
+only `col op lit`, every literal of `col op (..)`, and `lit op col`; every other literal keeps DataFusion's
+Int64 -- an integer expression beside a decimal is decimal(p, 0) for its type, and a u64 with a signed int
+is decimal at any depth (`test_decimal_with_nested_integer_arithmetic_equals_pylance`, 28 shapes). A filter with `arrow_cast(column, 'Decimal128(..)')` is still refused, now on
 evaluation (an empty dataset returns no rows instead of the error).
 
 ## 3. Oracles
