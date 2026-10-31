@@ -625,6 +625,26 @@ bool gather_leaf_runs(const ColumnValues& src, const RowRuns& runs, std::uint64_
             out.item_validity = std::move(bitmap);
         }
     }
+    if (src.outer_items_per_row != 0U && !src.outer_item_validity.empty()) {
+        // fixed_size_list<fixed_size_list> (W1a): the outer list's element validity, the same way.
+        const auto per_row = src.outer_items_per_row;
+        out.outer_items_per_row = per_row;
+        if (src.outer_item_validity.size() < bitmap_bytes(total * per_row)) {
+            error = "outer element validity bitmap covers fewer elements than the column claims";
+            return false;
+        }
+        std::vector<std::uint8_t> bitmap(bitmap_bytes(count * per_row), 0U);
+        std::uint64_t dst = 0;
+        for (const auto& [b, e] : runs) {
+            out.outer_item_null_count += copy_bits(src.outer_item_validity, b * per_row, (e - b) * per_row, bitmap, dst);
+            dst += (e - b) * per_row;
+        }
+        if (out.outer_item_null_count != 0U) {
+            out.outer_item_validity = std::move(bitmap);
+        }
+    } else if (src.outer_items_per_row != 0U) {
+        out.outer_items_per_row = src.outer_items_per_row;
+    }
     if (src.kind == ColumnValues::Kind::FixedWidth) {
         if (src.fixed_size() != 0U && (value_bytes == 0U || src.fixed_size() / value_bytes < total)) {
             error = "fixed-width buffer is shorter than the rows the column claims";

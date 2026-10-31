@@ -263,6 +263,26 @@ bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& m
         if (!init_schema_from_field(*child, mapping, *schema.children[0], error, blob)) {
             return false;
         }
+    } else if (std::string element; lance_fixed_size_list_parts(field.logical_type, element, fsl_items) &&
+                                    element.rfind("fixed_size_list:", 0) == 0) {
+        // fixed_size_list<fixed_size_list<T, a>, b> (W1a): the outer list's child is the inner list, made from
+        // the element's logical type the same way as this one (its own child is T).
+        std::uint64_t inner_items = 0;
+        std::string inner_element;
+        if (fsl_items > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()) ||
+            !lance_fixed_size_list_parts(element, inner_element, inner_items) ||
+            ArrowSchemaSetTypeFixedSize(&schema, NANOARROW_TYPE_FIXED_SIZE_LIST, static_cast<std::int32_t>(fsl_items)) !=
+                NANOARROW_OK) {
+            error = "failed to build the fixed_size_list schema for " + field.name;
+            return false;
+        }
+        ArrowSchemaRelease(schema.children[0]);
+        LanceField inner = field;
+        inner.logical_type = element;
+        inner.name = "item";
+        if (!init_schema_from_field(inner, mapping, *schema.children[0], error, blob)) {
+            return false;
+        }
     } else if (std::string element; lance_fixed_size_list_parts(field.logical_type, element, fsl_items)) {
         // Lance's schema has no child field for a fixed_size_list -- the element type lives in the
         // logical type string -- so the Arrow child is made up here, named "item" as Arrow and
@@ -789,6 +809,7 @@ struct ColumnPlan {
     const std::vector<std::string>* dict = nullptr;
     BlobHandling blob_shape = BlobHandling::Ingest;  // Blob: the shape the batch schema asks for
     std::size_t width = 0;                   // Fixed
+    std::size_t inner_width = 0;             // FixedSizeList of FixedSizeList (W1a): the inner list's size
     FixedFmt fmt = FixedFmt::kUnsupported;   // Fixed
     /// The struct and list arrays from the top-level field down to the leaf `array`, outermost
     /// first. When the decoded column carries `layers` (a list above it, or a struct that can be
@@ -1337,6 +1358,19 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
             plan.fmt = fixed_fmt_code(node_schema->children != nullptr && node_schema->n_children == 1
                                           ? node_schema->children[0]->format
                                           : "");
+            std::string inner_element;
+            std::uint64_t inner_items = 0;
+            if (fsl_element.rfind("fixed_size_list:", 0) == 0) {
+                // fixed_size_list<fixed_size_list<T, a>, b> (W1a): the values are the inner list's child.
+                if (!lance_fixed_size_list_parts(fsl_element, inner_element, inner_items) ||
+                    node_schema->n_children != 1 || node_schema->children[0]->n_children != 1 ||
+                    node_schema->children[0]->children[0] == nullptr) {
+                    collect_error = "column '" + field->name + "': a " + field->logical_type + " is not read yet";
+                    return false;
+                }
+                plan.inner_width = static_cast<std::size_t>(inner_items);
+                plan.fmt = fixed_fmt_code(node_schema->children[0]->children[0]->format);
+            }
         } else if (lance_field_is_variable_width(field->logical_type)) {
             plan.kind = ColumnPlan::Kind::Variable;
         } else {
@@ -1423,7 +1457,52 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
             // Validity first: nanoarrow expects buffer 0 filled before the data buffers it sizes
             // against, and both fill_* helpers set child->length/null_count at the end.
             bool ok = fill_validity(plan.array, *plan.values, leaf_length, error);
-            if (ok && plan.kind == ColumnPlan::Kind::FixedSizeList) {
+            if (ok && plan.kind == ColumnPlan::Kind::FixedSizeList && plan.inner_width != 0U) {
+                // fixed_size_list<fixed_size_list<T, a>, b> (W1a): the outer child is the inner list array, whose
+                // child holds the a*b values a row. Each level's validity is its own bitmap.
+                ArrowArray* outer = plan.array->n_children == 1 ? plan.array->children[0] : nullptr;
+                ArrowArray* leaf = outer != nullptr && outer->n_children == 1 ? outer->children[0] : nullptr;
+                std::uint64_t outer_length = 0;
+                std::uint64_t leaf_count = 0;
+                if (leaf == nullptr || !checked_mul(static_cast<std::uint64_t>(leaf_length),
+                                                    static_cast<std::uint64_t>(plan.width), outer_length) ||
+                    !checked_mul(outer_length, static_cast<std::uint64_t>(plan.inner_width), leaf_count) ||
+                    leaf_count > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+                    error = "nested fixed_size_list column has no child arrays or too many elements";
+                    ok = false;
+                } else {
+                    auto& outer_bits = plan.values->outer_item_validity;
+                    outer->null_count = 0;
+                    if (!outer_bits.empty()) {
+                        const auto expected = static_cast<std::size_t>((outer_length + 7U) / 8U);
+                        if (outer_bits.size() < expected) {
+                            error = "nested fixed_size_list outer validity covers fewer elements than the column has";
+                            ok = false;
+                        } else {
+                            outer_bits.resize(expected);
+                            ok = adopt_into_buffer(std::move(outer_bits), ArrowArrayBuffer(outer, 0), error);
+                            outer->null_count = static_cast<std::int64_t>(plan.values->outer_item_null_count);
+                        }
+                    }
+                    auto& bits = plan.values->item_validity;
+                    leaf->null_count = 0;
+                    if (ok && !bits.empty()) {
+                        const auto expected = static_cast<std::size_t>((leaf_count + 7U) / 8U);
+                        if (bits.size() < expected) {
+                            error = "nested fixed_size_list element validity covers fewer elements than the column has";
+                            ok = false;
+                        } else {
+                            bits.resize(expected);
+                            ok = adopt_into_buffer(std::move(bits), ArrowArrayBuffer(leaf, 0), error);
+                            leaf->null_count = static_cast<std::int64_t>(plan.values->item_null_count);
+                        }
+                    }
+                    ok = ok && fill_fixed_child(leaf, std::move(plan.values->fixed), static_cast<std::int64_t>(leaf_count),
+                                                plan.fmt, error);
+                    outer->length = static_cast<std::int64_t>(outer_length);
+                    plan.array->length = leaf_length;
+                }
+            } else if (ok && plan.kind == ColumnPlan::Kind::FixedSizeList) {
                 // Row-level validity sits on the list; the child carries every row's N elements,
                 // including a null row's, which is what Arrow's fixed_size_list layout requires.
                 ArrowArray* child = plan.array->n_children == 1 ? plan.array->children[0] : nullptr;

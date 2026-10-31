@@ -101,6 +101,13 @@ struct ColumnValues {
     std::vector<std::uint8_t> item_validity;
     std::uint64_t item_null_count = 0;
     std::uint64_t items_per_row = 0;
+    /// fixed_size_list<fixed_size_list<T, a>, b> only (W1a): `items_per_row` is then a*b, the LEAF values a row
+    /// (and `item_validity` their validity), and these describe the outer level. `outer_items_per_row` is b, the
+    /// inner lists a row; `outer_item_validity` holds one bit each for them, LSB-first, `outer_items_per_row`
+    /// bits a row, and is empty when none is null. Zero `outer_items_per_row` means no outer level.
+    std::vector<std::uint8_t> outer_item_validity;
+    std::uint64_t outer_item_null_count = 0;
+    std::uint64_t outer_items_per_row = 0;
 
     /// An Arrow dictionary column's dictionary, as stored: each entry's bytes (a fixed-width value,
     /// or a string's bytes), in order. Read: the pages' dictionaries, unused entries included; write:
