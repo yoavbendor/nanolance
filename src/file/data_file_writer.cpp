@@ -1245,8 +1245,10 @@ std::int64_t variable_offset(const ColumnValues& values, std::uint64_t i) {
 /// time of a high-cardinality column for no measurable gain in size. Declines (false) below Lance's
 /// thresholds -- under 32 KiB of strings, or none longer than 4 bytes -- or when nothing is learned.
 bool train_column_fsst(const LanceField& field, const ColumnValues& values, fsst::Encoder& encoder) {
+    // Lance's DataSize stat for a variable-width block counts its data AND its offsets (`data.len() +
+    // offsets.len()`), so FSST starts below 32 KiB of string bytes.
     if (!fsst_applies_to(field) || values.kind != ColumnValues::Kind::VariableWidth ||
-        values.variable.data.size() < kFsstMinBytes) {
+        values.variable.data.size() + values.variable.offsets.size() < kFsstMinBytes) {
         return false;
     }
     const auto count = values.variable.offsets.size() / (values.variable.large ? 8U : 4U);
@@ -1750,15 +1752,21 @@ bool write_nested_column(std::ostream& out, const LanceField& field, const Colum
     std::size_t page_bytes = kMaxValueBytes;
     repdef::Serialized ser;
     NestedPageBuffers built;
+    // Under fixed_size_list<struct>s a row is `unit` entries, and a page holds whole rows: cut mid-row, Lance reads
+    // a short list ("Incorrect length of values buffer for FixedSizeListArray").
+    std::uint64_t unit = 1U;
+    for (const auto& layer : values.layers) {
+        unit *= std::max<std::uint64_t>(1U, layer.fsl_items);
+    }
     while (row < rows) {
-        const auto n = std::min(try_rows, rows - row);
+        const auto n = std::max(unit, std::min(try_rows, rows - row) / unit * unit);
         if (!serialize_rows(row, n, ser)) {
             error = "column '" + field.name + "': " + error;
             return false;
         }
         pb::ColumnPage page;
         page.length = n;
-        page.priority = row;
+        page.priority = row / unit;  // a top-level row number: Lance does not scale it by the lists' sizes
         if (ser.items.empty()) {
             // No values at all -- every list empty or null. Lance writes a ConstantLayout with no
             // value and the levels as raw u16 buffers [rep, def]; so does this.
@@ -1786,8 +1794,8 @@ bool write_nested_column(std::ostream& out, const LanceField& field, const Colum
             if (bytes_per_row >= kLargeRowBytes) {
                 page_bytes = kLargeRowPageBytes;
             }
-            if (too_big || (built.payload.size() > page_bytes && n > 1U)) {
-                if (n == 1U) {
+            if (too_big || (built.payload.size() > page_bytes && n > unit)) {
+                if (n <= unit) {
                     error = "column '" + field.name + "': row " + std::to_string(row) +
                             " holds more list entries than one page chunk can describe";
                     return false;
@@ -3489,7 +3497,9 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
                    std::vector<pb::ColumnMetadata>& columns, std::string& error) {
     const auto& field = *state.physical_fields[field_index];
     const auto& values = *state.column_source[field_index];
-    const auto rows = state.rows;
+    // A nested leaf counts its entries by its first layer: the file's rows, or (under fixed_size_list<struct>s, W1k4)
+    // rows x the lists' sizes, as pylance's pages count them.
+    const auto rows = values.layers.empty() ? state.rows : values.layers.front().length;
     const bool compress = state.compress;
     int compression_level = state.compression_level;
 

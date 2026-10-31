@@ -118,6 +118,9 @@ struct ColumnValues {
         std::vector<std::uint8_t> validity;  // LSB-first; empty when no entry is null
         std::uint64_t null_count = 0;
         std::uint64_t length = 0;
+        // A fixed_size_list<struct> layer (W1k4): N, the elements a row holds. Its entries -- `length`, `validity`
+        // -- are then elements, each row's validity bit repeated N times, as Lance's FSL layer counts them.
+        std::uint64_t fsl_items = 0;
     };
     std::vector<NestedLayer> layers;
     /// Does this column need nested pages (repetition/definition levels per layer)? Only a list, or a

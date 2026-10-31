@@ -558,6 +558,11 @@ bool walk_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, con
         out.layers.resize(path.size() - 1U);
         for (std::size_t k = 0; k + 1U < path.size(); ++k) {
             out.layers[k].is_list = lance_logical_type_is_list(path[k]->logical_type);
+            std::string element;
+            if (!lance_fixed_size_list_parts(path[k]->logical_type, element, out.layers[k].fsl_items) ||
+                element != "struct") {
+                out.layers[k].fsl_items = 0;
+            }
             if (out.layers[k].is_list) {
                 out.layers[k].offsets.push_back(0);
             }
@@ -587,6 +592,59 @@ bool walk_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, con
     };
     for (std::size_t k = 0; k + 1U < path.size(); ++k) {
         auto& layer = out.layers[k];
+        std::string fsl_element;
+        std::uint64_t fsl_items = 0;
+        if (lance_fixed_size_list_parts(path[k]->logical_type, fsl_element, fsl_items) && fsl_element == "struct") {
+            // fixed_size_list<struct> (W1k4): a layer with no repetition that counts elements, as pylance writes it --
+            // each row's validity bit stands for its `fsl_items` elements -- over the struct child's entries.
+            if (node->n_children != 1 || node->children == nullptr || node->children[0] == nullptr || fsl_items == 0U) {
+                error = "fixed_size_list array for '" + path[k]->name + "' has no child";
+                return false;
+            }
+            const auto* rows = node->n_buffers >= 1 && node->buffers != nullptr && node->null_count != 0
+                                   ? static_cast<const std::uint8_t*>(node->buffers[0])
+                                   : nullptr;
+            const auto elements = static_cast<std::uint64_t>(count) * fsl_items;
+            if (rows != nullptr && layer.validity.empty()) {  // the first null: every element so far was valid
+                layer.validity.assign(static_cast<std::size_t>((layer.length + elements + 7U) / 8U), 0U);
+                for (std::uint64_t e = 0; e < layer.length; ++e) {
+                    layer.validity[static_cast<std::size_t>(e >> 3U)] |= static_cast<std::uint8_t>(1U << (e & 7U));
+                }
+            }
+            if (!layer.validity.empty()) {
+                layer.validity.resize(static_cast<std::size_t>((layer.length + elements + 7U) / 8U), 0U);
+                for (std::int64_t i = 0; i < count; ++i) {
+                    const auto r = at + i;
+                    const bool valid = rows == nullptr || ((rows[r / 8] >> (r % 8)) & 1U) != 0U;
+                    for (std::uint64_t e = 0; e < fsl_items; ++e) {
+                        const auto pos = layer.length + static_cast<std::uint64_t>(i) * fsl_items + e;
+                        if (valid) {
+                            layer.validity[static_cast<std::size_t>(pos >> 3U)] |= static_cast<std::uint8_t>(1U << (pos & 7U));
+                        } else {
+                            ++layer.null_count;
+                        }
+                    }
+                }
+            }
+            mask_own_nulls(*node);
+            layer.length += elements;
+            const auto* child = node->children[0];
+            if (ancestor_null != nullptr) {
+                std::vector<std::uint8_t> spread(static_cast<std::size_t>(elements), 0U);
+                for (std::size_t e = 0; e < spread.size(); ++e) {
+                    spread[e] = masked[e / static_cast<std::size_t>(fsl_items)];
+                }
+                masked = std::move(spread);
+            }
+            at = child->offset + at * static_cast<std::int64_t>(fsl_items);
+            count = static_cast<std::int64_t>(elements);
+            node = child;
+            if (at < 0 || at + count > node->offset + node->length) {
+                error = "column '" + field.name + "': a fixed_size_list points past the end of its child array";
+                return false;
+            }
+            continue;
+        }
         append_bits(layer.validity, layer.null_count, layer.length, *node, at, count);
         mask_own_nulls(*node);
         layer.length += static_cast<std::uint64_t>(count);
