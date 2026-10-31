@@ -55,9 +55,9 @@ CASES = {
 }
 
 
-# Cases whose layout text equals pylance's. Under a null struct Lance pushes the struct's nulls into its children, so
-# every leaf below it is a nullable layer; nanolance does not do that yet (see SPEC_GAPS W1t).
-LAYOUT_SAME = {"plain", "null_leaves"}
+# Lance compresses definition levels with its mini-block compressor choice, RLE when that wins (11 rows, 2 runs);
+# nanolance always bitpacks nested levels (SPEC_GAPS W1t2). Read back both ways all the same.
+LAYOUT_DIFFERS = {"first_row_null"}
 
 
 @pytest.mark.parametrize("name", sorted(CASES))
@@ -67,8 +67,7 @@ def test_fsl_struct_written_as_pylance(tmp_path, name):
     ours, theirs = tmp_path / "ours.lance", tmp_path / "theirs.lance"
     nl_write_dataset(table, str(ours))
     lance.write_dataset(table, str(theirs))
-    if name in LAYOUT_SAME:
-        assert _layout(ours) == _layout(theirs)
+    assert (_layout(ours) == _layout(theirs)) != (name in LAYOUT_DIFFERS)
     assert nl_dataset(str(ours)).to_table() == table
     # Lance 12 cannot read a fixed_size_list<struct> column together with another column (it counts the struct's
     # leaves, rows x N, against the other columns' rows -- also on files it wrote itself), so pylance reads "v" alone.
