@@ -407,12 +407,92 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
         o.hnsw_m = model.hnsw_m;
         o.hnsw_ef_construction = model.hnsw_ef_construction;
         o.hnsw_max_level = model.hnsw_max_level;
+        // Every segment's stored partition sizes, deleted rows included, summed: what Lance plans its splits and
+        // joins on (builder.rs check_partition_adjustment). Empty when a segment's partitions do not line up.
+        std::vector<std::uint64_t> stored(model.partitions, 0U);
+        const auto add_stored = [&](const std::vector<const pb::IndexMetadata*>& from) {
+            for (const auto* s : from) {
+                index_build::VectorModel m;
+                if (!index_build::load_vector_model(segment_dir(dataset_path, *s), m, error)) {
+                    error = "index '" + last.name + "': " + error;
+                    return false;
+                }
+                if (m.lengths.size() != stored.size()) {
+                    stored.clear();
+                    return true;
+                }
+                for (std::size_t p = 0; p < stored.size(); ++p) {
+                    stored[p] += m.lengths[p];
+                }
+            }
+            return true;
+        };
         index_build::VectorSegmentInputs vector_in;
-        if (!retrain) {
+        vector_in.details = &reference.details_value;
+        // Lance's default optimize with new rows: plan on the old segments' sizes plus the new rows. With no split
+        // or join it writes a delta over the new rows beside the old segments; with one it merges every segment.
+        // Explicit num_indices_to_merge never adjusts partitions (builder.rs: no_partition_adjustment).
+        const bool lance_default = !retrain && !options.num_indices_to_merge.has_value() && !unindexed.empty() &&
+                                   model.binary_centroids.empty();
+        if (lance_default) {
+            if (!add_stored(segments)) {
+                return false;
+            }
+        }
+        if (lance_default && !stored.empty()) {
+            std::vector<std::uint64_t> sums;
+            index_build::SegmentTarget delta = where;
+            delta.fragments = &unindexed;
+            delta.coverage = &unindexed;
             vector_in.model = &model;
             vector_in.rebalance_target = target_size;
+            vector_in.delta_base = &stored;
+            vector_in.adjust_sizes = &sums;
+            if (!index_build::build_vector_segment(dataset_path, column, o, delta, vector_in, error)) {
+                error = "index '" + last.name + "': " + error;
+                return false;
+            }
+            if (sums.empty()) {
+                replaced.clear();  // a delta: the old segments stay as they are
+                break;
+            }
+            // A split or a join: every segment merges, planned on the sums.
+            replaced = segments;
+            std::set<std::uint64_t> all(unindexed.begin(), unindexed.end());
+            for (const auto* s : segments) {
+                for (const auto id : coverage(*s)) {
+                    if (live.count(id) != 0U) {
+                        all.insert(id);
+                    }
+                }
+            }
+            const std::vector<std::uint64_t> merged(all.begin(), all.end());
+            index_build::SegmentTarget whole = where;
+            whole.fragments = &merged;
+            whole.coverage = nullptr;
+            vector_in.delta_base = nullptr;
+            vector_in.adjust_sizes = nullptr;
+            vector_in.plan_sizes = &sums;
+            if (!index_build::build_vector_segment(dataset_path, column, o, whole, vector_in, error)) {
+                error = "index '" + last.name + "': " + error;
+                return false;
+            }
+            break;
         }
-        vector_in.details = &reference.details_value;
+        if (!retrain) {
+            vector_in.model = &model;
+            if (!options.num_indices_to_merge.has_value()) {
+                // A steady-state rebalance (nothing new): planned on the stored sizes of what it replaces.
+                vector_in.rebalance_target = target_size;
+                stored.assign(model.partitions, 0U);
+                if (!add_stored(replaced)) {
+                    return false;
+                }
+                if (!stored.empty()) {
+                    vector_in.plan_sizes = &stored;
+                }
+            }
+        }
         if (!index_build::build_vector_segment(dataset_path, column, o, where, vector_in, error)) {
             error = "index '" + last.name + "': " + error;
             return false;

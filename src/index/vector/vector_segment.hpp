@@ -52,6 +52,17 @@ struct VectorSegmentInputs {
     /// A vector index with `model`: adjust its partitions to this target size as Lance does when it
     /// merges rows in (split the oversized, join the undersized); 0 leaves them as they are.
     std::size_t rebalance_target = 0;
+    /// With `model` and `rebalance_target` (the target size), Lance's default optimize (lance/src/index/vector/builder.rs, check_partition_adjustment):
+    /// every existing segment's stored partition sizes, deleted rows included, summed. The build adds its own
+    /// rows (the new ones) and plans splits and joins on the sums: with none it writes its segment over its rows
+    /// alone (a delta beside the old segments); with some it writes nothing and leaves the sums in
+    /// `*adjust_sizes` for the merge that follows. Null: no such plan.
+    const std::vector<std::uint64_t>* delta_base = nullptr;
+    std::vector<std::uint64_t>* adjust_sizes = nullptr;
+    /// With `rebalance_target`: the sizes Lance plans with (a `delta_base` build's sums) instead of this build's own
+    /// row counts. Lance copies the partitions it keeps as they are, deleted rows included, so its sizes count them
+    /// where nanolance, rebuilding from the live rows, does not. Null: this build's counts.
+    const std::vector<std::uint64_t>* plan_sizes = nullptr;
     /// A vector index: these details (VectorIndexDetails) instead of the options' own.
     const std::vector<std::uint8_t>* details = nullptr;
     /// A vector index: train the model only -- the IVF centroids, and for IVF_PQ the codebook --
