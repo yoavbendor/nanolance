@@ -865,6 +865,11 @@ struct FullZipPageParams {
     /// value, or zeros at the schema's width when there is no value (validity makes those null).
     bool constant_items = false;
     std::vector<std::uint8_t> constant_item;
+    /// fixed_size_list<fixed_size_list> with Constant leaves (W1a): `items` is then the a*b leaves a row, and
+    /// `outer_items` the b inner lists. Each slot is [outer validity, ceil(b/8) bytes][leaf validity, the rest of
+    /// item_validity_bytes]; no leaf value bytes. Zero `outer_items` means no outer level.
+    std::uint64_t outer_items = 0;
+    std::size_t outer_validity_bytes = 0;
     /// Fixed width: the bytes a row occupies in the output. Equal to value_bytes - item_validity_bytes
     /// except for constant items, whose output is wider than their slot.
     std::size_t out_row_bytes = 0;
@@ -1014,6 +1019,43 @@ bool full_zip_page_params(const page_layout::PageLayout& layout, std::uint64_t p
     std::uint64_t described_bits = 0;
     if (values->kind == page_layout::CompressiveKind::kFlat) {
         described_bits = values->bits_per_value;
+    } else if (values->kind == page_layout::CompressiveKind::kFixedSizeList && values->values != nullptr &&
+               values->values->kind == page_layout::CompressiveKind::kFixedSizeList &&
+               values->values->items_per_value != 0U && values->values->values != nullptr &&
+               values->values->values->kind == page_layout::CompressiveKind::kConstant &&
+               !values->values->values->has_constant_value && values->items_per_value != 0U) {
+        // fixed_size_list<fixed_size_list<T, a>, b> whose leaves are a null Constant (W1a): no value bytes, only
+        // the outer validity (b bits) and the leaf validity (a*b bits), each padded to whole bytes.
+        const std::uint64_t outer = values->items_per_value;
+        std::uint64_t leaves = 0;
+        if (!checked_mul(outer, values->values->items_per_value, leaves) || leaves == 0U) {
+            why = "unsupported FullZip value compression";
+            return false;
+        }
+        const std::uint64_t outer_bytes = values->has_validity ? (outer + 7U) / 8U : 0U;
+        const std::uint64_t leaf_bytes = values->values->has_validity ? (leaves + 7U) / 8U : 0U;
+        if (outer_bytes * 8U + leaf_bytes * 8U != fz.bits_per_value) {
+            why = "unsupported FullZip value compression";
+            return false;
+        }
+        out.constant_items = true;
+        out.items = leaves;
+        out.outer_items = outer;
+        out.outer_validity_bytes = static_cast<std::size_t>(outer_bytes);
+        out.item_validity_bytes = static_cast<std::size_t>(outer_bytes + leaf_bytes);
+        out.value_bytes = fz.bits_per_value / 8U;
+        // Every leaf is null, so its output is zeros at the schema's leaf width (validity makes them null). A
+        // caller that does not state the schema's width (the page's shape check) gets no item bytes; the read
+        // path always states it.
+        if (schema_row_bytes != 0U) {
+            if (schema_row_bytes % leaves != 0U) {
+                why = "unsupported FullZip value compression";
+                return false;
+            }
+            out.constant_item.assign(static_cast<std::size_t>(schema_row_bytes / leaves), 0U);
+            out.out_row_bytes = static_cast<std::size_t>(schema_row_bytes);
+        }
+        return true;
     } else if (values->kind == page_layout::CompressiveKind::kFixedSizeList && values->values != nullptr &&
                values->values->kind == page_layout::CompressiveKind::kConstant && values->items_per_value != 0U) {
         // Constant items: the slot carries the value's bytes per item when there is a value, none when
@@ -2559,7 +2601,17 @@ bool decode_full_zip_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
             if (!variable) {
                 const auto* slot = data.data() + lv.value_at;
                 const auto first_item = (rows_so_far + r) * params.items;
-                if (params.item_validity_bytes != 0U) {
+                if (params.outer_items != 0U) {
+                    // fixed_size_list<fixed_size_list> (W1a): the outer validity leads the slot, the leaf validity follows.
+                    out.outer_items_per_row = params.outer_items;
+                    append_element_bits(out.outer_item_validity, out.outer_item_null_count,
+                                        params.outer_validity_bytes != 0U ? slot : nullptr, params.outer_items,
+                                        (rows_so_far + r) * params.outer_items);
+                    const auto leaf_bits = params.item_validity_bytes > params.outer_validity_bytes
+                                               ? slot + params.outer_validity_bytes
+                                               : nullptr;
+                    append_element_bits(out.item_validity, out.item_null_count, leaf_bits, params.items, first_item);
+                } else if (params.item_validity_bytes != 0U) {
                     append_item_validity(out, slot, params.items, first_item);
                 } else if (params.items != 0U) {
                     append_item_validity(out, nullptr, params.items, first_item);

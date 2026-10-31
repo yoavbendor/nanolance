@@ -60,17 +60,6 @@ def _check(lance_mod, tmp_path, name):
     assert projected.to_pydict() == expected.select(["v"]).to_pydict()
 
 
-_XFAIL = {
-    "all_null": "FullZip with Constant items under fsl<fsl> is not classified yet (full_zip_page_params)",
-}
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        pytest.param(n, marks=pytest.mark.xfail(strict=True, reason=_XFAIL[n])) if n in _XFAIL else n
-        for n in sorted(CASES)
-    ],
-)
+@pytest.mark.parametrize("name", sorted(CASES))
 def test_fsl_of_fsl_matches_pylance(lance_mod, tmp_path, name):
     _check(lance_mod, tmp_path, name)
