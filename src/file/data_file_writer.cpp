@@ -2846,6 +2846,42 @@ bool write_dict_rle_column(const ColumnEncodeContext& ctx, std::ostream& out, st
 
 /// Writes a structural dictionary column: bitpacked indices, and an uncompressed dictionary block.
 /// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
+/// A dictionary's u32 indices in 1,024-value mini-block chunks, laid out as lance-encoding:compression says, as
+/// pylance's are (measured on 12.0.0, W1r): none -> Flat(32); lz4 / zstd -> General{codec, ByteStreamSplit{Flat(32)}},
+/// each chunk byte-split then framed; absent -> bit-packed, as nanolance has always written them.
+bool dict_index_chunks(const std::vector<std::uint32_t>& indices, ColumnCodec codec, int compression_level,
+                       DictIndexLayout& index_layout, std::uint64_t& index_scheme, std::vector<MiniblockChunk>& index_chunks) {
+    index_layout = codec == ColumnCodec::kUncompressed                           ? DictIndexLayout::kFlat
+                   : (codec == ColumnCodec::kLz4 || codec == ColumnCodec::kZstd) ? DictIndexLayout::kGeneral
+                                                                                 : DictIndexLayout::kBitpacked;
+    index_scheme = codec == ColumnCodec::kLz4 ? descriptor::kLz4 : descriptor::kZstd;
+    std::vector<std::uint8_t> planes;  // kGeneral: one chunk's byte-split indices, before framing
+    for (std::size_t off = 0; off < indices.size(); off += 1024U) {
+        const auto count = std::min<std::size_t>(1024U, indices.size() - off);
+        MiniblockChunk chunk;
+        chunk.value_count = count;
+        const auto* raw = reinterpret_cast<const std::uint8_t*>(indices.data() + off);
+        if (index_layout == DictIndexLayout::kBitpacked) {
+            bitpack::encode_block(raw, count, 4U, chunk.bytes);
+        } else if (index_layout == DictIndexLayout::kFlat) {
+            chunk.bytes.assign(raw, raw + count * 4U);
+        } else {
+            planes.resize(count * 4U);
+            (void)byte_stream_split::encode(std::as_bytes(std::span(raw, count * 4U)), 4U,
+                                            std::as_writable_bytes(std::span(planes)));
+            std::string error;
+            const bool framed_ok = index_scheme == descriptor::kLz4
+                                       ? general::lz4_frame(planes, chunk.bytes, error)
+                                       : general::zstd_frame(planes, compression_level, chunk.bytes, error);
+            if (!framed_ok) {
+                return false;
+            }
+        }
+        index_chunks.push_back(std::move(chunk));
+    }
+    return true;
+}
+
 bool write_dict_column(const ColumnEncodeContext& ctx, std::ostream& out, std::vector<pb::ColumnMetadata>& columns) {
     const auto& field = ctx.field;
     const auto& values = ctx.values;
@@ -2895,38 +2931,11 @@ bool write_dict_column(const ColumnEncodeContext& ctx, std::ostream& out, std::v
         have_plan ? values.structural_dict_plan.distinct : local_distinct;
     const std::vector<std::uint32_t>& indices =
         have_plan ? values.structural_dict_plan.indices : local_indices;
-    // The indices' layout follows lance-encoding:compression, as pylance's does for a dictionary column
-    // (measured on 12.0.0): none -> Flat(32); lz4 / zstd -> General{codec, ByteStreamSplit{Flat(32)}}, each
-    // chunk byte-split then framed. Absent keeps the bit-packed indices nanolance has always written.
-    const DictIndexLayout index_layout = ctx.codec == ColumnCodec::kUncompressed ? DictIndexLayout::kFlat
-                                         : (ctx.codec == ColumnCodec::kLz4 || ctx.codec == ColumnCodec::kZstd)
-                                             ? DictIndexLayout::kGeneral
-                                             : DictIndexLayout::kBitpacked;
-    const std::uint64_t index_scheme = ctx.codec == ColumnCodec::kLz4 ? descriptor::kLz4 : descriptor::kZstd;
+    DictIndexLayout index_layout = DictIndexLayout::kBitpacked;
+    std::uint64_t index_scheme = descriptor::kZstd;
     std::vector<MiniblockChunk> index_chunks;
-    std::vector<std::uint8_t> planes;  // kGeneral: one chunk's byte-split indices, before framing
-    for (std::size_t off = 0; off < indices.size(); off += 1024U) {
-        const auto count = std::min<std::size_t>(1024U, indices.size() - off);
-        MiniblockChunk chunk;
-        chunk.value_count = count;
-        const auto* raw = reinterpret_cast<const std::uint8_t*>(indices.data() + off);
-        if (index_layout == DictIndexLayout::kBitpacked) {
-            bitpack::encode_block(raw, count, 4U, chunk.bytes);
-        } else if (index_layout == DictIndexLayout::kFlat) {
-            chunk.bytes.assign(raw, raw + count * 4U);
-        } else {
-            planes.resize(count * 4U);
-            (void)byte_stream_split::encode(std::as_bytes(std::span(raw, count * 4U)), 4U,
-                                            std::as_writable_bytes(std::span(planes)));
-            std::string error;
-            const bool framed_ok = index_scheme == descriptor::kLz4
-                                       ? general::lz4_frame(planes, chunk.bytes, error)
-                                       : general::zstd_frame(planes, ctx.compression_level, chunk.bytes, error);
-            if (!framed_ok) {
-                return false;
-            }
-        }
-        index_chunks.push_back(std::move(chunk));
+    if (!dict_index_chunks(indices, ctx.codec, ctx.compression_level, index_layout, index_scheme, index_chunks)) {
+        return false;
     }
     const auto payload = miniblock_payload(index_chunks);
     const auto control = control_buffer_for(index_chunks);
@@ -3006,7 +3015,18 @@ bool write_dict_fixed_column(const ColumnEncodeContext& ctx, std::ostream& out, 
     RleChunks index_rle;
     // A nullable column (W1p3) carries each chunk's definition levels, as pylance's repdef=Bitpacked(16,Flat(1)).
     const bool nullable = ctx.column_has_nulls;
-    if (plan.index_rle) {
+    // Under lance-encoding:compression (W1r) the indices take the codec's layout, never RLE; the dictionary block is
+    // the plan's, as without one (measured: InlineBitpacking(64) for 1,000 entries, General{LZ4, Flat(64)} for 20).
+    // The write session dictionary-encodes such a column only without nulls.
+    const bool codec = ctx.codec != ColumnCodec::kAbsent;
+    DictIndexLayout index_layout = DictIndexLayout::kBitpacked;
+    std::uint64_t index_scheme = descriptor::kZstd;
+    if (codec) {
+        if (nullable || !dict_index_chunks(indices, ctx.codec, ctx.compression_level, index_layout, index_scheme,
+                                           index_chunks)) {
+            return false;
+        }
+    } else if (plan.index_rle) {
         index_rle = encode_rle_chunks(reinterpret_cast<const std::uint8_t*>(indices.data()), 4U, plan.index_runs,
                                       nullable ? &ctx.values.validity : nullptr);
     } else {
@@ -3021,8 +3041,10 @@ bool write_dict_fixed_column(const ColumnEncodeContext& ctx, std::ostream& out, 
             index_chunks.push_back(std::move(chunk));
         }
     }
-    const auto control = plan.index_rle ? miniblock::control_buffer(index_rle.metas) : control_buffer_for(index_chunks);
-    const auto payload = plan.index_rle ? std::move(index_rle.bytes) : miniblock_payload(index_chunks);
+    const bool use_index_rle = plan.index_rle && !codec;
+    const auto control = use_index_rle ? miniblock::control_buffer(index_rle.metas) : control_buffer_for(index_chunks);
+    const auto payload = use_index_rle ? std::move(index_rle.bytes) : miniblock_payload(index_chunks);
+    const auto& dict_block = plan.fixed_block;
 
     using FixedDictValues = StructuralDictPlan::FixedDictValues;
     descriptor::Bytes dict_desc;
@@ -3049,8 +3071,7 @@ bool write_dict_fixed_column(const ColumnEncodeContext& ctx, std::ostream& out, 
     out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
     align64(out);
     const auto dict_offset = pos(out);
-    out.write(reinterpret_cast<const char*>(plan.fixed_block.data()),
-              static_cast<std::streamsize>(plan.fixed_block.size()));
+    out.write(reinterpret_cast<const char*>(dict_block.data()), static_cast<std::streamsize>(dict_block.size()));
 
     pb::ColumnMetadata column;
     column.encoding = column_encoding_bytes();
@@ -3060,18 +3081,22 @@ bool write_dict_fixed_column(const ColumnEncodeContext& ctx, std::ostream& out, 
     page.buffer_offsets.push_back(dict_offset);
     page.buffer_sizes.push_back(control.size());
     page.buffer_sizes.push_back(payload.size());
-    page.buffer_sizes.push_back(plan.fixed_block.size());
+    page.buffer_sizes.push_back(dict_block.size());
     page.length = rows;
     page.priority = 0;
     descriptor::MiniBlock m;
-    m.value_compression = plan.index_rle ? descriptor::rle(descriptor::flat(32U), descriptor::flat(8U))
-                                         : descriptor::inline_bitpacking(32U);
+    m.value_compression =
+        use_index_rle                                    ? descriptor::rle(descriptor::flat(32U), descriptor::flat(8U))
+        : index_layout == DictIndexLayout::kFlat         ? descriptor::flat(32U)
+        : index_layout == DictIndexLayout::kGeneral
+            ? descriptor::general(index_scheme, descriptor::byte_stream_split(descriptor::flat(32U)))
+            : descriptor::inline_bitpacking(32U);
     m.dictionary = dict_desc;
     m.num_dictionary_items = static_cast<std::uint32_t>(plan.fixed_distinct.size());
     if (nullable) {
         m.def_compression = repdef_encoding_bytes();
     }
-    mini_block_tail(m, rows, plan.index_rle ? 2U : 1U, nullable);  // RLE: run values and run lengths are two buffers
+    mini_block_tail(m, rows, use_index_rle ? 2U : 1U, nullable);  // RLE: run values and run lengths are two buffers
     page.encoding = descriptor::page_encoding(m);
     column.pages.push_back(std::move(page));
     columns.push_back(std::move(column));
