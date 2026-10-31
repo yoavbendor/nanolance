@@ -10,6 +10,7 @@ Each shape is written by pylance 12 (data_storage_version 2.2), then read back w
 
 from __future__ import annotations
 
+import numpy as np
 import pyarrow as pa
 import pytest
 
@@ -137,3 +138,39 @@ def test_fsl_of_struct_is_refused_by_name_and_other_columns_read(lance_mod, tmp_
         with pytest.raises(Exception, match=r"column 'v': a fixed_size_list:struct:2 is not read yet"):
             read()
     assert pa.table(nanolance.read_table(path, columns=["k"])).column("k").to_pylist() == list(range(ROWS))
+
+
+def _bool_rows(n, rows, null_every=0, seed=0):
+    rng = np.random.default_rng(seed)
+    out = [[bool(x) for x in rng.integers(0, 2, n)] for _ in range(rows)]
+    return [None if null_every and i % null_every == 0 else r for i, r in enumerate(out)]
+
+
+BOOL_SHAPES = {
+    # FixedSizeList{N, Flat(1)}: N bools a row, bit-packed across the chunk (W1k3).
+    "fsl_bool4": lambda: pa.table({"v": pa.array(_bool_rows(4, ROWS), pa.list_(pa.bool_(), 4))}),
+    "fsl_bool4_nulls": lambda: pa.table({"v": pa.array(_bool_rows(4, ROWS, 7), pa.list_(pa.bool_(), 4))}),
+    "fsl_bool200": lambda: pa.table({"v": pa.array(_bool_rows(200, ROWS), pa.list_(pa.bool_(), 200))}),
+    "fsl_bool3000": lambda: pa.table({"v": pa.array(_bool_rows(3000, 500), pa.list_(pa.bool_(), 3000))}),
+    # Many chunks: a chunk's row count comes from the control words, not its bit count.
+    "fsl_bool3_multichunk": lambda: pa.table({"v": pa.array(_bool_rows(3, 300_000), pa.list_(pa.bool_(), 3))}),
+    "fsl_bool5_nulls_multichunk": lambda: pa.table({"v": pa.array(_bool_rows(5, 300_000, 9),
+                                                                   pa.list_(pa.bool_(), 5))}),
+    "list_of_fsl_bool": lambda: pa.table({"v": pa.array([[[True, False]] * (i % 4) for i in range(ROWS)],
+                                                        pa.list_(pa.list_(pa.bool_(), 2)))}),
+    "struct_of_fsl_bool": lambda: pa.table({"s": pa.array([{"f": [i % 2 == 0, True, i % 3 == 0]} for i in range(ROWS)],
+                                                          pa.struct([("f", pa.list_(pa.bool_(), 3))]))}),
+}
+
+
+@pytest.mark.parametrize("name", sorted(BOOL_SHAPES))
+def test_fsl_of_bool_reads_as_pylance(lance_mod, tmp_path, name):
+    table = _with_plain_column(BOOL_SHAPES[name]())
+    path = tmp_path / f"{name}.lance"
+    lance_mod.write_dataset(table, str(path), data_storage_version="2.2")
+    expected = _check_equal_to_pylance(lance_mod, path, table)
+    shape = table.column_names[0]
+    assert pa.table(nanolance.read_table(path, columns=[shape])).to_pydict() == expected.select([shape]).to_pydict()
+    n = table.num_rows
+    idx = [n - 1, 0, 7, n // 2, 3]
+    assert pa.table(nanolance.take(str(path), idx)).to_pydict() == lance_mod.dataset(str(path)).take(idx).to_pydict()

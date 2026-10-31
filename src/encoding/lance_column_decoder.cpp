@@ -698,6 +698,9 @@ struct ColumnEncodingPlan {
     /// per row (one per element, LSB-first, contiguous across rows) and its second the values.
     std::uint64_t fsl_items = 0;
     bool fsl_item_validity = false;
+    /// fixed_size_list<bool, N> (W1k3): FixedSizeList{N, Flat(1)}, each chunk's values N bits a row, LSB first;
+    /// they are unpacked to one byte an element, nanolance's bool representation.
+    bool fsl_bool = false;
     /// kDict / kDictRle: the fixed-width dictionary's entries are themselves FastLanes bit-packed
     /// rather than stored flat. Lance picks this once the entries are narrow enough for packing to
     /// pay -- an int64 column with runs gets it. It comes in two spellings, and they differ only in
@@ -1330,6 +1333,17 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
                 out.kind = ColumnEncodingKind::kFlat;
                 out.fsl_items = inner->items_per_value;
                 out.fsl_item_validity = inner->has_validity;
+                return true;
+            }
+            // FixedSizeList{N, Flat(1)}: N bools a row, bit-packed across the chunk (W1k3).
+            if (!has_dictionary && out.value_scheme == page_layout::BufferScheme::kNone && !out.fsst &&
+                inner->values != nullptr && inner->values->kind == page_layout::CompressiveKind::kFlat &&
+                inner->values->bits_per_value == 1U && inner->items_per_value != 0U &&
+                (!inner->has_validity || out.chunk_shape.num_buffers == 2U)) {
+                out.kind = ColumnEncodingKind::kFlat;
+                out.fsl_items = inner->items_per_value;
+                out.fsl_item_validity = inner->has_validity;
+                out.fsl_bool = true;
                 return true;
             }
             out.kind = ColumnEncodingKind::kUnsupported;
@@ -2918,6 +2932,23 @@ bool decode_fixed_width_column(const EncodingsIo& io, const pb::Field& on_disk_f
             !apply_item_view(*plan, chunks, error)) {
             return false;
         }
+        // fixed_size_list<bool>: a chunk's bits do not say how many rows it holds, so its row count comes from
+        // the page's control words (a power of two for every chunk but the last).
+        if (plan->fsl_bool && !nullable) {
+            std::vector<std::uint64_t> rows_of;
+            if (!miniblock::decode_chunk_items(control, plan->chunk_shape.large_buffer_sizes, page.length, rows_of,
+                                               error)) {
+                return false;
+            }
+            if (rows_of.size() != chunks.size()) {
+                error = "fixed_size_list<bool> page has " + std::to_string(chunks.size()) + " chunks and " +
+                        std::to_string(rows_of.size()) + " control words";
+                return false;
+            }
+            for (std::size_t i = 0; i < chunks.size(); ++i) {
+                chunks[i].items = rows_of[i];
+            }
+        }
         // How many values a chunk holds depends on how it is encoded, and the header only states it
         // when the chunk carries definition levels:
         //   * with definition levels, the header's count is authoritative;
@@ -2988,6 +3019,16 @@ bool decode_fixed_width_column(const EncodingsIo& io, const pb::Field& on_disk_f
                                                     error)) {
                     return false;
                 }
+            } else if (plan->fsl_bool) {
+                const auto bits = static_cast<std::uint64_t>(chunk_values) * encoding_plan.fsl_items;
+                if (chunk.values.size() != static_cast<std::size_t>((bits + 7U) / 8U)) {
+                    error = "fixed_size_list<bool> chunk is " + std::to_string(chunk.values.size()) + " bytes for " +
+                            std::to_string(bits) + " elements";
+                    return false;
+                }
+                const auto base = out.fixed.size();
+                out.fixed.resize(base + static_cast<std::size_t>(bits));
+                boolpack::unpack_lsb_first(chunk.values.data(), static_cast<std::size_t>(bits), out.fixed.data() + base);
             } else {
                 if (chunk.values.size() != static_cast<std::size_t>(chunk_values) * bytes_per_value) {
                     error = "fixed-width page byte count mismatch";
