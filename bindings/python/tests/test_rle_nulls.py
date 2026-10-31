@@ -115,3 +115,23 @@ def test_append_to_pylance_dataset(tmp_path, typ, rows, run, frac, under):
     expected = pa.concat_tables([table, extra])
     assert lance.dataset(str(theirs)).to_table().equals(expected)
     assert nl_dataset(str(theirs)).to_table().equals(expected)
+
+
+# W1p4: a chunk that carries definition levels holds up to 4,096 rows, as pylance's do, with the levels packed over
+# several 1,024-value blocks. The chunks (bytes and rows) then equal pylance's, for plain RLE and for RLE'd
+# dictionary indices. 50,000 rows: one page in both writers.
+@pytest.mark.parametrize(("typ", "run", "frac", "under"),
+                         [("int64", 2, 0.05, "zero"), ("int64", 2, 0.5, "zero"), ("int64", 5, 0.05, "hidden"),
+                          ("int64", 50, 0.05, "zero"), ("float64", 2, 0.05, "zero"), ("float64", 50, 0.5, "hidden")])
+def test_chunks_match_pylance(tmp_path, typ, run, frac, under):
+    from tests.test_rle_multichunk import _chunks
+
+    lance = require_pylance()
+    table = _table(typ, 50_000, run, frac, under)
+    ours, theirs = tmp_path / "ours.lance", tmp_path / "theirs.lance"
+    nl_write_dataset(table, str(ours))
+    lance.write_dataset(table, str(theirs))
+    assert any("Rle{" in line for line in _layout(ours)), _layout(ours)
+    assert _chunks(ours, "I") == _chunks(theirs, "I")
+    if run >= 5:  # long runs fill 4,096 rows before 8 KiB; runs of 2 fill 8 KiB at 1,024
+        assert any(rows == 4096 for page in _chunks(ours, "I") for _, rows in page)

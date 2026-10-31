@@ -241,37 +241,39 @@ std::size_t max_values_per_uncompressed_chunk(std::size_t bytes_per_value) {
 /// are padded with 0 (valid); the chunk header states the real count, so they are never read back.
 std::vector<std::uint8_t> pack_definition_levels(const std::vector<std::uint8_t>& validity,
                                                  std::uint64_t first_row, std::size_t count) {
-    // One FastLanes block is exactly 1024 values, so a chunk carrying levels must not exceed it.
-    // Callers cap their chunk size (see kMaxValuesPerNullableChunk); this is the backstop, because
-    // getting it wrong overruns `levels` below -- which it did, as a stack smash, when the flat
-    // path's 4095-value chunks were first given definition levels.
-    if (count > 1024U) {
-        std::abort();
-    }
-    std::uint16_t levels[1024] = {0};
-    for (std::size_t i = 0; i < count; ++i) {
-        const auto row = first_row + i;
-        const bool valid = (validity[static_cast<std::size_t>(row >> 3U)] >> (row & 7U)) & 1U;
-        levels[i] = valid ? 0U : 1U;
-    }
-    // A short final chunk has two legal spellings, and the choice is not ours: Lance's decoder infers
+    // The levels are OutOfLineBitpacking{16, Flat(1)}: every full 1,024-value block packed, one after another
+    // (W1p4: an RLE chunk carries up to 4,096 levels, as pylance writes it), then a short final block.
+    //
+    // A short final block has two legal spellings, and the choice is not ours: Lance's decoder infers
     // which one it is FROM THE BUFFER LENGTH, so writing the wrong one is silently misread rather
     // than rejected. Its rule is to pad up to a full block only when padding costs fewer bits than
     // packing saves; otherwise the levels go in raw, as plain u16 words. At width 1 that means a tail
     // of 64 or fewer values is raw -- and 64 is exactly the packed size, so a padded 64-value chunk
     // is indistinguishable from a raw one and would come back as 64 arbitrary levels.
     const auto packed_words = ::nanom::columnar::fastlanes::packed_words_1024<std::uint16_t>(1);
-    const std::size_t padding_cost = 1U * (1024U - count);
-    const std::size_t pack_savings = (16U - 1U) * count;
-    if (count < 1024U && padding_cost >= pack_savings) {
-        std::vector<std::uint8_t> out(count * sizeof(std::uint16_t));
-        std::memcpy(out.data(), levels, out.size());
-        return out;
+    std::vector<std::uint8_t> out;
+    out.reserve(((count + 1023U) / 1024U) * packed_words * sizeof(std::uint16_t));
+    std::uint16_t levels[1024];
+    std::uint16_t packed[1024];
+    for (std::size_t at = 0; at < count; at += 1024U) {
+        const std::size_t n = std::min<std::size_t>(1024U, count - at);
+        std::fill(std::begin(levels), std::end(levels), std::uint16_t{0});
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto row = first_row + at + i;
+            const bool valid = (validity[static_cast<std::size_t>(row >> 3U)] >> (row & 7U)) & 1U;
+            levels[i] = valid ? 0U : 1U;
+        }
+        const std::size_t padding_cost = 1U * (1024U - n);
+        const std::size_t pack_savings = (16U - 1U) * n;
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(levels);
+        if (n < 1024U && padding_cost >= pack_savings) {
+            out.insert(out.end(), bytes, bytes + n * sizeof(std::uint16_t));
+            continue;
+        }
+        ::nanom::columnar::fastlanes::pack_1024_unchecked<std::uint16_t>(1, levels, packed);
+        const auto* packed_bytes = reinterpret_cast<const std::uint8_t*>(packed);
+        out.insert(out.end(), packed_bytes, packed_bytes + packed_words * sizeof(std::uint16_t));
     }
-    std::vector<std::uint16_t> packed(packed_words);
-    ::nanom::columnar::fastlanes::pack_1024_unchecked<std::uint16_t>(1, levels, packed.data());
-    std::vector<std::uint8_t> out(packed_words * sizeof(std::uint16_t));
-    std::memcpy(out.data(), packed.data(), out.size());
     return out;
 }
 
@@ -2469,8 +2471,8 @@ RleChunks encode_rle_chunks(const std::uint8_t* data, std::size_t bpv,
     for (const auto& run : runs) {
         run_lengths_in_rows.push_back(run.second);
     }
-    // Definition levels pack in one FastLanes block, so a chunk that carries them holds at most 1,024 rows.
-    const auto rows_per_chunk = rle::chunk_rows(run_lengths_in_rows, bpv, validity != nullptr ? 1024U : 4096U);
+    // A chunk that carries definition levels holds up to 4,096 rows too (W1p4: the levels span several blocks).
+    const auto rows_per_chunk = rle::chunk_rows(run_lengths_in_rows, bpv);
     RleChunks out;
     out.metas.reserve(rows_per_chunk.size());
     std::size_t run_index = 0;

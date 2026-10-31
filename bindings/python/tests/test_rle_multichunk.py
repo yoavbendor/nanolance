@@ -55,9 +55,9 @@ def _chunks(path, word: str) -> list[list[tuple[int, int]]]:
         control = raw[offsets[0] : offsets[0] + sizes[0]]
         words = struct.unpack(f"<{len(control) // struct.calcsize(word)}{word}", control)
         chunks = []
-        for word in words:
-            log = word & 0x0F
-            chunks.append((((word >> 4) + 1) * 8, (1 << log) if log else 0))
+        for w in words:  # not `word`: that names the struct format for the next page
+            log = w & 0x0F
+            chunks.append((((w >> 4) + 1) * 8, (1 << log) if log else 0))
         pages.append(chunks)
     return pages
 
