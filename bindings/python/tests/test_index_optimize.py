@@ -183,9 +183,12 @@ def test_vector_model_kept_or_retrained(lance, tmp_path):
     nl.dataset(path).optimize.optimize_indices()
     stats = lance.dataset(path).stats.index_stats("vec_idx")
     assert stats["num_unindexed_rows"] == 0
-    assert lance.dataset(path).describe_indices()[0].segments[0].uuid != uuid0
-    assert np.allclose(stats["indices"][0]["centroids"], centroids0)  # the model is kept
-    assert sum(p["size"] for p in stats["indices"][0]["partitions"]) == 4_000
+    # No partition to split or join: as Lance's default optimize, a delta segment over the new rows beside the
+    # untouched old one, on the same model (pylance writes the same two segments here).
+    segments = lance.dataset(path).describe_indices()[0].segments
+    assert len(segments) == 2 and segments[0].uuid == uuid0
+    assert all(np.allclose(i["centroids"], centroids0) for i in stats["indices"])  # the model is kept
+    assert sum(p["size"] for i in stats["indices"] for p in i["partitions"]) == 4_000
     nl.dataset(path).optimize.optimize_indices(retrain=True)
     stats = lance.dataset(path).stats.index_stats("vec_idx")
     assert stats["num_unindexed_rows"] == 0 and len(stats["indices"][0]["partitions"]) == 4
@@ -247,3 +250,42 @@ def test_ivf_rq_optimized_after_an_append(lance, tmp_path):
     ref = lance.dataset(path).to_table(nearest=nearest, columns=["id"])
     assert got["id"].to_pylist() == ref["id"].to_pylist()
     np.testing.assert_allclose(got["_distance"].to_numpy(), ref["_distance"].to_numpy(), rtol=0, atol=1e-4)
+
+
+def _clusters(sizes, start=0, seed=0):
+    """Four well-separated clusters of 16-d vectors, `sizes[c]` rows in cluster c."""
+    rng = np.random.default_rng(seed)
+    centres = np.eye(16, dtype=np.float32)[:4] * 100
+    v = np.concatenate([centres[c] + rng.standard_normal((n, 16)).astype(np.float32) for c, n in enumerate(sizes)])
+    return pa.table({"id": np.arange(start, start + len(v)), "cluster": np.repeat(np.arange(len(sizes)), sizes),
+                     "vec": pa.FixedSizeListArray.from_arrays(pa.array(v.ravel()), 16)})
+
+
+@pytest.mark.parametrize("trial", range(3))
+def test_optimize_plans_on_stored_sizes_as_lance(lance, tmp_path, trial):
+    """Lance's default optimize plans splits and joins on every segment's stored partition sizes (deleted rows
+    included) plus the new rows: with none it writes a delta beside the old segment, with one it merges. Cluster 0
+    holds 1,000 live rows of 1,100 stored, just across the 1,024-row join threshold (target 4,096) only when its
+    deleted rows count. pylance trains the seed index (its k-means may join clusters); both optimizers must then
+    end with the same segments and partition counts."""
+    seed = str(tmp_path / "seed.lance")
+    lance.write_dataset(_clusters([1100, 1100, 1500, 1500], seed=trial), seed)
+    lance.dataset(seed).create_index("vec", "IVF_FLAT", num_partitions=4, name="flat_idx")
+    nl.write_dataset(_clusters([0, 0, 0, 50], start=10_000, seed=trial + 7), seed, mode="append")
+    nl.dataset(seed).delete("cluster = 0 AND id % 11 = 0")
+    theirs, ours = str(tmp_path / "theirs.lance"), str(tmp_path / "ours.lance")
+    shutil.copytree(seed, theirs)
+    shutil.copytree(seed, ours)
+    lance.dataset(theirs).optimize.optimize_indices()
+    nl.dataset(ours).optimize.optimize_indices()
+
+    def layout(path):
+        st = lance.dataset(path).stats.index_stats("flat_idx")
+        return st["num_unindexed_rows"], [len(i["partitions"]) for i in st["indices"]]
+
+    assert layout(ours) == layout(theirs)
+    assert _segments(lance, ours) == _segments(lance, theirs)
+    key = np.eye(16, dtype=np.float32)[0] * 100
+    a = lance.dataset(theirs).to_table(nearest={"column": "vec", "q": key, "k": 5}, columns=["id"])
+    b = nl.dataset(ours).to_table(nearest={"column": "vec", "q": key, "k": 5}, columns=["id"])
+    assert np.allclose(a.column("_distance").to_numpy(), b.column("_distance").to_numpy(), rtol=1e-5)

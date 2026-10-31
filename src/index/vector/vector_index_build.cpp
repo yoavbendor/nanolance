@@ -762,6 +762,28 @@ std::vector<std::uint32_t> nearest_centroids(const std::vector<float>& centroids
     return out;
 }
 
+/// Whether Lance's plan_partition_adjustment would split or join partitions of these sizes: one over the split
+/// threshold, or one under the join threshold while more than enough partitions remain to hold every row.
+bool partition_adjustment_needed(const std::vector<std::uint64_t>& sizes, std::size_t target) {
+    const std::size_t split_threshold = kMaxPartitionSizeFactor * target;
+    const std::size_t join_threshold = kMinPartitionSizePercent * target / 100U;
+    std::uint64_t total = 0;
+    bool small = false;
+    for (const auto n : sizes) {
+        if (n > split_threshold) {
+            return true;
+        }
+        total += n;
+        small = small || n < join_threshold;
+    }
+    if (sizes.size() < 2U || !small) {
+        return false;
+    }
+    const std::size_t keep_at_least =
+        std::max<std::size_t>(static_cast<std::size_t>((total + split_threshold - 1U) / split_threshold), 1U);
+    return sizes.size() > keep_at_least;
+}
+
 /// Lance 12's partition adjustment when it merges rows into an IVF index (lance/src/index/vector/
 /// builder.rs, plan_partition_adjustment): every partition over 4x the target is split straight to
 /// the target size, by k-means on a sample of its rows; when none is, partitions under a quarter of
@@ -770,13 +792,20 @@ std::vector<std::uint32_t> nearest_centroids(const std::vector<float>& centroids
 /// centroid that has room. Updates `centroids`, `k` and `label`.
 void adjust_partitions(const Rows& data, std::vector<float>& centroids, std::size_t& k,
                        std::vector<std::uint32_t>& label, std::size_t target, bool dot,
-                       std::uint32_t max_iters) {
+                       std::uint32_t max_iters, const std::vector<std::uint64_t>* plan_sizes) {
     const std::size_t d = data.d;
     const std::size_t split_threshold = kMaxPartitionSizeFactor * target;
     const std::size_t join_threshold = kMinPartitionSizePercent * target / 100U;
     std::vector<std::size_t> sizes(k, 0);
     for (const auto l : label) {
         ++sizes[l];
+    }
+    // The sizes Lance plans with, when given: its kept partitions' stored rows, deleted ones included
+    // (VectorSegmentInputs::plan_sizes).
+    if (plan_sizes != nullptr && plan_sizes->size() == k) {
+        for (std::size_t p = 0; p < k; ++p) {
+            sizes[p] = static_cast<std::size_t>((*plan_sizes)[p]);
+        }
     }
     std::vector<std::vector<std::size_t>> members(k);
     for (std::size_t r = 0; r < data.n; ++r) {
@@ -1832,7 +1861,9 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         }
     }
     // A Hamming index keeps its partitions as they are: Lance's split and join are float k-means.
-    const bool shuffle_first = model != nullptr && inputs.rebalance_target != 0U && !binary;
+    // A delta_base build only plans (with rebalance_target as the target size); it never adjusts its own rows.
+    const bool rebalance = model != nullptr && inputs.rebalance_target != 0U && !binary && inputs.delta_base == nullptr;
+    const bool shuffle_first = rebalance;
     std::vector<std::uint32_t> label;
     bool labelled = false;  // the codebook's sample covered every row: the labels are complete already
     const auto shuffle = [&] {
@@ -1844,9 +1875,9 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
                     assign(data, centroids, partitions, dot_metric, label, nullptr);
                 }
             }
-            if (model != nullptr && inputs.rebalance_target != 0U && !binary) {
+            if (rebalance) {
                 adjust_partitions(data, centroids, partitions, label, inputs.rebalance_target, dot_metric,
-                                  options.max_iters);
+                                  options.max_iters, inputs.plan_sizes);
             }
             if (progress != nullptr) {  // every row is labelled
                 (*progress)(1, "shuffle", data.n, "rows", data.n);
@@ -1930,6 +1961,19 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     }
     if (!shuffle_first) {
         shuffle();
+    }
+    // Lance's default optimize: plan on the old segments' stored sizes plus these rows; a split or a join means a
+    // merge of every segment instead, so this build writes nothing and hands the sums back (VectorSegmentInputs).
+    if (inputs.delta_base != nullptr && inputs.adjust_sizes != nullptr && !binary && inputs.rebalance_target != 0U &&
+        inputs.delta_base->size() == partitions) {
+        std::vector<std::uint64_t> sums = *inputs.delta_base;
+        for (const auto l : label) {
+            ++sums[l];
+        }
+        if (partition_adjustment_needed(sums, inputs.rebalance_target)) {
+            *inputs.adjust_sizes = std::move(sums);
+            return true;
+        }
     }
     std::vector<std::uint64_t> lengths(partitions, 0);
     for (const auto l : label) {
