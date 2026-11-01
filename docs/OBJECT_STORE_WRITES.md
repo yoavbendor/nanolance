@@ -104,6 +104,35 @@ a store that ignores the header), a later writer's overwrite lands after the ear
 own manifest back, and 6 of 12 appends reported done were lost. The read-back is kept only for step 3
 (a 412 that may be our own lost reply).
 
+### 3.4 Many writers on one dataset (2026-11-01)
+
+Reported by a downstream project running hundreds of separate AWS workers, each writing one chunk into the
+same S3 dataset with nothing coordinating them but the commit:
+
+- **Transaction names must be unique across processes.** The lost-response check in 3.2 step 3 trusts the
+  transaction uuid. It came from a per-thread generator, which a forked child copies: forked writers named
+  their transactions alike, and a loser read the winner's manifest as its own and reported success with its
+  rows lost (16 writers on moto exited cleanly, one writer's rows remained). Transaction ids, branch ids and
+  the backoff pauses now draw from the entropy source on every call (`new_uuid`, `commit_back_off`); data-file
+  names already did. `test_many_forked_writers_start_one_dataset_on_s3` reproduces the loss on the old code.
+- **Retry budget** (`include/nanolance/commit_backoff.hpp`): 200 attempts on an object store, 20 locally
+  (Lance's `conflict_retries`); `NANOLANCE_COMMIT_ATTEMPTS` (1 to 100,000) overrides both. On an object store
+  the pause is full jitter, uniform in [1 ms, ceiling], the ceiling doubling from 25 ms to 2 s; locally it is
+  unchanged (at most 50 ms).
+- **Starting a dataset from many writers: `CommitMode::CreateOrAppend`** (C `NANO_LANCE_COMMIT_CREATE_OR_APPEND`
+  = 3, Python `COMMIT_CREATE_OR_APPEND`). Each attempt creates when there is no version yet and appends
+  otherwise, so of many writers starting one dataset one creates it and the rest append. Appending needs the
+  writer's schema to equal the dataset's field for field (id, parent id, name, logical type, nullability),
+  since its data files name columns by field id: a mismatch fails with `schema mismatch: ...` and publishes
+  nothing. `nanolance.lance.write_dataset(mode="append")` on a dataset that does not exist yet commits this
+  way; it used to commit as an overwrite, and of two writers starting a dataset the later one replaced the
+  earlier one's rows. (pylance creates there, and a writer that loses that race fails.)
+
+Known limits, not fixed here: a process that uses S3 and then forks shares nanos3reader's pooled connections
+with its children (separate processes are not affected); commits to one dataset are serialised, so many
+writers finishing together take a while from outside AWS; a writer that gives up leaves its data files for
+`cleanup_old_versions`.
+
 ## 4. Tests
 
 - **moto** (CI already runs it for nanos3reader and the O-phase reads; it honours `If-None-Match` and

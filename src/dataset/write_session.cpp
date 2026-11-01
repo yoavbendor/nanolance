@@ -985,6 +985,7 @@ WriteStatus WriteSession::finish(int mode, uint64_t* version_out) {
         case kCommitCreate: commit_mode = CommitMode::Create; break;
         case kCommitAppend: commit_mode = CommitMode::Append; break;
         case kCommitOverwrite: commit_mode = CommitMode::Overwrite; break;
+        case kCommitCreateOrAppend: commit_mode = CommitMode::CreateOrAppend; break;
         default: return fail(WriteStatus::InvalidArgument, "unknown commit mode");
     }
     std::error_code ec;

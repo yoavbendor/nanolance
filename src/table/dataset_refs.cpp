@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/uuid.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/work_stats.hpp"
 #include <nanolance/dataset_refs.hpp>
@@ -1012,14 +1013,9 @@ std::string branch_json(const BranchInfo& branch) {
 }
 
 /// A version id as Lance makes one: a random (version 4) UUID, simple form (32 lowercase hex digits).
+/// Fresh from the entropy source each call, as random_uuid: a static generator repeats across forked writers.
 std::string new_branch_id() {
-    static std::mt19937_64 engine{std::random_device{}()};
-    std::array<std::uint8_t, 16> bytes{};
-    for (auto& b : bytes) {
-        b = static_cast<std::uint8_t>(engine() & 0xFFU);
-    }
-    bytes[6] = static_cast<std::uint8_t>((bytes[6] & 0x0FU) | 0x40U);
-    bytes[8] = static_cast<std::uint8_t>((bytes[8] & 0x3FU) | 0x80U);
+    const auto bytes = new_uuid();
     static const char* hex = "0123456789abcdef";
     std::string out;
     for (const auto b : bytes) {

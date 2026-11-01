@@ -1604,6 +1604,7 @@ NB_MODULE(_nanolance, m) {
     m.attr("COMMIT_CREATE") = static_cast<int>(NANO_LANCE_COMMIT_CREATE);
     m.attr("COMMIT_APPEND") = static_cast<int>(NANO_LANCE_COMMIT_APPEND);
     m.attr("COMMIT_OVERWRITE") = static_cast<int>(NANO_LANCE_COMMIT_OVERWRITE);
+    m.attr("COMMIT_CREATE_OR_APPEND") = static_cast<int>(NANO_LANCE_COMMIT_CREATE_OR_APPEND);
     m.def("_ds_delete", [](const std::filesystem::path& path, const std::string& predicate,
                            std::optional<std::uint64_t> read_version) {
         std::uint64_t deleted = 0;

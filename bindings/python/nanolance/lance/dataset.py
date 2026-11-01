@@ -5103,7 +5103,7 @@ def _is_pydantic(obj) -> bool:
 
 
 _MODES = {"create": _nanolance.COMMIT_CREATE, "append": _nanolance.COMMIT_APPEND,
-          "overwrite": _nanolance.COMMIT_OVERWRITE}
+          "overwrite": _nanolance.COMMIT_OVERWRITE, "create_or_append": _nanolance.COMMIT_CREATE_OR_APPEND}
 
 
 def write_dataset(
@@ -5182,7 +5182,7 @@ def write_dataset(
         if managed:
             _report_versions(ds, before)
         return ds
-    if mode not in _MODES:
+    if mode not in ("create", "append", "overwrite"):  # pylance's modes; create-or-append is how append starts one
         raise ValueError(f"Invalid mode: {mode}; expected one of create, append, overwrite")
     if data_storage_version not in (None, "stable", "2.2", "next") or use_legacy_format:
         raise unsupported(f"data_storage_version={data_storage_version!r} (nanolance writes 2.2)")
@@ -5245,7 +5245,10 @@ def write_dataset(
         _set_base_plan(writer, initial_bases, targets, exists)
 
     append = mode == "append" and exists
-    code = _MODES["append" if append else ("create" if mode == "create" else "overwrite")]
+    # An append to a dataset that does not exist yet creates it, as pylance's does -- as a create-or-append, so
+    # that of many writers starting the dataset at once one creates it and the others append (it used to commit
+    # as an overwrite, and a later starter replaced the earlier one's rows).
+    code = _MODES["append" if append else ("create_or_append" if mode == "append" else mode)]
     shown = _display_uri(uri, path)
     if append:
         _warn_mixed_format(_latest_info(path), shown)

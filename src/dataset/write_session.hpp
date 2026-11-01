@@ -26,6 +26,7 @@ enum class WriteStatus : int { Ok = 0, InvalidArgument = 1, InvalidState = 2, Io
 constexpr int kCommitCreate = 0;     // fail if a dataset exists there
 constexpr int kCommitAppend = 1;     // add the fragments to the latest version
 constexpr int kCommitOverwrite = 2;  // a new version holding only these fragments (or create one)
+constexpr int kCommitCreateOrAppend = 3;  // create if there is no version yet, else append (CommitMode::CreateOrAppend)
 
 /// The options a session opens with (NanoLanceWriteOptions, without the C types).
 struct WriteOptions {

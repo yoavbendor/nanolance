@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/commit_backoff.hpp"
 #include "nanolance/work_stats.hpp"
 #include "nanolance/manifest_writer.hpp"
 #include "nanolance/row_ids.hpp"
@@ -315,6 +316,36 @@ pb::DataFile manifest_data_file(const LanceSchemaMapping& mapping, const DataFil
     return file;
 }
 
+/// For a create-or-append that appends: the writer's schema, as the manifest would record it, against the
+/// dataset's -- the same fields, in order, with the same id, parent id, name, logical type and nullability. Its
+/// data files name columns by field id, so a writer whose ids differ would have its rows read under other
+/// columns. False with "schema mismatch: ..." naming the first difference.
+bool same_schema(const LanceSchemaMapping& mapping, const pb::Manifest& prior, std::string& error) {
+    const auto describe = [](const pb::Field& f) {
+        return "'" + f.name + "' (id " + std::to_string(f.id) + ", parent " + std::to_string(f.parent_id) + ", " +
+               f.logical_type + (f.nullable ? ", nullable" : ", not nullable") + ")";
+    };
+    const std::size_t n = std::max(mapping.fields.size(), prior.fields.size());
+    for (std::size_t i = 0; i < n; ++i) {
+        if (i >= mapping.fields.size()) {
+            error = "schema mismatch: the dataset has field " + describe(prior.fields[i]) + " that this writer lacks";
+            return false;
+        }
+        const auto ours = manifest_field(mapping.fields[i]);
+        if (i >= prior.fields.size()) {
+            error = "schema mismatch: this writer has field " + describe(ours) + " that the dataset lacks";
+            return false;
+        }
+        const auto& theirs = prior.fields[i];
+        if (ours.id != theirs.id || ours.parent_id != theirs.parent_id || ours.name != theirs.name ||
+            ours.logical_type != theirs.logical_type || ours.nullable != theirs.nullable) {
+            error = "schema mismatch: field " + describe(ours) + " where the dataset has " + describe(theirs);
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 pb::Field make_manifest_field(const LanceField& field) {
@@ -350,16 +381,17 @@ bool commit_dataset_version(const std::filesystem::path& dataset_path, const Lan
     // An append reads nothing of the dataset but its schema, and an overwrite nothing at all, so
     // when another writer commits first either still applies after it: built again on the newer
     // version and retried, as Lance retries compatible transactions.
+    const bool object_store = io::is_object_store_output(dataset_path.string());
+    const int attempts = commit_attempts(object_store);
     for (int attempt = 0;; ++attempt) {
         if (commit_dataset_version_once(dataset_path, mapping, fragments, mode, version, error, extras)) {
             return true;
         }
-        if (mode == CommitMode::Create || error.rfind("commit conflict", 0) != 0 || attempt + 1 >= 20) {
+        // CreateOrAppend retries a lost create too: its next attempt finds the version and appends.
+        if (mode == CommitMode::Create || error.rfind("commit conflict", 0) != 0 || attempt + 1 >= attempts) {
             return false;
         }
-        thread_local std::mt19937 rng{std::random_device{}()};
-        const int ceiling = std::min(50, 1 << std::min(attempt, 5));
-        std::this_thread::sleep_for(std::chrono::milliseconds(std::uniform_int_distribution<int>(1, ceiling)(rng)));
+        commit_back_off(attempt, object_store);
     }
 }
 
@@ -374,6 +406,10 @@ bool commit_dataset_version_once(const std::filesystem::path& dataset_path, cons
     bool unused_v2 = false;
     version = next_version(versions_dir, unused_v2);
     const bool exists = version > 1U;
+    const bool create_or_append = mode == CommitMode::CreateOrAppend;
+    if (create_or_append) {
+        mode = exists ? CommitMode::Append : CommitMode::Create;
+    }
     if (mode == CommitMode::Create && exists) {
         error = "dataset already exists: " + dataset_path.string();
         return false;
@@ -390,6 +426,9 @@ bool commit_dataset_version_once(const std::filesystem::path& dataset_path, cons
             return false;
         }
         if (!check_manifest_writable(prior, WriteKind::Insert, error)) {
+            return false;
+        }
+        if (create_or_append && !same_schema(mapping, prior, error)) {
             return false;
         }
     }
@@ -461,8 +500,8 @@ bool commit_dataset_version_once(const std::filesystem::path& dataset_path, cons
             next_id = static_cast<std::uint64_t>(prior.max_fragment_id) + 1U;
         }
     }
-    if (extras.schema_metadata != nullptr) {
-        manifest.schema_metadata = *extras.schema_metadata;
+    if (extras.schema_metadata != nullptr && !(create_or_append && mode == CommitMode::Append)) {
+        manifest.schema_metadata = *extras.schema_metadata;  // a create-or-append that appends keeps the dataset's
     }
     if (mode == CommitMode::Overwrite || mode == CommitMode::Create) {
         next_id = exists && prior.has_max_fragment_id ? next_id : 0U;
