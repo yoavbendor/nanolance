@@ -54,6 +54,9 @@ enum class CompressiveKind {
     /// fixed_size_list: NOT with repetition levels, but as a wrapper saying "every N consecutive
     /// values are one row". The schema has no child field for it either.
     kFixedSizeList = 11,
+    /// f13 VariablePackedStruct{ repeated FieldEncoding fields = 1 }: a struct's fields packed side by side per
+    /// row (how Lance stores a blob v2 descriptor), each with its own encoding. See Compressive::packed_fields.
+    kVariablePackedStruct = 13,
 };
 
 /// Buffer-compression schemes inside `General`, numbered as Lance's `CompressionScheme` enum does.
@@ -68,6 +71,16 @@ enum class BufferScheme {
 
 /// One node of the CompressiveEncoding tree. Children are owned; the tree is small (a handful of
 /// nodes per page) and built once per page, not per value.
+struct Compressive;
+
+/// One field of a VariablePackedStruct: how its values are compressed, and either the fixed width of each
+/// (bits_per_value) or the width of each value's length prefix (bits_per_length).
+struct PackedField {
+    std::unique_ptr<Compressive> value;
+    std::uint64_t bits_per_value = 0;
+    std::uint64_t bits_per_length = 0;
+};
+
 struct Compressive {
     CompressiveKind kind = CompressiveKind::kUnknown;
     /// Raw field number as it appeared on the wire. Preserved even for kUnknown so an error message
@@ -101,6 +114,8 @@ struct Compressive {
     std::unique_ptr<Compressive> values;
     /// Rle::lengths.
     std::unique_ptr<Compressive> lengths;
+    /// VariablePackedStruct: its fields, in struct order.
+    std::vector<PackedField> packed_fields;
 };
 
 /// PageLayout f1. `value_compression` describes the chunk payload; `dictionary` is present for

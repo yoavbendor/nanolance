@@ -147,12 +147,14 @@ private:
 
 /// A Blob v2 descriptor page's PageLayout (the inner ColumnEncoding message): Lance's FullZip of
 /// variable-width packed descriptors, with a definition level per row when the page has nulls.
-std::vector<std::uint8_t> blob_v2_descriptor_page_encoding(std::uint64_t rows, bool nullable);
+std::vector<std::uint8_t> blob_v2_descriptor_page_encoding(std::uint64_t rows, bool nullable,
+                                                           const std::vector<std::uint8_t>* uri_fsst_table = nullptr);
 /// The same for a blob inside lists or structs: `bits_rep` / `bits_def` per control word,
 /// `num_items` levels of which `num_visible_items` own a value slot, the layers innermost first.
 std::vector<std::uint8_t> blob_v2_descriptor_page_encoding(std::uint32_t bits_rep, std::uint32_t bits_def,
                                                            std::uint64_t num_items, std::uint64_t num_visible_items,
-                                                           const std::vector<std::uint8_t>& layers);
+                                                           const std::vector<std::uint8_t>& layers,
+                                                           const std::vector<std::uint8_t>* uri_fsst_table = nullptr);
 
 /// Where a blob's bytes are: a local file or an external URI, and the range within it.
 struct BlobV2Location {

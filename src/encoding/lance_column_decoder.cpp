@@ -999,8 +999,8 @@ bool full_zip_page_params(const page_layout::PageLayout& layout, std::uint64_t p
             out.value_scheme = values->scheme;
             values = values->values.get();
         }
-        if (g_blob_descriptor_values && values != nullptr && values->kind == page_layout::CompressiveKind::kUnknown &&
-            values->wire_field == 13U) {
+        if (g_blob_descriptor_values && values != nullptr &&
+            values->kind == page_layout::CompressiveKind::kVariablePackedStruct) {
             return true;  // a blob descriptor: kind, position, size, blob_id, uri, read as its bytes
         }
         if (values == nullptr || values->kind != page_layout::CompressiveKind::kVariable) {
@@ -1883,6 +1883,93 @@ bool decode_legacy_blob_column(const EncodingsIo& io, const pb::Field& field,
 
 namespace {
 
+/// A blob v2 descriptor page's value encoding: VariablePackedStruct{kind Flat(8), position Flat(64), size Flat(64),
+/// blob_id Flat(32), blob_uri Variable / Fsst{Variable}, length-prefixed}. pylance FSST-compresses the uri field per
+/// value (its table in the descriptor); nanolance used to store it plain. `fsst` says which, with the table in
+/// `table`. Any other field encoding is refused by name: reading the row's bytes as they are would return
+/// compressed bytes as the uri.
+bool blob_descriptor_uri_encoding(const page_layout::PageLayout& layout, bool& fsst, fsst::SymbolTable& table,
+                                  std::string& error) {
+    fsst = false;
+    if (layout.kind != page_layout::LayoutKind::kFullZip || layout.full_zip.value_compression == nullptr) {
+        return true;  // not a modeled layout: the caller's own checks apply
+    }
+    const auto& packed = *layout.full_zip.value_compression;
+    if (packed.kind != page_layout::CompressiveKind::kVariablePackedStruct) {
+        return true;
+    }
+    static constexpr std::uint64_t kWidths[4] = {8U, 64U, 64U, 32U};
+    const auto& f = packed.packed_fields;
+    bool ok = f.size() == 5U;
+    for (std::size_t i = 0; ok && i < 4U; ++i) {
+        ok = f[i].value != nullptr && f[i].value->kind == page_layout::CompressiveKind::kFlat &&
+             f[i].value->bits_per_value == kWidths[i] && f[i].bits_per_value == kWidths[i];
+    }
+    const auto* uri = ok ? f[4].value.get() : nullptr;
+    ok = ok && uri != nullptr && f[4].bits_per_length == 32U;
+    if (ok && uri->kind == page_layout::CompressiveKind::kFsst) {
+        if (!fsst::parse_symbol_table(uri->symbol_table, table, error)) {
+            error = "blob descriptor uri: " + error;
+            return false;
+        }
+        fsst = true;
+        uri = uri->values.get();
+    }
+    if (!ok || uri == nullptr || uri->kind != page_layout::CompressiveKind::kVariable) {
+        std::string described = "VariablePackedStruct";
+        if (layout.full_zip.value_compression) {
+            described = page_layout::describe_encoding(*layout.full_zip.value_compression);
+        }
+        error = "unsupported blob v2 descriptor encoding " + described;
+        return false;
+    }
+    return true;
+}
+
+/// Rewrites rows [u32 prefix][kind, position, size, blob_id][u32 uri_len][uri] appended to `payload` from
+/// `first_row` on, with each uri FSST-decompressed by `table` (and both lengths updated).
+bool blob_rows_decompress_uris(std::vector<std::uint8_t>& payload, std::vector<std::uint32_t>& row_sizes,
+                               std::size_t first_row, std::size_t first_byte, const fsst::SymbolTable& table,
+                               std::string& error) {
+    std::vector<std::uint8_t> out(payload.begin(), payload.begin() + static_cast<std::ptrdiff_t>(first_byte));
+    out.reserve(payload.size() * 2U);
+    std::vector<std::uint8_t> uri;
+    std::size_t at = first_byte;
+    for (std::size_t r = first_row; r < row_sizes.size(); ++r) {
+        const auto size = row_sizes[r];
+        if (size == 0U) {
+            continue;  // a null row
+        }
+        if (size < kBlobV2RecordHeaderBytes || at + size > payload.size()) {
+            error = "blob v2 descriptor row is too short";
+            return false;
+        }
+        const auto* row = payload.data() + at;
+        std::uint32_t len = 0;
+        std::memcpy(&len, row + 4U + 21U, 4U);
+        if (len != size - kBlobV2RecordHeaderBytes) {
+            error = "blob v2 descriptor row's uri length does not match the row";
+            return false;
+        }
+        uri.clear();
+        if (!fsst::decompress_value(table, row + kBlobV2RecordHeaderBytes, len, uri, error)) {
+            error = "blob v2 descriptor uri: " + error;
+            return false;
+        }
+        const auto plain = static_cast<std::uint32_t>(uri.size());
+        const std::uint32_t prefix = kBlobV2FixedDescriptorBytes + plain;
+        const auto base = out.size();
+        out.insert(out.end(), row, row + kBlobV2RecordHeaderBytes);
+        std::memcpy(out.data() + base, &prefix, 4U);
+        std::memcpy(out.data() + base + 4U + 21U, &plain, 4U);
+        out.insert(out.end(), uri.begin(), uri.end());
+        row_sizes[r] = static_cast<std::uint32_t>(kBlobV2RecordHeaderBytes + plain);
+        at += size;
+    }
+    payload = std::move(out);
+    return true;
+}
+
 /// Decodes a blob-v2 column (packed blob descriptions, payloads stored elsewhere).
 /// One branch of decode_column_impl, which has already bounded the row count.
 bool decode_blob_v2_column(const EncodingsIo& io, const pb::Field& on_disk_field,
@@ -1906,9 +1993,18 @@ bool decode_blob_v2_column(const EncodingsIo& io, const pb::Field& on_disk_field
         // alone. nanolance's own blob columns are never null and carry none.
         std::size_t control_bytes = 0;
         std::uint32_t def_mask = 0;
+        bool uri_fsst = false;
+        fsst::SymbolTable uri_table;
+        const auto page_first_row = out.blob_v2.row_packed_sizes.size();
+        const auto page_first_byte = out.blob_v2.packed_payload.size();
         if (!page.encoding.empty()) {
             page_layout::PageLayout layout;
             std::string why;
+            if (page_layout::decode_page_layout(page.encoding, layout, why) &&
+                !blob_descriptor_uri_encoding(layout, uri_fsst, uri_table, error)) {
+                error = "column '" + on_disk_field.name + "': " + error;
+                return false;
+            }
             if (page_layout::decode_page_layout(page.encoding, layout, why) &&
                 layout.kind == page_layout::LayoutKind::kFullZip) {
                 if (layout.full_zip.bits_rep != 0U) {
@@ -1958,6 +2054,11 @@ bool decode_blob_v2_column(const EncodingsIo& io, const pb::Field& on_disk_field
         }
         if (offset != values.size()) {
             error = "blob values buffer has trailing bytes";
+            return false;
+        }
+        if (uri_fsst && !blob_rows_decompress_uris(out.blob_v2.packed_payload, out.blob_v2.row_packed_sizes,
+                                                   page_first_row, page_first_byte, uri_table, error)) {
+            error = "column '" + on_disk_field.name + "': " + error;
             return false;
         }
     }
@@ -5525,6 +5626,46 @@ bool decode_nested_blob_column(const EncodingsIo& io, const pb::Field& field,
                                           bytes.variable.data.begin() + static_cast<std::ptrdiff_t>(begin),
                                           bytes.variable.data.begin() + static_cast<std::ptrdiff_t>(end));
         out.blob_v2.row_packed_sizes.push_back(length + 4U);
+    }
+    // pylance FSST-compresses each descriptor's uri (its table in the page descriptor). The rows here come from
+    // every page at once, so one table must cover them all; pages with different tables are refused.
+    bool any_fsst = false;
+    bool any_plain = false;
+    fsst::SymbolTable shared;
+    std::vector<std::uint8_t> shared_bytes;
+    for (const auto& page : column_metadata.pages) {
+        page_layout::PageLayout layout;
+        std::string why;
+        if (page.encoding.empty() || !page_layout::decode_page_layout(page.encoding, layout, why)) {
+            continue;
+        }
+        bool fsst_page = false;
+        fsst::SymbolTable table;
+        if (!blob_descriptor_uri_encoding(layout, fsst_page, table, error)) {
+            error = "column '" + field.name + "': " + error;
+            return false;
+        }
+        if (!fsst_page) {
+            any_plain = any_plain || (layout.kind == page_layout::LayoutKind::kFullZip);
+            continue;
+        }
+        const auto& bytes_now = layout.full_zip.value_compression->packed_fields[4].value->symbol_table;
+        if (any_fsst && bytes_now != shared_bytes) {
+            error = "column '" + field.name + "': a nested blob column whose pages use different uri tables is not read yet";
+            return false;
+        }
+        any_fsst = true;
+        shared = table;
+        shared_bytes = bytes_now;
+    }
+    if (any_fsst && any_plain) {
+        error = "column '" + field.name + "': a nested blob column mixing plain and FSST uris is not read yet";
+        return false;
+    }
+    if (any_fsst && !blob_rows_decompress_uris(out.blob_v2.packed_payload, out.blob_v2.row_packed_sizes, 0U, 0U,
+                                               shared, error)) {
+        error = "column '" + field.name + "': " + error;
+        return false;
     }
     return true;
 }

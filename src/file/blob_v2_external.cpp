@@ -237,23 +237,28 @@ void record_validity(ColumnValues& out, std::size_t row, bool valid) {
 
 }  // namespace
 
-std::vector<std::uint8_t> blob_v2_descriptor_page_encoding(const std::uint64_t rows, const bool nullable) {
+std::vector<std::uint8_t> blob_v2_descriptor_page_encoding(const std::uint64_t rows, const bool nullable,
+                                                           const std::vector<std::uint8_t>* uri_fsst_table) {
     return blob_v2_descriptor_page_encoding(0U, nullable ? 1U : 0U, rows, rows,
-                                            {static_cast<std::uint8_t>(nullable ? 3U : 1U)});
+                                            {static_cast<std::uint8_t>(nullable ? 3U : 1U)}, uri_fsst_table);
 }
 
 std::vector<std::uint8_t> blob_v2_descriptor_page_encoding(const std::uint32_t bits_rep, const std::uint32_t bits_def,
                                                            const std::uint64_t num_items,
                                                            const std::uint64_t num_visible_items,
-                                                           const std::vector<std::uint8_t>& layers) {
+                                                           const std::vector<std::uint8_t>& layers,
+                                                           const std::vector<std::uint8_t>* uri_fsst_table) {
     // As Lance writes it: Any{type_url, PageLayout{full_zip_layout = FullZipLayout{bits_def, bits_per_offset
     // = 32, num_items, num_visible_items, value = packed struct of (kind u8, position u64, size u64,
     // blob_id u32, blob_uri variable), layers (innermost first)}}}; with rep / def bits when the
     // blob is inside lists or nullable structs.
-    static const std::uint8_t kValue[] = {
-        0x6a, 0x36, 0x0a, 0x08, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x08, 0x10, 0x08, 0x0a, 0x08, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x40, 0x10,
+    // The four fixed fields: FieldEncoding{value = Flat(bits), bits_per_value = bits}.
+    static const std::uint8_t kFixedFields[] = {
+        0x0a, 0x08, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x08, 0x10, 0x08, 0x0a, 0x08, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x40, 0x10,
         0x40, 0x0a, 0x08, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x40, 0x10, 0x40, 0x0a, 0x08, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x20,
-        0x10, 0x20, 0x0a, 0x0c, 0x0a, 0x08, 0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x20, 0x18, 0x20};
+        0x10, 0x20};
+    // Variable{offsets = Flat(32)}, as a CompressiveEncoding.
+    static const std::uint8_t kVariable[] = {0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x20};
     const auto varint = [](std::vector<std::uint8_t>& out, std::uint64_t v) {
         while (v >= 0x80U) {
             out.push_back(static_cast<std::uint8_t>(v | 0x80U));
@@ -280,7 +285,25 @@ std::vector<std::uint8_t> blob_v2_descriptor_page_encoding(const std::uint32_t b
     varint(full_zip, num_items);
     full_zip.push_back(0x30);
     varint(full_zip, num_visible_items);
-    message(full_zip, 0x3a, std::vector<std::uint8_t>(std::begin(kValue), std::end(kValue)));
+    // The uri field: Variable, or (as pylance writes it) Fsst{symbol_table, values = Variable} per value;
+    // bits_per_length = 32.
+    std::vector<std::uint8_t> uri_value;
+    if (uri_fsst_table != nullptr) {
+        std::vector<std::uint8_t> fsst;
+        message(fsst, 0x0a, *uri_fsst_table);
+        message(fsst, 0x12, std::vector<std::uint8_t>(std::begin(kVariable), std::end(kVariable)));
+        message(uri_value, 0x32, fsst);
+    } else {
+        uri_value.assign(std::begin(kVariable), std::end(kVariable));
+    }
+    std::vector<std::uint8_t> uri_field;
+    message(uri_field, 0x0a, uri_value);
+    uri_field.insert(uri_field.end(), {0x18, 0x20});
+    std::vector<std::uint8_t> fields(std::begin(kFixedFields), std::end(kFixedFields));
+    message(fields, 0x0a, uri_field);
+    std::vector<std::uint8_t> value;
+    message(value, 0x6a, fields);  // CompressiveEncoding.variable_packed_struct (13)
+    message(full_zip, 0x3a, value);
     message(full_zip, 0x42, layers);
     std::vector<std::uint8_t> layout;
     message(layout, 0x1a, full_zip);
