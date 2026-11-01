@@ -252,22 +252,22 @@ every benchmark run. The table below is the latest run's summary.
 
 <!-- bench-summary:start -->
 
-Latest run: 2026-10-25 14:05 UTC on `claude/nanolance-optimization-review-h3rxi7` (`9c1c79c`), [full results](https://yoavbendor.github.io/nanolance/bench/).
+Latest run: 2026-11-01 16:01 UTC on `main` (`5e66afd`), [full results](https://yoavbendor.github.io/nanolance/bench/).
 
 | Benchmark | Reference | nanolance speed | Faster in |
 |---|---|---:|---:|
-| Read, C++ library, all cores | pylance | 2.99× | 27 of 27 |
-| Read, C++ library, 1 core | pylance | 3.87× | 27 of 27 |
-| Write, C++ library, all cores | pylance | 2.07× | 26 of 27 |
-| Write, C++ library, 1 core | pylance | 1.97× | 26 of 27 |
-| Read, Python binding, all cores | pylance | 2.86× | 27 of 27 |
-| Write, Python binding, all cores | pylance | 1.61× | 27 of 27 |
-| Scalar indexes, build | Rust Lance | 2.37× | 5 of 5 |
+| Read, C++ library, all cores | pylance | 3.05× | 27 of 27 |
+| Read, C++ library, 1 core | pylance | 3.97× | 27 of 27 |
+| Write, C++ library, all cores | pylance | 2.18× | 26 of 27 |
+| Write, C++ library, 1 core | pylance | 2.15× | 27 of 27 |
+| Read, Python binding, all cores | pylance | 2.89× | 27 of 27 |
+| Write, Python binding, all cores | pylance | 1.97× | 27 of 27 |
+| Scalar indexes, build | Rust Lance | 1.97× | 5 of 5 |
 | Scalar indexes, query | Rust Lance | 3.66× | 14 of 14 |
-| Vector indexes, build | Rust Lance | 1.13× | 1 of 3 |
-| Vector indexes, search | Rust Lance | 3.20× | 12 of 12 |
-| Full-text index, build | Rust Lance | 1.36× | 1 of 1 |
-| Full-text index, search | Rust Lance | 11.76× | 7 of 7 |
+| Vector indexes, build | Rust Lance | 1.09× | 1 of 3 |
+| Vector indexes, search | Rust Lance | 3.22× | 12 of 12 |
+| Full-text index, build | Rust Lance | 1.43× | 1 of 1 |
+| Full-text index, search | Rust Lance | 12.31× | 7 of 7 |
 
 <!-- bench-summary:end -->
 
