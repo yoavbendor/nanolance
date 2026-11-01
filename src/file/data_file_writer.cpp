@@ -2031,6 +2031,78 @@ bool write_nested_full_zip_fixed_column(std::ostream& out, const LanceField& fie
     return true;
 }
 
+/// The uris of a page of blob descriptor rows ([u32 prefix][kind, position, size, blob_id][u32 len][uri]) FSST-
+/// compressed per value, as pylance stores them (Fsst in the VariablePackedStruct's uri field): when Lance's
+/// thresholds hold (the uris' data and offsets >= 32 KiB, the longest >= 5 bytes) and, as nanolance keeps FSST
+/// elsewhere (W1g3), the result with its table is at least 10% smaller. A dataset of millions of rows naming a
+/// few recordings stores each long uri in a few bytes. False when not worth it (rows left as they are).
+bool fsst_blob_uris(const std::vector<std::uint8_t>& payload, const std::vector<std::uint32_t>& sizes,
+                    std::vector<std::uint8_t>& out_payload, std::vector<std::uint32_t>& out_sizes,
+                    std::vector<std::uint8_t>& table) {
+    std::vector<std::pair<const std::uint8_t*, std::size_t>> uris;
+    uris.reserve(sizes.size());
+    std::uint64_t raw = 0;
+    std::size_t longest = 0;
+    std::size_t at = 0;
+    for (const auto size : sizes) {
+        if (size < kBlobV2RecordHeaderBytes || at + size > payload.size()) {
+            if (size != 0U) {
+                return false;  // not a descriptor row as written here: leave it alone
+            }
+            uris.emplace_back(nullptr, 0U);
+            continue;
+        }
+        const auto len = size - kBlobV2RecordHeaderBytes;
+        uris.emplace_back(payload.data() + at + kBlobV2RecordHeaderBytes, len);
+        raw += len;
+        longest = std::max<std::size_t>(longest, len);
+        at += size;
+    }
+    if (raw + 4U * (uris.size() + 1U) < kFsstMinBytes || longest < kFsstMinMaxLength) {
+        return false;
+    }
+    std::vector<std::pair<const std::uint8_t*, std::size_t>> sample;
+    sample.reserve(uris.size());
+    for (const auto& u : uris) {
+        if (u.first != nullptr) {
+            sample.push_back(u);
+        }
+    }
+    fsst::Encoder encoder;
+    if (!fsst::train(sample, encoder)) {
+        return false;
+    }
+    out_payload.clear();
+    out_payload.reserve(payload.size());
+    out_sizes.assign(sizes.size(), 0U);
+    std::vector<std::uint8_t> compressed;
+    std::uint64_t packed = 0;
+    at = 0;
+    for (std::size_t r = 0; r < sizes.size(); ++r) {
+        if (sizes[r] == 0U) {
+            continue;
+        }
+        compressed.clear();
+        fsst::compress_value(encoder, uris[r].first, uris[r].second, compressed);
+        packed += compressed.size();
+        const auto len = static_cast<std::uint32_t>(compressed.size());
+        const std::uint32_t prefix = kBlobV2FixedDescriptorBytes + len;
+        const auto base = out_payload.size();
+        out_payload.insert(out_payload.end(), payload.begin() + static_cast<std::ptrdiff_t>(at),
+                           payload.begin() + static_cast<std::ptrdiff_t>(at + kBlobV2RecordHeaderBytes));
+        std::memcpy(out_payload.data() + base, &prefix, 4U);
+        std::memcpy(out_payload.data() + base + 4U + 21U, &len, 4U);
+        out_payload.insert(out_payload.end(), compressed.begin(), compressed.end());
+        out_sizes[r] = static_cast<std::uint32_t>(kBlobV2RecordHeaderBytes + len);
+        at += sizes[r];
+    }
+    if ((packed + fsst::kSymbolTableBytes) * 10U >= raw * 9U) {
+        return false;
+    }
+    table = fsst::serialize(encoder);
+    return true;
+}
+
 /// A Blob v2 column inside structs or lists, as Lance writes one: a FullZip page of the packed
 /// descriptors, each level's control word (`rep << bits_def | def`) followed -- for a valid item --
 /// by the item's descriptor (its u32 length, then kind..uri); a null item, and an empty or null list,
@@ -2070,13 +2142,21 @@ bool write_nested_blob_column(std::ostream& out, const LanceField& field, const 
     const auto levels = ser.has_rep || ser.has_def ? std::max(ser.rep.size(), ser.def.size())
                                                     : static_cast<std::size_t>(ser.items.size());
 
+    // The uris FSST-compressed per value when that pays, as pylance writes them.
+    std::vector<std::uint8_t> fsst_payload;
+    std::vector<std::uint32_t> fsst_sizes;
+    std::vector<std::uint8_t> uri_table;
+    const bool uri_fsst = fsst_blob_uris(values.blob_v2.packed_payload, values.blob_v2.row_packed_sizes, fsst_payload,
+                                         fsst_sizes, uri_table);
+    const auto& item_payload = uri_fsst ? fsst_payload : values.blob_v2.packed_payload;
+    const auto& item_sizes = uri_fsst ? fsst_sizes : values.blob_v2.row_packed_sizes;
     // Each item's descriptor row, by item index.
-    std::vector<std::size_t> starts(values.blob_v2.row_packed_sizes.size() + 1U, 0U);
-    for (std::size_t i = 0; i < values.blob_v2.row_packed_sizes.size(); ++i) {
-        starts[i + 1U] = starts[i] + values.blob_v2.row_packed_sizes[i];
+    std::vector<std::size_t> starts(item_sizes.size() + 1U, 0U);
+    for (std::size_t i = 0; i < item_sizes.size(); ++i) {
+        starts[i + 1U] = starts[i] + item_sizes[i];
     }
     std::vector<std::uint8_t> data;
-    data.reserve(values.blob_v2.packed_payload.size() + levels * control_bytes);
+    data.reserve(item_payload.size() + levels * control_bytes);
     std::vector<std::uint32_t> row_sizes;
     std::size_t row_start = 0;
     std::size_t slot = 0;
@@ -2100,8 +2180,8 @@ bool write_nested_blob_column(std::ostream& out, const LanceField& field, const 
             error = "column '" + field.name + "': a valid blob item has no descriptor";
             return false;
         }
-        data.insert(data.end(), values.blob_v2.packed_payload.begin() + static_cast<std::ptrdiff_t>(starts[item]),
-                    values.blob_v2.packed_payload.begin() + static_cast<std::ptrdiff_t>(starts[item + 1U]));
+        data.insert(data.end(), item_payload.begin() + static_cast<std::ptrdiff_t>(starts[item]),
+                    item_payload.begin() + static_cast<std::ptrdiff_t>(starts[item + 1U]));
     }
     if (levels != 0U) {
         row_sizes.push_back(static_cast<std::uint32_t>(data.size() - row_start));
@@ -2125,7 +2205,8 @@ bool write_nested_blob_column(std::ostream& out, const LanceField& field, const 
     page.length = rows;
     page.priority = 0;
     page.encoding = blob_v2_descriptor_page_encoding(bits_rep, bits_def, levels, slot,
-                                                     std::vector<std::uint8_t>(ser.layers.begin(), ser.layers.end()));
+                                                     std::vector<std::uint8_t>(ser.layers.begin(), ser.layers.end()),
+                                                     uri_fsst ? &uri_table : nullptr);
     column.pages.push_back(std::move(page));
     return true;
 }
@@ -2197,29 +2278,37 @@ bool write_blob_v2_column(const ColumnEncodeContext& ctx, std::ostream& out, std
         error += field.name;
         return false;
     }
+    // The uris FSST-compressed per value when that pays, as pylance writes them.
+    std::vector<std::uint8_t> fsst_payload;
+    std::vector<std::uint32_t> fsst_sizes;
+    std::vector<std::uint8_t> uri_table;
+    const bool uri_fsst = fsst_blob_uris(blob.packed_payload, blob.row_packed_sizes,
+                                                               fsst_payload, fsst_sizes, uri_table);
+    const auto& rows_payload = uri_fsst ? fsst_payload : blob.packed_payload;
+    const auto& rows_sizes = uri_fsst ? fsst_sizes : blob.row_packed_sizes;
     // With nulls, each row starts with its definition level (1: null), a null row being that
     // byte alone -- Lance's FullZip with one definition layer.
     const bool nullable = column_has_nulls;
     std::vector<std::uint8_t> with_levels;
     std::vector<std::uint32_t> level_sizes;
     if (nullable) {
-        with_levels.reserve(blob.packed_payload.size() + blob.row_packed_sizes.size());
-        level_sizes.reserve(blob.row_packed_sizes.size());
+        with_levels.reserve(rows_payload.size() + rows_sizes.size());
+        level_sizes.reserve(rows_sizes.size());
         std::size_t at = 0;
-        for (std::size_t r = 0; r < blob.row_packed_sizes.size(); ++r) {
+        for (std::size_t r = 0; r < rows_sizes.size(); ++r) {
             const bool valid = validity_bit(values.validity, r);
-            const auto n = blob.row_packed_sizes[r];
+            const auto n = rows_sizes[r];
             with_levels.push_back(valid ? 0U : 1U);
             if (valid) {
-                with_levels.insert(with_levels.end(), blob.packed_payload.begin() + static_cast<std::ptrdiff_t>(at),
-                                   blob.packed_payload.begin() + static_cast<std::ptrdiff_t>(at + n));
+                with_levels.insert(with_levels.end(), rows_payload.begin() + static_cast<std::ptrdiff_t>(at),
+                                   rows_payload.begin() + static_cast<std::ptrdiff_t>(at + n));
             }
             at += n;
             level_sizes.push_back(valid ? n + 1U : 1U);
         }
     }
-    const auto& payload = nullable ? with_levels : blob.packed_payload;
-    const auto control = blob_v2_build_control_buffer(nullable ? level_sizes : blob.row_packed_sizes);
+    const auto& payload = nullable ? with_levels : rows_payload;
+    const auto control = blob_v2_build_control_buffer(nullable ? level_sizes : rows_sizes);
 
     align64(out);
     const auto values_offset = pos(out);
@@ -2238,7 +2327,7 @@ bool write_blob_v2_column(const ColumnEncodeContext& ctx, std::ostream& out, std
     page.buffer_sizes.push_back(control.size());
     page.length = rows;
     page.priority = 0;
-    page.encoding = blob_v2_descriptor_page_encoding(rows, nullable);
+    page.encoding = blob_v2_descriptor_page_encoding(rows, nullable, uri_fsst ? &uri_table : nullptr);
     column.pages.push_back(std::move(page));
     columns.push_back(std::move(column));
     return true;

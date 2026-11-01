@@ -148,6 +148,100 @@ bool convert_constant(const nm::unknown_fields& u, Compressive& out, bool& found
 }
 
 bool convert(const wire::CompressiveEncoding& w, Compressive& out, int depth, std::string& error);
+bool child(const nm::pb_lazy<wire::CompressiveEncoding>& lazy, std::unique_ptr<Compressive>& out, int depth,
+           std::string& error);
+
+/// CompressiveEncoding field 13, VariablePackedStruct{ repeated FieldEncoding fields = 1 }, FieldEncoding{
+/// CompressiveEncoding value = 1; oneof { uint64 bits_per_value = 2; uint64 bits_per_length = 3; } }. Not a member
+/// of nanom's CompressiveEncoding, so it arrives in `unknown`; `found` says whether it was there.
+bool convert_variable_packed(const nm::unknown_fields& u, Compressive& out, bool& found, int depth, std::string& error) {
+    const std::span<const std::byte> all(u.bytes);
+    std::size_t at = 0;
+    while (at < all.size()) {
+        std::uint64_t key = 0;
+        if (!read_varint(all, at, key)) {
+            error = "page layout: malformed CompressiveEncoding";
+            return false;
+        }
+        const auto wt = static_cast<std::uint8_t>(key & 7U);
+        if (key >> 3U != 13U || wt != 2U) {
+            if (!skip_field(all, at, wt)) {
+                error = "page layout: malformed CompressiveEncoding";
+                return false;
+            }
+            continue;
+        }
+        std::uint64_t n = 0;
+        if (!read_varint(all, at, n) || n > all.size() - at) {
+            error = "page layout: malformed VariablePackedStruct";
+            return false;
+        }
+        const auto payload = all.subspan(at, static_cast<std::size_t>(n));
+        at += static_cast<std::size_t>(n);
+        found = true;
+        out.kind = CompressiveKind::kVariablePackedStruct;
+        out.wire_field = 13U;
+        out.packed_fields.clear();
+        std::size_t p = 0;
+        while (p < payload.size()) {
+            std::uint64_t fkey = 0;
+            if (!read_varint(payload, p, fkey)) {
+                error = "page layout: malformed VariablePackedStruct";
+                return false;
+            }
+            const auto fwt = static_cast<std::uint8_t>(fkey & 7U);
+            if (fkey >> 3U != 1U || fwt != 2U) {
+                if (!skip_field(payload, p, fwt)) {
+                    error = "page layout: malformed VariablePackedStruct";
+                    return false;
+                }
+                continue;
+            }
+            std::uint64_t len = 0;
+            if (!read_varint(payload, p, len) || len > payload.size() - p) {
+                error = "page layout: malformed VariablePackedStruct field";
+                return false;
+            }
+            const auto field = payload.subspan(p, static_cast<std::size_t>(len));
+            p += static_cast<std::size_t>(len);
+            PackedField packed;
+            std::size_t q = 0;
+            while (q < field.size()) {
+                std::uint64_t k = 0;
+                if (!read_varint(field, q, k)) {
+                    error = "page layout: malformed VariablePackedStruct field";
+                    return false;
+                }
+                const auto kwt = static_cast<std::uint8_t>(k & 7U);
+                if (k >> 3U == 1U && kwt == 2U) {
+                    std::uint64_t vlen = 0;
+                    if (!read_varint(field, q, vlen) || vlen > field.size() - q) {
+                        error = "page layout: malformed VariablePackedStruct field";
+                        return false;
+                    }
+                    nm::pb_lazy<wire::CompressiveEncoding> lazy;
+                    lazy.set_region(field.data() + q, static_cast<std::size_t>(vlen));
+                    q += static_cast<std::size_t>(vlen);
+                    if (!child(lazy, packed.value, depth, error)) {
+                        return false;
+                    }
+                } else if ((k >> 3U == 2U || k >> 3U == 3U) && kwt == 0U) {
+                    std::uint64_t v = 0;
+                    if (!read_varint(field, q, v)) {
+                        error = "page layout: malformed VariablePackedStruct field";
+                        return false;
+                    }
+                    (k >> 3U == 2U ? packed.bits_per_value : packed.bits_per_length) = v;
+                } else if (!skip_field(field, q, kwt)) {
+                    error = "page layout: malformed VariablePackedStruct field";
+                    return false;
+                }
+            }
+            out.packed_fields.push_back(std::move(packed));
+        }
+    }
+    return true;
+}
 
 /// A child node: its bytes were only length-checked with the parent, so they are decoded (and
 /// fully checked) here, one level deeper.
@@ -255,6 +349,13 @@ bool convert(const wire::CompressiveEncoding& w, Compressive& out, int depth, st
         return false;
     }
     if (constant) {
+        return true;
+    }
+    bool packed = false;
+    if (!convert_variable_packed(*w.unknown, out, packed, depth, error)) {
+        return false;
+    }
+    if (packed) {
         return true;
     }
     // Parsed, just not modeled. Recording the wire field lets the caller refuse by name instead of
@@ -450,6 +551,18 @@ void describe_compressive(const Compressive* node, std::string& out) {
         case CompressiveKind::kConstant:
             out += node->has_constant_value ? "Constant{" + std::to_string(node->constant_value.size()) + "B}"
                                             : "Constant{null}";
+            return;
+        case CompressiveKind::kVariablePackedStruct:
+            out += "VariablePackedStruct{";
+            for (std::size_t i = 0; i < node->packed_fields.size(); ++i) {
+                const auto& f = node->packed_fields[i];
+                out += i == 0U ? "" : ",";
+                describe_compressive(f.value.get(), out);
+                if (f.bits_per_length != 0U) {
+                    out += "/len" + std::to_string(f.bits_per_length);
+                }
+            }
+            out += "}";
             return;
         case CompressiveKind::kUnknown:
         default:
