@@ -362,6 +362,7 @@ public:
                     flags_[k].has_null = true;
                     ++levels_;
                     items_ += lists_below_[k] ? 0U : 1U;
+                    mark_hidden_nulls(k, idx);
                     return true;
                 }
                 push(rep, null_level_[k], lists_below_[k] ? kNoSlot : idx);
@@ -512,6 +513,24 @@ public:
 
 private:
     static constexpr std::uint64_t kNoSlot = ~std::uint64_t{0};
+
+    /// Lance decides a layer's kind from its whole bitmap (`add_validity_bitmap`: any null), so a null under an outer
+    /// null -- a struct's, pushed down to its children, or pyarrow's under a null fixed-size list row -- still makes
+    /// that layer nullable, though no level shows it. The layers inside a null non-list layer `k` share its index
+    /// down to the first list.
+    void mark_hidden_nulls(std::size_t k, std::uint64_t idx) {
+        for (auto j = next_[k]; j < layers_.size(); j = next_[j]) {
+            if (!valid_at(layers_[j].validity, idx)) {
+                flags_[j].has_null = true;
+            }
+            if (layers_[j].is_list) {
+                return;
+            }
+        }
+        if (!valid_at(&item_validity_, idx)) {
+            flags_[layers_.size()].has_null = true;
+        }
+    }
 
     static bool passthrough(const SerializeLayer& layer) {
         return !layer.is_list && (layer.validity == nullptr || layer.validity->empty());

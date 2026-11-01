@@ -57,7 +57,7 @@ feature. Compaction already remaps indexes; the FRI only serves deferred remap.
 | Staged (distributed) INVERTED builds over list elements are refused; `infer_index_segment_details` would drop `document_granularity` (field 14) | -- | small | FTS_LISTS L2 |
 | `Compaction.plan`, `lance.debug.format_fragment`, `lance.util.KMeans`, `lance.pydantic.Vector` | 3-4 each | small each | |
 | lance-c prepared fuzzy FTS (`lance_dataset_prepare_fts_match_query` with fuzziness) | -- | small | the fuzzy query exists |
-| Expression leftovers: `l[1 + 1]`, projecting a struct element `ls[1]`, `array_element(...)`, `ts - arrow_cast(ts, 'Timestamp(..)')` (unit dropped), arrow_cast of a column to Duration, `coalesce(ts, ts_ms)` (coarser unit), `d32 - ts`, `dec + i32 * 1` (strict xfail), comparisons as projections keep old typing | ~0 directly | 1 session | `docs/tasks/EXPR_TYPES.md` outcomes A1-C3 |
+| Expression leftovers: `l[1 + 1]`, projecting a struct element `ls[1]`, `array_element(...)`, `ts - arrow_cast(ts, 'Timestamp(..)')` (unit dropped), arrow_cast of a column to Duration, `coalesce(ts, ts_ms)` (coarser unit), `d32 - ts`, comparisons as projections keep old typing | ~0 directly | 1 session | `docs/tasks/EXPR_TYPES.md` outcomes A1-C3 |
 | LABEL_LIST exact counts from the index; ScalarIndexQuery metrics in the count plan | -- | small | ROADMAP "Count from an exact scalar-index mask" |
 | Validate a fuzzy token's dictionary scan cost (~0.15 s per token on 1M terms) -- an FST walk | -- | 1 session | perf, not correctness |
 | Stemming and stop words for languages other than English | several | 1-2 sessions | the 18 language names are validated already |

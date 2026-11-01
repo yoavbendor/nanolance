@@ -374,8 +374,35 @@ void test_fixed_dict() {
                 cv.structural_dict_plan.fixed_width == 40U,
             "more than one block: OutOfLineBitpacking at the 40-bit width");
 
+    // Lance's sample starts block b at b * rows / 32: with 5,000 distinct values of period 5,000 its blocks 16..31
+    // repeat 0..15, the ratio halves and pylance 12 takes the dictionary (measured); 6,007 has no such repeat.
     cv = fixed_column(shuffled_64(50000, 5000));
-    require(!ec::fixed_column_dict_beneficial(cv), "5,000 distinct: the sample projects past rows / 2");
+    require(ec::fixed_column_dict_beneficial(cv) && cv.structural_dict_plan.fixed_distinct.size() == 5000U,
+            "5,000 distinct of period 5,000: the sample repeats, a dictionary as pylance");
+    cv = fixed_column(shuffled_64(50000, 6007));
+    require(!ec::fixed_column_dict_beneficial(cv), "6,007 distinct: the sample projects past rows / 2");
+
+    // 128-bit values (decimal128, fixed_size_binary(16)): the same decision at 16 bytes an entry, the dictionary
+    // never bitpacked (LZ4 by default), 2 words an entry in the plan.
+    {
+        std::vector<std::uint64_t> words;
+        for (std::size_t i = 0; i < 50000U; ++i) {
+            words.push_back((i * 7919U) % 20U);
+            words.push_back(0x1234U);
+        }
+        cv = fixed_column(words);
+        require(ec::fixed_column_dict_beneficial(cv, {}, 16U) && cv.structural_dict_plan.fixed_bytes == 16U &&
+                    cv.structural_dict_plan.fixed_distinct.size() == 40U &&
+                    cv.structural_dict_plan.fixed_values == FixedDictValues::kLz4,
+                "128-bit, 20 distinct: a dictionary, LZ4");
+        std::vector<std::uint64_t> unique;
+        for (std::size_t i = 0; i < 50000U; ++i) {
+            unique.push_back(i);
+            unique.push_back(0U);
+        }
+        cv = fixed_column(unique);
+        require(!ec::fixed_column_dict_beneficial(cv, {}, 16U), "128-bit, all distinct: no dictionary");
+    }
 
     cv = fixed_column(shuffled_64(1000000, 1000));
     require(!ec::fixed_column_dict_beneficial(cv), "1,000,000 rows, 1,000 distinct: projected past 100,000");

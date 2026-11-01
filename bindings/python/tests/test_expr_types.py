@@ -891,11 +891,22 @@ def test_decimal_results_past_their_precision_are_returned_like_pylance(tmp_path
     assert _decimal_projection(ours, expr) == _decimal_projection(theirs, expr)
 
 
-@pytest.mark.xfail(strict=True, reason="phase C2 leftover: nested integer arithmetic beside a decimal (dec + i32 * 1)")
-def test_decimal_with_nested_integer_arithmetic_equals_pylance(tmp_path):
+# Lance's resolve_expr types a literal by a column only at the top (`col op lit`, and every literal of `col op (..)`);
+# every other literal keeps DataFusion's Int64, and an integer expression beside a decimal is decimal(p, 0) for its type.
+LITERAL_RESOLUTION = [
+    "dec + i32 * 1", "dec + i32 * 2", "dec + i8 * 2", "dec + u * 2", "dec + 1 * 2", "dec + i32 * i32",
+    "dec + (i8 + i8)", "dec + (1 + 1)", "dec + (dec + 1)", "(dec + 1) * 2", "2 * (dec + 1)", "(dec + 1) + i32",
+    "i32 + (dec + 1)", "(i32 + 1) + dec", "dec * 2 + i32 * 2", "(i8 + 1) * 300",
+    # integers alone: the literals of `col op (..)` take the column's type; a u64 with a signed int is decimal at any depth
+    "i8 + (1 + 1)", "i8 + (2 * 100)", "(i8 + 1) + 1", "1 + (i8 + 1)", "i32 + (1 - 2) * 3", "i8 * (u + 1)",
+    "u + (i8 + 1)", "(u + i8) * 2", "(u + 1) + i8", "-(u + i8)", "abs(u + i8)", "dec + (u + i8)",
+]
+
+
+@pytest.mark.parametrize("expr", LITERAL_RESOLUTION)
+def test_decimal_with_nested_integer_arithmetic_equals_pylance(tmp_path, expr):
     lance = require_pylance()
     ours, theirs = _datasets(lance, tmp_path, _decimal_table())
-    expr = "dec + i32 * 1"
     assert _decimal_projection(ours, expr) == _decimal_projection(theirs, expr)
 
 

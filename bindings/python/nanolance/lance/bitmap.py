@@ -47,6 +47,10 @@ def _u32_values(values: Iterable[int]) -> set:
     pa = _arrow_module()
     if pa is not None and isinstance(values, (pa.Array, pa.ChunkedArray)):
         return _from_arrow(values, pa)
+    # Plain ints already in range (a decoded overlay's offsets): one C-speed pass each, no per-value check.
+    if isinstance(values, (set, frozenset, list, tuple)) and all(type(v) is int for v in values) and \
+            (not values or (0 <= min(values) and max(values) < _U32)):
+        return set(values)
     out = set()
     for v in values:
         n = operator.index(v)  # TypeError for non-integers, as pylance
@@ -87,6 +91,14 @@ class Bitmap(MutableSet):
 
     def __init__(self, values: Iterable[int] = ()):
         self._ids = _u32_values(values)
+
+    @classmethod
+    def _of_u32_set(cls, ids: set) -> "Bitmap":
+        """A bitmap over `ids`, a set of ints already known to be u32 (a decoded RoaringBitmap's): no per-value
+        check."""
+        out = cls.__new__(cls)
+        out._ids = ids
+        return out
 
     def __contains__(self, value) -> bool:
         return value in self._ids
@@ -154,6 +166,40 @@ def _serialize_roaring(values: Iterable[int]) -> bytes:
     """`values` (u32) in the portable RoaringBitmap format, as roaring-rs writes it without run
     containers: array containers up to 4096 values, bitmap containers above."""
     import struct
+
+    try:
+        import numpy as np
+    except ImportError:  # pragma: no cover - numpy comes with pyarrow
+        np = None
+    if np is not None:
+        # The same bytes as the loop below, with the grouping and the bitmap containers built in numpy (a 100,000
+        # offset overlay took 130 ms in the loop).
+        arr = np.array(values if isinstance(values, (list, tuple, np.ndarray)) else list(values), dtype=np.uint64)
+        arr.sort()
+        if arr.size > 1:  # sorted: a value is new when it differs from the one before
+            arr = arr[np.concatenate(([True], arr[1:] != arr[:-1]))]
+        keys_arr = (arr >> 16).astype(np.uint32)
+        lows = (arr & 0xFFFF).astype(np.uint16)
+        uniq, starts, counts = np.unique(keys_arr, return_index=True, return_counts=True)
+        out = bytearray(struct.pack("<II", 12346, len(uniq)))
+        for k, n in zip(uniq.tolist(), counts.tolist()):
+            out += struct.pack("<HH", k, n - 1)
+        offset = len(out) + 4 * len(uniq)
+        bodies = []
+        for start, n in zip(starts.tolist(), counts.tolist()):
+            low = lows[start:start + n]
+            if n <= 4096:
+                body = low.astype("<u2").tobytes()
+            else:
+                bits = np.zeros(65536, dtype=np.uint8)
+                bits[low] = 1
+                body = np.packbits(bits, bitorder="little").tobytes()
+            out += struct.pack("<I", offset)
+            offset += len(body)
+            bodies.append(body)
+        for body in bodies:
+            out += body
+        return bytes(out)
 
     by_key = {}
     for v in sorted(set(int(x) for x in values)):

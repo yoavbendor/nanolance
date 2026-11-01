@@ -52,9 +52,10 @@ struct StructuralDictPlan {
     std::vector<std::uint64_t> fixed_distinct;
     std::vector<std::uint8_t> fixed_block;
     /// How the dictionary block is stored: the bitpacking Lance chose, or the general codec when it did not.
-    enum class FixedDictValues : std::uint8_t { kInlineBitpacking, kOutOfLineBitpacking, kFlat, kLz4 };
+    enum class FixedDictValues : std::uint8_t { kInlineBitpacking, kOutOfLineBitpacking, kFlat, kLz4, kZstd };
     FixedDictValues fixed_values = FixedDictValues::kFlat;
     unsigned fixed_width = 0;  // kOutOfLineBitpacking: the one width every block is packed at
+    unsigned fixed_bytes = 8;  // a value's bytes: 8, or 16 for a 128-bit dictionary (`fixed_distinct` then 2 words an entry)
     /// Run-length encoding of the indices (W1p2), as pylance writes a sorted or run-heavy dictionary column:
     /// `Rle{Flat(32),Flat(8)}` over the u32 indices. `index_runs` holds (row, length) per run of `indices`, as
     /// FixedRlePlan does; the indices are then not bitpacked.
@@ -101,6 +102,13 @@ struct ColumnValues {
     std::vector<std::uint8_t> item_validity;
     std::uint64_t item_null_count = 0;
     std::uint64_t items_per_row = 0;
+    /// fixed_size_list<fixed_size_list<T, a>, b> only (W1a): `items_per_row` is then a*b, the LEAF values a row
+    /// (and `item_validity` their validity), and these describe the outer level. `outer_items_per_row` is b, the
+    /// inner lists a row; `outer_item_validity` holds one bit each for them, LSB-first, `outer_items_per_row`
+    /// bits a row, and is empty when none is null. Zero `outer_items_per_row` means no outer level.
+    std::vector<std::uint8_t> outer_item_validity;
+    std::uint64_t outer_item_null_count = 0;
+    std::uint64_t outer_items_per_row = 0;
 
     /// An Arrow dictionary column's dictionary, as stored: each entry's bytes (a fixed-width value,
     /// or a string's bytes), in order. Read: the pages' dictionaries, unused entries included; write:
@@ -118,6 +126,9 @@ struct ColumnValues {
         std::vector<std::uint8_t> validity;  // LSB-first; empty when no entry is null
         std::uint64_t null_count = 0;
         std::uint64_t length = 0;
+        // A fixed_size_list<struct> layer (W1k4): N, the elements a row holds. Its entries -- `length`, `validity`
+        // -- are then elements, each row's validity bit repeated N times, as Lance's FSL layer counts them.
+        std::uint64_t fsl_items = 0;
     };
     std::vector<NestedLayer> layers;
     /// Does this column need nested pages (repetition/definition levels per layer)? Only a list, or a

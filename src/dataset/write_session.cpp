@@ -143,6 +143,13 @@ bool read_encoding_options(const LanceField& field, encoding_choice::ColumnEncod
     if (const auto it = field.metadata.find("lance-encoding:dict-values-compression"); it != field.metadata.end()) {
         out.dict_values_compression = it->second;
     }
+    if (const auto it = field.metadata.find("lance-encoding:dict-values-compression-level"); it != field.metadata.end()) {
+        int level = 0;
+        const auto [end, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), level);
+        if (ec == std::errc{} && end == it->second.data() + it->second.size()) {
+            out.dict_values_level = level;  // a non-number is accepted and ignored, as pylance does
+        }
+    }
     return true;
 }
 
@@ -710,6 +717,15 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
                 continue;
             }
             auto& cv = commit_columns[i];
+            // The caller's own lance-encoding:compression on this column (from the schema as given).
+            const auto column_has_own_codec = [&](std::int32_t id) {
+                for (const auto& original : state->schema_mapping.fields) {
+                    if (original.id == id) {
+                        return original.metadata.find("lance-encoding:compression") != original.metadata.end();
+                    }
+                }
+                return false;
+            };
             std::vector<std::uint8_t> value;
             bool constant = false;
             if (cv.kind == ColumnValues::Kind::FixedWidth) {
@@ -742,6 +758,28 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
                 }
                 continue;
             }
+            // A 128-bit column -- decimal128, fixed_size_binary(16) -- is dictionary-encoded as Lance 12 does it (its
+            // dictionary_encode takes 64- and 128-bit values): the same decision at 16 bytes an entry, the dictionary
+            // stored by the general codec (W1p, 128-bit). Its own lance-encoding:compression keeps the codec's layout.
+            if (cv.kind == ColumnValues::Kind::FixedWidth && lance_logical_type_value_bytes(pf->logical_type) == 16U &&
+                (pf->logical_type.rfind("decimal:128:", 0) == 0 || pf->logical_type == "fixed_size_binary:16")) {
+                const bool own_codec = column_has_own_codec(pf->id);
+                if (own_codec && cv.null_count != 0U) {
+                    continue;  // under its own codec only without nulls, as the 64-bit columns (W1r)
+                }
+                if (encoding_choice::fixed_column_dict_beneficial(cv, enc_options, 16U)) {
+                    for (auto& field : disk_schema.fields) {
+                        if (field.id == pf->id) {
+                            field.metadata["nanolance:packing"] = "dict";
+                            if (!own_codec) {
+                                field.metadata.erase("lance-encoding:compression");
+                            }
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
             // Run-length encoding for repetitive fixed-width integer columns (beats bitpacking when
             // there are long runs, e.g. dictionary indices later).
             // Floats take the same decisions on their raw bits (W1s: pylance dictionary-encodes, RLEs and bitpacks
@@ -753,8 +791,9 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
                 const bool is_float = lance_logical_type_is_float(pf->logical_type);
                 // A 64-bit dictionary (W1p) is decided before RLE, as pylance does: a dictionary column's indices are
                 // RLE'd when they have runs (W1p2, in fixed_column_dict_beneficial), and a column without a dictionary
-                // is RLE'd or not as before. A column with its own lance-encoding:compression keeps its layout (the
-                // dictionary is not written under a codec yet).
+                // is RLE'd or not as before. A column with its own lance-encoding:compression is still a dictionary when
+                // one pays, as in pylance (W1r): its indices take the codec's layout, never RLE (write_dict_fixed_column);
+                // without a dictionary it keeps the codec's layout. Nullable ones keep the codec's layout for now.
                 bool own_codec = false;
                 for (const auto& original : state->schema_mapping.fields) {
                     if (original.id == pf->id) {
@@ -771,18 +810,23 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
                             break;
                         }
                     }
-                    if (own_codec || bss_tagged) {
+                    if (bss_tagged || (own_codec && (bpv != 8U || cv.null_count != 0U))) {
                         continue;
                     }
                 }
-                if (bpv == 8U && !own_codec && encoding_choice::fixed_column_dict_beneficial(cv, enc_options)) {
+                const bool dict_allowed = !own_codec || cv.null_count == 0U;
+                if (bpv == 8U && dict_allowed && encoding_choice::fixed_column_dict_beneficial(cv, enc_options)) {
                     for (auto& field : disk_schema.fields) {
                         if (field.id == pf->id) {
                             field.metadata["nanolance:packing"] = "dict";
-                            field.metadata.erase("lance-encoding:compression");
+                            if (!own_codec) {
+                                field.metadata.erase("lance-encoding:compression");
+                            }
                             break;
                         }
                     }
+                } else if (is_float && own_codec) {
+                    continue;  // no dictionary: the codec's layout, as before
                 } else if (encoding_choice::fixed_column_rle_plan(cv, bpv, enc_options)) {
                     for (auto& field : disk_schema.fields) {
                         if (field.id == pf->id) {
@@ -811,7 +855,7 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
                         }
                     }
                 }
-            } else if (cv.kind == ColumnValues::Kind::VariableWidth &&
+            } else if (cv.kind == ColumnValues::Kind::VariableWidth && !column_has_own_codec(pf->id) &&
                        encoding_choice::variable_column_dict_rle_beneficial(cv, enc_options)) {
                 // Low-cardinality run-length string column -> dictionary + RLE'd indices.
                 for (auto& field : disk_schema.fields) {
@@ -822,7 +866,11 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
                     }
                 }
             } else if (cv.kind == ColumnValues::Kind::VariableWidth &&
-                       encoding_choice::variable_column_dict_beneficial(cv, enc_options)) {
+                       (encoding_choice::variable_column_dict_beneficial(cv, enc_options) ||
+                        (column_has_own_codec(pf->id) &&
+                         encoding_choice::variable_column_dict_rle_beneficial(cv, enc_options)))) {
+                // (Under its own lance-encoding:compression a string column with runs is a dictionary too, but its
+                // indices take the codec's layout, not RLE, as pylance writes it: W1r.)
                 // Scattered low-cardinality strings -> structural dictionary + indices. The indices take the
                 // caller's lance-encoding:compression layout (write_dict_column). The writer-wide compression flag
                 // tagged every string column zstd above; that tag is not the caller's, so it is replaced by the

@@ -164,12 +164,37 @@ def test_fsl_element_nulls_append_to_pylance_dataset(tmp_path, shape):
     assert nl_dataset(path).to_table().to_pylist() == expected
 
 
+@pytest.mark.parametrize("nulls", [True, False])
 @pytest.mark.parametrize("shape", ["list", "struct"])
-def test_fsl_element_nulls_of_256_bytes_or_more_stay_refused(tmp_path, shape):
-    """Rows of 256 bytes or more are FullZip in pylance; nanolance has no nested FullZip writer yet (W1k2 stop)."""
-    table = _fsl_table(100, 256, shape)
-    with pytest.raises(ValueError, match="FullZip pages"):
-        nl_write_dataset(table, str(tmp_path / "wide"))
+def test_fsl_of_256_bytes_or_more_is_nested_full_zip(tmp_path, shape, nulls):
+    """Rows of 256 bytes or more under a list or struct are FullZip in pylance (Lance's is_narrow rule), with or
+    without element nulls: a control word per level, a slot per item, a repetition index under a list. The layout
+    text equals pylance's and both read it back, take included."""
+    lance = require_pylance()
+    table = _fsl_table(2_000, 256, shape)
+    if not nulls:
+        table = pa.Table.from_pylist([_fill_nulls(r) for r in table.to_pylist()], schema=table.schema)
+    ours, theirs = str(tmp_path / "ours.lance"), str(tmp_path / "theirs.lance")
+    nl_write_dataset(table, ours)
+    lance.write_dataset(table, theirs)
+    layout = _layout(ours)
+    assert any("FullZip" in line for line in layout), layout
+    assert layout == _layout(theirs)
+    assert nl_dataset(ours).to_table() == table
+    assert lance.dataset(ours).to_table() == table
+    picks = [0, 1, 7, 1_000, 1_999]
+    assert lance.dataset(ours).take(picks) == table.take(picks)
+    assert nl_dataset(ours).take(picks) == table.take(picks)
+
+
+def _fill_nulls(value):
+    """`value` with every null element of a fixed_size_list replaced by 0.0 (rows and lists stay as they are)."""
+    if isinstance(value, dict):
+        return {k: _fill_nulls(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [0.0 if v is None and (not value or all(not isinstance(x, (list, dict)) for x in value)) else
+                _fill_nulls(v) for v in value]
+    return value
 
 
 def test_struct_child_with_nulls_is_read_by_pylance(tmp_path):

@@ -701,6 +701,11 @@ struct ColumnEncodingPlan {
     /// fixed_size_list<bool, N> (W1k3): FixedSizeList{N, Flat(1)}, each chunk's values N bits a row, LSB first;
     /// they are unpacked to one byte an element, nanolance's bool representation.
     bool fsl_bool = false;
+    /// fixed_size_list<fixed_size_list<T, a>, b> (W1a): FixedSizeList{b, FixedSizeList{a, Flat}}. `fsl_items` is then
+    /// a*b leaves a row; `fsl_outer_items` is b. A chunk's buffers are [outer validity if fsl_outer_validity]
+    /// [leaf validity if fsl_item_validity][values], in that order, all but the values optional.
+    std::uint64_t fsl_outer_items = 0;
+    bool fsl_outer_validity = false;
     /// kDict / kDictRle: the fixed-width dictionary's entries are themselves FastLanes bit-packed
     /// rather than stored flat. Lance picks this once the entries are narrow enough for packing to
     /// pay -- an int64 column with runs gets it. It comes in two spellings, and they differ only in
@@ -792,9 +797,9 @@ using DictionaryBlock = nano_lance::dictionary::Block;
 /// element `at` of `out.item_validity`. `src == nullptr` appends valid elements. The
 /// bitmap is materialized lazily: nothing is stored until the first null element, at which point
 /// every element before it is filled in as valid.
-void append_item_validity(ColumnValues& out, const std::uint8_t* src, std::uint64_t count, std::uint64_t at) {
+void append_element_bits(std::vector<std::uint8_t>& bits, std::uint64_t& null_count, const std::uint8_t* src,
+                         std::uint64_t count, std::uint64_t at) {
     namespace col = ::nanom::columnar;
-    auto& bits = out.item_validity;
     if (src == nullptr) {
         if (!bits.empty()) {
             bits.resize(static_cast<std::size_t>((at + count + 7U) / 8U), 0U);
@@ -816,7 +821,11 @@ void append_item_validity(ColumnValues& out, const std::uint8_t* src, std::uint6
                                                     static_cast<std::size_t>((count + 7U) / 8U)),
                          static_cast<std::size_t>(count), std::as_writable_bytes(std::span(bits)),
                          static_cast<std::size_t>(at));  // both sized above, so it cannot refuse
-    out.item_null_count += count - valid;
+    null_count += count - valid;
+}
+
+void append_item_validity(ColumnValues& out, const std::uint8_t* src, std::uint64_t count, std::uint64_t at) {
+    append_element_bits(out.item_validity, out.item_null_count, src, count, at);
 }
 
 /// What decoding one FullZip page needs, derived from THAT page's descriptor. Not hoisted to the
@@ -856,6 +865,11 @@ struct FullZipPageParams {
     /// value, or zeros at the schema's width when there is no value (validity makes those null).
     bool constant_items = false;
     std::vector<std::uint8_t> constant_item;
+    /// fixed_size_list<fixed_size_list> with Constant leaves (W1a): `items` is then the a*b leaves a row, and
+    /// `outer_items` the b inner lists. Each slot is [outer validity, ceil(b/8) bytes][leaf validity, the rest of
+    /// item_validity_bytes]; no leaf value bytes. Zero `outer_items` means no outer level.
+    std::uint64_t outer_items = 0;
+    std::size_t outer_validity_bytes = 0;
     /// Fixed width: the bytes a row occupies in the output. Equal to value_bytes - item_validity_bytes
     /// except for constant items, whose output is wider than their slot.
     std::size_t out_row_bytes = 0;
@@ -1005,6 +1019,43 @@ bool full_zip_page_params(const page_layout::PageLayout& layout, std::uint64_t p
     std::uint64_t described_bits = 0;
     if (values->kind == page_layout::CompressiveKind::kFlat) {
         described_bits = values->bits_per_value;
+    } else if (values->kind == page_layout::CompressiveKind::kFixedSizeList && values->values != nullptr &&
+               values->values->kind == page_layout::CompressiveKind::kFixedSizeList &&
+               values->values->items_per_value != 0U && values->values->values != nullptr &&
+               values->values->values->kind == page_layout::CompressiveKind::kConstant &&
+               !values->values->values->has_constant_value && values->items_per_value != 0U) {
+        // fixed_size_list<fixed_size_list<T, a>, b> whose leaves are a null Constant (W1a): no value bytes, only
+        // the outer validity (b bits) and the leaf validity (a*b bits), each padded to whole bytes.
+        const std::uint64_t outer = values->items_per_value;
+        std::uint64_t leaves = 0;
+        if (!checked_mul(outer, values->values->items_per_value, leaves) || leaves == 0U) {
+            why = "unsupported FullZip value compression";
+            return false;
+        }
+        const std::uint64_t outer_bytes = values->has_validity ? (outer + 7U) / 8U : 0U;
+        const std::uint64_t leaf_bytes = values->values->has_validity ? (leaves + 7U) / 8U : 0U;
+        if (outer_bytes * 8U + leaf_bytes * 8U != fz.bits_per_value) {
+            why = "unsupported FullZip value compression";
+            return false;
+        }
+        out.constant_items = true;
+        out.items = leaves;
+        out.outer_items = outer;
+        out.outer_validity_bytes = static_cast<std::size_t>(outer_bytes);
+        out.item_validity_bytes = static_cast<std::size_t>(outer_bytes + leaf_bytes);
+        out.value_bytes = fz.bits_per_value / 8U;
+        // Every leaf is null, so its output is zeros at the schema's leaf width (validity makes them null). A
+        // caller that does not state the schema's width (the page's shape check) gets no item bytes; the read
+        // path always states it.
+        if (schema_row_bytes != 0U) {
+            if (schema_row_bytes % leaves != 0U) {
+                why = "unsupported FullZip value compression";
+                return false;
+            }
+            out.constant_item.assign(static_cast<std::size_t>(schema_row_bytes / leaves), 0U);
+            out.out_row_bytes = static_cast<std::size_t>(schema_row_bytes);
+        }
+        return true;
     } else if (values->kind == page_layout::CompressiveKind::kFixedSizeList && values->values != nullptr &&
                values->values->kind == page_layout::CompressiveKind::kConstant && values->items_per_value != 0U) {
         // Constant items: the slot carries the value's bytes per item when there is a value, none when
@@ -1334,6 +1385,24 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
                 out.fsl_items = inner->items_per_value;
                 out.fsl_item_validity = inner->has_validity;
                 return true;
+            }
+            // FixedSizeList{b, FixedSizeList{a, Flat(bits)}} (W1a): a*b values a row, with the outer list's
+            // validity (b bits a row) and the inner's (a*b bits a row) ahead of them when present.
+            if (!has_dictionary && out.value_scheme == page_layout::BufferScheme::kNone && !out.fsst &&
+                inner->values != nullptr && inner->values->kind == page_layout::CompressiveKind::kFixedSizeList &&
+                inner->values->values != nullptr && inner->values->values->kind == page_layout::CompressiveKind::kFlat &&
+                inner->values->values->bits_per_value % 8U == 0U && inner->values->values->bits_per_value != 0U &&
+                inner->items_per_value != 0U && inner->values->items_per_value != 0U) {
+                const std::uint32_t outer_bits = inner->has_validity ? 1U : 0U;
+                const std::uint32_t leaf_bits = inner->values->has_validity ? 1U : 0U;
+                if (out.chunk_shape.num_buffers == 1U + outer_bits + leaf_bits) {
+                    out.kind = ColumnEncodingKind::kFlat;
+                    out.fsl_outer_items = inner->items_per_value;
+                    out.fsl_outer_validity = inner->has_validity;
+                    out.fsl_items = inner->items_per_value * inner->values->items_per_value;
+                    out.fsl_item_validity = inner->values->has_validity;
+                    return true;
+                }
             }
             // FixedSizeList{N, Flat(1)}: N bools a row, bit-packed across the chunk (W1k3).
             if (!has_dictionary && out.value_scheme == page_layout::BufferScheme::kNone && !out.fsst &&
@@ -2532,7 +2601,17 @@ bool decode_full_zip_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
             if (!variable) {
                 const auto* slot = data.data() + lv.value_at;
                 const auto first_item = (rows_so_far + r) * params.items;
-                if (params.item_validity_bytes != 0U) {
+                if (params.outer_items != 0U) {
+                    // fixed_size_list<fixed_size_list> (W1a): the outer validity leads the slot, the leaf validity follows.
+                    out.outer_items_per_row = params.outer_items;
+                    append_element_bits(out.outer_item_validity, out.outer_item_null_count,
+                                        params.outer_validity_bytes != 0U ? slot : nullptr, params.outer_items,
+                                        (rows_so_far + r) * params.outer_items);
+                    const auto leaf_bits = params.item_validity_bytes > params.outer_validity_bytes
+                                               ? slot + params.outer_validity_bytes
+                                               : nullptr;
+                    append_element_bits(out.item_validity, out.item_null_count, leaf_bits, params.items, first_item);
+                } else if (params.item_validity_bytes != 0U) {
                     append_item_validity(out, slot, params.items, first_item);
                 } else if (params.items != 0U) {
                     append_item_validity(out, nullptr, params.items, first_item);
@@ -2968,7 +3047,29 @@ bool decode_fixed_width_column(const EncodingsIo& io, const pb::Field& on_disk_f
                 }
                 std::swap(chunk.values, raw);
             }
-            if (encoding_plan.fsl_item_validity) {
+            if (encoding_plan.fsl_outer_items != 0U) {
+                // [outer validity][leaf validity][values] (W1a), each validity optional. Reordered to
+                // values = the last buffer, extra_buffers = {leaf validity, outer validity}, empty when absent.
+                const std::size_t outer_bits = encoding_plan.fsl_outer_validity ? 1U : 0U;
+                const std::size_t leaf_bits = encoding_plan.fsl_item_validity ? 1U : 0U;
+                if (chunk.extra_buffers.size() + 1U != 1U + outer_bits + leaf_bits) {
+                    error = "nested fixed_size_list chunk has the wrong number of buffers";
+                    return false;
+                }
+                std::vector<std::vector<std::uint8_t>> all;
+                all.push_back(std::move(chunk.values));
+                for (auto& buffer : chunk.extra_buffers) {
+                    all.push_back(std::move(buffer));
+                }
+                chunk.values = std::move(all.back());
+                chunk.extra_buffers.assign(2U, std::vector<std::uint8_t>{});
+                if (outer_bits != 0U) {
+                    chunk.extra_buffers[1] = std::move(all[0]);
+                }
+                if (leaf_bits != 0U) {
+                    chunk.extra_buffers[0] = std::move(all[outer_bits]);
+                }
+            } else if (encoding_plan.fsl_item_validity) {
                 // [element validity bits][values]: move the values into place and keep the bits.
                 if (chunk.extra_buffers.size() != 1U) {
                     error = "fixed_size_list chunk with element validity does not carry two buffers";
@@ -3051,6 +3152,20 @@ bool decode_fixed_width_column(const EncodingsIo& io, const pb::Field& on_disk_f
                 } else {
                     append_item_validity(out, nullptr, items, first_item);
                 }
+            }
+            if (encoding_plan.fsl_outer_items != 0U) {
+                // The outer list's element validity, one bit per inner list (W1a).
+                out.outer_items_per_row = encoding_plan.fsl_outer_items;
+                const auto first_outer = (page_rows_before + page.length - remaining) * encoding_plan.fsl_outer_items;
+                const auto outer = static_cast<std::uint64_t>(chunk_values) * encoding_plan.fsl_outer_items;
+                const auto& bits = chunk.extra_buffers[1];
+                if (encoding_plan.fsl_outer_validity && bits.size() < static_cast<std::size_t>((outer + 7U) / 8U)) {
+                    error = "nested fixed_size_list outer validity is " + std::to_string(bits.size()) + " bytes for " +
+                            std::to_string(outer) + " elements";
+                    return false;
+                }
+                append_element_bits(out.outer_item_validity, out.outer_item_null_count,
+                                     encoding_plan.fsl_outer_validity ? bits.data() : nullptr, outer, first_outer);
             }
             remaining -= chunk_values;
         }
@@ -4870,7 +4985,10 @@ static bool decode_lance_physical_column_rows_impl(const EncodingsIo& io, const 
     const bool nested = column_is_nested(column_metadata);
     std::size_t chunks_touched = 0;
     std::size_t chunks_total = 0;
-    bool chunked = !rows.empty();
+    // fixed_size_list<fixed_size_list> (W1a): the per-chunk take reads only one validity level, so these read
+    // the whole column and pick the rows out of it (the chunk path is not taught the outer level yet).
+    const bool nested_fsl = on_disk_field.logical_type.rfind("fixed_size_list:fixed_size_list:", 0) == 0;
+    bool chunked = !rows.empty() && !nested_fsl;
     for (std::size_t t = 0; t < touched.size() && chunked; ++t) {
         const auto& page = column_metadata.pages[touched[t].first];
         page_layout::PageLayout layout;
@@ -5096,6 +5214,12 @@ bool append_flat_values(ColumnValues& dst, std::uint64_t dst_rows, ColumnValues&
     if (src.items_per_row != 0U) {
         append_validity_bits(dst.item_validity, dst.item_null_count, dst_rows * src.items_per_row, src.item_validity,
                              src.item_null_count, src_rows * src.items_per_row);
+    }
+    if (src.outer_items_per_row != 0U) {
+        // fixed_size_list<fixed_size_list> (W1a): the outer list's element validity, its own count a row.
+        dst.outer_items_per_row = src.outer_items_per_row;
+        append_validity_bits(dst.outer_item_validity, dst.outer_item_null_count, dst_rows * src.outer_items_per_row,
+                             src.outer_item_validity, src.outer_item_null_count, src_rows * src.outer_items_per_row);
     }
     return true;
 }
