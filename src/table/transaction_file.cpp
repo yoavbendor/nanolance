@@ -9,6 +9,7 @@
 // indices, config -- except where the change alone cannot say (an overwrite, a restore, a
 // compaction: the commit says so in Manifest::operation).
 
+#include "base/uuid.hpp"
 #include "nanolance/work_stats.hpp"
 #include "table/transaction_file.hpp"
 
@@ -176,17 +177,12 @@ std::map<std::string, std::string> as_strings(const std::map<std::string, std::v
     return out;
 }
 
+/// A transaction's uuid, which names its file and is how a commit recognises its own manifest after a lost
+/// response. Drawn afresh from the entropy source each call (new_uuid): a per-thread generator is copied into
+/// every process a writer forks, and forked writers then named their transactions alike -- a loser read the
+/// winner's manifest as its own and reported success with its rows lost.
 std::string random_uuid() {
-    thread_local std::mt19937_64 rng{std::random_device{}() ^ (static_cast<std::uint64_t>(std::random_device{}()) << 32U)};
-    std::uint8_t b[16];
-    for (int i = 0; i < 16; i += 8) {
-        const auto r = rng();
-        for (int j = 0; j < 8; ++j) {
-            b[i + j] = static_cast<std::uint8_t>(r >> (8 * j));
-        }
-    }
-    b[6] = static_cast<std::uint8_t>((b[6] & 0x0FU) | 0x40U);  // version 4
-    b[8] = static_cast<std::uint8_t>((b[8] & 0x3FU) | 0x80U);  // RFC 4122 variant
+    const auto b = new_uuid();
     char s[37];
     std::snprintf(s, sizeof(s), "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x", b[0], b[1], b[2],
                   b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);

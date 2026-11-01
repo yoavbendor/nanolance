@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/byte_sink.hpp"
+#include "nanolance/commit_backoff.hpp"
 #include "nanolance/byte_source.hpp"
 #include "nanolance/dataset.hpp"
 #include "nanolance/base_paths.hpp"
@@ -59,14 +61,6 @@ bool is_conflict(const std::string& error) {
     return error.rfind("commit conflict", 0) == 0;
 }
 
-/// A short, growing, jittered pause between attempts, so racing writers spread out.
-void back_off(int attempt) {
-    thread_local std::mt19937 rng{std::random_device{}()};
-    const int ceiling = std::min(50, 1 << std::min(attempt, 5));
-    std::this_thread::sleep_for(std::chrono::milliseconds(std::uniform_int_distribution<int>(1, ceiling)(rng)));
-}
-
-constexpr int kCommitAttempts = 20;  // Lance's default conflict_retries
 
 std::atomic<std::uint64_t> g_rebased{0};
 std::atomic<std::uint64_t> g_retried{0};
@@ -329,7 +323,9 @@ bool commit_next_version(const std::filesystem::path& dataset_path, pb::Manifest
         error = first_error;
         return false;
     }
-    for (int attempt = 0; attempt < kCommitAttempts; ++attempt) {
+    const bool object_store = io::is_object_store_output(dataset_path.string());
+    const int attempts = commit_attempts(object_store);
+    for (int attempt = 0; attempt < attempts; ++attempt) {
         pb::Manifest latest;
         std::uint64_t latest_version = 0;
         error.clear();
@@ -393,7 +389,7 @@ bool commit_next_version(const std::filesystem::path& dataset_path, pb::Manifest
         if (!is_conflict(error)) {
             return false;
         }
-        back_off(attempt);
+        commit_back_off(attempt, object_store);
     }
     return false;
 }

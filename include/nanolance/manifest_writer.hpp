@@ -23,6 +23,12 @@ enum class CommitMode {
     Create,     // fail if the dataset exists
     Append,     // add fragments to the latest version (its schema)
     Overwrite,  // a new version holding only these fragments (creating the dataset if need be)
+    // Create the dataset if no version exists yet, else append -- decided again on every attempt, so of many
+    // writers starting the same dataset at once one creates it and the others append. The writer's schema
+    // must then equal the dataset's field for field (id, parent id, name, logical type, nullability): its data
+    // files name columns by field id, and a different schema would read its rows under other columns. A
+    // mismatch fails with "schema mismatch: ..." and publishes nothing.
+    CreateOrAppend,
 };
 
 /// A data file written for a commit, and its row count.

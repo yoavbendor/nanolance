@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "nanolance/commit_backoff.hpp"
 #include "lance_minimal.pb.hpp"
 
 #include <algorithm>
@@ -73,9 +74,7 @@ bool retry_on_conflict(F&& attempt, std::string& error) {
             return false;
         }
         count_commit_retry();
-        thread_local std::mt19937 rng{std::random_device{}()};
-        const int ceiling = std::min(50, 1 << std::min(tries, 5));
-        std::this_thread::sleep_for(std::chrono::milliseconds(std::uniform_int_distribution<int>(1, ceiling)(rng)));
+        commit_back_off(tries, false);
     }
 }
 

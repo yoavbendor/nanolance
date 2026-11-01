@@ -80,7 +80,10 @@ typedef struct NanoLanceWriteOptions {
 enum {
     NANO_LANCE_COMMIT_CREATE = 0,    // fail if a dataset exists there
     NANO_LANCE_COMMIT_APPEND = 1,    // add the fragments to the latest version
-    NANO_LANCE_COMMIT_OVERWRITE = 2  // a new version holding only these fragments (or create one)
+    NANO_LANCE_COMMIT_OVERWRITE = 2,  // a new version holding only these fragments (or create one)
+    /* Create the dataset if it has no version yet, else append; decided on each commit attempt, so many writers
+       can start one dataset together. The schema must equal the dataset's ("schema mismatch: ..." otherwise). */
+    NANO_LANCE_COMMIT_CREATE_OR_APPEND = 3
 };
 
 /// Fill `options` with the defaults. Equivalent to zero-initializing it.

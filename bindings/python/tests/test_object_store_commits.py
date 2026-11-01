@@ -1383,3 +1383,45 @@ def test_io_stats_count_what_a_write_to_s3_puts(tmp_path):
     s3, local = stats
     assert s3.write_iops == local.write_iops > 0
     assert abs(s3.written_bytes - local.written_bytes) <= 16 and s3.written_bytes > 0  # manifests differ by a byte or two
+
+
+def _start_writer(uri, start, rows, out):
+    """One forked writer: an append (creating the dataset if no one has yet) of `rows` ids from `start`."""
+    try:
+        nl.write_dataset(pa.table({"id": pa.array(range(start, start + rows), pa.int64())}), uri, mode="append",
+                         storage_options=options())
+        out.put((start, "ok"))
+    except Exception as exc:  # noqa: BLE001 -- reported to the parent
+        out.put((start, f"{type(exc).__name__}: {exc}"))
+
+
+@pytest.mark.parametrize("writers", [16])
+def test_many_forked_writers_start_one_dataset_on_s3(tmp_path, writers):
+    """Separate writers each `mode="append"` into an s3:// dataset that does not exist yet: one creates it, the others
+    append (create-or-append), none fails, and every row is there once. The parent writes before it forks, so the
+    children inherit one generator state: transaction names used to repeat across them, and a writer whose commit
+    lost took the winner's manifest (naming "its" transaction) for its own -- 16 writers exited cleanly and one
+    version held one writer's rows. (Before create-or-append, an append that started the dataset was an overwrite,
+    and a later starter replaced the earlier one's rows.)"""
+    import multiprocessing
+
+    nl.write_dataset(pa.table({"id": [0]}), str(tmp_path / "warm.lance"))  # local: no S3 connection to share
+    uri = fresh_uri()
+    ctx = multiprocessing.get_context("fork")
+    out = ctx.Queue()
+    rows = 500
+    procs = [ctx.Process(target=_start_writer, args=(uri, k * rows, rows, out)) for k in range(writers)]
+    for p in procs:
+        p.start()
+    results = [out.get(timeout=300) for _ in procs]
+    for p in procs:
+        p.join(timeout=60)
+    failures = [r for r in results if r[1] != "ok"]
+    assert not failures, failures
+    ds = nl.dataset(uri, storage_options=options())
+    ids = ds.to_table()["id"].to_pylist()
+    assert sorted(ids) == list(range(writers * rows))
+    assert len(ds.versions()) == writers
+    lance = require_pylance()
+    assert lance.dataset(uri, storage_options=options()).count_rows() == writers * rows
+
