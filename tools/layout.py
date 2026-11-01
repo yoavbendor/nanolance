@@ -73,7 +73,7 @@ HEADERS = {
     "file": ["data_file_reader", "data_file_writer", "lance_file_writer", "blob_v2_external"],
     "table": ["manifest_reader", "manifest_writer", "deletion_vector", "row_ids", "base_paths", "overlays",
               "dataset_commit", "dataset_transaction", "mem_wal", "dataset_refs", "frag_reuse",
-              "index_maintenance"],
+              "index_maintenance", "commit_backoff"],
     "expr": ["expr"],
     "scan": ["lance_table_reader"],
     "index": ["index_search", "scalar_index", "bloom_filter", "fts_tokenizer", "fts_lindera", "fts_search", "fts_index_build",

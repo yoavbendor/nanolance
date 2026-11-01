@@ -16,3 +16,10 @@ target_include_directories(nano_lance_dataset_transaction_ops_test PRIVATE ${NAN
 target_link_libraries(nano_lance_dataset_transaction_ops_test PRIVATE nanolance)
 add_test(NAME nano_lance_dataset_transaction_ops COMMAND $<TARGET_FILE:nano_lance_dataset_transaction_ops_test>)
 set_tests_properties(nano_lance_dataset_transaction_ops PROPERTIES LABELS "smoke")
+
+add_executable(nano_lance_commit_backoff_test tests/table/test_commit_backoff.cpp)
+target_compile_features(nano_lance_commit_backoff_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_commit_backoff_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_link_libraries(nano_lance_commit_backoff_test PRIVATE nanolance)
+add_test(NAME nano_lance_commit_backoff COMMAND $<TARGET_FILE:nano_lance_commit_backoff_test>)
+set_tests_properties(nano_lance_commit_backoff PROPERTIES LABELS "smoke")
