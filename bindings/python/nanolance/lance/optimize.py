@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, List
+from typing import Any, List, Optional, TypedDict
 
 
 @dataclass
@@ -30,6 +30,29 @@ class RewriteResult:
     def __repr__(self) -> str:
         return (f"RewriteResult(read_version={self.read_version}, new_fragments={self.new_fragments!r}, "
                 f"old_fragments={self.old_fragments!r})")
+
+
+class CompactionOptions(TypedDict, total=False):
+    """Options for ``Compaction.plan`` / ``DatasetOptimizer.compact_files``, as pylance names them."""
+
+    target_rows_per_fragment: Optional[int]
+    max_rows_per_group: Optional[int]
+    max_bytes_per_file: Optional[int]
+    materialize_deletions: Optional[bool]
+    materialize_deletions_threshold: Optional[float]
+    num_threads: Optional[int]
+    batch_size: Optional[int]
+    io_buffer_size: Optional[int]
+    defer_index_remap: Optional[bool]
+    max_source_fragments: Optional[int]
+    max_source_rows: Optional[int]
+    max_source_bytes: Optional[int]
+    excluded_fragment_ids: Optional[List[int]]
+
+
+# pylance re-exports the step-by-step compaction API here (`from lance.optimize import Compaction`); lance.lance
+# imports this module only inside functions, so the import below makes no cycle.
+from nanolance.lance.lance import Compaction, CompactionPlan, CompactionTask  # noqa: E402
 
 
 def __getattr__(name: str):
