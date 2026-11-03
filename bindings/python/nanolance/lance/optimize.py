@@ -52,7 +52,7 @@ class CompactionOptions(TypedDict, total=False):
 
 # pylance re-exports the step-by-step compaction API here (`from lance.optimize import Compaction`); lance.lance
 # imports this module only inside functions, so the import below makes no cycle.
-from nanolance.lance.lance import Compaction, CompactionPlan, CompactionTask  # noqa: E402
+from nanolance.lance.lance import Compaction, CompactionPlan, CompactionTask  # noqa: E402, F401  (re-exported)
 
 
 def __getattr__(name: str):
