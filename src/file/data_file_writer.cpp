@@ -564,7 +564,8 @@ enum class DictIndexLayout { kBitpacked, kFlat, kGeneral };
 std::vector<std::uint8_t> page_layout_bytes_dict(std::uint32_t num_distinct, std::uint64_t num_items, bool large,
                                                  std::uint64_t dict_scheme = 0U,
                                                  DictIndexLayout index_layout = DictIndexLayout::kBitpacked,
-                                                 std::uint64_t index_scheme = descriptor::kZstd) {
+                                                 std::uint64_t index_scheme = descriptor::kZstd,
+                                                 bool nullable = false) {
     descriptor::MiniBlock m;
     switch (index_layout) {
         case DictIndexLayout::kBitpacked:
@@ -581,7 +582,11 @@ std::vector<std::uint8_t> page_layout_bytes_dict(std::uint32_t num_distinct, std
     const auto plain = descriptor::variable(descriptor::flat(offset_bits_token(large)));
     m.dictionary = dict_scheme == 0U ? plain : descriptor::general(dict_scheme, plain);
     m.num_dictionary_items = num_distinct;
-    miniblock_tail(m, num_items, 1U);
+    // A nullable column's chunks carry definition levels, Bitpacked(16, Flat(1)) as pylance writes them.
+    if (nullable) {
+        m.def_compression = repdef_encoding_bytes();
+    }
+    mini_block_tail(m, num_items, 1U, nullable);
     return descriptor::page_encoding(m);
 }
 
@@ -3026,6 +3031,13 @@ bool write_dict_column(const ColumnEncodeContext& ctx, std::ostream& out, std::v
     if (!dict_index_chunks(indices, ctx.codec, ctx.compression_level, index_layout, index_scheme, index_chunks)) {
         return false;
     }
+    // A nullable column: each chunk (1,024 rows, as dict_index_chunks cut them) carries its rows' definition levels.
+    // A null row's index is the entry its empty value got (every slot is hashed, as Lance's dictionary_encode does).
+    if (ctx.column_has_nulls) {
+        for (std::size_t c = 0; c < index_chunks.size(); ++c) {
+            index_chunks[c].repdef = pack_definition_levels(values.validity, c * 1024U, index_chunks[c].value_count);
+        }
+    }
     const auto payload = miniblock_payload(index_chunks);
     const auto control = control_buffer_for(index_chunks);
     // lance-encoding:dict-values-compression = none | lz4 | zstd (+ dict-values-compression-level) wraps the whole
@@ -3083,7 +3095,7 @@ bool write_dict_column(const ColumnEncodeContext& ctx, std::ostream& out, std::v
     page.priority = 0;
     page.encoding =
         page_layout_bytes_dict(static_cast<std::uint32_t>(distinct.size()), rows, values.variable.large, dict_scheme,
-                               index_layout, index_scheme);
+                               index_layout, index_scheme, ctx.column_has_nulls);
     column.pages.push_back(std::move(page));
     columns.push_back(std::move(column));
     return true;
@@ -3728,6 +3740,16 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
             return true;
         }
     }
+    // A flat column whose every row is null stores no value at all: pylance writes it as a Constant null page
+    // (`Constant{nullable, all-null}`), and nanolance wrote a zeroed value slot per row, 8 bytes a row for an int64.
+    std::uint64_t fsl_items_unused = 0;
+    std::string fsl_element_unused;
+    if (column_has_nulls && values.null_count == rows && rows > 0 && values.layers.empty() && field.parent_id < 0 &&
+        field.dictionary_index_format.empty() && values.item_validity.empty() &&
+        (values.kind == ColumnValues::Kind::FixedWidth || values.kind == ColumnValues::Kind::VariableWidth) &&
+        !lance_fixed_size_list_parts(field.logical_type, fsl_element_unused, fsl_items_unused)) {
+        return write_all_null_column(ctx, columns);
+    }
     if (values.needs_nested_pages() || nested_leaf) {
         pb::ColumnMetadata column;
         if (!write_nested_column(out, field, values, rows, column, error)) {
@@ -3818,7 +3840,7 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
 
     // Structural dictionary for scattered low-cardinality strings: flat bitpacked u32 indices in
     // buffer[1], uncompressed dictionary variable block in buffer[2].
-    if (!column_has_nulls && packing_it != field.metadata.end() && packing_it->second == "dict" &&
+    if (packing_it != field.metadata.end() && packing_it->second == "dict" &&
         values.kind == ColumnValues::Kind::VariableWidth) {
         return write_dict_column(ctx, out, columns);
     }
