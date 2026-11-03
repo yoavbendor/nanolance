@@ -38,14 +38,49 @@
 EM_JS(int, wl_js_range, (const char* url, double offset, double len, uint8_t* dst, char* final_url,
                          int final_cap, double* total_out), {
   const target = UTF8ToString(url);
+  // A file a server answered compressed (see below): read once whole, sliced from memory after that.
+  const whole = globalThis.wlWhole && globalThis.wlWhole.get(target);
+  if (whole) {
+    if (final_cap > 0) stringToUTF8(target, final_url, final_cap);
+    HEAPF64[total_out >> 3] = whole.byteLength;
+    if (offset + len > whole.byteLength) return -2;
+    HEAPU8.set(whole.subarray(offset, offset + len), dst);
+    return 206;
+  }
   const xhr = new XMLHttpRequest();
   xhr.open('GET', target, false);
   xhr.responseType = 'arraybuffer';
   xhr.setRequestHeader('Range', 'bytes=' + offset + '-' + (offset + len - 1));
+  let failed = false;
   try {
     xhr.send();
   } catch (e) {
-    return -1;
+    failed = true;
+  }
+  // Some CDNs (GitHub Pages') answer a Range request with a slice of the gzip-compressed file when the browser
+  // accepts gzip -- Safari and Firefox do on Range requests, and a page cannot change that header. The browser
+  // then either fails to decode the slice (a network error here) or hands over bytes that are not the file's
+  // (a 206 with a Content-Encoding). Either way: read the file once without a range (the browser decodes it)
+  // and slice it. A real network failure fails that read too.
+  const enc = failed ? '' : (xhr.getResponseHeader('Content-Encoding') || '').toLowerCase();
+  if (failed || (xhr.status === 206 && enc !== '' && enc !== 'identity')) {
+    const full = new XMLHttpRequest();
+    full.open('GET', target, false);
+    full.responseType = 'arraybuffer';
+    try {
+      full.send();
+    } catch (e) {
+      return -1;
+    }
+    if (full.status !== 200) return full.status;
+    const bytes = new Uint8Array(full.response);
+    globalThis.wlWhole = globalThis.wlWhole || new Map();
+    globalThis.wlWhole.set(target, bytes);
+    if (final_cap > 0) stringToUTF8(full.responseURL || target, final_url, final_cap);
+    HEAPF64[total_out >> 3] = bytes.byteLength;
+    if (offset + len > bytes.byteLength) return -2;
+    HEAPU8.set(bytes.subarray(offset, offset + len), dst);
+    return 206;
   }
   if (final_cap > 0) stringToUTF8(xhr.responseURL || target, final_url, final_cap);
   const cr = xhr.getResponseHeader('Content-Range');
