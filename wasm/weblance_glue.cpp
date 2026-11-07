@@ -38,14 +38,49 @@
 EM_JS(int, wl_js_range, (const char* url, double offset, double len, uint8_t* dst, char* final_url,
                          int final_cap, double* total_out), {
   const target = UTF8ToString(url);
+  // A file a server answered compressed (see below): read once whole, sliced from memory after that.
+  const whole = globalThis.wlWhole && globalThis.wlWhole.get(target);
+  if (whole) {
+    if (final_cap > 0) stringToUTF8(target, final_url, final_cap);
+    HEAPF64[total_out >> 3] = whole.byteLength;
+    if (offset + len > whole.byteLength) return -2;
+    HEAPU8.set(whole.subarray(offset, offset + len), dst);
+    return 206;
+  }
   const xhr = new XMLHttpRequest();
   xhr.open('GET', target, false);
   xhr.responseType = 'arraybuffer';
   xhr.setRequestHeader('Range', 'bytes=' + offset + '-' + (offset + len - 1));
+  let failed = false;
   try {
     xhr.send();
   } catch (e) {
-    return -1;
+    failed = true;
+  }
+  // Some CDNs (GitHub Pages') answer a Range request with a slice of the gzip-compressed file when the browser
+  // accepts gzip -- Safari and Firefox do on Range requests, and a page cannot change that header. The browser
+  // then either fails to decode the slice (a network error here) or hands over bytes that are not the file's
+  // (a 206 with a Content-Encoding). Either way: read the file once without a range (the browser decodes it)
+  // and slice it. A real network failure fails that read too.
+  const enc = failed ? '' : (xhr.getResponseHeader('Content-Encoding') || '').toLowerCase();
+  if (failed || (xhr.status === 206 && enc !== '' && enc !== 'identity')) {
+    const full = new XMLHttpRequest();
+    full.open('GET', target, false);
+    full.responseType = 'arraybuffer';
+    try {
+      full.send();
+    } catch (e) {
+      return -1;
+    }
+    if (full.status !== 200) return full.status;
+    const bytes = new Uint8Array(full.response);
+    globalThis.wlWhole = globalThis.wlWhole || new Map();
+    globalThis.wlWhole.set(target, bytes);
+    if (final_cap > 0) stringToUTF8(full.responseURL || target, final_url, final_cap);
+    HEAPF64[total_out >> 3] = bytes.byteLength;
+    if (offset + len > bytes.byteLength) return -2;
+    HEAPU8.set(bytes.subarray(offset, offset + len), dst);
+    return 206;
   }
   if (final_cap > 0) stringToUTF8(xhr.responseURL || target, final_url, final_cap);
   const cr = xhr.getResponseHeader('Content-Range');
@@ -284,7 +319,7 @@ std::string trim_slashes(std::string s) {
     return s;
 }
 
-bool remote_for(const std::string& dir, Remote& r, std::string& error) {
+bool remote_for(const std::string& dir, Remote& r, std::string& error, bool static_listing = false) {
     static const std::string hf = "https://huggingface.co/datasets/";
     if (dir.rfind(hf, 0) == 0) {
         // datasets/<owner>/<repo>/resolve/<rev>[/<dir>]
@@ -305,6 +340,16 @@ bool remote_for(const std::string& dir, Remote& r, std::string& error) {
                      (dir_rel.empty() ? "" : "/" + dir_rel) + "?recursive=false";
         return true;
     }
+    if (static_listing) {
+        // Any static host (GitHub Pages, a CDN, a bucket): <dir>/.lance-tree.json, written next to the
+        // files when the site is built, lists the directory in the Hugging Face tree API's shape with
+        // each entry's path being its name (relative to the directory). A missing listing is a 404: an
+        // absent directory, as for the other listings.
+        r.base = trim_slashes(dir) + "/";
+        r.dir_rel.clear();
+        r.list_url = r.base + ".lance-tree.json";
+        return true;
+    }
     if (is_local_http(dir)) {
         // The test server: <origin>/__tree/<dir>, entries relative to the origin.
         const auto slash = dir.find('/', 7);
@@ -314,6 +359,9 @@ bool remote_for(const std::string& dir, Remote& r, std::string& error) {
         r.dir_rel = dir_rel;
         r.list_url = origin + "/__tree/" + dir_rel;
         return true;
+    }
+    if (dir.rfind("https://", 0) == 0) {
+        return remote_for(dir, r, error, true);
     }
     error = "no directory listing for " + dir;
     return false;
@@ -329,11 +377,28 @@ std::string js_listing_text(int which) {
 
 // Entries directly under `dir`, each file's size recorded for its URL. A missing directory lists as
 // empty (a 404), as the library expects for an absent prefix.
+bool list_remote_with(const Remote& r, std::vector<DirEntry>& out, std::string& error, bool& missing);
+
 bool list_remote(const std::string& dir, std::vector<DirEntry>& out, std::string& error) {
     Remote r;
+    bool missing = false;
+    if (is_local_http(dir)) {
+        // A local server: a static listing when the site has one (as it will have when published),
+        // else the test server's /__tree.
+        Remote s;
+        if (remote_for(dir, s, error, true) && list_remote_with(s, out, error, missing) && !missing) {
+            return true;
+        }
+        out.clear();
+    }
     if (!remote_for(dir, r, error)) {
         return false;
     }
+    return list_remote_with(r, out, error, missing);
+}
+
+bool list_remote_with(const Remote& r, std::vector<DirEntry>& out, std::string& error, bool& missing) {
+    missing = false;
     const std::string prefix = r.dir_rel.empty() ? "" : r.dir_rel + "/";
     std::string next = r.list_url;
     for (int page = 0; !next.empty() && page < 10000; ++page) {
@@ -349,6 +414,7 @@ bool list_remote(const std::string& dir, std::vector<DirEntry>& out, std::string
             }
         }
         if (status == 404) {
+            missing = page == 0;
             break;
         }
         if (status != 200) {

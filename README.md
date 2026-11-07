@@ -40,7 +40,8 @@ Lance's protobuf metadata. A program links only the parts it calls: a writer of 
   pointing and match words with and without diacritics ([docs/FTS_INDEX.md](docs/FTS_INDEX.md)).
 - **Three ways in:** a C++ library; a C writer/reader API; `liblance_c`, lance-c's C API over nanolance (code
   written for lance-c links unchanged, [docs/LANCE_C_COMPAT.md](docs/LANCE_C_COMPAT.md)); and Python bindings
-  whose `nanolance.lance` module speaks pylance's API ([docs/PYLANCE_COMPAT.md](docs/PYLANCE_COMPAT.md)).
+  whose `nanolance.lance` module speaks pylance's API ([docs/PYLANCE_COMPAT.md](docs/PYLANCE_COMPAT.md)) and
+  `nanolance.lancedb` LanceDB's, sync and async (cognee's LanceDB tests pass on it, [docs/LANCEDB_COMPAT.md](docs/LANCEDB_COMPAT.md)).
 - **A hardened reader:** every size and offset read from a file is bounds- and overflow-checked before it drives
   an allocation or a copy, allocations are budgeted, paths are jailed, and the decode path runs under ASan, UBSan
   and libFuzzer in CI ([docs/SAFETY.md](docs/SAFETY.md)).
