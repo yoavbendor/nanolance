@@ -81,11 +81,10 @@ def _assert_same_up_to_ties(rd, ri, gd, gi):
     may also let an equally distant row outside the top k replace one, so there only the count must match."""
     assert len(rd) == len(gd) == len(ri) == len(gi)
     assert np.allclose(rd, gd, rtol=1e-4, atol=1e-4), (rd[:5], gd[:5])
-    groups = _tie_groups(rd)
-    for lo, hi in groups[:-1]:
+    for lo, hi in _tie_groups(rd)[:-1]:
         assert sorted(ri[lo:hi]) == sorted(gi[lo:hi]), (lo, hi, ri[lo:hi], gi[lo:hi])
-    lo, hi = groups[-1]
-    assert hi - lo == len(gi[lo:hi])
+    # At the cut the distances above already pin each row's distance; the rows must still be distinct.
+    assert len(set(gi)) == len(gi), gi
 
 
 def _same(ref, got, four_bit=False, refined=False):
