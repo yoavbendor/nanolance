@@ -332,3 +332,92 @@ def test_float_order_and_float32_literals_match_pylance(lance, tmp_path, kind):
             flt = flt.format(c=c)
             want = _ids(theirs.to_table(filter=flt, columns=["id"], use_scalar_index=False))
             assert _ids(nl.dataset(path).to_table(filter=flt, columns=["id"])) == want, (kind, flt)
+
+
+# ── IN lists, ORs and NOTs over a BTREE: the answer is the rows a Python evaluation of the same
+# predicate passes, duplicates, NULLs, empty lists, mixed-type constants, NaN and -0.0 included ───────
+
+def _in_table(n: int, start: int) -> pa.Table:
+    k = np.arange(start, start + n)
+    return pa.table({
+        "k": pa.array(k),
+        # 3000 distinct ids over n rows: each id repeats, and a few rows are NULL.
+        "id": pa.array([None if i % 997 == 5 else f"id-{(i * 7919) % 3000:06d}" for i in k], pa.string()),
+        "n": pa.array([None if i % 10 == 0 else (i * 13) % 50 for i in k], pa.int32()),
+        "f": pa.array([[-0.0, 0.0, 1.5, 2.5, float("nan"), -3.25][i % 6] for i in k], pa.float64()),
+        "s": pa.array([None if i % 13 == 0 else ["", "a", "é", "b", "zz"][i % 5] for i in k], pa.string()),
+        "d": pa.array((10_950 + (k * 37) % 800).astype("datetime64[D]")),
+    })
+
+
+@pytest.fixture(scope="module")
+def in_dataset(tmp_path_factory):
+    """Four fragments with deleted rows, BTREEs on id, n, f and d (s stays unindexed), and an appended
+    fragment the indexes do not cover."""
+    path = str(tmp_path_factory.mktemp("inlists") / "t.lance")
+    nl.write_dataset(_in_table(40_000, 0), path, max_rows_per_file=10_000)
+    nl.dataset(path).delete("n = 7")
+    ds = nl.dataset(path)
+    for column in ("id", "n", "f", "d"):
+        ds.create_scalar_index(column, "BTREE", name=f"{column}_bt")
+    nl.write_dataset(_in_table(1_000, 40_000), path, mode="append", max_rows_per_file=10_000)
+    return path
+
+
+def _in(column, values):
+    """`column IN (values)` as SQL text and as a Python predicate over a row (NULL matches nothing)."""
+    literal = {str: lambda v: "'" + v + "'", type(None): lambda v: "NULL"}
+    items = ", ".join(literal.get(type(v), str)(v) for v in values)
+    members = {v for v in values if v is not None}
+    return f"{column} IN ({items})", lambda r: r[column] is not None and r[column] in members
+
+
+def _filters():
+    import datetime as dt
+
+    a, b = "id-000001", "id-000002"
+    n_in, n_pred = _in("n", (5, 6))
+    id_in, id_pred = _in("id", (a, b))
+    s_eq = "s = 'a'"
+    cases = [
+        _in("id", (a, a, "id-nope")),                       # duplicates and a value that is not there
+        _in("id", (a, None)),                               # a NULL item matches no row
+        _in("id", (None,)),
+        ("id IN ()", lambda r: False),                      # an empty list
+        _in("n", (1, 2, 1)),
+        _in("n", (1.0, 2.5, 7)),                            # an integer column, float items (7 is deleted)
+        _in("n", (-1, 99_999)),
+        _in("f", (-0.0, 1.5)),                              # -0.0 and 0.0 are equal; NaN never is
+        _in("f", (0.0, -3.25, 2.5)),
+        _in("s", ("", "é", "zz")),                          # unindexed: the scan answers
+        (f"d IN (DATE '2001-01-01', DATE '2002-02-02')",
+         lambda r: r["d"] in {dt.date(2001, 1, 1), dt.date(2002, 2, 2)}),
+        (f"{n_in} OR {s_eq}", lambda r: n_pred(r) or r["s"] == "a"),          # OR with an unindexed side
+        (f"({n_in} OR n = 9) AND s IS NOT NULL", lambda r: (n_pred(r) or r["n"] == 9) and r["s"] is not None),
+        (f"{n_in} AND ({id_in} OR f < 0)", lambda r: n_pred(r) and (id_pred(r) or (r["f"] is not None and r["f"] < 0))),
+        ("n IN (2, 3) OR n IN (3, 4)", lambda r: r["n"] in {2, 3, 4}),
+        ("NOT (n IN (1, 2))", lambda r: r["n"] is not None and r["n"] not in {1, 2}),
+        ("n IN (1, 2) AND n IN (2, 3)", lambda r: r["n"] == 2),
+        (f"{id_in} OR n IN (3)", lambda r: id_pred(r) or r["n"] == 3),
+        (f"id IN ('{a}') OR id IN ('{b}') OR d IN (DATE '2001-01-01')",
+         lambda r: r["id"] in {a, b} or r["d"] == dt.date(2001, 1, 1)),
+        ("f IN (2.5, 1.5) AND n IN (5, 6, 7)", lambda r: r["f"] in {2.5, 1.5} and r["n"] in {5, 6, 7}),
+    ]
+    return cases
+
+
+@pytest.mark.parametrize("index", range(len(_filters())))
+def test_in_lists_and_ors_answer_what_a_scan_answers(in_dataset, index):
+    flt, predicate = _filters()[index]
+    ds = nl.dataset(in_dataset)
+    rows = ds.to_table(columns=["k", "id", "n", "f", "s", "d"]).to_pylist()
+    expected = sorted(r["k"] for r in rows if predicate(r))
+    indexed = sorted(ds.to_table(filter=flt, columns=["k"]).column("k").to_pylist())
+    scanned = sorted(ds.to_table(filter=flt, columns=["k"], use_scalar_index=False).column("k").to_pylist())
+    assert indexed == scanned == expected, flt
+
+
+def test_the_index_answers_an_in_list(in_dataset):
+    ds = nl.dataset(in_dataset)
+    flt, _ = _in("id", ("id-000001", "id-000002", "id-000003"))
+    assert "@id_bt(" in ds.scanner(filter=flt).explain_plan()

@@ -125,6 +125,7 @@ typedef struct NanoLanceWorkStats {
     uint64_t buffer_pool_misses;
     uint64_t take_cache_hits;
     uint64_t indexed_fragments; /* fragments a scalar index narrowed a filter to */
+    uint64_t index_evaluations; /* predicate evaluations over index values (one bind each) */
 } NanoLanceWorkStats;
 
 void nano_lance_work_stats(NanoLanceWorkStats* out);

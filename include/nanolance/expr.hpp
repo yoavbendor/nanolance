@@ -98,11 +98,42 @@ public:
 
 private:
     friend class Expression;
+    friend class ValueComparer;
     Test test_ = Test::Compare;
     std::optional<JsonAccess> json_;
     std::vector<std::string> column_;
     std::string op_;
     std::vector<std::shared_ptr<const Node>> constants_;
+};
+
+/// An array's values as a predicate's constants compare with them, in the filter's own order. Built once for an
+/// array, then compared with any constant of the predicate over any rows of it.
+class ValueComparer {
+public:
+    /// `type` is the array's type, as the filter sees it (the column's type).
+    ValueComparer(const ArrowSchema& type, const ArrowArray& values);
+    ~ValueComparer();
+    ValueComparer(const ValueComparer&) = delete;
+    ValueComparer& operator=(const ValueComparer&) = delete;
+
+    /// False when the filter has no direct comparison for this type: Predicate::filter then.
+    bool ok() const { return ok_; }
+
+    /// Constant k of `p` against rows [begin, begin + count): ways[r] is -1, 0 or 1 as row begin + r sorts below,
+    /// equal to or above the constant, and 2 for a NULL row (every row, for a NULL constant). False when the
+    /// constant has no direct comparison (it is not a literal): Predicate::filter then.
+    bool compare(const Predicate& p, std::size_t k, std::int64_t begin, std::int64_t count,
+                 std::vector<std::int8_t>& ways);
+
+    /// Whether row `row` is NULL.
+    bool is_null(std::int64_t row) const;
+
+private:
+    ArrowArrayView view_{};
+    std::int64_t base_ = 0;  // the array's first row in view_
+    ArrowType type_ = NANOARROW_TYPE_UNINITIALIZED;
+    ArrowTimeUnit unit_ = NANOARROW_TIME_UNIT_SECOND;
+    bool ok_ = false;
 };
 
 /// A parsed expression.

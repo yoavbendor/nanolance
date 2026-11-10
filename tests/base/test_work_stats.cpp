@@ -39,12 +39,14 @@ int main() {
         ws::add(c.data_reads, 2);
         ws::add(c.fragment_reads, 3);
         ws::add(c.indexed_fragments, 4);
+        ws::add(c.index_evaluations, 5);
         ws::reset();
         require(c.data_bytes_read.load() == 0 && c.data_reads.load() == 0 && c.largest_read.load() == 0 &&
                     c.page_windows.load() == 0 && c.read_morsels.load() == 0 && c.fragment_reads.load() == 0 &&
                     c.parallel_column_writes.load() == 0 && c.write_buffered_bytes.load() == 0 &&
                     c.buffer_pool_hits.load() == 0 && c.buffer_pool_misses.load() == 0 &&
-                    c.take_cache_hits.load() == 0 && c.indexed_fragments.load() == 0,
+                    c.take_cache_hits.load() == 0 && c.indexed_fragments.load() == 0 &&
+                    c.index_evaluations.load() == 0,
                 "reset() clears every work counter");
         checks += 1;
     }
