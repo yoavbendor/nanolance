@@ -9,6 +9,8 @@ name: wasm
 
 on:
   push:
+    # Branches other than main run through pull_request only, so a PR push is not built twice.
+    branches: [main]
   pull_request:
   workflow_dispatch:
 

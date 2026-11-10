@@ -6,7 +6,8 @@ name: Memory safety
 
 on:
   push:
-    branches: [main, "claude/**", "cursor/**"]
+    # Branches other than main run through pull_request only, so a PR push is not built twice.
+    branches: [main]
     paths:
       - "include/**"
       - "src/**"
