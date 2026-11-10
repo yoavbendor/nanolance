@@ -1835,8 +1835,14 @@ bool write_nested_column(std::ostream& out, const LanceField& field, const Colum
     return true;
 }
 
-/// Values at least this big on average are written as FullZip pages (see write_full_zip_variable_column).
+/// Values at least this big on average are written as FullZip pages (see write_full_zip_variable_column). A column
+/// that sets its own encoding (lance-encoding:compression or any other lance-encoding: key) keeps this threshold.
 constexpr std::uint64_t kFullZipMinAverageValueBytes = 4096U;
+/// The same threshold for a default column: no codec and no lance-encoding: metadata. Measured on pylance 12.0.0:
+/// unique 128-byte strings stay MiniBlock, 256-byte ones are FullZip. A MiniBlock chunk of variable-width values is
+/// 1024 values whatever their size (build_nested_page), so at a few hundred bytes a row a single take reads a chunk
+/// of hundreds of KB; FullZip rows are read through their own index.
+constexpr std::uint64_t kDefaultFullZipMinAverageValueBytes = 128U;
 
 /// A column of large values -- images, audio clips, documents -- as FullZip pages, the layout Lance
 /// itself writes for them: each row's bytes stored whole, one after the other, behind a per-row index.
@@ -3366,6 +3372,30 @@ bool write_packed_fixed_column(const ColumnEncodeContext& ctx, const FixedWidthC
     return true;
 }
 
+/// Whether a variable-width column takes the default layout: no codec named, and no lance-encoding: key set by the
+/// user (structural-encoding, blob, ...). Only such a column gets the default FullZip threshold.
+bool uses_default_layout(const ColumnEncodeContext& ctx) {
+    if (ctx.codec != ColumnCodec::kAbsent) {
+        return false;
+    }
+    for (const auto& [key, value] : ctx.field.metadata) {
+        if (key.rfind("lance-encoding:", 0) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether a plain variable-width column is written as FullZip pages: its non-null values average at least `min_bytes`.
+bool plain_variable_is_full_zip(const ColumnValues& values, std::uint64_t rows, std::uint64_t min_bytes) {
+    std::uint64_t valid_rows = 0;
+    for (std::uint64_t r = 0; r < rows; ++r) {
+        valid_rows += validity_bit(values.validity, r) ? 1U : 0U;
+    }
+    const auto total_bytes = static_cast<std::uint64_t>(variable_offset(values, rows) - variable_offset(values, 0));
+    return valid_rows != 0U && total_bytes / valid_rows >= min_bytes;
+}
+
 /// Writes a plain variable-width column: FullZip pages for large values, MiniBlock chunks otherwise.
 /// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
 bool write_plain_variable_column(const ColumnEncodeContext& ctx, std::ostream& out,
@@ -3377,12 +3407,8 @@ bool write_plain_variable_column(const ColumnEncodeContext& ctx, std::ostream& o
     pb::ColumnMetadata column;
     // Large values get FullZip pages (row-addressable, as Lance writes them); the rest
     // MiniBlock chunks.
-    std::uint64_t valid_rows = 0;
-    for (std::uint64_t r = 0; r < rows; ++r) {
-        valid_rows += validity_bit(values.validity, r) ? 1U : 0U;
-    }
-    const auto total_bytes = static_cast<std::uint64_t>(variable_offset(values, rows) - variable_offset(values, 0));
-    const bool full_zip = valid_rows != 0U && total_bytes / valid_rows >= kFullZipMinAverageValueBytes;
+    const bool full_zip = plain_variable_is_full_zip(
+        values, rows, uses_default_layout(ctx) ? kDefaultFullZipMinAverageValueBytes : kFullZipMinAverageValueBytes);
     if (full_zip ? !write_full_zip_variable_column(out, values, rows, column, error)
                  : !write_nested_column(out, field, values, rows, column, error, nullptr, /*plain=*/true)) {
         return false;
@@ -3563,9 +3589,14 @@ bool write_variable_column(const ColumnEncodeContext& ctx, std::ostream& out,
     // Only when the writer's structural detection tagged the column: FSST is one of those
     // encodings, and set_structural_encoding(false) must still write plain pages.
     fsst::Encoder fsst_encoder;
+    // An uncompressed column of large values is FullZip (below), not FSST mini-block chunks: those chunks hold 1024
+    // values whatever their size, so a take reads a chunk of hundreds of KB per row.
+    const bool default_full_zip =
+        !compress_column && uses_default_layout(ctx) &&
+        plain_variable_is_full_zip(values, rows, kDefaultFullZipMinAverageValueBytes);
     // A column that names its codec (lz4, zstd or none) is laid out as that codec says: no FSST.
     if (packing_it != field.metadata.end() && packing_it->second == "fsst" && ctx.codec == ColumnCodec::kAbsent &&
-        train_column_fsst(field, values, fsst_encoder) &&
+        !default_full_zip && train_column_fsst(field, values, fsst_encoder) &&
         !zstd_requested && (!compress || fsst_pays_on_first_page(fsst_encoder, values, rows))) {
         pb::ColumnMetadata column;
         if (!write_nested_column(out, field, values, rows, column, error, &fsst_encoder)) {

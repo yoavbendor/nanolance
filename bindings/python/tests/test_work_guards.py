@@ -365,3 +365,25 @@ def test_take_and_ranges_of_long_strings_in_lists(lance_mod, tmp_path, version, 
         if limit <= 10:
             assert stats["data_bytes_read"] < whole / 20, (offset, limit, stats)
     assert ours.to_table().equals(theirs.to_table())
+
+
+def test_take_of_default_strings_of_a_few_hundred_bytes_reads_just_those_rows(lance_mod, tmp_path):
+    """A utf8 column of ~650-byte values written with no field metadata is FullZip, as pylance writes it. It was
+    MiniBlock with 1024-value chunks (about 650 KB each), so a take of 100 scattered rows read the whole 96 MB
+    column (46 ms; 0.5 ms now, against 9 ms for the zstd layout)."""
+    rng = np.random.default_rng(11)
+    n = 20_000
+    alphabet = np.frombuffer(b'abcdefghijklmnopqrstuvwxyz0123456789 {}:,"_', dtype=np.uint8)
+    values = [bytes(rng.choice(alphabet, int(rng.integers(200, 1_100)))).decode() for _ in range(n)]
+    table = pa.table({"id": pa.array(range(n)), "properties": pa.array(values, pa.string())})
+    path = tmp_path / "t.lance"
+    import nanolance.lance as nl
+
+    nl.write_dataset(table, str(path))
+    ours = nl.dataset(str(path))
+    whole = sum(os.path.getsize(f) for f in glob.glob(f"{path}/data/*.lance"))
+    rows = sorted(rng.choice(n, 100, replace=False).tolist())
+    stats, got = _stats_of(lambda: ours.take(rows, columns=["properties"]))
+    assert got.column("properties").to_pylist() == [values[r] for r in rows]
+    assert stats["data_bytes_read"] < whole / 10, stats
+    assert lance_mod.dataset(str(path)).take(rows, columns=["properties"]).equals(got)
