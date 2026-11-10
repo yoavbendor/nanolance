@@ -7,7 +7,8 @@
 //              when the page starts with nulls), last value (max) and null count. A predicate keeps
 //              the pages whose bounds allow a match -- evaluated on the bounds with the filter's own
 //              semantics -- and is then evaluated on those pages' values (page_data.lance), whose
-//              row ids are the answer.
+//              row ids are the answer. An IN list compares each value with the bounds once, and
+//              binary-searches each kept page's sorted values for its values, in one pass.
 //   Bitmap     bitmap_page_lookup.lance: per distinct value, a serialized RowAddrTreeMap of its rows.
 //              The predicate is evaluated on the values; the matching values' bitmaps are the answer.
 //   LabelList  the same over a list column's elements, plus the rows whose list is null (global
@@ -376,6 +377,7 @@ using Test = expr::Predicate::Test;
 /// pass[i] |= the predicate on row i of column `c` of each batch of `table`, the batches in order.
 bool evaluate(const expr::Predicate& p, const FileTable& table, std::size_t c, std::vector<std::uint8_t>& pass,
               std::string& error) {
+    work_stats::add(work_stats::counters().index_evaluations, 1U);
     pass.clear();
     std::vector<std::uint8_t> part;
     for (const auto& b : table.batches) {
@@ -541,6 +543,162 @@ bool prune_by_bounds(const expr::Predicate& p, const FileTable& bounds, const st
 
 }
 
+/// Constant k compared with each row of column `c` of `bounds`, the batches in order (ways as
+/// ValueComparer::compare gives them). False when the filter cannot compare that constant.
+bool compare_bounds(const expr::Predicate& p, std::size_t k, const FileTable& bounds, std::size_t c,
+                    std::vector<std::int8_t>& ways) {
+    ways.clear();
+    std::vector<std::int8_t> part;
+    for (const auto& b : bounds.batches) {
+        expr::ValueComparer values(bounds.type(c), *b.children[c]);
+        if (!values.ok() || !values.compare(p, k, 0, b.length, part)) {
+            return false;
+        }
+        ways.insert(ways.end(), part.begin(), part.end());
+    }
+    return true;
+}
+
+/// An IN list over a BTREE, answered in one pass. Each constant is compared with each page's min and max
+/// (no predicate evaluation per constant), so it is only compared with the pages whose bounds may hold it.
+/// The pages with a constant are read as runs of adjacent pages. A page's values are sorted, so each of its
+/// constants is found by a binary search over the page's non-null rows, and the rows equal to it follow.
+/// A constant the filter cannot compare keeps every page, and the predicate then evaluates each page whole.
+bool search_btree_in(const BTreeIndex& index, const expr::Predicate& p, RowSet& out, bool& answered,
+                     std::string& error) {
+    answered = true;
+    const auto& lookup = index.lookup;
+    const auto page_idx = u32_column(lookup, 3);
+    const std::size_t pages = page_idx.size();
+    std::vector<std::uint8_t> min_null;
+    std::vector<std::uint8_t> min_nan;
+    std::vector<std::uint8_t> max_null;
+    std::vector<std::uint8_t> max_nan;
+    nulls_of(lookup, 0, min_null, min_nan);
+    nulls_of(lookup, 1, max_null, max_nan);
+    std::vector<std::vector<std::size_t>> constants_of(pages);
+    bool all_compared = true;
+    for (std::size_t k = 0; k < p.constants(); ++k) {
+        std::vector<std::int8_t> min_ways;
+        std::vector<std::int8_t> max_ways;
+        if (!compare_bounds(p, k, lookup, 0, min_ways) || !compare_bounds(p, k, lookup, 1, max_ways)) {
+            all_compared = false;
+            for (auto& constants : constants_of) {
+                constants.push_back(k);
+            }
+            continue;
+        }
+        for (std::size_t i = 0; i < pages; ++i) {
+            // The page may hold the constant where its min is at most it and its max at least it; a NULL or
+            // NaN min, or a NaN max, says nothing about the others. A page of only nulls holds no match.
+            const bool from_ok = min_null[i] != 0 || min_nan[i] != 0 || min_ways[i] <= 0;
+            const bool to_ok = max_nan[i] != 0 || max_ways[i] >= 0;
+            if (max_null[i] == 0 && from_ok && to_ok) {
+                constants_of[i].push_back(k);
+            }
+        }
+    }
+
+    std::vector<std::uint64_t> addrs;
+    std::vector<std::uint8_t> pass;
+    std::vector<std::int64_t> live;  // a segment's non-null rows, ascending
+    std::vector<std::int8_t> ways;
+    for (std::size_t i = 0; i < pages;) {
+        if (constants_of[i].empty()) {
+            ++i;
+            continue;
+        }
+        std::size_t j = i;
+        while (j + 1 < pages && !constants_of[j + 1].empty() && page_idx[j + 1] == page_idx[j] + 1U) {
+            ++j;
+        }
+        LanceRowRange range;
+        range.offset = static_cast<std::uint64_t>(page_idx[i]) * index.batch_size;
+        range.length = static_cast<std::uint64_t>(page_idx[j] - page_idx[i] + 1U) * index.batch_size;
+        FileTable values;
+        if (!read_table(index.page_data, nullptr, range, values, error)) {
+            return false;
+        }
+        if (values.schema.n_children != 2 || values.schema.children[1]->format == nullptr ||
+            std::string(values.schema.children[1]->format) != "L") {
+            error = "btree index: page_data.lance is not values, ids (uint64)";
+            return false;
+        }
+        std::int64_t total = 0;
+        for (const auto& b : values.batches) {
+            total += b.length;
+        }
+        pass.assign(static_cast<std::size_t>(total), 0U);
+        if (!all_compared) {
+            if (!evaluate(p, values, 0, pass, error)) {
+                return false;
+            }
+        } else {
+            // Page i + q of the run holds rows [q * batch, (q + 1) * batch) of the read.
+            const auto batch = static_cast<std::int64_t>(index.batch_size);
+            std::int64_t first = 0;
+            for (const auto& b : values.batches) {
+                expr::ValueComparer column(values.type(0), *b.children[0]);
+                if (!column.ok()) {
+                    error = "btree index: page values do not compare with the IN list";
+                    return false;
+                }
+                for (std::size_t q = 0; q <= j - i; ++q) {
+                    const std::int64_t lo = std::max(first, static_cast<std::int64_t>(q) * batch);
+                    const std::int64_t hi = std::min(first + b.length, static_cast<std::int64_t>(q + 1) * batch);
+                    if (lo >= hi) {
+                        continue;
+                    }
+                    live.clear();
+                    for (std::int64_t r = lo; r < hi; ++r) {
+                        if (!column.is_null(r - first)) {
+                            live.push_back(r - first);
+                        }
+                    }
+                    for (const auto k : constants_of[i + q]) {
+                        // The first live row not below the constant, then the rows equal to it.
+                        std::size_t lo_at = 0;
+                        std::size_t hi_at = live.size();
+                        while (lo_at < hi_at) {
+                            const std::size_t mid = lo_at + (hi_at - lo_at) / 2;
+                            if (!column.compare(p, k, live[mid], 1, ways)) {
+                                error = "btree index: IN constant does not compare with the values";
+                                return false;
+                            }
+                            if (ways[0] < 0) {
+                                lo_at = mid + 1;
+                            } else {
+                                hi_at = mid;
+                            }
+                        }
+                        for (std::size_t t = lo_at; t < live.size(); ++t) {
+                            column.compare(p, k, live[t], 1, ways);
+                            if (ways[0] != 0) {
+                                break;
+                            }
+                            pass[static_cast<std::size_t>(first + live[t])] = 1;
+                        }
+                    }
+                }
+                first += b.length;
+            }
+        }
+        std::size_t r = 0;
+        for (const auto& b : values.batches) {
+            const ArrowArray* ids = b.children[1];
+            const auto* v = static_cast<const std::uint64_t*>(ids->buffers[1]) + ids->offset;
+            for (std::int64_t k = 0; k < ids->length; ++k, ++r) {
+                if (pass[r] != 0) {
+                    addrs.push_back(v[k]);
+                }
+            }
+        }
+        i = j + 1;
+    }
+    add_addresses(out, addrs);
+    return true;
+}
+
 bool search_btree(const std::filesystem::path& dir, const expr::Predicate& p, RowSet& out, bool& answered,
                   std::string& error) {
     answered = false;
@@ -550,6 +708,9 @@ bool search_btree(const std::filesystem::path& dir, const expr::Predicate& p, Ro
     std::shared_ptr<const BTreeIndex> index;
     if (!load_btree(dir, index, error)) {
         return false;
+    }
+    if (p.test() == Test::In) {
+        return search_btree_in(*index, p, out, answered, error);
     }
     const auto& lookup = index->lookup;
     const auto null_counts = u32_column(lookup, 2);

@@ -1239,6 +1239,7 @@ NB_MODULE(_nanolance, m) {
         d["buffer_pool_misses"] = w.buffer_pool_misses;
         d["take_cache_hits"] = w.take_cache_hits;
         d["indexed_fragments"] = w.indexed_fragments;
+        d["index_evaluations"] = w.index_evaluations;
         return d;
     }, "Counters of the work done since the last reset (tests and diagnostics; not a stable API).");
     m.def("_reset_work_stats", [] { nano_lance_reset_work_stats(); });

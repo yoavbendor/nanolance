@@ -5531,6 +5531,58 @@ void no_release_array(ArrowArray* array) { array->release = nullptr; }
 
 }  // namespace
 
+ValueComparer::ValueComparer(const ArrowSchema& type, const ArrowArray& values) {
+    ArrowSchemaView sv{};
+    if (ArrowSchemaViewInit(&sv, &type, nullptr) != NANOARROW_OK ||
+        ArrowArrayViewInitFromSchema(&view_, &type, nullptr) != NANOARROW_OK) {
+        return;
+    }
+    if (ArrowArrayViewSetArray(&view_, &values, nullptr) != NANOARROW_OK) {
+        ArrowArrayViewReset(&view_);
+        return;
+    }
+    base_ = view_.offset;
+    type_ = sv.type;
+    unit_ = sv.time_unit;
+    ok_ = true;
+}
+
+ValueComparer::~ValueComparer() {
+    if (ok_) {
+        ArrowArrayViewReset(&view_);
+    }
+}
+
+bool ValueComparer::compare(const Predicate& p, std::size_t k, std::int64_t begin, std::int64_t count,
+                            std::vector<std::int8_t>& ways) {
+    ways.assign(static_cast<std::size_t>(count), 2);
+    if (!ok_) {
+        return false;
+    }
+    const Node& c = *p.constants_.at(k);
+    if (c.op != Op::Literal) {
+        return false;
+    }
+    if (c.literal.is_null()) {
+        return true;
+    }
+    view_.offset = base_ + begin;  // compare_column and the null test index from the view's offset
+    std::vector<std::int8_t> compared;
+    const bool ok = compare_column(view_, type_, unit_, c.literal, count, compared);
+    if (ok) {
+        for (std::int64_t r = 0; r < count; ++r) {
+            const auto at = static_cast<std::size_t>(r);
+            ways[at] = ArrowArrayViewIsNull(&view_, r) ? 2 : compared[at];
+        }
+    }
+    view_.offset = base_;
+    return ok;
+}
+
+bool ValueComparer::is_null(std::int64_t row) const {
+    return ArrowArrayViewIsNull(&view_, row);
+}
+
 bool Predicate::filter(const ArrowSchema& type, const ArrowArray& values, std::vector<std::uint8_t>& pass,
                        std::string& error) const {
     error.clear();

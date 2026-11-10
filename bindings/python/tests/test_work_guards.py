@@ -36,6 +36,7 @@ import pyarrow as pa
 import pytest
 
 import nanolance
+import nanolance.lance as nl
 from tests.support import require_pylance
 
 
@@ -365,3 +366,90 @@ def test_take_and_ranges_of_long_strings_in_lists(lance_mod, tmp_path, version, 
         if limit <= 10:
             assert stats["data_bytes_read"] < whole / 20, (offset, limit, stats)
     assert ours.to_table().equals(theirs.to_table())
+
+
+def test_take_of_default_strings_of_a_few_hundred_bytes_reads_just_those_rows(lance_mod, tmp_path):
+    """A utf8 column of ~650-byte values written with no field metadata is FullZip, as pylance writes it. It was
+    MiniBlock with 1024-value chunks (about 650 KB each), so a take of 100 scattered rows read the whole 96 MB
+    column (46 ms; 0.5 ms now, against 9 ms for the zstd layout)."""
+    rng = np.random.default_rng(11)
+    n = 20_000
+    alphabet = np.frombuffer(b'abcdefghijklmnopqrstuvwxyz0123456789 {}:,"_', dtype=np.uint8)
+    values = [bytes(rng.choice(alphabet, int(rng.integers(200, 1_100)))).decode() for _ in range(n)]
+    table = pa.table({"id": pa.array(range(n)), "properties": pa.array(values, pa.string())})
+    path = tmp_path / "t.lance"
+    import nanolance.lance as nl
+
+    nl.write_dataset(table, str(path))
+    ours = nl.dataset(str(path))
+    whole = sum(os.path.getsize(f) for f in glob.glob(f"{path}/data/*.lance"))
+    rows = sorted(rng.choice(n, 100, replace=False).tolist())
+    stats, got = _stats_of(lambda: ours.take(rows, columns=["properties"]))
+    assert got.column("properties").to_pylist() == [values[r] for r in rows]
+    assert stats["data_bytes_read"] < whole / 10, stats
+    assert lance_mod.dataset(str(path)).take(rows, columns=["properties"]).equals(got)
+
+
+# ── scalar index answers: an IN list is one pass over the BTREE's pages ─────────────────────────────
+
+def _keyed(n, seed=0):
+    """Unique sorted ids, each row a 600-byte payload that does not compress: a file the reads can be measured on."""
+    rng = np.random.default_rng(seed)
+    payload = [rng.bytes(300).hex() for _ in range(n)]
+    return pa.table({"id": pa.array([f"row-{k:08d}" for k in range(n)]), "payload": pa.array(payload),
+                     "tag": pa.array([k % 1000 for k in range(n)], pa.int64())})
+
+
+def _data_bytes(path):
+    return sum(os.path.getsize(f) for f in glob.glob(f"{path}/data/*.lance"))
+
+
+@pytest.fixture(scope="module")
+def keyed_dataset(tmp_path_factory):
+    path = str(tmp_path_factory.mktemp("keyed") / "keyed.lance")
+    nl.write_dataset(_keyed(60_000), path, max_rows_per_file=20_000)
+    ds = nl.dataset(path)
+    ds.create_scalar_index("id", "BTREE", name="id_bt")
+    ds.create_scalar_index("tag", "BTREE", name="tag_bt")
+    return path
+
+
+def _in_sql(column, values):
+    return f"{column} IN (" + ", ".join(f"'{v}'" if isinstance(v, str) else str(v) for v in values) + ")"
+
+
+def test_an_in_list_of_300_values_binds_no_predicate(keyed_dataset):
+    """Each value of an IN list used to be bound twice against the bounds of every page (600 binds for 300
+    values); the pages are now compared with the values in one pass, so the index binds nothing.
+    `index_evaluations` counts the predicate binds the index made."""
+    rng = np.random.default_rng(5)
+    wanted = [f"row-{k:08d}" for k in rng.choice(60_000, 300, replace=False)]
+    ds = nl.dataset(keyed_dataset)
+    stats, got = _stats_of(lambda: sorted(ds.to_table(columns=["id"], filter=_in_sql("id", wanted))
+                                          .column("id").to_pylist()))
+    assert got == sorted(wanted)
+    assert stats["indexed_fragments"] > 0, stats
+    assert stats["index_evaluations"] <= 2, stats
+
+
+def test_an_in_list_of_three_values_reads_only_their_pages(keyed_dataset):
+    wanted = ["row-00000007", "row-00031234", "row-00059999"]
+    ds = nl.dataset(keyed_dataset)
+    stats, got = _stats_of(lambda: ds.to_table(columns=["id"], filter=_in_sql("id", wanted)).num_rows)
+    assert got == 3
+    assert stats["indexed_fragments"] > 0, stats
+    # Measured: the three values' pages of the index and the rows' chunks of the data, a small fraction of the
+    # ~36 MB of payload.
+    assert stats["data_bytes_read"] < _data_bytes(keyed_dataset) // 8, stats
+
+
+def test_an_or_of_two_in_lists_is_answered_by_both_indexes(keyed_dataset):
+    ids = [f"row-{k:08d}" for k in (3, 4_004, 59_000)]
+    tags = [7, 8]
+    flt = f"{_in_sql('id', ids)} OR {_in_sql('tag', tags)}"
+    ds = nl.dataset(keyed_dataset)
+    expected = sum(1 for k in range(60_000) if f"row-{k:08d}" in ids or k % 1000 in tags)
+    stats, got = _stats_of(lambda: ds.to_table(columns=["tag"], filter=flt).num_rows)
+    assert got == expected
+    assert stats["indexed_fragments"] > 0, stats
+    assert stats["index_evaluations"] <= 2, stats

@@ -28,12 +28,29 @@ concurrency:
   group: memory-safety-${{ github.ref }}
   cancel-in-progress: true
 
+# nanom and nanos3reader are private: git reads these keys from the environment and clones those two
+# repositories (submodule and CMake FetchContent) with a read-only token. Other URLs are untouched.
+env:
+  GIT_CONFIG_COUNT: "2"
+  GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.PRIVATE_REPOS_READ_TOKEN }}@github.com/yoavbendor/nanom.insteadOf
+  GIT_CONFIG_VALUE_0: https://github.com/yoavbendor/nanom
+  GIT_CONFIG_KEY_1: url.https://x-access-token:${{ secrets.PRIVATE_REPOS_READ_TOKEN }}@github.com/yoavbendor/nanos3reader.insteadOf
+  GIT_CONFIG_VALUE_1: https://github.com/yoavbendor/nanos3reader
+
 jobs:
   sanitizers:
     name: ASan + UBSan (ctest)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
+      # Sanitized builds link 400+ static test executables with debug info, which fills the runner's
+      # ~14 GB free disk ("No space left on device" at link time). Drop preinstalled SDKs this job
+      # never uses (about 20 GB).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - name: Install toolchain
         run: |
@@ -77,6 +94,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
+      # Sanitized builds link 400+ static test executables with debug info, which fills the runner's
+      # ~14 GB free disk ("No space left on device" at link time). Drop preinstalled SDKs this job
+      # never uses (about 20 GB).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - name: Install toolchain
         run: |
