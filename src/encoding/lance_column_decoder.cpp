@@ -5406,6 +5406,26 @@ std::uint64_t lance_page_items(const pb::ColumnPage& page) {
     return page.length;
 }
 
+std::uint64_t lance_page_expanded_bytes(const pb::ColumnPage& page) {
+    page_layout::PageLayout layout;
+    std::string why;
+    if (page.encoding.empty() || !page_layout::decode_page_layout(page.encoding, layout, why) ||
+        layout.kind != page_layout::LayoutKind::kConstant) {
+        return 0;
+    }
+    const auto& c = layout.constant;
+    // The value: inline, or (no inline value, 1 or 3 buffers) buffer 0.
+    std::uint64_t value = 0;
+    if (c.inline_value.has_value()) {
+        value = c.inline_value->size();
+    } else if ((page.buffer_sizes.size() == 1U || page.buffer_sizes.size() == 3U)) {
+        value = page.buffer_sizes[0];
+    }
+    const std::uint64_t items = std::max({page.length, c.num_rep_values, c.num_def_values});
+    std::uint64_t total = 0;
+    return checked_mul(items, value, total) ? total : std::numeric_limits<std::uint64_t>::max();
+}
+
 bool lance_page_row_addressable(const pb::ColumnPage& page) {
     page_layout::PageLayout layout;
     FullZipPageParams params;
