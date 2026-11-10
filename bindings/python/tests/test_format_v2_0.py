@@ -145,6 +145,22 @@ def test_compressed_strings(lance, tmp_path, scheme):
     assert nl.dataset(path).take([1, 2, 999, 1_998]).equals(lance.dataset(path).take([1, 2, 999, 1_998]))
 
 
+@pytest.mark.parametrize("key_type", [pa.int8(), pa.uint16(), pa.int32()])
+def test_arrow_dictionary_column(lance, tmp_path, key_type):
+    """An Arrow dictionary column in 2.0 stores its keys as they are (null rows through a null item
+    or a null key), not key + 1 with 0 for null as Lance's own string dictionaries do."""
+    items = pa.array(["a", "bb", None, "ccc", ""])
+    keys = pa.array([(i * 7) % 5 if i % 11 else None for i in range(3_000)], key_type)
+    table = pa.table({"c": pa.DictionaryArray.from_arrays(keys, items)})
+    path = str(tmp_path / "dict.lance")
+    lance.write_dataset(table, path, data_storage_version="2.0")
+    expected = lance.dataset(path).to_table().column("c").cast(pa.string())
+    ours = nl.dataset(path)
+    assert ours.to_table().column("c").cast(pa.string()).equals(expected)
+    rows = [0, 1, 2, 11, 1_234, 2_999]
+    assert ours.take(rows).column("c").cast(pa.string()).equals(expected.take(rows))
+
+
 def test_blob_column(lance, tmp_path):
     """A 2.0 blob column: (position, size) descriptions in a packed struct, the bytes elsewhere in the
     data file. pylance reads the bytes; so does nanolance."""
