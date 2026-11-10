@@ -1930,6 +1930,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> plan_morsels(const std::vec
         std::uint64_t bytes = 0;
         std::uint64_t items = 0;  // values it decodes to
         std::uint32_t lists = 0;  // list layers to unravel
+        std::uint64_t whole = 0;  // what decoding it whole costs: its bytes, or a constant's expansion
         bool addressable = false;
     };
     std::vector<std::vector<PageInfo>> pages(columns.size());
@@ -1953,6 +1954,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> plan_morsels(const std::vec
             info.addressable = lance_page_row_addressable(page);
             info.items = lance_page_items(page);
             info.lists = lance_page_list_depth(page);
+            info.whole = std::max(info.bytes, lance_page_expanded_bytes(page));
             column_bytes += info.bytes;
             pages[c].push_back(info);
         }
@@ -1980,12 +1982,17 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> plan_morsels(const std::vec
             // width -- and has a level for every row, empty lists included.
             const auto units = page.lists != 0U ? std::max(page.items, rows) : page.items;
             const auto weight = page.lists != 0U ? std::max<std::uint64_t>(per_value, 32U * page.lists) : per_value;
-            work += std::max(page.bytes, units * rows_here / rows * weight);
+            work += std::max({page.bytes, units * rows_here / rows * weight, page.whole * rows_here / rows});
         }
     }
-    auto want = std::min<std::uint64_t>(2U * threads, work / morsel_min_bytes());
+    const bool test_setting = morsel_min_bytes() < (std::uint64_t{64} << 10U);
+    // The tests' setting cuts through any page; four morsels give every page a first, middle and last
+    // cut. More only multiply what each morsel decodes whole -- a chunk of a dictionary page is
+    // expanded by every morsel it overlaps (16 morsels of a 171 MB chunk took 2.9 GB).
+    auto want = std::min<std::uint64_t>(test_setting ? 4U : 2U * threads, work / morsel_min_bytes());
 
-    // What a plan decodes: every overlapped page, whole unless it is row-addressable.
+    // What a plan decodes: every overlapped page, whole unless it is row-addressable -- and a whole
+    // constant page costs what it expands to, which a page that small on disk would otherwise hide.
     const auto cost = [&](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& plan) {
         double total = 0;
         for (const auto& column : pages) {
@@ -1996,7 +2003,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> plan_morsels(const std::vec
                     if (lo < hi) {
                         total += page.addressable ? static_cast<double>(page.bytes) * static_cast<double>(hi - lo) /
                                                         static_cast<double>(page.end - page.begin)
-                                                  : static_cast<double>(page.bytes);
+                                                  : static_cast<double>(page.whole);
                     }
                 }
             }
@@ -2006,7 +2013,10 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> plan_morsels(const std::vec
     const auto& spine = pages[heaviest];
     const bool spine_addressable =
         std::all_of(spine.begin(), spine.end(), [](const PageInfo& p) { return p.addressable; });
-    const bool test_setting = morsel_min_bytes() < (std::uint64_t{64} << 10U);
+    const double whole_cost = cost(single);
+    // Nor into many whole decodes of one large page: each morsel holds its own copy at once (16
+    // morsels of a 300 MB constant page took 4.7 GB).
+    constexpr double kTestExtraDecode = 64.0 * 1024.0 * 1024.0;
     for (; want > 1U; want /= 2U) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> plan;
         std::uint64_t at = first;
@@ -2031,8 +2041,12 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> plan_morsels(const std::vec
             }
         }
         plan.emplace_back(at, end);
-        // Morsels under 64 KiB are a test setting: cut evenly, through any page, whatever it costs.
-        if (plan.size() > 1U && (test_setting || cost(plan) <= 1.25 * static_cast<double>(range_bytes))) {
+        // Morsels under 64 KiB are a test setting: cut evenly, through any page, while what the cuts
+        // decode twice stays small; otherwise a plan may decode at most a quarter more than one read.
+        const double planned = plan.size() > 1U ? cost(plan) : 0.0;
+        if (plan.size() > 1U && (test_setting ? planned - whole_cost <= kTestExtraDecode
+                                              : planned <= 1.25 * std::max(static_cast<double>(range_bytes),
+                                                                           whole_cost))) {
             return plan;
         }
     }

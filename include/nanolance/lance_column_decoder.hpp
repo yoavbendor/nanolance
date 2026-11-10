@@ -39,6 +39,11 @@ bool lance_page_row_addressable(const pb::ColumnPage& page);
 /// work: a dictionary-encoded page of strings is small on disk and large once decoded.
 std::uint64_t lance_page_items(const pb::ColumnPage& page);
 
+/// The bytes a constant page expands to (its one value once per item), 0 for any other page. A
+/// constant page is a few bytes on disk and can be hundreds of megabytes decoded (one 300 KB value
+/// in each of 1,009 rows), so its stored size says nothing of what decoding it costs.
+std::uint64_t lance_page_expanded_bytes(const pb::ColumnPage& page);
+
 /// How many list layers the page's levels describe (0: none). Unravelling them is decode work of its
 /// own, per layer.
 std::uint32_t lance_page_list_depth(const pb::ColumnPage& page);

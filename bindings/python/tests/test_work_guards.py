@@ -168,6 +168,28 @@ def test_a_dictionary_coded_list_column_is_read_in_parallel(tmp_path, threads):
 
 
 @pytest.mark.skipif(_knob_overridden("NANOLANCE_MORSEL_KB"), reason="tuning knob set")
+def test_a_constant_page_is_not_expanded_once_per_morsel(lance_mod, tmp_path, threads):
+    """pylance stores 1,009 rows of one 300 KB value as a constant page: 300 KB on disk, 300 MB decoded,
+    and decoded whole by every row range it overlaps. Beside a column worth cutting (16 MB of
+    embeddings), the cuts used to be priced by the page's stored bytes, so four morsels expanded it
+    four times; priced by what it expands to, the read is not cut."""
+    n = 1_009
+    big = b"x" * 299_593
+    table = pa.table({
+        "emb": pa.FixedSizeListArray.from_arrays(pa.array(np.ones(n * 4_096, dtype=np.float32)), 4_096),
+        "val": pa.array([[big]] * n, pa.list_(pa.binary())),
+    })
+    path = tmp_path / "constant.lance"
+    lance_mod.write_dataset(table, str(path), data_storage_version="2.2")
+    (page,) = _pages(path, 1)
+    assert "ConstantLayout" in str(page.encoding)
+    threads(8)
+    stats, got = _stats_of(lambda: nl.dataset(str(path)).to_table(columns=["emb", "val"]))
+    assert got.column("val").to_pylist()[::250] == table.column("val").to_pylist()[::250]
+    assert stats["read_morsels"] == stats["fragment_reads"] == 1, stats
+
+
+@pytest.mark.skipif(_knob_overridden("NANOLANCE_MORSEL_KB"), reason="tuning knob set")
 def test_a_small_column_is_not_split(tmp_path, threads):
     path = tmp_path / "small.lance"
     nanolance.write_table(pa.table({"c": pa.array(np.arange(100_000, dtype=np.int32))}), path)
