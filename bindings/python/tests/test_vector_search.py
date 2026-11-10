@@ -64,12 +64,36 @@ def indexed(lance, tmp_path_factory):
     return out
 
 
+def _tie_groups(d):
+    """Runs of consecutive positions whose distances are equal within the test tolerance."""
+    groups, start = [], 0
+    for i in range(1, len(d)):
+        if not np.isclose(d[i], d[i - 1], rtol=1e-4, atol=1e-4):
+            groups.append((start, i))
+            start = i
+    if len(d):
+        groups.append((start, len(d)))
+    return groups
+
+
+def _assert_same_up_to_ties(rd, ri, gd, gi):
+    """Same distances, and the same rows up to order within each tie. A tie at the cut (the last group)
+    may also let an equally distant row outside the top k replace one, so there only the count must match."""
+    assert len(rd) == len(gd) == len(ri) == len(gi)
+    assert np.allclose(rd, gd, rtol=1e-4, atol=1e-4), (rd[:5], gd[:5])
+    for lo, hi in _tie_groups(rd)[:-1]:
+        assert sorted(ri[lo:hi]) == sorted(gi[lo:hi]), (lo, hi, ri[lo:hi], gi[lo:hi])
+    # At the cut the distances above already pin each row's distance; the rows must still be distinct.
+    assert len(set(gi)) == len(gi), gi
+
+
 def _same(ref, got, four_bit=False, refined=False):
     rd, gd = ref.column("_distance").to_numpy(), got.column("_distance").to_numpy()
     assert len(rd) == len(gd)
     if not four_bit:
-        assert np.allclose(rd, gd, rtol=1e-4, atol=1e-4), (rd[:5], gd[:5])
-        assert ref.column("id").to_pylist() == got.column("id").to_pylist()
+        # Rows that tie in distance may come in another order, and at the cut another row: compare
+        # the ids per tie, not by position.
+        _assert_same_up_to_ties(rd, ref.column("id").to_pylist(), gd, got.column("id").to_pylist())
         return
     if not refined:
         # 4-bit PQ: which of equally (quantized) distant rows come first, or make the cut, is
@@ -83,6 +107,18 @@ def _same(ref, got, four_bit=False, refined=False):
     shared = set(ref_d) & set(got_d)
     assert len(shared) >= 0.8 * len(ref_d), (sorted(ref_d), sorted(got_d))
     assert all(abs(ref_d[i] - got_d[i]) <= 1e-4 + 1e-4 * abs(ref_d[i]) for i in shared)
+
+
+def test_same_up_to_ties_helper():
+    """The tie rule itself, on plain arrays (no lance needed)."""
+    d = np.array([1.0, 2.0, 2.0, 3.0])
+    _assert_same_up_to_ties(d, [1, 2, 3, 4], d, [1, 2, 3, 4])  # identical
+    _assert_same_up_to_ties(d, [1, 2, 3, 4], d, [1, 3, 2, 4])  # swapped tie in the middle
+    tie_at_cut = np.array([1.0, 2.0, 3.0, 3.0])
+    _assert_same_up_to_ties(tie_at_cut, [1, 2, 3, 4], tie_at_cut, [1, 2, 3, 5])  # other row in the tie at the cut
+    with pytest.raises(AssertionError):  # a different row, not in any tie
+        d = np.array([1.0, 2.0, 3.0, 4.0])
+        _assert_same_up_to_ties(d, [1, 2, 3, 4], d, [1, 9, 3, 4])
 
 
 QUERIES = [

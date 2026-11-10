@@ -250,6 +250,8 @@ if(NOT nanom_POPULATED)
 endif()
 add_library(nanolance_nanom INTERFACE)
 target_include_directories(nanolance_nanom SYSTEM INTERFACE "${nanom_SOURCE_DIR}/include")
+# MSVC's default preprocessor passes __VA_ARGS__ on as one argument, which NANOM_DESCRIBE needs split.
+target_compile_options(nanolance_nanom INTERFACE $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>)
 
 add_library(nanolance_proto STATIC generated/lance_minimal.pb.cpp src/base/roaring_bitmap.cpp src/encoding/page_layout.cpp)
 target_compile_features(nanolance_proto PUBLIC cxx_std_20 PRIVATE cxx_std_23)
