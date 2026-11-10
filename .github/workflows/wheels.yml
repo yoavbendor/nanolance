@@ -38,6 +38,15 @@ concurrency:
   group: wheels-${{ github.ref }}
   cancel-in-progress: true
 
+# nanom and nanos3reader are private: git reads these keys from the environment and clones those two
+# repositories (submodule and CMake FetchContent) with a read-only token. Other URLs are untouched.
+env:
+  GIT_CONFIG_COUNT: "2"
+  GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.PRIVATE_REPOS_READ_TOKEN }}@github.com/yoavbendor/nanom.insteadOf
+  GIT_CONFIG_VALUE_0: https://github.com/yoavbendor/nanom
+  GIT_CONFIG_KEY_1: url.https://x-access-token:${{ secrets.PRIVATE_REPOS_READ_TOKEN }}@github.com/yoavbendor/nanos3reader.insteadOf
+  GIT_CONFIG_VALUE_1: https://github.com/yoavbendor/nanos3reader
+
 jobs:
   build:
     name: ${{ matrix.os }} ${{ matrix.archs }}
@@ -78,6 +87,9 @@ jobs:
           # Each wheel recompiles nanoarrow, zstd and nanolance from scratch; the runners have more
           # cores than cibuildwheel's default of one.
           CMAKE_BUILD_PARALLEL_LEVEL: "4"
+          # Linux wheels build in a container: hand it the git keys that reach the private repositories.
+          CIBW_ENVIRONMENT_PASS_LINUX: >-
+            GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1
 
       - uses: actions/upload-artifact@v4
         with:

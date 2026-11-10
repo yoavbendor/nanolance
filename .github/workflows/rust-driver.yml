@@ -17,6 +17,15 @@ concurrency:
   group: rust-driver-${{ github.ref }}
   cancel-in-progress: true
 
+# nanom and nanos3reader are private: git reads these keys from the environment and clones those two
+# repositories (submodule and CMake FetchContent) with a read-only token. Other URLs are untouched.
+env:
+  GIT_CONFIG_COUNT: "2"
+  GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.PRIVATE_REPOS_READ_TOKEN }}@github.com/yoavbendor/nanom.insteadOf
+  GIT_CONFIG_VALUE_0: https://github.com/yoavbendor/nanom
+  GIT_CONFIG_KEY_1: url.https://x-access-token:${{ secrets.PRIVATE_REPOS_READ_TOKEN }}@github.com/yoavbendor/nanos3reader.insteadOf
+  GIT_CONFIG_VALUE_1: https://github.com/yoavbendor/nanos3reader
+
 jobs:
   build:
     runs-on: ubuntu-latest

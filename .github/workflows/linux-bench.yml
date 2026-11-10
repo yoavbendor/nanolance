@@ -36,13 +36,25 @@ on:
 permissions:
   contents: write
 
+# nanom and nanos3reader are private: git reads these keys from the environment and clones those two
+# repositories (submodule and CMake FetchContent) with a read-only token. Other URLs are untouched.
+env:
+  GIT_CONFIG_COUNT: "2"
+  GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.PRIVATE_REPOS_READ_TOKEN }}@github.com/yoavbendor/nanom.insteadOf
+  GIT_CONFIG_VALUE_0: https://github.com/yoavbendor/nanom
+  GIT_CONFIG_KEY_1: url.https://x-access-token:${{ secrets.PRIVATE_REPOS_READ_TOKEN }}@github.com/yoavbendor/nanos3reader.insteadOf
+  GIT_CONFIG_VALUE_1: https://github.com/yoavbendor/nanos3reader
+
 jobs:
   bench:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive  # vendored nanom (examples/pcapng2lance/extern/nanom) must be present
+
+      # The vendored nanom (examples/pcapng2lance/extern/nanom) must be present. It is fetched here, not
+      # by actions/checkout, whose own credentials would replace the private-repository token above.
+      - name: Fetch submodules
+        run: git -c http.https://github.com/.extraheader= submodule update --init --recursive
 
       - name: Install dependencies
         run: |
