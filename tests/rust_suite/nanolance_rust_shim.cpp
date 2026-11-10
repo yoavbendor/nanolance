@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -90,6 +91,33 @@ __attribute__((visibility("default"))) int nanolance_rust_write_file(const char*
     if (copy.n_children == 1 && (copy.children[0]->name == nullptr || copy.children[0]->name[0] == '\0')) {
         ArrowSchemaSetName(copy.children[0], "c");
     }
+    // Lance's legacy blob marker. nanolance's writer refuses it (Lance does from format 2.2 on), but a
+    // 2.0 file of Lance's own 2.0 pages carries it: take it off for the mapping and put it back below.
+    static const std::string kBlobKey = "lance-encoding:blob";
+    std::map<std::string, std::string> legacy_blob;  // top-level field name -> marker value
+    for (int64_t i = 0; i < copy.n_children; ++i) {
+        ArrowSchema* child = copy.children[i];
+        ArrowStringView value{};
+        if (ArrowMetadataGetValue(child->metadata, ArrowCharView(kBlobKey.c_str()), &value) != NANOARROW_OK ||
+            value.data == nullptr) {
+            continue;
+        }
+        legacy_blob[child->name == nullptr ? "" : child->name] =
+            std::string(value.data, static_cast<std::size_t>(value.size_bytes));
+        ArrowBuffer rebuilt;
+        // Removing the last key leaves an empty buffer, which is no metadata at all (not a key count).
+        if (ArrowMetadataBuilderInit(&rebuilt, child->metadata) != NANOARROW_OK ||
+            ArrowMetadataBuilderRemove(&rebuilt, ArrowCharView(kBlobKey.c_str())) != NANOARROW_OK ||
+            ArrowSchemaSetMetadata(child, rebuilt.size_bytes < 4 ? nullptr
+                                                                 : reinterpret_cast<const char*>(rebuilt.data)) !=
+                NANOARROW_OK) {
+            ArrowBufferReset(&rebuilt);
+            ArrowSchemaRelease(&copy);
+            set_message(msg, msg_cap, "cannot rewrite the field metadata");
+            return 1;
+        }
+        ArrowBufferReset(&rebuilt);
+    }
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
     const bool mapped = nano_lance::map_arrow_schema(copy, mapping, error);
@@ -142,19 +170,30 @@ __attribute__((visibility("default"))) int nanolance_rust_write_file(const char*
         }
     }
 
+    if (!legacy_blob.empty() && !v2_0) {
+        set_message(msg, msg_cap, "schema: a legacy blob column (\"lance-encoding:blob\") is read from format 2.0 only");
+        return 1;
+    }
+
     nano_lance::pb::FileDescriptor descriptor;
     descriptor.length = num_rows;
     for (const auto& f : mapping.fields) {
         nano_lance::pb::Field field;
         field.name = f.name;
-        field.logical_type = nano_lance::lance_on_disk_logical_type(f.logical_type);
+        // As the manifest writer declares it: an Arrow dictionary column keeps its "dict:" type and
+        // the dictionary field encoding, which is what tells a 2.0 reader its indices are the keys.
+        field.logical_type = nano_lance::lance_field_disk_logical_type(f);
         field.id = f.id;
         field.parent_id = f.parent_id;
         field.type = 2;
         field.nullable = f.nullable;
-        field.encoding = nano_lance::lance_on_disk_field_encoding(f.logical_type);
+        field.encoding =
+            f.dictionary_index_format.empty() ? nano_lance::lance_on_disk_field_encoding(f.logical_type) : 3;
         for (const auto& kv : f.metadata) {
             field.metadata[kv.first] = std::vector<std::uint8_t>(kv.second.begin(), kv.second.end());
+        }
+        if (const auto blob = legacy_blob.find(f.name); f.parent_id < 0 && blob != legacy_blob.end()) {
+            field.metadata[kBlobKey] = std::vector<std::uint8_t>(blob->second.begin(), blob->second.end());
         }
         descriptor.fields.push_back(std::move(field));
     }

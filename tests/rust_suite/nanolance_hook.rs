@@ -107,6 +107,21 @@ pub(crate) fn compare(expected: &ArrayRef, actual: &ArrayRef) -> (&'static str, 
     if expected.len() != actual.len() {
         return ("mismatch", format!("{} rows, expected {}", actual.len(), expected.len()));
     }
+    // A dictionary is compared by the values its keys select: which key holds a value, and whether a
+    // null is a null key or a key of a null item, is the writer's choice, not part of the data.
+    if let arrow_schema::DataType::Dictionary(_, value_type) = expected.data_type() {
+        return match (arrow_cast::cast(expected, value_type), arrow_cast::cast(actual, value_type)) {
+            (Ok(e), Ok(a)) if e.as_ref() == a.as_ref() && expected.data_type() == actual.data_type() => {
+                ("pass", String::new())
+            }
+            (Ok(e), Ok(a)) if e.as_ref() == a.as_ref() => (
+                "type",
+                format!("read as {} (Rust: {})", actual.data_type(), expected.data_type()),
+            ),
+            (Ok(e), Ok(a)) => ("mismatch", first_difference(&e, &a)),
+            _ => ("mismatch", format!("read as {} (Rust: {})", actual.data_type(), expected.data_type())),
+        };
+    }
     if expected.data_type() == actual.data_type() {
         if expected.as_ref() == actual.as_ref() {
             return ("pass", String::new());

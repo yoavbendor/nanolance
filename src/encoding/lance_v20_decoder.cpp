@@ -336,9 +336,12 @@ struct PageReader {
     const pb::ColumnPage& page;
     const pb::ColumnMetadata& column;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::string>, std::vector<std::uint8_t>> whole;
+    // The column's Arrow type is a dictionary: a Dictionary page's indices are the keys themselves
+    // (lance-encoding's DirectDictionaryPageDecoder), not key + 1 with 0 for null.
+    bool dictionary_keys = false;
 
-    PageReader(const EncodingsIo& file, const pb::ColumnPage& pg, const pb::ColumnMetadata& c)
-        : io(file), page(pg), column(c) {}
+    PageReader(const EncodingsIo& file, const pb::ColumnPage& pg, const pb::ColumnMetadata& c, bool keys)
+        : io(file), page(pg), column(c), dictionary_keys(keys) {}
 
     bool locate(const BufferRef& ref, std::uint64_t& offset, std::uint64_t& size, std::string& error) const {
         if (!ref.present) {
@@ -717,7 +720,8 @@ bool decode_fsst(const Enc& enc, std::uint64_t start, std::uint64_t count, PageR
     return true;
 }
 
-/// Dictionary: item i + 1 per row, 0 for a null (lance-encoding's DictionaryPageDecoder).
+/// Dictionary: item i + 1 per row, 0 for a null (lance-encoding's DictionaryPageDecoder), or, for a
+/// column whose Arrow type is a dictionary, item i per row, a row null when its index or its item is.
 bool decode_dictionary(const Enc& enc, std::uint64_t start, std::uint64_t count, PageReader& io, Arr& out,
                        std::string& error) {
     if (!enc.a || !enc.b) {
@@ -733,6 +737,22 @@ bool decode_dictionary(const Enc& enc, std::uint64_t start, std::uint64_t count,
     if (!decode(*enc.a, start, count, io, indices_arr, error) || !as_u64(indices_arr, indices, error)) {
         return false;
     }
+    const bool keys = io.dictionary_keys;
+    // Item k of row i, or none for a null row.
+    const auto item_of = [&](std::uint64_t i, std::uint64_t& k) {
+        k = indices[static_cast<std::size_t>(i)];
+        if (!keys) {
+            if (k == 0U) {
+                return false;
+            }
+            --k;
+            return true;
+        }
+        if (!indices_arr.validity.empty() && !bit_at(indices_arr.validity, i)) {
+            return false;
+        }
+        return k >= items.n || items.validity.empty() || bit_at(items.validity, k);
+    };
     out = Arr{};
     out.n = count;
     if (items.shape == Arr::Shape::kVariable) {
@@ -740,16 +760,16 @@ bool decode_dictionary(const Enc& enc, std::uint64_t start, std::uint64_t count,
         out.offsets.assign(1, 0U);
         out.offsets.reserve(static_cast<std::size_t>(count) + 1U);
         for (std::uint64_t i = 0; i < count; ++i) {
-            const auto k = indices[static_cast<std::size_t>(i)];
-            if (k == 0U) {
+            std::uint64_t k = 0;
+            if (!item_of(i, k)) {
                 mark_null(out, i);
-            } else if (k > items.n) {
-                error = "format 2.0 dictionary index " + std::to_string(k - 1U) + " past its " +
+            } else if (k >= items.n) {
+                error = "format 2.0 dictionary index " + std::to_string(k) + " past its " +
                         std::to_string(items.n) + " items";
                 return false;
             } else {
-                const auto a = items.offsets[static_cast<std::size_t>(k - 1U)];
-                const auto b = items.offsets[static_cast<std::size_t>(k)];
+                const auto a = items.offsets[static_cast<std::size_t>(k)];
+                const auto b = items.offsets[static_cast<std::size_t>(k) + 1U];
                 out.bytes.insert(out.bytes.end(), items.bytes.begin() + static_cast<std::ptrdiff_t>(a),
                                  items.bytes.begin() + static_cast<std::ptrdiff_t>(b));
                 if (out.bytes.size() > default_read_limits().max_uncompressed_bytes) {
@@ -766,14 +786,14 @@ bool decode_dictionary(const Enc& enc, std::uint64_t start, std::uint64_t count,
         out.width = items.width;
         out.bytes.assign(static_cast<std::size_t>(count * items.width), 0U);
         for (std::uint64_t i = 0; i < count; ++i) {
-            const auto k = indices[static_cast<std::size_t>(i)];
-            if (k == 0U) {
+            std::uint64_t k = 0;
+            if (!item_of(i, k)) {
                 mark_null(out, i);
-            } else if (k > items.n) {
+            } else if (k >= items.n) {
                 error = "format 2.0 dictionary index past its items";
                 return false;
             } else {
-                std::memcpy(out.bytes.data() + i * items.width, items.bytes.data() + (k - 1U) * items.width,
+                std::memcpy(out.bytes.data() + i * items.width, items.bytes.data() + k * items.width,
                             items.width);
             }
         }
@@ -1086,8 +1106,9 @@ bool append_page(ColumnValues& out, const LeafType& t, Arr& a, const std::string
 }
 
 /// Rows [start, start + count) of one page.
-bool decode_page(const EncodingsIo& io, const pb::ColumnMetadata& column, const pb::ColumnPage& page,
-                 std::uint64_t start, std::uint64_t count, Arr& out, std::string& error) {
+bool decode_page(const EncodingsIo& io, const pb::Field& field, const pb::ColumnMetadata& column,
+                 const pb::ColumnPage& page, std::uint64_t start, std::uint64_t count, Arr& out,
+                 std::string& error) {
     if (start > page.length || count > page.length - start) {
         error = "rows " + std::to_string(start) + "+" + std::to_string(count) + " past the page's " +
                 std::to_string(page.length);
@@ -1097,7 +1118,7 @@ bool decode_page(const EncodingsIo& io, const pb::ColumnMetadata& column, const 
     if (!parse_page_encoding(page.encoding, enc, error)) {
         return false;
     }
-    PageReader reader(io, page, column);
+    PageReader reader(io, page, column, field.encoding == 3);  // Encoding::DICTIONARY
     return decode(enc, start, count, reader, out, error);
 }
 
@@ -1198,7 +1219,7 @@ bool decode_pages(const EncodingsIo& io, const pb::Field& field, const pb::Colum
             continue;
         }
         Arr a;
-        if (!decode_page(io, column, page, 0, page.length, a, error)) {
+        if (!decode_page(io, field, column, page, 0, page.length, a, error)) {
             error = "column '" + field.name + "' page " + std::to_string(p) + ": " + error;
             return false;
         }
@@ -1236,7 +1257,7 @@ bool decode_list_layer(const EncodingsIo& io, const Ancestor& list, ColumnValues
             error = "list '" + list.name + "' page " + std::to_string(p) + " is not a format 2.0 List page";
             return false;
         }
-        PageReader reader(io, page, *list.column);
+        PageReader reader(io, page, *list.column, false);
         Arr offsets_arr;
         std::vector<std::uint64_t> offsets;
         if (!decode(*enc.a, 0, page.length, reader, offsets_arr, error) || !as_u64(offsets_arr, offsets, error)) {
@@ -1340,7 +1361,7 @@ bool append_rows(const EncodingsIo& io, const pb::Field& field, const pb::Column
                  const LeafContext* context, std::size_t p, std::uint64_t start, std::uint64_t count,
                  const LeafType& t, ColumnValues& out, std::string& error) {
     Arr a;
-    if (!decode_page(io, column, column.pages[p], start, count, a, error)) {
+    if (!decode_page(io, field, column, column.pages[p], start, count, a, error)) {
         error = "column '" + field.name + "' page " + std::to_string(p) + ": " + error;
         return false;
     }
