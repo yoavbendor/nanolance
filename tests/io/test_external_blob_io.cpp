@@ -6,6 +6,7 @@
 // (InvalidArgument), an unknown scheme (IoError), a missing file, and the NANO_LANCE_BLOB_BASE_DIR jail, which
 // confines file:// paths to one directory when set. Files live in a directory this test creates and removes.
 
+#include "../posix_env.hpp"
 #include "io/external_blob.hpp"
 
 #include <chrono>

@@ -6,6 +6,7 @@
 // processes draw different ids from new_uuid, which names transactions and branches (seeded per call, not copied
 // into the child).
 
+#include "../posix_env.hpp"
 #include "nanolance/commit_backoff.hpp"
 #include "base/uuid.hpp"
 

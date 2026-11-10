@@ -9,6 +9,7 @@
 // that does not exist or is a file, a dictionary whose metadata.json is not Lindera's, and a config read
 // through LINDERA_CONFIG_PATH.
 
+#include "../posix_env.hpp"
 #include "nanolance/fts_lindera.hpp"
 
 #include "index_test_util.hpp"

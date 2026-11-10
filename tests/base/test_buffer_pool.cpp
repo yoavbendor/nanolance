@@ -7,6 +7,7 @@
 // counters record each decision. Runs with the default budget, set explicitly so the test does not depend
 // on the environment.
 
+#include "../posix_env.hpp"
 #include "nanolance/buffer_pool.hpp"
 #include "nanolance/work_stats.hpp"
 

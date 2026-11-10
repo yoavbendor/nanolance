@@ -1835,9 +1835,14 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
             file.size = static_cast<std::uint64_t>(it->file_size(entry_ec));
             const auto modified = it->last_write_time(entry_ec);
             const auto age = std::chrono::duration_cast<std::chrono::nanoseconds>(file_now - modified).count();
-            const auto modified_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                         fs::file_time_type::clock::to_sys(modified).time_since_epoch())
-                                         .count();
+#ifdef _MSC_VER
+            // MSVC's file_clock has no to_sys; clock_cast is its spelling (libstdc++ before 13 lacks it).
+            const auto modified_sys = std::chrono::clock_cast<std::chrono::system_clock>(modified);
+#else
+            const auto modified_sys = fs::file_time_type::clock::to_sys(modified);
+#endif
+            const auto modified_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(modified_sys.time_since_epoch()).count();
             if (!entry_ec) {
                 consider(std::move(file), age, modified_ns);
             }

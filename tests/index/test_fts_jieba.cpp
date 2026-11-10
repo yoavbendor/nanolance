@@ -8,6 +8,7 @@
 // directory, a malformed frequency and a bad config are refused. language_model_home follows
 // LANCE_LANGUAGE_MODEL_HOME.
 
+#include "../posix_env.hpp"
 #include "nanolance/fts_jieba.hpp"
 
 #include "index_test_util.hpp"
