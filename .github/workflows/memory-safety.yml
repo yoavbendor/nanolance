@@ -44,6 +44,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Sanitized builds link 400+ static test executables with debug info, which fills the runner's
+      # ~14 GB free disk ("No space left on device" at link time). Drop preinstalled SDKs this job
+      # never uses (about 20 GB).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - name: Install toolchain
         run: |
           # Tolerate flaky third-party apt repos on the runner (azure-cli mirror occasionally 404s).
@@ -86,6 +94,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
+      # Sanitized builds link 400+ static test executables with debug info, which fills the runner's
+      # ~14 GB free disk ("No space left on device" at link time). Drop preinstalled SDKs this job
+      # never uses (about 20 GB).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - name: Install toolchain
         run: |
