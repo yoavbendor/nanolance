@@ -62,8 +62,13 @@
 #include <set>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <vector>
+
+#ifdef _WIN32
+#include <process.h>  // _getpid
+#else
+#include <unistd.h>  // getpid
+#endif
 
 struct LanceSession {
     uint64_t index_cache_size_bytes = 0;
@@ -269,9 +274,18 @@ R guarded(R on_error, F&& f) {
 
 // ── URIs ────────────────────────────────────────────────────────────────────────────────────────
 
+// The process id, to name the memory:// directory. getpid is POSIX; the Windows CRT has _getpid.
+int process_id() {
+#ifdef _WIN32
+    return _getpid();
+#else
+    return getpid();
+#endif
+}
+
 std::filesystem::path memory_root() {
     static const std::filesystem::path root = [] {
-        auto dir = std::filesystem::temp_directory_path() / ("nanolance-lance-c-memory-" + std::to_string(getpid()));
+        auto dir = std::filesystem::temp_directory_path() / ("nanolance-lance-c-memory-" + std::to_string(process_id()));
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
         return dir;
@@ -328,7 +342,7 @@ LanceDataset* open_dataset(const char* uri, const char* const* storage_opts, uin
     if (!resolve_uri(uri, path, true)) {
         return nullptr;
     }
-    if (path.native().rfind("s3://", 0) == 0) {
+    if (path.string().rfind("s3://", 0) == 0) {
         std::vector<std::pair<std::string, std::string>> pairs;
         for (auto* kv = storage_opts; kv != nullptr && kv[0] != nullptr; kv += 2) {
             if (kv[1] == nullptr) {
@@ -343,7 +357,7 @@ LanceDataset* open_dataset(const char* uri, const char* const* storage_opts, uin
             invalid(error);
             return nullptr;
         }
-        if (!nano_lance::io::set_object_store_options(path.native(), options, error)) {
+        if (!nano_lance::io::set_object_store_options(path.string(), options, error)) {
             set_error(code_for(error), error);
             return nullptr;
         }

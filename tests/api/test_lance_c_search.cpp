@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <map>
 #include <cstdint>
@@ -983,7 +984,7 @@ void test_hamming(const std::filesystem::path& dir) {
         std::vector<std::pair<int, int>> brute;  // (distance, id)
         for (int i = 0; i < kRows; ++i) {
             int bits = 0;
-            for (int b = 0; b < kBytes; ++b) bits += __builtin_popcount(rows[i * kBytes + b] ^ q[b]);
+            for (int b = 0; b < kBytes; ++b) bits += std::popcount(static_cast<unsigned>(rows[i * kBytes + b] ^ q[b]));
             brute.emplace_back(bits, i);
         }
         std::sort(brute.begin(), brute.end());

@@ -11,6 +11,7 @@
 // Overwrite carrying a deletion file, a Merge that drops a fragment, and an operation nanolance does not
 // read. Also dataset_fragment_messages / dataset_field_messages, which hand the version's messages back.
 
+#include "../posix_env.hpp"
 #include "nanolance/dataset_transaction.hpp"
 #include "nanolance/manifest_reader.hpp"
 
@@ -27,8 +28,6 @@
 #include <map>
 #include <string>
 #include <vector>
-
-#include <unistd.h>
 
 namespace fs = std::filesystem;
 namespace nl = nano_lance;

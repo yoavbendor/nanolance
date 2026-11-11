@@ -10,8 +10,10 @@
 #include "nanolance/commit_backoff.hpp"
 #include "base/uuid.hpp"
 
+#ifndef _WIN32
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <chrono>
 #include <cstdlib>
@@ -63,6 +65,12 @@ int main() {
         require(pause_ms(40, false) < 50 + 200, "the local ceiling is 50 ms");
     }
 
+#ifdef _WIN32
+    // The fork case below needs fork(), which Windows does not have. The checks above ran.
+    std::cout << "skipped on Windows: needs fork (transaction ids drawn in forked children)\n";
+    std::cout << "commit backoff: attempts, pauses OK\n";
+    return 0;
+#else
     // Transaction ids drawn in forked children after the parent drew one: all different.
     const std::string parent = uuid_bytes();
     int fds[2];
@@ -97,4 +105,5 @@ int main() {
     }
     std::cout << "commit backoff: attempts, pauses, fork-distinct transaction ids OK\n";
     return 0;
+#endif
 }
