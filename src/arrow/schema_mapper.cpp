@@ -372,6 +372,27 @@ ParsedFormat parse_fixed_size_list(const ArrowSchema& field) {
         out.rejection = "a fixed_size_list needs one child and a non-zero size";
         return out;
     }
+    // fixed_size_list<fixed_size_list<T, a>, b> (W1a): the element is itself a fixed-width list of a plain
+    // fixed-width T. Its logical type nests as pylance's does: "fixed_size_list:fixed_size_list:T:a:b".
+    if (starts_with(field.children[0]->format, "+w:")) {
+        if (field.children[0]->n_children != 1 || field.children[0]->children == nullptr ||
+            field.children[0]->children[0] == nullptr) {
+            out.rejection = "a fixed_size_list needs one child and a non-zero size";
+            return out;
+        }
+        const ParsedFormat inner = parse_fixed_size_list(*field.children[0]);
+        const char* leaf_format = field.children[0]->children[0]->format;
+        const bool leaf_bool = leaf_format != nullptr && std::strcmp(leaf_format, "b") == 0;
+        if (!inner.supported || leaf_bool || inner.logical_type.rfind("fixed_size_list:struct:", 0) == 0 ||
+            inner.logical_type.rfind("fixed_size_list:bool:", 0) == 0) {
+            out.rejection = std::string("fixed_size_list of '") + field.children[0]->format +
+                            "' is not supported; a fixed_size_list inside one must hold fixed-width numbers";
+            return out;
+        }
+        out.logical_type = "fixed_size_list:" + inner.logical_type + ":" + std::to_string(items);
+        out.supported = true;
+        return out;
+    }
     const auto element = parse_format(field.children[0]->format);
     // bool elements are written bit-packed, FixedSizeList{N x Flat(1)}, as pylance writes them.
     // A struct element (fixed_size_list<struct>, W1k4) is written as pylance writes it: the struct's leaves, rows x N
