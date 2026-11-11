@@ -123,6 +123,58 @@ void test_nullable_flag_is_accepted() {
     require(legacy.fields[0].nullable == mapping.fields[0].nullable, "legacy argument changed nullability");
 }
 
+// fixed_size_list<fixed_size_list<int32, 4>, 2> (W1a) maps to pylance's nesting, outer size last; a
+// boolean or struct leaf under the inner list is still refused by name.
+void test_fixed_size_list_of_fixed_size_list() {
+    ArrowSchema leaf{};
+    leaf.format = "i";
+    leaf.name = "item";
+    leaf.flags = ARROW_FLAG_NULLABLE;
+    ArrowSchema* inner_children[] = {&leaf};
+    ArrowSchema inner{};
+    inner.format = "+w:4";
+    inner.name = "item";
+    inner.flags = ARROW_FLAG_NULLABLE;
+    inner.n_children = 1;
+    inner.children = inner_children;
+    ArrowSchema* outer_children[] = {&inner};
+    ArrowSchema outer{};
+    outer.format = "+w:2";
+    outer.name = "vectors";
+    outer.flags = 0;
+    outer.n_children = 1;
+    outer.children = outer_children;
+
+    nano_lance::LanceSchemaMapping mapping;
+    std::string error;
+    require(nano_lance::map_arrow_schema(outer, mapping, error), error);
+    require(mapping.fields.size() == 1, "fixed_size_list of fixed_size_list: one field expected");
+    require(mapping.fields[0].logical_type == "fixed_size_list:fixed_size_list:int32:4:2",
+            "fixed_size_list of fixed_size_list logical type mismatch: " + mapping.fields[0].logical_type);
+
+    ArrowSchema bool_leaf{};
+    bool_leaf.format = "b";
+    bool_leaf.name = "item";
+    bool_leaf.flags = ARROW_FLAG_NULLABLE;
+    ArrowSchema* bool_children[] = {&bool_leaf};
+    ArrowSchema bool_inner{};
+    bool_inner.format = "+w:4";
+    bool_inner.name = "item";
+    bool_inner.flags = ARROW_FLAG_NULLABLE;
+    bool_inner.n_children = 1;
+    bool_inner.children = bool_children;
+    ArrowSchema* bool_outer_children[] = {&bool_inner};
+    ArrowSchema bool_outer{};
+    bool_outer.format = "+w:2";
+    bool_outer.name = "flags";
+    bool_outer.flags = 0;
+    bool_outer.n_children = 1;
+    bool_outer.children = bool_outer_children;
+    nano_lance::LanceSchemaMapping refused;
+    require(!nano_lance::map_arrow_schema(bool_outer, refused, error),
+            "fixed_size_list of fixed_size_list of bool should be refused");
+}
+
 void test_fixed_size_binary() {
     ArrowSchema mac{};
     mac.format = "w:6";
@@ -478,6 +530,7 @@ int main() {
     test_nullable_flag_is_accepted();
     test_unenforced_primary_key();
     test_fixed_size_binary();
+    test_fixed_size_list_of_fixed_size_list();
     test_dictionary_schema();
     test_extension_struct();
     test_top_level_named_struct_maps_as_field();
