@@ -387,10 +387,12 @@ add_library(nanolance STATIC
     src/encoding/values/general.cpp
     src/encoding/values/byte_stream_split.cpp
     src/encoding/values/rle.cpp
+    src/encoding/values/child_block.cpp
     src/encoding/values/dictionary.cpp
     src/encoding/values/scalar_value.cpp
     src/encoding/layout/miniblock.cpp
     src/encoding/layout/full_zip.cpp
+    src/encoding/layout/sparse.cpp
     src/dataset/write_session.cpp
     src/dataset/dataset_scan.cpp
     src/api/nano_lance_writer.cpp

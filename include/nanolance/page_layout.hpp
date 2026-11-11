@@ -199,13 +199,67 @@ struct FullZip {
     std::vector<std::uint8_t> layers;
 };
 
-enum class LayoutKind { kNone, kMiniBlock, kConstant, kFullZip };
+/// One position set of a sparse layout (SparsePositionSet): which slots of a domain are set. `kAll` and
+/// `kRange` carry no bytes; `kExplicit` stores the set's delta-coded u64 positions in a buffer.
+struct SparsePositions {
+    enum class Kind { kEmpty, kAll, kRange, kExplicit };
+    Kind kind = Kind::kEmpty;
+    std::uint64_t start = 0;            ///< kRange
+    std::uint64_t length = 0;           ///< kRange
+    std::uint64_t num_positions = 0;    ///< the set's cardinality, as declared
+    std::unique_ptr<Compressive> encoding;  ///< kExplicit: how the u64 deltas are stored
+};
+
+/// SparseCountSet: the child count of each non-empty list slot.
+struct SparseCounts {
+    enum class Kind { kEmpty, kConstant, kExplicit };
+    Kind kind = Kind::kEmpty;
+    std::uint64_t value = 0;                ///< kConstant: the one count every non-empty slot has
+    std::unique_ptr<Compressive> encoding;  ///< kExplicit: how the u64 counts are stored
+};
+
+/// SparseValiditySet: `null_positions` says whether `positions` lists the null slots (else the valid ones).
+struct SparseValidity {
+    bool null_positions = true;
+    SparsePositions positions;
+};
+
+/// One SparseStructuralLayer: a nullable item or struct (`kValidity`), a list (`kList`) or a
+/// fixed-size list (`kFixedSizeList`). Outermost first in SparseLayout::layers.
+struct SparseLayer {
+    enum class Kind { kValidity, kList, kFixedSizeList };
+    Kind kind = Kind::kValidity;
+    std::uint64_t num_slots = 0;        ///< the parent domain's size
+    std::uint64_t num_child_slots = 0;  ///< kList: the child domain's size
+    std::uint64_t dimension = 0;        ///< kFixedSizeList: children per slot
+    SparsePositions non_empty;          ///< kList: the slots with children
+    SparseCounts counts;                ///< kList: those slots' child counts
+    SparseValidity validity;
+};
+
+/// PageLayout f5, SparseLayout (file version 2.3). The values are mini-block chunks, as in MiniBlock,
+/// with their own 8-byte chunk metadata; the structure is one layer per Arrow level that has a
+/// validity or list. See nanolance/sparse.hpp.
+struct SparseLayout {
+    std::unique_ptr<Compressive> value_compression;
+    /// The value_compression message's raw bytes, so a MiniBlock descriptor for the value chunks can be
+    /// rebuilt around them.
+    std::vector<std::uint8_t> value_compression_bytes;
+    std::uint64_t num_buffers = 0;
+    std::uint64_t num_items = 0;
+    std::uint64_t num_visible_items = 0;
+    bool has_large_chunk = false;
+    std::vector<SparseLayer> layers;
+};
+
+enum class LayoutKind { kNone, kMiniBlock, kConstant, kFullZip, kSparse };
 
 struct PageLayout {
     LayoutKind kind = LayoutKind::kNone;
     MiniBlock mini_block;
     Constant constant;
     FullZip full_zip;
+    SparseLayout sparse;
     /// Set when the descriptor named a layout this build does not model (Blob, Sparse, ...), so
     /// the caller can refuse by name rather than misinterpret the page's buffers.
     std::uint32_t unknown_layout_field = 0;

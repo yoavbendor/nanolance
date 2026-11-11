@@ -24,6 +24,7 @@
 #include "nanolance/lz4_block.hpp"
 #include "nanolance/read_safety.hpp"
 #include "nanolance/repdef.hpp"
+#include "nanolance/sparse_layout.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include <nanom/columnar.hpp>
@@ -3891,6 +3892,44 @@ bool decode_nested_mini_block_levels(NestedDecodeState& st, const pb::ColumnPage
     return true;
 }
 
+/// Reads a sparse page's structural buffers and its value chunks' metadata, and unravels the page to the
+/// per-layer offsets and validity a level-encoded page gives. One step of decode_nested_column, for the
+/// Sparse layout (nanolance/sparse_layout.hpp). The values are read later, as mini-block chunks.
+bool decode_nested_sparse_levels(NestedDecodeState& st, const pb::ColumnPage& page,
+                                 const page_layout::PageLayout& layout, const std::string& where,
+                                 NestedPageState& page_state, std::vector<repdef::UnraveledLayer>& unraveled,
+                                 std::string& error) {
+    const EncodingsIo& io = st.io;
+    const auto& sparse_layout = layout.sparse;
+    std::size_t structural = 0;
+    if (page.buffer_offsets.size() != page.buffer_sizes.size() ||
+        !sparse::structural_buffer_count(sparse_layout, structural, error) ||
+        page.buffer_offsets.size() != 2U + structural) {
+        error = where + (error.empty() ? "a sparse page's buffers do not match its layers" : error);
+        return false;
+    }
+    std::vector<std::uint8_t> meta;
+    if (!io.read(page.buffer_offsets[0], page.buffer_sizes[0], meta, error)) {
+        error = where + error;
+        return false;
+    }
+    std::vector<std::vector<std::uint8_t>> buffers(structural);
+    for (std::size_t i = 0; i < structural; ++i) {
+        if (!io.read(page.buffer_offsets[2U + i], page.buffer_sizes[2U + i], buffers[i], error)) {
+            error = where + error;
+            return false;
+        }
+    }
+    std::vector<std::uint64_t> items;
+    if (!sparse::chunk_items(meta, page.buffer_sizes[1], sparse_layout.num_visible_items, items, error) ||
+        !sparse::unravel(sparse_layout, page.length, st.on_disk_field.nullable, buffers, unraveled, error)) {
+        error = where + error;
+        return false;
+    }
+    page_state.items = std::move(items);
+    return true;
+}
+
 /// Decodes the levels of a constant page: its repetition and definition level buffers, and the layers
 /// they describe. One step of decode_nested_column, for the Constant layout.
 bool decode_nested_constant_levels(NestedDecodeState& st, const pb::ColumnPage& page,
@@ -4115,6 +4154,20 @@ bool decode_nested_page_values(NestedDecodeState& st, const pb::ColumnPage& page
         if (!decode_column_impl(io, on_disk_field, one_page, page_values, error, view)) {
             return false;
         }
+    } else if (layout.kind == page_layout::LayoutKind::kSparse && page_items != 0U) {
+        // The value chunks are mini-block chunks with no levels: the page is read as one, with the
+        // descriptor the sparse layout's own value encoding gives and the item counts its metadata holds.
+        pb::ColumnPage value_page = page;
+        value_page.encoding = sparse::value_descriptor(layout.sparse, layout.sparse.num_visible_items);
+        value_page.length = page_items;
+        pb::ColumnMetadata one_page;
+        one_page.pages.push_back(std::move(value_page));
+        auto view = std::make_shared<ItemView>();
+        view->page_chunk_items.push_back(std::move(items));
+        if (!decode_column_impl(io, on_disk_field, one_page, page_values, error, view)) {
+            error = where + error;
+            return false;
+        }
     } else if (page_items != 0U) {
         if (!decode_nested_constant_items(st, page, layout, unraveled, where, out, page_values, error)) {
             return false;
@@ -4232,12 +4285,17 @@ bool decode_nested_column(const EncodingsIo& io, const pb::Field& on_disk_field,
         }
         rep.clear();
         def.clear();
+        std::vector<repdef::UnraveledLayer> sparse_unraveled;
         if (layout.kind == page_layout::LayoutKind::kMiniBlock) {
             if (!decode_nested_mini_block_levels(st, page, layout, where, window, page_state, error)) {
                 return false;
             }
         } else if (layout.kind == page_layout::LayoutKind::kConstant) {
             if (!decode_nested_constant_levels(st, page, layout, where, page_state, error)) {
+                return false;
+            }
+        } else if (layout.kind == page_layout::LayoutKind::kSparse) {
+            if (!decode_nested_sparse_levels(st, page, layout, where, page_state, sparse_unraveled, error)) {
                 return false;
             }
         } else if (layout.kind == page_layout::LayoutKind::kFullZip) {
@@ -4260,7 +4318,9 @@ bool decode_nested_column(const EncodingsIo& io, const pb::Field& on_disk_field,
         }
 
         std::vector<repdef::UnraveledLayer> unraveled;
-        if (!decode_nested_unravel_page(st, page_state, where, unraveled, error)) {
+        if (layout.kind == page_layout::LayoutKind::kSparse) {
+            unraveled = std::move(sparse_unraveled);
+        } else if (!decode_nested_unravel_page(st, page_state, where, unraveled, error)) {
             return false;
         }
         const auto page_items = unraveled[0].length;
@@ -4338,6 +4398,10 @@ bool column_is_nested(const pb::ColumnMetadata& column_metadata) {
                     return true;
                 }
                 break;
+            case page_layout::LayoutKind::kSparse:
+                // Every sparse page is read by the nested path: its leaf may be nullable with no
+                // struct or list above it, which the flat path would not read as validity.
+                return true;
             default:
                 break;
         }
