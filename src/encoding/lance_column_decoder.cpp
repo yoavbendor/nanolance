@@ -2232,11 +2232,127 @@ bool decode_rle_column(const EncodingsIo& io, const pb::Field& on_disk_field, co
     return true;
 }
 
+/// Appends the dictionary entries of `picked` (one dictionary index per row a row selection keeps) to a
+/// fixed-width output: only those rows are expanded.
+bool append_dict_fixed(const DictionaryBlock& dict, const std::vector<std::uint32_t>& picked, ColumnValues& out,
+                       std::string& error) {
+    const std::size_t base = out.fixed.size();
+    out.fixed.resize(base + picked.size() * dict.value_bytes);
+    std::uint8_t* dest = out.fixed.data() + base;
+    for (const auto index : picked) {
+        if (index >= dict.count) {
+            error = "dict index out of range";
+            return false;
+        }
+        std::memcpy(dest, dict.entry(index), dict.value_bytes);
+        dest += dict.value_bytes;
+    }
+    return true;
+}
+
+/// As append_dict_fixed, for a variable-width output: the offsets of the picked rows and their bytes.
+bool append_dict_variable(const DictionaryBlock& dict, const std::vector<std::uint32_t>& picked, ColumnValues& out,
+                          std::string& error) {
+    if (out.variable.offsets.empty()) {
+        append_list_offset(out.variable.offsets, 0, out.variable.large);
+    }
+    std::uint64_t page_bytes = 0;
+    for (const auto index : picked) {
+        if (index >= dict.count) {
+            error = "dict index out of range";
+            return false;
+        }
+        page_bytes += dict.entry_size(index);
+    }
+    const std::size_t data_base = out.variable.data.size();
+    std::uint64_t data_end = 0;
+    if (!checked_add(static_cast<std::uint64_t>(data_base), page_bytes, data_end) || !fits_size_t(data_end) ||
+        data_end > default_read_limits().max_uncompressed_bytes ||
+        (!out.variable.large && data_end > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()))) {
+        error = "dictionary column expands past the decoded-size limit";
+        return false;
+    }
+    const auto width = static_cast<std::size_t>(out.variable.large ? 8U : 4U);
+    const std::size_t offsets_base = out.variable.offsets.size();
+    if (data_end > out.variable.data.capacity()) {
+        out.variable.data.reserve(static_cast<std::size_t>(data_end));
+        advise_huge_pages(out.variable.data);
+    }
+    out.variable.data.resize(static_cast<std::size_t>(data_end));
+    out.variable.offsets.resize(offsets_base + picked.size() * width);
+    std::uint8_t* dest = out.variable.data.data() + data_base;
+    std::uint8_t* offsets = out.variable.offsets.data() + offsets_base;
+    auto cumulative = static_cast<std::uint64_t>(data_base);
+    for (std::size_t r = 0; r < picked.size(); ++r) {
+        const std::size_t len = dict.entry_size(picked[r]);
+        if (len != 0U) {
+            std::memcpy(dest, dict.entry(picked[r]), len);
+        }
+        dest += len;
+        cumulative += len;
+        if (out.variable.large) {
+            std::memcpy(offsets + r * 8U, &cumulative, 8U);
+        } else {
+            const auto narrow = static_cast<std::int32_t>(cumulative);
+            std::memcpy(offsets + r * 4U, &narrow, 4U);
+        }
+    }
+    return true;
+}
+
+/// Narrows the validity bits of one page's rows to the rows `keep` selects. The page's bits sit in `out` from
+/// bit `first` (one per row, the output's rows before it being `first`); the kept ones are packed from `first`
+/// and the nulls among the dropped rows come off `out.null_count`. No bits means every row is valid.
+void keep_page_validity(ColumnValues& out, std::uint64_t first, const std::uint8_t* keep, std::uint64_t rows) {
+    if (out.validity.empty()) {
+        return;
+    }
+    std::uint64_t at = first;  // where the next kept row's bit goes
+    std::uint64_t nulls_dropped = 0;
+    for (std::uint64_t row = 0; row < rows; ++row) {
+        const std::uint64_t bit = first + row;
+        const bool valid = ((out.validity[static_cast<std::size_t>(bit >> 3U)] >> (bit & 7U)) & 1U) != 0U;
+        if (keep[row] == 0U) {
+            nulls_dropped += valid ? 0U : 1U;
+            continue;
+        }
+        auto& byte = out.validity[static_cast<std::size_t>(at >> 3U)];
+        const auto mask = static_cast<std::uint8_t>(1U << (at & 7U));
+        byte = valid ? static_cast<std::uint8_t>(byte | mask) : static_cast<std::uint8_t>(byte & ~mask);
+        ++at;
+    }
+    // The bits past the last kept row are the dropped rows' old values: clear them, then drop the bytes past them.
+    if ((at & 7U) != 0U) {
+        auto& last = out.validity[static_cast<std::size_t>(at >> 3U)];
+        last = static_cast<std::uint8_t>(last & ((1U << (at & 7U)) - 1U));
+    }
+    out.validity.resize(static_cast<std::size_t>((at + 7U) / 8U));
+    out.null_count -= nulls_dropped;
+}
+
 /// Decodes a dictionary column whose indices are run-length encoded.
-/// One branch of decode_column_impl, which has already bounded the row count.
+/// One branch of decode_column_impl, which has already bounded the row count. With `keep` (one byte per row of all
+/// the pages, in order), only the rows it keeps are expanded, and the output holds just those.
 bool decode_dict_rle_column(const EncodingsIo& io, const pb::Field& on_disk_field,
                             const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
-                            const ColumnEncodingPlan& encoding_plan) {
+                            const ColumnEncodingPlan& encoding_plan,
+                            const std::vector<std::uint8_t>* keep = nullptr) {
+    // With a row selection, `keep` has one byte per row of all the pages, in order; only the rows it keeps are
+    // decoded, and the output holds them. `kept_total` is then the output's row count, which is where each
+    // page's validity bits go.
+    std::uint64_t keep_at = 0;     // first row of the page within `keep`
+    std::uint64_t kept_total = 0;  // rows the output holds so far (with a selection)
+    if (keep != nullptr) {
+        std::uint64_t rows = 0;
+        for (const auto& p : column_metadata.pages) {
+            rows += p.length;
+        }
+        if (rows != keep->size()) {
+            error = "row selection covers " + std::to_string(keep->size()) + " rows but the pages have " +
+                    std::to_string(rows);
+            return false;
+        }
+    }
     const bool fixed_dict = encoding_plan.dict_value_bits != 0U;
     out.kind = fixed_dict ? ColumnValues::Kind::FixedWidth : ColumnValues::Kind::VariableWidth;
     out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
@@ -2263,6 +2379,9 @@ bool decode_dict_rle_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
         }
         // Same splitter as every other miniblock path, so a nullable column's definition levels
         // are read here rather than being mistaken for run data.
+        if (keep != nullptr) {
+            validity_rows = kept_total;  // the page's bits go after the rows the output already holds
+        }
         if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, chunks, validity_rows, out,
                                             error)) {
             return false;
@@ -2311,6 +2430,30 @@ bool decode_dict_rle_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
             return false;
         }
 
+        if (keep != nullptr) {
+            // Only the rows the selection keeps are expanded: walk the runs, and keep the index of each such row.
+            const std::uint8_t* page_keep = keep->data() + keep_at;
+            std::vector<std::uint32_t> picked;
+            std::size_t row = 0;
+            for (const auto& [index, run] : runs) {
+                for (std::size_t c = 0; c < run; ++c, ++row) {
+                    if (page_keep[row] != 0U) {
+                        picked.push_back(index);
+                    }
+                }
+            }
+            if (!(fixed_dict ? append_dict_fixed(dict, picked, out, error)
+                             : append_dict_variable(dict, picked, out, error))) {
+                return false;
+            }
+            keep_page_validity(out, kept_total, page_keep, page.length);
+            kept_total += picked.size();
+            keep_at += page.length;
+            work_stats::add(work_stats::counters().dict_rows_expanded, picked.size());
+            continue;
+        }
+
+        work_stats::add(work_stats::counters().dict_rows_expanded, page.length);
         if (fixed_dict) {
             const std::size_t base = out.fixed.size();
             out.fixed.resize(base + total_data);
@@ -2368,10 +2511,26 @@ bool decode_dict_rle_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
 }
 
 /// Decodes a dictionary column.
-/// One branch of decode_column_impl, which has already bounded the row count.
+/// One branch of decode_column_impl, which has already bounded the row count. With `keep` (one byte per row of all
+/// the pages, in order), only the rows it keeps are expanded, and the output holds just those.
 bool decode_dict_column(const EncodingsIo& io, const pb::Field& on_disk_field,
                         const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
-                        const ColumnEncodingPlan& encoding_plan) {
+                        const ColumnEncodingPlan& encoding_plan,
+                        const std::vector<std::uint8_t>* keep = nullptr) {
+    // With a row selection, `keep` has one byte per row of all the pages, in order (as in decode_dict_rle_column).
+    std::uint64_t keep_at = 0;     // first row of the page within `keep`
+    std::uint64_t kept_total = 0;  // rows the output holds so far (with a selection)
+    if (keep != nullptr) {
+        std::uint64_t rows = 0;
+        for (const auto& p : column_metadata.pages) {
+            rows += p.length;
+        }
+        if (rows != keep->size()) {
+            error = "row selection covers " + std::to_string(keep->size()) + " rows but the pages have " +
+                    std::to_string(rows);
+            return false;
+        }
+    }
     const bool fixed_dict = encoding_plan.dict_value_bits != 0U;
     out.kind = fixed_dict ? ColumnValues::Kind::FixedWidth : ColumnValues::Kind::VariableWidth;
     out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
@@ -2401,6 +2560,9 @@ bool decode_dict_column(const EncodingsIo& io, const pb::Field& on_disk_field,
         // encoding exists for) carries its definition levels here like anywhere else. The
         // dedicated chunk-list parser this replaced rejected the level buffer outright with
         // "unexpected miniblock payload prefix".
+        if (keep != nullptr) {
+            validity_rows = kept_total;  // the page's bits go after the rows the output already holds
+        }
         if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, index_chunks,
                                             validity_rows, out, error)) {
             return false;
@@ -2491,6 +2653,32 @@ bool decode_dict_column(const EncodingsIo& io, const pb::Field& on_disk_field,
             error = "dict index count mismatch";
             return false;
         }
+        if (keep != nullptr) {
+            // Every index is checked, as a full decode checks them; only the kept rows are expanded.
+            const std::uint8_t* page_keep = keep->data() + keep_at;
+            std::vector<std::uint32_t> picked;
+            for (std::uint64_t r = 0; r < page.length; ++r) {
+                std::uint32_t index = 0;
+                std::memcpy(&index, indices_bytes.data() + r * 4U, 4U);
+                if (index >= num_dict) {
+                    error = "dict index out of range";
+                    return false;
+                }
+                if (page_keep[r] != 0U) {
+                    picked.push_back(index);
+                }
+            }
+            if (!(fixed_dict ? append_dict_fixed(dict, picked, out, error)
+                             : append_dict_variable(dict, picked, out, error))) {
+                return false;
+            }
+            keep_page_validity(out, kept_total, page_keep, page.length);
+            kept_total += picked.size();
+            keep_at += page.length;
+            work_stats::add(work_stats::counters().dict_rows_expanded, picked.size());
+            continue;
+        }
+        work_stats::add(work_stats::counters().dict_rows_expanded, page.length);
         if (fixed_dict) {
             // Every row is the same width, so the destination is sized once and written through
             // a pointer -- no per-row growth, and no offsets to maintain.
@@ -3289,7 +3477,8 @@ bool decode_fixed_width_column(const EncodingsIo& io, const pb::Field& on_disk_f
 /// pass (decode_list_column), which reads the leaf values as a flat column of items.
 bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
                         const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
-                        const std::shared_ptr<ItemView>& item_view) {
+                        const std::shared_ptr<ItemView>& item_view,
+                        const std::vector<std::uint8_t>* keep = nullptr) {
     error.clear();
     out = ColumnValues{};
 
@@ -3343,6 +3532,14 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
         return false;
     }
 
+    // A row selection (see decode_flat_column_selected) is only ever taken by a dictionary page, which
+    // expands the rows it keeps. Any other page is decoded whole by its caller and picked from.
+    if (keep != nullptr && encoding_plan.kind != ColumnEncodingKind::kDict &&
+        encoding_plan.kind != ColumnEncodingKind::kDictRle) {
+        error = "column '" + on_disk_field.name + "': a row selection reached a page that is not dictionary coded";
+        return false;
+    }
+
     // A constant page carries a value when the descriptor has an inline one, or when the page has 1
     // or 3 buffers (value; value + rep + def). 0 or 2 buffers with no inline value is how Lance says
     // every row is null. This is `ConstantPageScheduler::try_new`'s `has_scalar_value` inverted, and
@@ -3379,7 +3576,7 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
     // anything naming the cause. A repetitive string column past ~5000 rows is exactly that shape,
     // and so is any integer column with runs, whose dictionary is fixed-width rather than variable.
     if (encoding_plan.kind == ColumnEncodingKind::kDictRle) {
-        return decode_dict_rle_column(io, on_disk_field, column_metadata, out, error, encoding_plan);
+        return decode_dict_rle_column(io, on_disk_field, column_metadata, out, error, encoding_plan, keep);
     }
 
     // Structural dictionary column: buffer[1] = bitpacked u32 indices, buffer[2] = dictionary.
@@ -3390,7 +3587,7 @@ bool decode_column_impl(const EncodingsIo& io, const pb::Field& on_disk_field,
     // column once its cardinality justifies a dictionary. Reading a flat block as a variable-width
     // one read the first value as an offset header and refused with "dict block header invalid".
     if (encoding_plan.kind == ColumnEncodingKind::kDict) {
-        return decode_dict_column(io, on_disk_field, column_metadata, out, error, encoding_plan);
+        return decode_dict_column(io, on_disk_field, column_metadata, out, error, encoding_plan, keep);
     }
 
     // FullZip: values stored row by row, each behind a control word. What Lance writes when a page's
@@ -4870,6 +5067,10 @@ namespace {
 
 bool decode_flat_column(const EncodingsIo& io, const pb::Field& on_disk_field,
                         const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error);
+bool has_dictionary_page(const pb::Field& on_disk_field, const pb::ColumnMetadata& column_metadata);
+bool decode_flat_column_selected(const EncodingsIo& io, const pb::Field& on_disk_field,
+                                 const pb::ColumnMetadata& column_metadata, const std::vector<std::uint8_t>& keep,
+                                 std::size_t value_bytes, ColumnValues& out, std::string& error);
 
 bool take_flat_miniblock_chunks(const EncodingsIo& io, const pb::Field& field,
                                 const pb::ColumnMetadata& column, const std::vector<std::uint64_t>& rows,
@@ -4921,8 +5122,7 @@ bool take_flat_miniblock_chunks(const EncodingsIo& io, const pb::Field& field,
             i = j;
         }
     }
-    if (!decode_flat_column(io, field, subset, out, error) ||
-        !compact_column_values(out, keep, keep.size(), value_bytes, error)) {
+    if (!decode_flat_column_selected(io, field, subset, keep, value_bytes, out, error)) {
         return false;
     }
     done = true;
@@ -5215,6 +5415,10 @@ static bool decode_lance_physical_column_rows_impl(const EncodingsIo& io, const 
         keep.assign(static_cast<std::size_t>(column_metadata.pages.front().length), 0U);
         subset_rows = column_metadata.pages.front().length;
     }
+    if (!column_is_nested(column_metadata) && has_dictionary_page(on_disk_field, subset)) {
+        // Whole pages of a dictionary column: only the rows asked for are expanded out of them.
+        return decode_flat_column_selected(io, on_disk_field, subset, keep, value_bytes, out, error);
+    }
     if (!decode_lance_physical_column(io, on_disk_field, subset, out, error)) {
         return false;
     }
@@ -5326,6 +5530,79 @@ bool append_flat_values(ColumnValues& dst, std::uint64_t dst_rows, ColumnValues&
 }
 
 /// decode_column_impl for a flat column, one page at a time when its pages need plans of their own.
+/// Does any page of this flat column decode as a dictionary (plain or run-length coded)?
+bool has_dictionary_page(const pb::Field& on_disk_field, const pb::ColumnMetadata& column_metadata) {
+    if (field_metadata_is_true(on_disk_field, "lance-encoding:blob")) {
+        return false;  // a blob column decodes through its own path
+    }
+    for (const auto& page : column_metadata.pages) {
+        pb::ColumnMetadata one_page = column_metadata;
+        one_page.pages.assign(1U, page);
+        const auto kind = classify_column_encoding(on_disk_field, one_page).kind;
+        if (kind == ColumnEncodingKind::kDict || kind == ColumnEncodingKind::kDictRle) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The rows of a flat column's pages that `keep` selects (one byte per row of all the pages, in order),
+/// decoded. A dictionary page expands only the rows it keeps, so a take or a range over a page of whole
+/// chunks copies out just what it asked for; any other page is decoded whole and picked from.
+bool decode_flat_column_selected(const EncodingsIo& io, const pb::Field& on_disk_field,
+                                 const pb::ColumnMetadata& column_metadata, const std::vector<std::uint8_t>& keep,
+                                 std::size_t value_bytes, ColumnValues& out, std::string& error) {
+    if (!has_dictionary_page(on_disk_field, column_metadata)) {
+        return decode_flat_column(io, on_disk_field, column_metadata, out, error) &&
+               compact_column_values(out, keep, keep.size(), value_bytes, error);
+    }
+    // Dictionary pages that share one plan are decoded in one pass, which takes the whole mask and appends
+    // each page's kept rows straight into `out`.
+    bool all_dictionary = true;
+    for (const auto& page : column_metadata.pages) {
+        pb::ColumnMetadata one_page = column_metadata;
+        one_page.pages.assign(1U, page);
+        const auto kind = classify_column_encoding(on_disk_field, one_page).kind;
+        all_dictionary = all_dictionary && (kind == ColumnEncodingKind::kDict || kind == ColumnEncodingKind::kDictRle);
+    }
+    if (all_dictionary && pages_share_one_plan(on_disk_field, column_metadata)) {
+        return decode_column_impl(io, on_disk_field, column_metadata, out, error, nullptr, &keep);
+    }
+    out = ColumnValues{};
+    std::uint64_t at = 0;        // first row of the page within `keep`
+    std::uint64_t out_rows = 0;  // rows appended to `out` so far
+    for (const auto& page : column_metadata.pages) {
+        if (page.length > keep.size() - at) {
+            error = "column '" + on_disk_field.name + "': a row selection covers fewer rows than its pages hold";
+            return false;
+        }
+        const std::vector<std::uint8_t> page_keep(keep.begin() + static_cast<std::ptrdiff_t>(at),
+                                                  keep.begin() + static_cast<std::ptrdiff_t>(at + page.length));
+        std::uint64_t kept = 0;
+        for (const auto k : page_keep) {
+            kept += k != 0U ? 1U : 0U;
+        }
+        pb::ColumnMetadata one_page = column_metadata;
+        one_page.pages.assign(1U, page);
+        ColumnValues part;
+        const auto kind = classify_column_encoding(on_disk_field, one_page).kind;
+        if (kind == ColumnEncodingKind::kDict || kind == ColumnEncodingKind::kDictRle) {
+            if (!decode_column_impl(io, on_disk_field, one_page, part, error, nullptr, &page_keep)) {
+                return false;
+            }
+        } else if (!decode_column_impl(io, on_disk_field, one_page, part, error, nullptr) ||
+                   !compact_column_values(part, page_keep, page.length, value_bytes, error)) {
+            return false;
+        }
+        if (!append_flat_values(out, out_rows, part, kept, error)) {
+            return false;
+        }
+        out_rows += kept;
+        at += page.length;
+    }
+    return true;
+}
+
 bool decode_flat_column(const EncodingsIo& io, const pb::Field& on_disk_field,
                         const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {
     if (pages_share_one_plan(on_disk_field, column_metadata)) {
@@ -5554,11 +5831,18 @@ static bool decode_lance_physical_column_range_impl(const EncodingsIo& io, const
         subset_first = first;
         subset_rows = column_metadata.pages.front().length;
     }
+    if (first == subset_first && count == subset_rows) {
+        return decode_flat_column(io, on_disk_field, subset, out, error);
+    }
+    if (has_dictionary_page(on_disk_field, subset)) {
+        // A dictionary page of whole chunks expands only the rows of the range, not every row of its chunks.
+        std::vector<std::uint8_t> keep(static_cast<std::size_t>(subset_rows), 0U);
+        const auto lo = static_cast<std::ptrdiff_t>(first - subset_first);
+        std::fill(keep.begin() + lo, keep.begin() + lo + static_cast<std::ptrdiff_t>(count), std::uint8_t{1});
+        return decode_flat_column_selected(io, on_disk_field, subset, keep, value_bytes, out, error);
+    }
     if (!decode_flat_column(io, on_disk_field, subset, out, error)) {
         return false;
-    }
-    if (first == subset_first && count == subset_rows) {
-        return true;
     }
     return slice_column_values(out, first - subset_first, count, subset_rows, value_bytes, error);
 }
