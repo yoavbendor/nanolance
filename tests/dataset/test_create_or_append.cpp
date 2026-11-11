@@ -12,8 +12,10 @@
 
 #include "support.hpp"
 
+#ifndef _WIN32
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -97,6 +99,14 @@ int main() {
     require(stage_and_finish(seq.string(), range(2000, 10), NANO_LANCE_COMMIT_CREATE, error) != NANO_LANCE_OK,
             "create refuses an existing dataset");
 
+#ifdef _WIN32
+    // The race forks one writer per process, and Windows has no fork. The cases above ran.
+    std::cout << "skipped on Windows: needs fork (the race of forked writers)\n";
+    std::error_code ec;
+    std::filesystem::remove_all(seq, ec);
+    std::cout << "create-or-append: sequential, schema mismatch OK\n";
+    return 0;
+#else
     // The race.
     int writers = 16;
     if (const char* env = std::getenv("NANOLANCE_TEST_RACE_WRITERS"); env != nullptr && std::atoi(env) > 0) {
@@ -149,4 +159,5 @@ int main() {
     std::filesystem::remove_all(local, ec);
     std::cout << "create-or-append: sequential, schema mismatch, " << writers << " forked writers OK\n";
     return 0;
+#endif
 }
