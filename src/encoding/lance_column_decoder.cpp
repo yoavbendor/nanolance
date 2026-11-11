@@ -25,6 +25,7 @@
 #include "nanolance/read_safety.hpp"
 #include "nanolance/repdef.hpp"
 #include "nanolance/sparse_layout.hpp"
+#include "nanolance/child_block.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include <nanom/columnar.hpp>
@@ -678,6 +679,12 @@ struct ColumnEncodingPlan {
     /// is a property of the PAGE (its buffer count), not of the descriptor -- so it is decided at
     /// decode time. See `constant_def_buffer_index`.
     bool constant_declares_levels = false;
+    /// kRle: how a chunk's run values and run lengths are stored. Set for a plain RLE column; the
+    /// chunk decode reads each child as its own encoding says (flat, bitpacked or general), with the
+    /// run lengths' width from `rle_length_bits`.
+    std::shared_ptr<const page_layout::Compressive> rle_values;
+    std::shared_ptr<const page_layout::Compressive> rle_lengths;
+    std::uint32_t rle_length_bits = 8;
     /// kVariable written by stock Lance: the page's FSST symbol table, parsed once per column. Empty
     /// `symbol_count` with `passthrough` set is the ordinary case for a small file -- Lance skips FSST
     /// below 32 KiB of input but still wraps the page in the encoding.
@@ -1335,6 +1342,12 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
     switch (inner->kind) {
         case page_layout::CompressiveKind::kRle:
             out.kind = has_dictionary ? ColumnEncodingKind::kDictRle : ColumnEncodingKind::kRle;
+            if (!has_dictionary && inner->values != nullptr && inner->lengths != nullptr) {
+                out.rle_values = page_layout::clone(*inner->values);
+                out.rle_lengths = page_layout::clone(*inner->lengths);
+                const auto bits = child_block::value_bits(*inner->lengths);
+                out.rle_length_bits = bits != 0U ? bits : 8U;
+            }
             if (has_dictionary && inner->values != nullptr && inner->values->kind == page_layout::CompressiveKind::kFlat &&
                 (inner->values->bits_per_value == 8U || inner->values->bits_per_value == 16U ||
                  inner->values->bits_per_value == 32U || inner->values->bits_per_value == 64U)) {
@@ -2225,7 +2238,16 @@ bool decode_rle_column(const EncodingsIo& io, const pb::Field& on_disk_field, co
                 error = "rle chunk is missing its run-lengths buffer";
                 return false;
             }
-            if (!rle::decode(chunk.values, chunk.extra_buffers[0], bpv, out.fixed, error)) {
+            // A General wrapper around the whole RLE encoding frames its first buffer, the run values, one
+            // frame per chunk; the run lengths stay as they are (Lance's general decompressor takes data[0]
+            // only). decode_rle_chunk unframes the values, when the plan says there is a scheme.
+            if (encoding_plan.rle_values != nullptr && encoding_plan.rle_lengths != nullptr) {
+                if (!child_block::decode_rle_chunk(*encoding_plan.rle_values, *encoding_plan.rle_lengths, chunk.values,
+                                                   chunk.extra_buffers[0], encoding_plan.value_scheme, bpv * 8U,
+                                                   encoding_plan.rle_length_bits, out.fixed, error)) {
+                    return false;
+                }
+            } else if (!rle::decode(chunk.values, chunk.extra_buffers[0], bpv, out.fixed, error)) {
                 return false;
             }
         }

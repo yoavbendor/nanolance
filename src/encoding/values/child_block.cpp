@@ -92,7 +92,7 @@ bool decode(const Compressive& encoding, const std::vector<std::uint8_t>& bytes,
             if (count.has_value() ? bytes.size() != need : bytes.size() % width != 0U) {
                 error = "flat child block is " + std::to_string(bytes.size()) + " bytes" +
                         (count.has_value() ? " for " + std::to_string(*count) + " values" : "") +
-                        " at " + std::to_string(bits) + " bits";
+                        " at " + std::to_string(bits) + " bits (" + page_layout::describe_encoding(encoding) + ")";
                 return false;
             }
             out = bytes;
@@ -153,7 +153,8 @@ bool decode(const Compressive& encoding, const std::vector<std::uint8_t>& bytes,
             }
             const std::vector<std::uint8_t> values(bytes.begin() + 8, bytes.begin() + 8 + static_cast<std::ptrdiff_t>(values_size));
             const std::vector<std::uint8_t> lengths(bytes.begin() + 8 + static_cast<std::ptrdiff_t>(values_size), bytes.end());
-            if (!decode_rle_chunk(*encoding.values, *encoding.lengths, values, lengths, bits, length_bits, out, error)) {
+            if (!decode_rle_chunk(*encoding.values, *encoding.lengths, values, lengths, page_layout::BufferScheme::kNone, bits,
+                                  length_bits, out, error)) {
                 return false;
             }
             if (count.has_value() && out.size() != need) {
@@ -176,9 +177,15 @@ bool decode(const Compressive& encoding, const std::vector<std::uint8_t>& bytes,
             }
             std::vector<std::uint8_t> raw;
             if (!general::decompress(scheme, bytes.data(), bytes.size(), raw, error)) {
+                error += " (" + page_layout::describe_encoding(encoding) + ")";
                 return false;
             }
-            return decode(*encoding.values, raw, count, bits, out, error);
+            if (!decode(*encoding.values, raw, count, bits, out, error)) {
+                error += " (" + page_layout::describe_encoding(encoding) + ", " + std::to_string(bytes.size()) +
+                         " compressed bytes)";
+                return false;
+            }
+            return true;
         }
         default:
             error = "child block uses an encoding nanolance does not read: " +
@@ -187,10 +194,50 @@ bool decode(const Compressive& encoding, const std::vector<std::uint8_t>& bytes,
     }
 }
 
+namespace {
+bool decode_rle_chunk_impl(const Compressive& values_encoding, const Compressive& lengths_encoding,
+                           const std::vector<std::uint8_t>& values, const std::vector<std::uint8_t>& lengths,
+                           std::uint32_t bits, std::uint32_t length_bits, std::vector<std::uint8_t>& out,
+                           std::string& error);
+
+/// Adds the two buffers' sizes to a refusal, so a chunk that does not split as its header says is named.
+void name_rle_buffers(std::string& error, const std::vector<std::uint8_t>& values, const std::vector<std::uint8_t>& lengths) {
+    error += " (rle chunk: values " + std::to_string(values.size()) + " bytes, run lengths " +
+             std::to_string(lengths.size()) + " bytes)";
+}
+}  // namespace
+
 bool decode_rle_chunk(const Compressive& values_encoding, const Compressive& lengths_encoding,
                       const std::vector<std::uint8_t>& values, const std::vector<std::uint8_t>& lengths,
-                      std::uint32_t bits, std::uint32_t length_bits, std::vector<std::uint8_t>& out,
-                      std::string& error) {
+                      page_layout::BufferScheme values_scheme, std::uint32_t bits, std::uint32_t length_bits,
+                      std::vector<std::uint8_t>& out, std::string& error) {
+    std::vector<std::uint8_t> framed_values;
+    const std::vector<std::uint8_t>* raw_values = &values;
+    if (values_scheme != page_layout::BufferScheme::kNone) {
+        bool known = false;
+        const char* scheme = scheme_name(values_scheme, known);
+        if (!known) {
+            error = "rle chunk uses an unsupported buffer compression";
+            return false;
+        }
+        if (!general::decompress(scheme, values.data(), values.size(), framed_values, error)) {
+            name_rle_buffers(error, values, lengths);
+            return false;
+        }
+        raw_values = &framed_values;
+    }
+    const bool ok = decode_rle_chunk_impl(values_encoding, lengths_encoding, *raw_values, lengths, bits, length_bits, out, error);
+    if (!ok) {
+        name_rle_buffers(error, values, lengths);
+    }
+    return ok;
+}
+
+namespace {
+bool decode_rle_chunk_impl(const Compressive& values_encoding, const Compressive& lengths_encoding,
+                           const std::vector<std::uint8_t>& values, const std::vector<std::uint8_t>& lengths,
+                           std::uint32_t bits, std::uint32_t length_bits, std::vector<std::uint8_t>& out,
+                           std::string& error) {
     if (!valid_width(bits) || (length_bits != 8U && length_bits != 16U && length_bits != 32U)) {
         error = "rle chunk declares " + std::to_string(bits) + "-bit values and " + std::to_string(length_bits) +
                 "-bit run lengths, which nanolance does not read";
@@ -269,5 +316,7 @@ bool decode_rle_chunk(const Compressive& values_encoding, const Compressive& len
     }
     return true;
 }
+
+}  // namespace
 
 }  // namespace nano_lance::child_block

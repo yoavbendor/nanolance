@@ -271,6 +271,9 @@ struct PageLayout {
 /// being read, and it costs nothing to keep reading them).
 bool decode_page_layout(const std::vector<std::uint8_t>& encoding, PageLayout& out, std::string& error);
 
+/// A deep copy of one encoding subtree, for a caller that keeps part of a descriptor past the layout's life.
+std::unique_ptr<Compressive> clone(const Compressive& node);
+
 /// Human-readable one-line summary, for error messages and the differential test's diagnostics.
 std::string describe(const PageLayout& layout);
 

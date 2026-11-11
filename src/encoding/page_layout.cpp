@@ -915,6 +915,36 @@ void describe_layers(const std::vector<std::uint8_t>& layers, std::string& out) 
 
 }  // namespace
 
+std::unique_ptr<Compressive> clone(const Compressive& node) {
+    auto out = std::make_unique<Compressive>();
+    out->kind = node.kind;
+    out->wire_field = node.wire_field;
+    out->bits_per_value = node.bits_per_value;
+    out->scheme = node.scheme;
+    out->wire_scheme = node.wire_scheme;
+    out->symbol_table = node.symbol_table;
+    out->items_per_value = node.items_per_value;
+    out->has_validity = node.has_validity;
+    out->has_constant_value = node.has_constant_value;
+    out->constant_value = node.constant_value;
+    if (node.values != nullptr) {
+        out->values = clone(*node.values);
+    }
+    if (node.lengths != nullptr) {
+        out->lengths = clone(*node.lengths);
+    }
+    for (const auto& field : node.packed_fields) {
+        PackedField copy;
+        if (field.value != nullptr) {
+            copy.value = clone(*field.value);
+        }
+        copy.bits_per_value = field.bits_per_value;
+        copy.bits_per_length = field.bits_per_length;
+        out->packed_fields.push_back(std::move(copy));
+    }
+    return out;
+}
+
 std::string describe_encoding(const Compressive& node) {
     std::string out;
     describe_compressive(&node, out);

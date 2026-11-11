@@ -445,7 +445,7 @@ void test_rle_chunk_widths_and_child_encodings() {
     // Values 0x0102 x2 and 0x0304 x3, lengths as u16.
     const Bytes values = {0x02, 0x01, 0x04, 0x03};
     const Bytes lengths = {2, 0, 3, 0};
-    require(child_block::decode_rle_chunk(flat(16), flat(16), values, lengths, 16, 16, out, error),
+    require(child_block::decode_rle_chunk(flat(16), flat(16), values, lengths, page_layout::BufferScheme::kNone, 16, 16, out, error),
             "u16 lengths: " + error);
     require(out == Bytes({0x02, 0x01, 0x02, 0x01, 0x04, 0x03, 0x04, 0x03, 0x04, 0x03}), "runs expanded");
 
@@ -457,15 +457,31 @@ void test_rle_chunk_widths_and_child_encodings() {
     ib.kind = CompressiveKind::kInlineBitpacking;
     ib.bits_per_value = 32;
     out.clear();
-    require(child_block::decode_rle_chunk(ib, flat(8), packed, Bytes({3, 1}), 32, 8, out, error),
+    require(child_block::decode_rle_chunk(ib, flat(8), packed, Bytes({3, 1}), page_layout::BufferScheme::kNone, 32, 8, out, error),
             "bitpacked values: " + error);
     require(out == Bytes({1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0}), "bitpacked-values runs");
 
+    // The whole RLE encoding under a General wrapper frames its values (one zstd frame per chunk); the lengths are
+    // raw. Two runs: 0x0102 x2 and 0x0304 x3, as in the first case.
+    {
+        Bytes framed;
+        require(general::zstd_frame(values, 1, framed, error), "zstd values frame: " + error);
+        out.clear();
+        require(child_block::decode_rle_chunk(flat(16), flat(16), framed, lengths, page_layout::BufferScheme::kZstd, 16,
+                                              16, out, error),
+                "framed values: " + error);
+        require(out == Bytes({0x02, 0x01, 0x02, 0x01, 0x04, 0x03, 0x04, 0x03, 0x04, 0x03}), "framed values expand");
+        out.clear();
+        require(!child_block::decode_rle_chunk(flat(16), flat(16), values, lengths, page_layout::BufferScheme::kZstd, 16,
+                                               16, out, error),
+                "unframed values under a zstd scheme are refused");
+    }
+
     // Two children that both need the run count are refused.
-    require(!child_block::decode_rle_chunk(ib, ib, packed, packed, 32, 32, out, error),
+    require(!child_block::decode_rle_chunk(ib, ib, packed, packed, page_layout::BufferScheme::kNone, 32, 32, out, error),
             "both children need the count refused");
     // Lengths that do not match the values' runs are refused.
-    require(!child_block::decode_rle_chunk(flat(16), flat(8), values, Bytes({2, 3, 4}), 16, 8, out, error),
+    require(!child_block::decode_rle_chunk(flat(16), flat(8), values, Bytes({2, 3, 4}), page_layout::BufferScheme::kNone, 16, 8, out, error),
             "run count mismatch refused");
     require(error.find("run count") != std::string::npos, "the refusal names the mismatch: " + error);
 }

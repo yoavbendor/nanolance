@@ -36,9 +36,13 @@ bool decode(const page_layout::Compressive& encoding, const std::vector<std::uin
 /// its own compressive encoding. At most one of the two may need the run count, which the other one
 /// gives. The runs are appended to `out` as raw values of `value_bits` each, every run repeated by its
 /// length. `length_bits` is the width of a run length (8, 16 or 32).
+///
+/// `values_scheme` is the buffer compression a General wrapper put around the whole RLE encoding: it
+/// frames the values buffer (one frame per chunk), and the lengths are never framed. kNone: `values` is
+/// the values as they are.
 bool decode_rle_chunk(const page_layout::Compressive& values_encoding, const page_layout::Compressive& lengths_encoding,
                       const std::vector<std::uint8_t>& values, const std::vector<std::uint8_t>& lengths,
-                      std::uint32_t value_bits, std::uint32_t length_bits, std::vector<std::uint8_t>& out,
-                      std::string& error);
+                      page_layout::BufferScheme values_scheme, std::uint32_t value_bits, std::uint32_t length_bits,
+                      std::vector<std::uint8_t>& out, std::string& error);
 
 }  // namespace nano_lance::child_block
