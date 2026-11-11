@@ -75,6 +75,9 @@ public:
     /// `column <op> constant k`, a Compare.
     Predicate compare_with(const std::string& op, std::size_t k) const;
 
+    /// Whether constant k is a literal NULL (a comparison with it is never TRUE).
+    bool constant_is_null(std::size_t k) const;
+
     /// Constant k as one value of `type` (the column's type, cast as the filter casts it): a one-element
     /// array in `out` (the caller releases it), NULL for a NULL constant. False with `error` set when the
     /// constant does not convert.

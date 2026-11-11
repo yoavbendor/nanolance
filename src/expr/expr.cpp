@@ -27,6 +27,8 @@
 #include <chrono>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
+#include <string_view>
 #include <utility>
 
 namespace nano_lance::expr {
@@ -3630,6 +3632,133 @@ bool fast_arith_compare(const Node& n, const ArrowArrayView& batch, int64_t leng
     return true;
 }
 
+/// An IN list over more non-NULL items than this takes the hash path (in_list_hit) when the column allows it.
+constexpr std::size_t kHashInItems = 8;
+
+/// The key a literal has in an integer column's value domain: the column's value as uint64 (two's complement
+/// for a signed column), so one set serves both. Never: no value of the column equals the literal, as
+/// compare_column decides it. Unsupported: the literal is one compare_column would not compare with this
+/// column, or the comparison rounds a large integer to a double (the per-literal path decides those).
+enum class IntKey { Key, Never, Unsupported };
+
+IntKey int_in_key(const Value& lit, bool is_signed, std::uint64_t& key) {
+    // Doubles are compared as doubles: below 2^53 every integer converts exactly, so an integral double
+    // equals exactly one integer and a non-integral one equals none.
+    constexpr double kExact = 9007199254740992.0;  // 2^53
+    switch (lit.kind) {
+        case Kind::Int:
+            if (!is_signed && lit.i < 0) {
+                return IntKey::Never;
+            }
+            key = static_cast<std::uint64_t>(lit.i);
+            return IntKey::Key;
+        case Kind::UInt:
+            if (is_signed && lit.u > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+                return IntKey::Never;
+            }
+            key = lit.u;
+            return IntKey::Key;
+        case Kind::Double: {
+            const double d = lit.d;
+            if (std::isnan(d)) {
+                return IntKey::Never;
+            }
+            if (std::fabs(d) >= kExact) {
+                return IntKey::Unsupported;
+            }
+            if (d != std::trunc(d) || (!is_signed && d < 0.0)) {
+                return IntKey::Never;  // -0.0 is integral and equals 0
+            }
+            key = is_signed ? static_cast<std::uint64_t>(static_cast<std::int64_t>(d)) : static_cast<std::uint64_t>(d);
+            return IntKey::Key;
+        }
+        default:
+            return IntKey::Unsupported;
+    }
+}
+
+/// Whether the column's type is one of the integer types compare_column compares as integers.
+bool is_integer_type(ArrowType type, bool& is_signed) {
+    switch (type) {
+        case NANOARROW_TYPE_INT8:
+        case NANOARROW_TYPE_INT16:
+        case NANOARROW_TYPE_INT32:
+        case NANOARROW_TYPE_INT64:
+            is_signed = true;
+            return true;
+        case NANOARROW_TYPE_UINT8:
+        case NANOARROW_TYPE_UINT16:
+        case NANOARROW_TYPE_UINT32:
+        case NANOARROW_TYPE_UINT64:
+            is_signed = false;
+            return true;
+        default:
+            return false;
+    }
+}
+
+/// hit[r] = 1 where row r of `v` (of `type`) equals one of the IN list's non-NULL items `n.args[1..]`: one hash
+/// lookup per row instead of one comparison per item and row. Rows that are NULL are left 0 (the caller sets
+/// them). False, with nothing decided, when an item is not one the column's comparison takes directly.
+bool in_list_hit(const ArrowArrayView& v, ArrowType type, const Node& n, int64_t length,
+                 std::vector<std::uint8_t>& hit) {
+    bool is_signed = false;
+    const bool integral = is_integer_type(type, is_signed);
+    const bool text = type == NANOARROW_TYPE_STRING || type == NANOARROW_TYPE_LARGE_STRING ||
+                      type == NANOARROW_TYPE_BINARY || type == NANOARROW_TYPE_LARGE_BINARY;
+    if (!integral && !text) {
+        return false;
+    }
+    hit.assign(static_cast<std::size_t>(length), 0);
+    if (integral) {
+        std::unordered_set<std::uint64_t> keys;
+        keys.reserve(n.args.size());
+        for (std::size_t k = 1; k < n.args.size(); ++k) {
+            const Value& lit = n.args[k]->literal;
+            if (lit.is_null()) {
+                continue;
+            }
+            std::uint64_t key = 0;
+            switch (int_in_key(lit, is_signed, key)) {
+                case IntKey::Key: keys.insert(key); break;
+                case IntKey::Never: break;
+                case IntKey::Unsupported: return false;
+            }
+        }
+        for (int64_t r = 0; r < length; ++r) {
+            if (ArrowArrayViewIsNull(&v, r)) {
+                continue;
+            }
+            const std::uint64_t key = is_signed ? static_cast<std::uint64_t>(ArrowArrayViewGetIntUnsafe(&v, r))
+                                                : ArrowArrayViewGetUIntUnsafe(&v, r);
+            hit[static_cast<std::size_t>(r)] = keys.count(key) != 0 ? 1 : 0;
+        }
+        return true;
+    }
+    // Text and binary compare bytes, with a String or Binary literal (compare_column and compare() alike).
+    std::unordered_set<std::string_view> keys;
+    keys.reserve(n.args.size());
+    for (std::size_t k = 1; k < n.args.size(); ++k) {
+        const Value& lit = n.args[k]->literal;
+        if (lit.is_null()) {
+            continue;
+        }
+        if (lit.kind != Kind::String && lit.kind != Kind::Binary) {
+            return false;
+        }
+        keys.insert(lit.s);
+    }
+    for (int64_t r = 0; r < length; ++r) {
+        if (ArrowArrayViewIsNull(&v, r)) {
+            continue;
+        }
+        const ArrowBufferView bytes = ArrowArrayViewGetBytesUnsafe(&v, r);
+        hit[static_cast<std::size_t>(r)] =
+            keys.count(std::string_view(bytes.data.as_char, static_cast<std::size_t>(bytes.size_bytes))) != 0 ? 1 : 0;
+    }
+    return true;
+}
+
 bool fast_eval(const Node& n, const ArrowArrayView& batch, int64_t length, std::vector<std::uint8_t>& out) {
     const auto rows = static_cast<std::size_t>(length);
     switch (n.op) {
@@ -3739,18 +3868,32 @@ bool fast_eval(const Node& n, const ArrowArrayView& batch, int64_t length, std::
             // x IN (a, b): TRUE if any equals; else NULL if any item is NULL; else FALSE.
             out.assign(rows, kFalse);
             bool null_item = false;
+            std::size_t items = 0;
             for (std::size_t k = 1; k < n.args.size(); ++k) {
-                const auto& lit = n.args[k]->literal;
-                if (lit.is_null()) {
-                    null_item = true;
-                    continue;
-                }
-                if (!compare_column(*v, c.type, c.unit, lit, length, ways)) {
-                    return false;
-                }
+                items += n.args[k]->literal.is_null() ? 0U : 1U;
+                null_item = null_item || n.args[k]->literal.is_null();
+            }
+            // A long list is one hash lookup per row; a list the hash cannot take is compared item by item.
+            std::vector<std::uint8_t> hit;
+            if (items > kHashInItems && in_list_hit(*v, c.type, n, length, hit)) {
                 for (std::size_t r = 0; r < rows; ++r) {
-                    if (ways[r] == 0) {
+                    if (hit[r] != 0) {
                         out[r] = kTrue;
+                    }
+                }
+            } else {
+                for (std::size_t k = 1; k < n.args.size(); ++k) {
+                    const auto& lit = n.args[k]->literal;
+                    if (lit.is_null()) {
+                        continue;
+                    }
+                    if (!compare_column(*v, c.type, c.unit, lit, length, ways)) {
+                        return false;
+                    }
+                    for (std::size_t r = 0; r < rows; ++r) {
+                        if (ways[r] == 0) {
+                            out[r] = kTrue;
+                        }
                     }
                 }
             }
@@ -5494,6 +5637,11 @@ Predicate Predicate::compare_with(const std::string& op, std::size_t k) const {
     p.op_ = op;
     p.constants_.push_back(constants_.at(k));
     return p;
+}
+
+bool Predicate::constant_is_null(std::size_t k) const {
+    const Node& c = *constants_.at(k);
+    return c.op == Op::Literal && c.literal.is_null();
 }
 
 namespace {

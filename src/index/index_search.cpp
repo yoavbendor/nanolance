@@ -524,10 +524,51 @@ bool prune_by_bounds(const expr::Predicate& p, const FileTable& bounds, const st
                 return false;
             }
             break;
-        case Test::In:
+        case Test::In: {
+            // Each constant is compared with each unit's bounds through a ValueComparer (one per bounds column
+            // and batch, built once): no predicate is bound per constant. The same rule value_range applies:
+            // max >= c and min <= c, where a NULL or NaN min says nothing below and a NaN max nothing above, and
+            // a unit whose max is NULL holds no value. A constant the comparison does not take (or a NULL
+            // constant, which matches nothing) is handled as value_range handles it.
+            std::vector<std::unique_ptr<expr::ValueComparer>> min_cmp;
+            std::vector<std::unique_ptr<expr::ValueComparer>> max_cmp;
+            const auto comparers = [&](std::size_t column, std::vector<std::unique_ptr<expr::ValueComparer>>& out) {
+                for (const auto& b : bounds.batches) {
+                    out.push_back(std::make_unique<expr::ValueComparer>(bounds.type(column), *b.children[column]));
+                    if (!out.back()->ok()) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            const bool compared = comparers(0, min_cmp) && comparers(1, max_cmp);
+            // ways of constant k over every unit, batch by batch; false when the comparison does not take k.
+            const auto ways_of = [&](std::vector<std::unique_ptr<expr::ValueComparer>>& cs, std::size_t k,
+                                     std::vector<std::int8_t>& ways) {
+                ways.clear();
+                std::vector<std::int8_t> part;
+                for (std::size_t bi = 0; bi < cs.size(); ++bi) {
+                    if (!cs[bi]->compare(p, k, 0, bounds.batches[bi].length, part)) {
+                        return false;
+                    }
+                    ways.insert(ways.end(), part.begin(), part.end());
+                }
+                return true;
+            };
+            std::vector<std::int8_t> min_ways;
+            std::vector<std::int8_t> max_ways;
             for (std::size_t k = 0; k < p.constants(); ++k) {
-                std::vector<std::uint8_t> one;
-                if (!value_range(k, ">=", k, "<=", one)) {
+                if (p.constant_is_null(k)) {
+                    continue;  // x = NULL is never TRUE: no unit holds it
+                }
+                std::vector<std::uint8_t> one(pages, 0);
+                if (compared && ways_of(min_cmp, k, min_ways) && ways_of(max_cmp, k, max_ways)) {
+                    for (std::size_t i = 0; i < pages; ++i) {
+                        const bool max_reaches = max_nan[i] != 0 || max_ways[i] >= 0;  // max >= c
+                        const bool min_reaches = min_null[i] != 0 || min_nan[i] != 0 || min_ways[i] <= 0;  // min <= c
+                        one[i] = static_cast<std::uint8_t>(max_reaches && min_reaches && max_null[i] == 0);
+                    }
+                } else if (!value_range(k, ">=", k, "<=", one)) {
                     return false;
                 }
                 for (std::size_t i = 0; i < pages; ++i) {
@@ -535,6 +576,7 @@ bool prune_by_bounds(const expr::Predicate& p, const FileTable& bounds, const st
                 }
             }
             break;
+        }
         default:
             handled = false;
             return true;
