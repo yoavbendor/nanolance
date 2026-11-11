@@ -343,6 +343,12 @@ bool append_fixed_width(const ArrowArray& array,
 /// `item_validity`, which the writer stores as FixedSizeList.has_validity.
 bool append_fixed_size_list(const ArrowArray& array, const LanceField& field, const std::string& element,
                             std::uint64_t items, ColumnValues& out, std::string& error) {
+    // fixed_size_list<fixed_size_list<T, a>, b> is read (W1a) but not written yet: its values are a nested
+    // layout this writer does not produce. Refused by name here, before any file is started.
+    if (element.rfind("fixed_size_list:", 0) == 0) {
+        error = "column '" + field.name + "': a fixed_size_list of fixed_size_list is read but not written yet";
+        return false;
+    }
     const ArrowArray* child = array.n_children == 1 && array.children != nullptr ? array.children[0] : nullptr;
     if (child == nullptr || child->n_buffers < 2 || child->buffers == nullptr || child->buffers[1] == nullptr) {
         error = "fixed_size_list column '" + field.name + "' has no values buffer";
