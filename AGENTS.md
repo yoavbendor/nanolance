@@ -51,7 +51,8 @@ Lifecycle rules:
   fixed-width columns (int, float, bool, timestamp/date/time, decimal, `fixed_size_binary`) and in
   variable-width ones (`utf8`, `binary`). A null **struct** (as opposed to a null field inside one) is stored
   as its own definition level, at any depth and under lists, as Lance stores it (`test_lance_parity.py`,
-  `test_lance_list_writes.py`). Still refused, by name: a null in a `lance.blob.v2` external-reference column.
+  `test_lance_list_writes.py`). A null row in a `lance.blob.v2` column is stored too, external references
+  included, with pylance's page layout (`test_blob_kinds.py::test_null_external_references_written_as_pylance_writes_them`).
   `nano_lance_writer_set_ignore_nullability` is a no-op kept for compatibility; the manifest's
   nullable flag now mirrors the Arrow schema, as pylance's does.
 - Types nanolance cannot round-trip are refused at `write_batch` rather than written, each by name: a

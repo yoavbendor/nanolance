@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 import random
 import re
+import subprocess
+from pathlib import Path
 
 import pyarrow as pa
 import pytest
@@ -432,3 +434,32 @@ def test_large_blob_page_takes_in_pylance(tmp_path, external):
     assert [r["b"]["size"] for r in lance.dataset(path).take([3, 4000]).to_pylist()] == [5, 5]
     nl.dataset(path).delete("id % 7 = 0")
     assert lance.dataset(path).to_table().equals(nl.dataset(path).to_table())
+
+
+PAGELAYOUT = Path(__file__).resolve().parents[3] / "build" / "nlance-pagelayout"
+
+
+def _layout(path) -> list[str]:
+    if not PAGELAYOUT.exists():
+        pytest.skip(f"{PAGELAYOUT} not built")
+    out = subprocess.run([str(PAGELAYOUT), str(path)], capture_output=True, text=True, check=True).stdout
+    return sorted(re.sub(r",rows=\d+", "", line.split("  ", 1)[1]) for line in out.splitlines() if "  " in line)
+
+
+def test_null_external_references_written_as_pylance_writes_them(tmp_path, external):
+    """A null row in a lance.blob.v2 column of external references is written: both libraries read the same bytes
+    back, from either writer, and nanolance's page layout is pylance's."""
+    lance = require_pylance()
+    values = [lance.blob.Blob.from_uri(external), None, lance.blob.Blob.from_uri(external, position=3, size=10), None]
+    table = pa.table({"id": range(len(values)), "blob": lance.blob_array(values)},
+                     schema=pa.schema([pa.field("id", pa.int64()), lance.blob_field("blob")]))
+    paths = {"pylance": str(tmp_path / "pylance"), "nanolance": str(tmp_path / "nanolance")}
+    lance.write_dataset(table, paths["pylance"], allow_external_blob_outside_bases=True)
+    nl.write_dataset(table, paths["nanolance"], allow_external_blob_outside_bases=True)
+    data = bytes(range(256)) * 4  # the content of the `external` fixture
+    for label, path in paths.items():
+        for lib in (nl, lance):
+            blobs = lib.dataset(path).take_blobs("blob", indices=list(range(len(values))))
+            got = [None if f is None else f.readall() for f in blobs]
+            assert got == [data, None, data[3:13], None], (label, lib.__name__)
+    assert _layout(paths["nanolance"]) == _layout(paths["pylance"])

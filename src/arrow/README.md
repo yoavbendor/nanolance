@@ -34,7 +34,9 @@ where a schema is stored (the manifest) is the table layer's. It uses `base`.
   `SharedBatch`; every view keeps the batch alive, so views and their children can be released in any order,
   as the C data interface requires. `slice_batches` trims a list of batches to a row range.
 - **Blob v2** (`include/nanolance/blob_builder.hpp`): builds the write-side `lance.blob.v2` struct (inline
-  data, or a URI with position and size) from `BlobV2Row`s.
+  data, or a URI with position and size) from `BlobV2Row`s. A null row (a null blob, not a null reference
+  inside one) is written as a null of the column, with pylance's page layout
+  (`bindings/python/tests/test_blob_kinds.py::test_null_external_references_written_as_pylance_writes_them`).
 - **JSON** (`include/nanolance/jsonb.hpp`): `jsonb::encode` parses JSON text as Lance's writer does and
   produces the same JSONB bytes; `to_text` prints it back as Lance does; `Item` and `select` walk a value
   for the `json_*` functions without decoding it.

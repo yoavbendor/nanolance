@@ -207,7 +207,7 @@ nanolance or Lance cannot read back.
 | `timestamp` (with or without an IANA time zone), `date32/64`, `time32/64`, `duration`, `decimal128/256` | round-trips |
 | `struct` (any depth, null structs included), `list`, `large_list`, `map`, `fixed_size_list` | round-trips, with null and empty lists and null items at any level |
 | `null` | round-trips (Lance's all-null page) |
-| `lance.blob.v2` | external references written; inline, packed, dedicated and external blobs read |
+| `lance.blob.v2` | external references written, with null rows (page layout as pylance's, `test_blob_kinds.py`); inline, packed, dedicated and external blobs read |
 | Arrow `dictionary` with an integer index over a string, binary or fixed-width type, at the top level | round-trips, stored as Lance stores one (low-cardinality strings are dictionary-encoded on disk anyway) |
 | Arrow `dictionary` inside a `struct` or `list` | read with any integer index; written only with int32 indices (`writing it is not supported unless its indices are int32`). Other dictionary shapes are refused: cast to the value type |
 | `list`, `large_list` or `map` under a `fixed_size_list` of structs | round-trips at format 2.2, with nulls at every level, whole, by row range and by take; pylance 12 reads it back (`test_fsl_struct_list_write.py`) |

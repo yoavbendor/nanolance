@@ -157,7 +157,7 @@ already decoded them all by the time it returns.
 | Floats | float32, float64 | Written **uncompressed** (no byte-stream-split yet) |
 | Strings / binary | utf8, binary, fixed_size_binary | dict-RLE, structural dictionary, constant layout **on by default**; zstd for high-cardinality columns only with `compression=True`. `large_utf8`/`large_binary` are refused — cast to the 32-bit offset type first. |
 | Structs | nested struct columns | Same type coverage as [nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet) |
-| Nullability | values and schemas | Nulls are **stored**, via Lance's definition-level layer, and stock Lance reads them back — in fixed-width and in `utf8`/`binary` columns. A null **struct** is stored as its own definition level (not the same as a struct whose fields are null), as Lance stores it. A null in a `lance.blob.v2` column is refused. `ignore_nullability` is a no-op kept for compatibility. |
+| Nullability | values and schemas | Nulls are **stored**, via Lance's definition-level layer, and stock Lance reads them back — in fixed-width and in `utf8`/`binary` columns. A null **struct** is stored as its own definition level (not the same as a struct whose fields are null), as Lance stores it. A null row in a `lance.blob.v2` column is stored too, external references included. `ignore_nullability` is a no-op kept for compatibility. |
 | Append | `WriteOptions(append=True)` or `append=True` kwarg | Adds a fragment to an existing dataset |
 | Multi-batch tables | yes | Streams all record batches from the input |
 
