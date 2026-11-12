@@ -744,24 +744,14 @@ bool refuse_unwritten_nested_dictionaries(const LanceSchemaMapping& mapping, std
     return true;
 }
 
-bool refuse_unwritten_lists_under_fixed_size_list(const LanceSchemaMapping& mapping, std::string& error) {
+bool refuse_unwritten_under_fixed_size_list(const LanceSchemaMapping& mapping, std::string& error) {
     for (const auto& field : mapping.fields) {
-        if (!lance_logical_type_is_list(field.logical_type)) {
-            continue;
-        }
-        for (auto parent = field.parent_id; parent >= 0;) {
-            const auto up = std::find_if(mapping.fields.begin(), mapping.fields.end(),
-                                         [&](const LanceField& f) { return f.id == parent; });
-            if (up == mapping.fields.end()) {
-                break;
-            }
-            std::string element;
-            std::uint64_t items = 0;
-            if (lance_fixed_size_list_parts(up->logical_type, element, items) && element == "struct") {
-                error = "column '" + field.name + "': a list or map under a fixed_size_list is read but not written yet";
-                return false;
-            }
-            parent = up->parent_id;
+        // fixed_size_list<fixed_size_list> is written at the top level only: its leaves are one nested layout
+        // of the whole column, which a struct or list above it would need its own levels for.
+        if (field.parent_id >= 0 && field.logical_type.rfind("fixed_size_list:fixed_size_list:", 0) == 0) {
+            error = "column '" + field.name +
+                    "': a fixed_size_list of fixed_size_list under a struct or list is read but not written yet";
+            return false;
         }
     }
     return true;
