@@ -61,11 +61,11 @@ Lance 12.0.0 crates:
 | | |
 |---|---|
 | tests run (lance-encoding and lance-file 12.0.0) | 1,986; each also passes in Rust |
-| tests with round trips that nanolance reads back, all equal | **1,254** (`expected_pass.txt`) |
-| tests where nanolance refuses some round trip | 209 |
+| tests with round trips that nanolance reads back, all equal | **1,446** (`expected_pass.txt`) |
+| tests where nanolance refuses some round trip | 17 |
 | tests with no round trip (unit tests of one component) | 523 |
-| round trips read back equal | **10,337** |
-| round trips refused | 650 (each under its first reason, below) |
+| round trips read back equal | **10,913** |
+| round trips refused | 74 (each under its first reason, below) |
 | round trips with different rows | **0** |
 
 The runs so far found three bugs in nanolance, all fixed and pinned by tests that do not need Rust:
@@ -93,21 +93,21 @@ The later runs found and fixed these, each pinned by a test that does not need R
 - **Packed structs** (`lance-encoding:packed`) in formats 2.1 and 2.2, when their children are fixed-width.
   A packed struct inside another struct is refused by name.
 - **Fixed-size lists of fixed-size lists** are read. Writing them is refused by name.
+- **Lists, large lists and maps under a fixed-size list of structs** are read (576 round trips), whole,
+  by row range and by take. Writing them is refused by name.
 - **Format 2.0 fixed-size lists of booleans** are read.
 - **Dictionaries inside lists and structs** are read with any integer index.
 
 What nanolance refuses, by round trips (each refused round trip is counted under its first reason):
 
-- **Lists or maps under a fixed-size list** (576: 432 under `values`, 144 under `props`). nanolance's
-  schema mapping refuses them by name and does not decode them yet. The suite's own tests of these
-  shapes pass in Rust, so this is nanolance's nested decoder that is missing, not a case the suite
-  shows Lance failing.
 - **Legacy blob columns** (`lance-encoding:blob`) outside format 2.0 (48). The harness refuses them
   there; nanolance reads its own blob layout, not the one Lance writes.
 - **Several fields in one column** (20): files with more columns than leaf fields. This is the
   layout of blob v2 structs.
-- **Variable-width packed structs** (`VariablePackedStruct`, 2 round trips). Their utf8 and
-  blob v2 descriptor children are not read yet.
-- **Sparse pages with a fixed-size-list layer** (1). The sparse layout is read, but this layer is not.
-- A few single cases: a fixed-size list of structs inside a struct or list (write refusal, 1), a nested
-  column decoded to a different shape than its schema (1), and a dict-RLE run count mismatch (1).
+- **Others** (6):
+  - Variable-width packed structs (`VariablePackedStruct`, 2 round trips). Their utf8 and blob v2
+    descriptor children are not read yet.
+  - A fixed-size list of structs inside a struct or list (write refusal, 1).
+  - A map's `keys` column in the sparse layout, decoded to a different shape than its schema (1).
+  - A sparse page with a fixed-size-list layer (1). The sparse layout is read, but this layer is not.
+  - A dict-RLE run count mismatch (1).

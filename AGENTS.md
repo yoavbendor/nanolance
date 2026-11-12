@@ -55,7 +55,7 @@ Lifecycle rules:
   nullable flag now mirrors the Arrow schema, as pylance's does.
 - Types nanolance cannot round-trip are refused at `write_batch` rather than written, each by name: a
   `timestamp` whose timezone is a UTC offset rather than an IANA name (Lance panics on those), a list of
-  `fixed_size_list`, a null element inside a valid `fixed_size_list` row, a `fixed_size_list` of
+  `fixed_size_list`, a list or map under a `fixed_size_list` of structs (`a list or map under a fixed_size_list is read but not written yet`), a null element inside a valid `fixed_size_list` row, a `fixed_size_list` of
   `fixed_size_list` (`a fixed_size_list of fixed_size_list is read but not written yet`), a struct marked
   `lance-encoding:packed` (`a packed struct is read but not written yet`), and a dictionary inside a struct
   or list with non-int32 indices (`writing it is not supported unless its indices are int32`). Top-level
