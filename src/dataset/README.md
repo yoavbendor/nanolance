@@ -1,7 +1,7 @@
 # dataset: the operations a user calls on a dataset, each committed as one version
 
 <!-- layer-deps:start -->
-Layer 10 of 11 (1 is the bottom, 11 the top). Uses: [io](../io/README.md), [arrow](../arrow/README.md), [encoding](../encoding/README.md), [file](../file/README.md), [table](../table/README.md), [expr](../expr/README.md), [scan](../scan/README.md), [index](../index/README.md). Used by: [api](../api/README.md). See [docs/LAYERS.md](../../docs/LAYERS.md).
+Layer 10 of 11 (1 is the bottom, 11 the top). Uses: [base](../base/README.md), [io](../io/README.md), [arrow](../arrow/README.md), [encoding](../encoding/README.md), [file](../file/README.md), [table](../table/README.md), [expr](../expr/README.md), [scan](../scan/README.md), [index](../index/README.md). Used by: [api](../api/README.md). See [docs/LAYERS.md](../../docs/LAYERS.md).
 <!-- layer-deps:end -->
 Example: [examples/layers/dataset.cpp](../../examples/layers/dataset.cpp) (run with ctest -R nano_lance_example_dataset).
 
