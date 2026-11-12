@@ -133,3 +133,12 @@ equals pylance on ids.
   queries. It has no secondary index on `source_id`, `type` or `name` in this benchmark.
 - Caveats: 4 cores, one process, one query at a time, and warm cache. Results are for
   this graph shape and these query sizes, and may not match other machines or workloads.
+
+## Changes since
+
+The tables above were measured before these nanolance changes, so they do not include them:
+
+- Unindexed IN lists use a hash set (`1636abe`, from `dd3dc04`).
+- Dictionary pages expand only the rows a read asks for (`a0f0ca3`, from `73e1b9c`). That change
+  copied a column's page records once per page in flat decodes, which was quadratic in the page
+  count; `31c9097` fixed the copy.

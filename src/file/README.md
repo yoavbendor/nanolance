@@ -87,8 +87,8 @@ Against the Lance format specification at https://lance.org/format/ (as of Lance
   pylance writes them by default.
 - **Page priority** is written as 0 for every page. Lance's readers use it only to order I/O, and pylance reads
   the files; writing each page's first top-level row would be a few lines in each page writer.
-- **Older and newer formats**: 0.1 is refused; 2.0 and 2.1 are read but not written (nanolance writes 2.2
-  everywhere, including appends to older datasets); 2.3 is unstable and refused.
+- **Older and newer formats**: 0.1 is refused; 2.0 to 2.3 are read, and only 2.2 is written (nanolance writes 2.2
+  everywhere, including appends to older datasets); 2.4 is refused by name.
 - **The FixedSizeList all-null compatibility caveat** is untested in both spellings; a pylance-written file of
   that shape belongs in `test_lance_read_matrix.py`.
 - **Statistics** in global buffers are not written: the specification leaves their format open.

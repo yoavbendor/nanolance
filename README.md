@@ -208,11 +208,14 @@ nanolance or Lance cannot read back.
 | `struct` (any depth, null structs included), `list`, `large_list`, `map`, `fixed_size_list` | round-trips, with null and empty lists and null items at any level |
 | `null` | round-trips (Lance's all-null page) |
 | `lance.blob.v2` | external references written; inline, packed, dedicated and external blobs read |
-| Arrow `dictionary` | refused: cast to the value type (low-cardinality strings are dictionary-encoded on disk anyway) |
+| Arrow `dictionary` with an integer index over a string, binary or fixed-width type, at the top level | round-trips, stored as Lance stores one (low-cardinality strings are dictionary-encoded on disk anyway) |
+| Arrow `dictionary` inside a `struct` or `list` | read with any integer index; written only with int32 indices (`writing it is not supported unless its indices are int32`). Other dictionary shapes are refused: cast to the value type |
+| `fixed_size_list` of `fixed_size_list` | read, from pylance-written files; written refused (`a fixed_size_list of fixed_size_list is read but not written yet`) |
+| `struct` marked `lance-encoding:packed` | read in 2.1 and 2.2 files when its children are fixed-width; written refused (`a packed struct is read but not written yet`) |
 | `timestamp` with a UTC-offset zone (`+05:30`) | refused: Lance supports IANA names only |
 | a null element inside a valid `fixed_size_list` row | refused |
 
-Nulls are stored in every column kind.
+Nulls are stored in every column kind. Files in formats 2.0 to 2.3 are read; nanolance writes 2.2.
 
 ## Things to know
 
