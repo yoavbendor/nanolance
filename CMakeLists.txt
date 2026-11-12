@@ -781,6 +781,10 @@ add_executable(nano_lance_fsl_of_fsl_write_refused_test tests/api/test_fsl_of_fs
 target_compile_features(nano_lance_fsl_of_fsl_write_refused_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_fsl_of_fsl_write_refused_test PRIVATE nanolance)
 
+add_executable(nano_lance_nested_dictionary_write_refused_test tests/api/test_nested_dictionary_write_refused.cpp)
+target_compile_features(nano_lance_nested_dictionary_write_refused_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_nested_dictionary_write_refused_test PRIVATE nanolance)
+
 add_executable(nano_lance_read_safety_test tests/base/test_read_safety.cpp)
 target_compile_features(nano_lance_read_safety_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_read_safety_test PRIVATE nanolance)
@@ -1151,6 +1155,8 @@ add_test(NAME nano_lance_schema_change_error COMMAND $<TARGET_FILE:nano_lance_sc
 set_tests_properties(nano_lance_schema_change_error PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_fsl_of_fsl_write_refused COMMAND $<TARGET_FILE:nano_lance_fsl_of_fsl_write_refused_test>)
 set_tests_properties(nano_lance_fsl_of_fsl_write_refused PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_nested_dictionary_write_refused COMMAND $<TARGET_FILE:nano_lance_nested_dictionary_write_refused_test>)
+set_tests_properties(nano_lance_nested_dictionary_write_refused PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_read_safety COMMAND $<TARGET_FILE:nano_lance_read_safety_test>)
 set_tests_properties(nano_lance_read_safety PROPERTIES LABELS "smoke")

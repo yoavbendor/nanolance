@@ -315,6 +315,9 @@ bool lance_field_is_empty_struct(const LanceField& field, const LanceSchemaMappi
 /// (see append_batch_column_values), where the data is.
 bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, std::string& error,
                       bool ignore_nullability = false);
+/// The write-side refusal of a mapped schema's dictionary inside a struct or list whose indices are not int32:
+/// such a dictionary is read for any integer index, but written only as pylance 12 writes it (int32 indices).
+bool refuse_unwritten_nested_dictionaries(const LanceSchemaMapping& mapping, std::string& error);
 /// The same schema, field for field -- names, types, nullability, nesting -- whatever the field ids
 /// and column positions. What an append checks a batch against: a dataset's field ids need not run
 /// 0..n (a dropped or re-typed column leaves a gap), a new batch's always do.
