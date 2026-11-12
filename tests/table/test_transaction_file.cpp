@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -52,7 +53,8 @@ void require(bool ok, const std::string& msg, const std::string& detail) {
     require(ok, msg + detail);
 }
 
-int main() {
+int main() try {
+    std::cout << "running nano_lance_transaction_file\n" << std::flush;
     // An append records the new fragments, as a lance.table.Append.
     {
         auto parent = manifest(1, {fragment(0, 5)});
@@ -142,8 +144,12 @@ int main() {
         const auto path = root / "_transactions" / name;
         require(std::filesystem::exists(path), "the transaction file is written");
 
-        std::ifstream in(path, std::ios::binary);
-        const Bytes bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        Bytes bytes;
+        {
+            // Closed before the file is removed below: Windows cannot delete a file that is open.
+            std::ifstream in(path, std::ios::binary);
+            bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
         std::uint32_t field = 0;
         Bytes message;
         require(nano_lance::transaction_file_operation(bytes, field, message, error), "the file holds an operation");
@@ -158,4 +164,7 @@ int main() {
 
     std::cout << "transaction file: derived append, restore, reserve, delete, overwrite; file name and removal OK\n";
     return 0;
+} catch (const std::exception& e) {
+    std::cerr << "FAIL: uncaught exception: " << e.what() << '\n';
+    return 1;
 }
