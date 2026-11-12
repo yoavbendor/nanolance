@@ -49,8 +49,9 @@ Lifecycle rules:
   `write_batch` and only says so at runtime (`INVALID_STATE`).
 - **Nulls are stored** via Lance's definition-level layer, and stock Lance reads them back: in
   fixed-width columns (int, float, bool, timestamp/date/time, decimal, `fixed_size_binary`) and in
-  variable-width ones (`utf8`, `binary`). Still refused, by name: a null **struct** (as opposed to a
-  null field inside one), and a null in a `lance.blob.v2` external-reference column.
+  variable-width ones (`utf8`, `binary`). A null **struct** (as opposed to a null field inside one) is stored
+  as its own definition level, at any depth and under lists, as Lance stores it (`test_lance_parity.py`,
+  `test_lance_list_writes.py`). Still refused, by name: a null in a `lance.blob.v2` external-reference column.
   `nano_lance_writer_set_ignore_nullability` is a no-op kept for compatibility; the manifest's
   nullable flag now mirrors the Arrow schema, as pylance's does.
 - Types nanolance cannot round-trip are refused at `write_batch` rather than written, each by name: a
