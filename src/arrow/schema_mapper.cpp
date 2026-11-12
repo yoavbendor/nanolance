@@ -746,6 +746,12 @@ bool refuse_unwritten_nested_dictionaries(const LanceSchemaMapping& mapping, std
 
 bool refuse_unwritten_lists_under_fixed_size_list(const LanceSchemaMapping& mapping, std::string& error) {
     for (const auto& field : mapping.fields) {
+        // fixed_size_list<fixed_size_list> is written at the top level only: its leaves are one nested layout
+        // of the whole column, which a struct or list above it would need its own levels for.
+        if (field.parent_id >= 0 && field.logical_type.rfind("fixed_size_list:fixed_size_list:", 0) == 0) {
+            error = "column '" + field.name + "': a fixed_size_list of fixed_size_list under a struct or list is read but not written yet";
+            return false;
+        }
         if (!lance_logical_type_is_list(field.logical_type)) {
             continue;
         }

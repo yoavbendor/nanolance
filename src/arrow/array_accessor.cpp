@@ -336,6 +336,73 @@ bool append_fixed_width(const ArrowArray& array,
     return true;
 }
 
+/// Appends the validity bits of `count` entries of `source`, from entry `first`, to `bits`, which holds the bits of
+/// the `held` entries before them (LSB-first, a set bit is a valid entry). `bits` stays empty while every entry so
+/// far is valid; the first run with a null brings the earlier entries in as valid. Nulls are counted in `null_count`.
+void append_entry_validity(std::vector<std::uint8_t>& bits, std::uint64_t& null_count, std::uint64_t held,
+                           const ArrowArray& source, std::uint64_t first, std::uint64_t count) {
+    const auto* src = static_cast<const std::uint8_t*>(source.buffers[0]);
+    bool any_null = false;
+    if (src != nullptr && source.null_count != 0) {
+        for (std::uint64_t k = first; k < first + count && !any_null; ++k) {
+            any_null = ((src[k >> 3U] >> (k & 7U)) & 1U) == 0U;
+        }
+    }
+    if (bits.empty()) {
+        if (!any_null) {
+            return;
+        }
+        bits.assign(static_cast<std::size_t>((held + 7U) / 8U), 0xFFU);
+    }
+    bits.resize(static_cast<std::size_t>((held + count + 7U) / 8U), 0U);
+    for (std::uint64_t k = 0; k < count; ++k) {
+        const auto at = held + k;
+        const bool valid = src == nullptr || ((src[(first + k) >> 3U] >> ((first + k) & 7U)) & 1U) != 0U;
+        if (valid) {
+            bits[at >> 3U] |= static_cast<std::uint8_t>(1U << (at & 7U));
+        } else {
+            bits[at >> 3U] &= static_cast<std::uint8_t>(~(1U << (at & 7U)));
+            ++null_count;
+        }
+    }
+}
+
+/// fixed_size_list<fixed_size_list<leaf, inner>, outer> (the outer list's rows hold `outer` inner lists of `inner`
+/// leaves). Row r of the outer array takes the inner lists [(o + r) * outer, ...) of its child, and those take the
+/// leaves [(m + k) * inner, ...) of the grandchild, o and m being the offsets of the arrays themselves. The leaves
+/// are copied as one run, which is the byte layout Lance stores: the outer validity holds one bit an inner list, the
+/// leaf validity one bit a leaf, each as the writer stores FixedSizeList.has_validity at its level.
+bool append_fixed_size_list_of_fixed_size_list(const ArrowArray& array, const LanceField& field,
+                                               const std::string& leaf, std::uint64_t inner, std::uint64_t outer,
+                                               ColumnValues& out, std::string& error) {
+    const ArrowArray* middle = array.n_children == 1 && array.children != nullptr ? array.children[0] : nullptr;
+    if (middle == nullptr || middle->n_children != 1 || middle->children == nullptr || middle->children[0] == nullptr) {
+        error = "fixed_size_list column '" + field.name + "' has no values buffer";
+        return false;
+    }
+    const ArrowArray* leaves = middle->children[0];
+    if (leaves->n_buffers < 2 || leaves->buffers == nullptr || leaves->buffers[1] == nullptr) {
+        error = "fixed_size_list column '" + field.name + "' has no values buffer";
+        return false;
+    }
+    const std::size_t leaf_bytes = lance_logical_type_value_bytes(leaf);
+    const auto middle_first = static_cast<std::uint64_t>(middle->offset) + static_cast<std::uint64_t>(array.offset) * outer;
+    const auto middle_count = static_cast<std::uint64_t>(array.length) * outer;
+    const auto leaf_first = static_cast<std::uint64_t>(leaves->offset) + middle_first * inner;
+    const auto leaf_count = middle_count * inner;
+    const std::uint64_t held_leaves = leaf_bytes == 0U ? 0U : out.fixed.size() / leaf_bytes;
+    const std::uint64_t held_middle = held_leaves / inner;
+    append_entry_validity(out.outer_item_validity, out.outer_item_null_count, held_middle, *middle, middle_first,
+                          middle_count);
+    append_entry_validity(out.item_validity, out.item_null_count, held_leaves, *leaves, leaf_first, leaf_count);
+    out.items_per_row = inner * outer;
+    out.outer_items_per_row = outer;
+    out.kind = ColumnValues::Kind::FixedWidth;
+    const auto* bytes = static_cast<const std::uint8_t*>(leaves->buffers[1]) + leaf_first * leaf_bytes;
+    out.fixed.insert(out.fixed.end(), bytes, bytes + leaf_count * leaf_bytes);
+    return true;
+}
+
 /// A fixed_size_list's rows are its child's elements, N per row: row r of a list at offset `o` is
 /// child elements [(o + r) * N, (o + r + 1) * N), further shifted by the child's own offset. Copied as
 /// one run -- that byte layout is exactly what Lance stores. Row-level nulls were taken by
@@ -343,11 +410,19 @@ bool append_fixed_width(const ArrowArray& array,
 /// `item_validity`, which the writer stores as FixedSizeList.has_validity.
 bool append_fixed_size_list(const ArrowArray& array, const LanceField& field, const std::string& element,
                             std::uint64_t items, ColumnValues& out, std::string& error) {
-    // fixed_size_list<fixed_size_list<T, a>, b> is read (W1a) but not written yet: its values are a nested
-    // layout this writer does not produce. Refused by name here, before any file is started.
+    // fixed_size_list<fixed_size_list<T, a>, b>: two levels of validity over the leaves (see the function above).
+    // A leaf the writer does not lay out (bool, a string, a struct, a deeper nesting) is refused by name.
     if (element.rfind("fixed_size_list:", 0) == 0) {
-        error = "column '" + field.name + "': a fixed_size_list of fixed_size_list is read but not written yet";
-        return false;
+        std::string leaf;
+        std::uint64_t inner = 0;
+        if (!lance_fixed_size_list_parts(element, leaf, inner) || leaf == "bool" || leaf == "struct" ||
+            leaf.rfind("fixed_size_list", 0) == 0 || lance_field_is_variable_width(leaf) ||
+            lance_logical_type_value_bytes(leaf) == 0U) {
+            error = "column '" + field.name + "': a fixed_size_list of fixed_size_list of " + leaf +
+                    " is read but not written yet";
+            return false;
+        }
+        return append_fixed_size_list_of_fixed_size_list(array, field, leaf, inner, items, out, error);
     }
     const ArrowArray* child = array.n_children == 1 && array.children != nullptr ? array.children[0] : nullptr;
     if (child == nullptr || child->n_buffers < 2 || child->buffers == nullptr || child->buffers[1] == nullptr) {

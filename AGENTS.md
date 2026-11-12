@@ -56,7 +56,7 @@ Lifecycle rules:
 - Types nanolance cannot round-trip are refused at `write_batch` rather than written, each by name: a
   `timestamp` whose timezone is a UTC offset rather than an IANA name (Lance panics on those), a list of
   `fixed_size_list`, a list or map under a `fixed_size_list` of structs (`a list or map under a fixed_size_list is read but not written yet`), a null element inside a valid `fixed_size_list` row, a `fixed_size_list` of
-  `fixed_size_list` (`a fixed_size_list of fixed_size_list is read but not written yet`), a struct marked
+  `fixed_size_list` under a struct or list (`a fixed_size_list of fixed_size_list under a struct or list is read but not written yet`; at the top level it is written, with nulls at both levels), a struct marked
   `lance-encoding:packed` (`a packed struct is read but not written yet`), and a dictionary inside a struct
   or list with non-int32 indices (`writing it is not supported unless its indices are int32`). Top-level
   Arrow dictionaries with an integer index are written. Everything else round-trips, including
