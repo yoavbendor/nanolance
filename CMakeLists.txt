@@ -1088,6 +1088,17 @@ target_link_libraries(nano_lance_packed_struct_read_test PRIVATE nanolance)
 add_test(NAME nano_lance_packed_struct_read COMMAND $<TARGET_FILE:nano_lance_packed_struct_read_test>)
 set_tests_properties(nano_lance_packed_struct_read PROPERTIES LABELS "smoke")
 
+# A legacy blob (`lance-encoding:blob`) in a Lance 2.1 file, read from pylance's file (tests/generate_golden_legacy_blob.py
+# writes it): whole, by a row range and by a take, as the bytes of each row.
+add_executable(nano_lance_legacy_blob_v21_read_test tests/file/test_legacy_blob_v21_read.cpp)
+target_compile_features(nano_lance_legacy_blob_v21_read_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_legacy_blob_v21_read_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_compile_definitions(nano_lance_legacy_blob_v21_read_test PRIVATE
+    NANO_LANCE_LEGACY_BLOB_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/legacy_blob_v21/v21_legacy_blob.lance")
+target_link_libraries(nano_lance_legacy_blob_v21_read_test PRIVATE nanolance)
+add_test(NAME nano_lance_legacy_blob_v21_read COMMAND $<TARGET_FILE:nano_lance_legacy_blob_v21_read_test>)
+set_tests_properties(nano_lance_legacy_blob_v21_read PROPERTIES LABELS "smoke")
+
 # Live S3 integration test (only with the nanos3reader provider): range GETs against a real S3-compatible
 # endpoint; skips unless NANOLANCE_S3_TEST_URI (+ AWS_* env) is set. tests/s3_minio_integration.sh wires
 # this up against a throwaway MinIO. The SigV4 signer vectors now live in the nanos3reader repo's own tests.

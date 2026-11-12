@@ -5,7 +5,7 @@
 // nanolance_hook.rs and tools/rust_suite.py). Built only for that run, as a shared library.
 //
 // nanolance_rust_write_file wraps the Rust encoder's output -- its data bytes, positioned as the start
-// of a file, and its page tables -- into a Lance 2.2 file (2.0 for 2.0 pages): the schema (a file descriptor), each
+// of a file, and its page tables -- into a Lance 2.2 file (2.0 for 2.0 pages, 2.1 for a legacy blob column): the schema (a file descriptor), each
 // column's metadata, and the footer, laid out as Lance's file writer lays them out.
 // nanolance_rust_read then reads that file as a nanolance user would.
 
@@ -170,10 +170,9 @@ __attribute__((visibility("default"))) int nanolance_rust_write_file(const char*
         }
     }
 
-    if (!legacy_blob.empty() && !v2_0) {
-        set_message(msg, msg_cap, "schema: a legacy blob column (\"lance-encoding:blob\") is read from format 2.0 only");
-        return 1;
-    }
+    // A legacy blob's structural pages (Lance 2.1+: a BlobLayout over a packed (position, size) descriptor)
+    // are a 2.1 file: Lance refuses the legacy marker from 2.2 on (pylance 12 says so), so the footer says 2.1.
+    const bool v2_1_blob = !legacy_blob.empty() && !v2_0;
 
     nano_lance::pb::FileDescriptor descriptor;
     descriptor.length = num_rows;
@@ -228,7 +227,7 @@ __attribute__((visibility("default"))) int nanolance_rust_write_file(const char*
     write_le(out, 1, 4);
     write_le(out, metadata.size(), 4);
     write_le(out, v2_0 ? 0 : 2, 2);  // major (2.0's footer says 0.3)
-    write_le(out, v2_0 ? 3 : 2, 2);  // minor
+    write_le(out, v2_0 ? 3 : (v2_1_blob ? 1 : 2), 2);  // minor
     out.write("LANC", 4);
     out.close();
     if (!out) {
