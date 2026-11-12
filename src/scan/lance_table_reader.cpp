@@ -3869,6 +3869,40 @@ namespace {
 
 /// A standalone data file, as a one-fragment dataset: its own schema (the file's descriptor) with its
 /// leaf fields numbered as the file's columns, and the file's directory as the data directory.
+/// A blob v2 struct as a data file stores it: its parent carries `lance-encoding:blob` and the five descriptor
+/// children (kind, position, size, blob_id, blob_uri) follow it with no ids of their own. Gives each child an id
+/// under the parent and the blob v2 extension to the parent, as the dataset's manifest has them, so the file's
+/// fields map like a dataset's.
+bool is_file_blob_v2_parent(const pb::Field& f) {
+    if (f.parent_id >= 0 || f.logical_type != "struct") {
+        return false;
+    }
+    const auto it = f.metadata.find("lance-encoding:blob");
+    static const std::vector<std::uint8_t> kTrue{'t', 'r', 'u', 'e'};
+    return it != f.metadata.end() && it->second == kTrue;
+}
+
+void link_file_blob_v2_children(pb::FileDescriptor& descriptor) {
+    std::int32_t next_id = 0;
+    for (const auto& f : descriptor.fields) {
+        next_id = std::max(next_id, f.id + 1);
+    }
+    for (std::size_t i = 0; i < descriptor.fields.size(); ++i) {
+        auto& parent = descriptor.fields[i];
+        if (!is_file_blob_v2_parent(parent)) {
+            continue;
+        }
+        const std::string extension = "lance.blob.v2";
+        parent.metadata["ARROW:extension:name"] = std::vector<std::uint8_t>(extension.begin(), extension.end());
+        for (std::size_t j = i + 1; j < descriptor.fields.size() && descriptor.fields[j].id == -1 &&
+                                    descriptor.fields[j].parent_id == -1;
+             ++j) {
+            descriptor.fields[j].id = next_id++;
+            descriptor.fields[j].parent_id = parent.id;
+        }
+    }
+}
+
 bool open_file_plan(const std::filesystem::path& file_path, const LanceScanRequest& request, ReadPlan& plan,
                     ArrowSchema& out_schema, std::string& error, LanceFileInfo* info = nullptr) {
     pb::FileDescriptor descriptor;
@@ -3877,6 +3911,7 @@ bool open_file_plan(const std::filesystem::path& file_path, const LanceScanReque
         release_schema_if_held(out_schema);
         return false;
     }
+    link_file_blob_v2_children(descriptor);
     pb::Manifest manifest;
     manifest.fields = descriptor.fields;
     pb::DataFile file;
@@ -3926,6 +3961,13 @@ bool open_file_plan(const std::filesystem::path& file_path, const LanceScanReque
         for (const auto& f : descriptor.fields) {
             if (packed.count(f.parent_id) != 0U) {
                 packed.insert(f.id);
+                continue;
+            }
+            if (is_file_blob_v2_parent(f)) {
+                // A blob v2 struct is one column: its descriptor's pages, from which its children are read.
+                packed.insert(f.id);
+                file.fields.push_back(f.id);
+                file.column_indices.push_back(column++);
                 continue;
             }
             const bool is_parent = parents.count(f.id) != 0U;

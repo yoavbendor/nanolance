@@ -1099,6 +1099,17 @@ target_link_libraries(nano_lance_legacy_blob_v21_read_test PRIVATE nanolance)
 add_test(NAME nano_lance_legacy_blob_v21_read COMMAND $<TARGET_FILE:nano_lance_legacy_blob_v21_read_test>)
 set_tests_properties(nano_lance_legacy_blob_v21_read PROPERTIES LABELS "smoke")
 
+# A blob v2 column in a standalone 2.2 data file pylance wrote (tests/generate_golden_blob_v2_file.py): one column for the
+# struct, read as Lance describes it (kind, position, size, blob_id, blob_uri), whole and by a take.
+add_executable(nano_lance_blob_v2_file_read_test tests/file/test_blob_v2_file_read.cpp)
+target_compile_features(nano_lance_blob_v2_file_read_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_blob_v2_file_read_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_compile_definitions(nano_lance_blob_v2_file_read_test PRIVATE
+    NANO_LANCE_BLOB_V2_FILE_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/blob_v2_file/v22_blob_v2.lance")
+target_link_libraries(nano_lance_blob_v2_file_read_test PRIVATE nanolance)
+add_test(NAME nano_lance_blob_v2_file_read COMMAND $<TARGET_FILE:nano_lance_blob_v2_file_read_test>)
+set_tests_properties(nano_lance_blob_v2_file_read PROPERTIES LABELS "smoke")
+
 # Live S3 integration test (only with the nanos3reader provider): range GETs against a real S3-compatible
 # endpoint; skips unless NANOLANCE_S3_TEST_URI (+ AWS_* env) is set. tests/s3_minio_integration.sh wires
 # this up against a throwaway MinIO. The SigV4 signer vectors now live in the nanos3reader repo's own tests.

@@ -103,6 +103,8 @@ pub(crate) fn check(
     let path = format!("{dir}/nanolance-rust-{}-{case}.lance", std::process::id());
     let c_path = CString::new(path.clone()).unwrap();
     let mut outcome = Outcome::new();
+    // A blob v2 field is read as Lance describes it (the shape the Rust test expects); anything else as nanolance reads it.
+    let descriptions = field.metadata().get("ARROW:extension:name").map(String::as_str) == Some("lance.blob.v2");
 
     let schema = Schema::new(vec![field.clone()]);
     let written = match FFI_ArrowSchema::try_from(&schema) {
@@ -122,7 +124,7 @@ pub(crate) fn check(
     match written {
         Err(e) => outcome.note("refused", e, "file"),
         Ok(()) => {
-            match read(&c_path, 0, num_rows, None) {
+            match read(&c_path, 0, num_rows, None, descriptions) {
                 Err(e) => outcome.note("refused", e, "read"),
                 Ok(actual) => {
                     if let Some(expected) = expected {
@@ -135,7 +137,7 @@ pub(crate) fn check(
             }
             for range in ranges {
                 let what = format!("range {}..{}", range.start, range.end);
-                match read(&c_path, range.start, range.end - range.start, None) {
+                match read(&c_path, range.start, range.end - range.start, None, descriptions) {
                     Err(e) => outcome.note("refused", e, &what),
                     Ok(actual) => {
                         if let Some(expected) = expected {
@@ -152,7 +154,7 @@ pub(crate) fn check(
                 sorted.sort_unstable();
                 sorted.dedup();
                 let what = format!("take {} rows", idx.len());
-                match read(&c_path, 0, 0, Some(&sorted)) {
+                match read(&c_path, 0, 0, Some(&sorted), descriptions) {
                     Err(e) => outcome.note("refused", e, &what),
                     Ok(actual) => {
                         let positions = UInt64Array::from(
