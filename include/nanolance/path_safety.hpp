@@ -16,6 +16,9 @@
 
 #include "nanolance/byte_source.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -45,18 +48,55 @@ namespace nano_lance {
         if (part.has_root_name() || part.has_root_directory()) {
             return std::nullopt;
         }
+        // A backslash separates components on Windows, so a name carrying one would walk a path there.
+        // Refused on every platform, so a dataset means the same thing wherever it is read.
+        const std::string name = part.string();
+        if (name.find('\\') != std::string::npos) {
+            return std::nullopt;
+        }
+#ifdef _WIN32
+        // A drive-relative name ("C:x"), an NTFS alternate data stream ("a:stream") or a reserved device
+        // name ("CON", "nul.txt"): each opens something other than the file the name says.
+        if (name.find(':') != std::string::npos) {
+            return std::nullopt;
+        }
+        std::string stem = name.substr(0, name.find('.'));
+        while (!stem.empty() && stem.back() == ' ') {
+            stem.pop_back();
+        }
+        for (auto& c : stem) {
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+        static constexpr std::array<const char*, 22> reserved{
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"};
+        for (const char* device : reserved) {
+            if (stem == device) {
+                return std::nullopt;
+            }
+        }
+#endif
     }
 
     if (io::is_remote(base.string())) {
         // A URI is not a file-system path: lexical normalization would collapse its "//" (mem:///x to
-        // mem:/x). The components were checked above, so the URI is only joined.
-        std::filesystem::path joined = base;
+        // mem:/x). The components were checked above, so the URI is only joined, with "/" whatever the
+        // platform's separator: object keys are "/"-separated, and std::filesystem would add a "\" on Windows.
+        // (string(), not generic_string(): the latter rebuilds the path from its elements and drops the "//".)
+        std::string joined = base.string();
+#ifdef _WIN32
+        std::replace(joined.begin(), joined.end(), '\\', '/');
+#endif
         for (const auto& part : relative) {
-            if (part != ".") {
-                joined /= part;
+            if (part == ".") {
+                continue;
             }
+            if (joined.empty() || joined.back() != '/') {
+                joined += '/';
+            }
+            joined += part.string();
         }
-        return joined;
+        return std::filesystem::path(joined);
     }
     const std::filesystem::path base_norm = base.lexically_normal();
     const std::filesystem::path joined = (base_norm / relative).lexically_normal();
