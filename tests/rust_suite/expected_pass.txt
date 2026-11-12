@@ -3,6 +3,7 @@ lance-encoding::array_encoding::logical::blob::tests::test_basic_blob::encoding_
 lance-encoding::array_encoding::logical::blob::tests::test_basic_blob::encoding_1_TestEncoding__Array::page_size_2_1024_1024::use_slicing_1_false
 lance-encoding::array_encoding::logical::blob::tests::test_basic_blob::encoding_1_TestEncoding__Array::page_size_2_1024_1024::use_slicing_2_true
 lance-encoding::array_encoding::physical::bitmap::tests::test_bitmap_boolean
+lance-encoding::array_encoding::physical::bitmap::tests::test_fsl_bitmap_boolean
 lance-encoding::array_encoding::physical::bitmap::tests::test_simple_boolean
 lance-encoding::array_encoding::physical::bitmap::tests::test_tiny_boolean
 lance-encoding::array_encoding::physical::dictionary::tests::test_empty_strings
@@ -157,6 +158,7 @@ lance-encoding::array_encoding::physical::fixed_size_binary::tests::test_fixed_s
 lance-encoding::array_encoding::physical::fixed_size_binary::tests::test_fixed_size_sliced_utf8
 lance-encoding::array_encoding::physical::fixed_size_binary::tests::test_simple_fixed_size_utf8
 lance-encoding::array_encoding::physical::fixed_size_binary::tests::test_simple_fixed_size_with_nulls_utf8
+lance-encoding::array_encoding::physical::fixed_size_list::tests::test_nested_fsl
 lance-encoding::array_encoding::physical::fixed_size_list::tests::test_simple_fsl
 lance-encoding::array_encoding::physical::fixed_size_list::tests::test_value_fsl_primitive::data_type_1_DataType__Int8::encoding_1_TestEncoding__Array::page_size_1_4096::use_slicing_1_false
 lance-encoding::array_encoding::physical::fixed_size_list::tests::test_value_fsl_primitive::data_type_1_DataType__Int8::encoding_1_TestEncoding__Array::page_size_1_4096::use_slicing_2_true
@@ -647,6 +649,7 @@ lance-encoding::encodings::logical::list::tests::test_simple_large_list
 lance-encoding::encodings::logical::list::tests::test_simple_list::structural_encoding_1_STRUCTURAL_ENCODING_MINIBLOCK
 lance-encoding::encodings::logical::list::tests::test_simple_list::structural_encoding_2_STRUCTURAL_ENCODING_FULLZIP
 lance-encoding::encodings::logical::list::tests::test_simple_list_all_null
+lance-encoding::encodings::logical::list::tests::test_simple_list_dict
 lance-encoding::encodings::logical::list::tests::test_simple_nested_list_ends_with_null::structural_encoding_1_STRUCTURAL_ENCODING_MINIBLOCK
 lance-encoding::encodings::logical::list::tests::test_simple_nested_list_ends_with_null::structural_encoding_2_STRUCTURAL_ENCODING_FULLZIP
 lance-encoding::encodings::logical::list::tests::test_simple_sliced_list::structural_encoding_1_STRUCTURAL_ENCODING_MINIBLOCK
