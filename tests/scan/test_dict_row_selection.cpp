@@ -11,6 +11,7 @@
 // The take cache is switched off for this process (NANOLANCE_TAKE_CACHE_MB=0): a small column is otherwise decoded
 // whole and cached on its first take, and the chunk and whole-page take paths would go untested.
 
+#include "../posix_env.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/nano_lance_writer.h"
 #include "nanolance/work_stats.hpp"
