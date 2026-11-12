@@ -4728,7 +4728,13 @@ bool take_full_zip_rows(const EncodingsIo& io, const std::string& column, const 
 /// Bounded: at most NANOLANCE_TAKE_CACHE_MB of decoded columns (default 256; 0 turns the cache off,
 /// for a device that would rather decode again than hold them), dropped all at once when full. Keyed
 /// by file path, size and modification time and the field -- Lance never rewrites a data file in place.
-constexpr std::uint64_t kCacheColumnBytes = std::uint64_t{16} << 20U;
+constexpr std::uint64_t kCacheColumnBytes = std::uint64_t{64} << 20U;
+
+/// A take of at least one row in this many fills the cache with a column's whole copy on its first take: a dense take
+/// (a hub node's 30k edges of a million) reads and decodes most of the column's pages anyway, so the copy costs little
+/// more and the repeated take is served from it. A sparser take reads only the chunks holding its rows, as before
+/// (an indexed IN of 500 values reads 2.6k rows of a million: decoding the column whole would cost more than that).
+constexpr std::uint64_t kDenseTakeDivisor = 64;
 
 std::uint64_t take_cache_budget() {
     static const std::uint64_t budget = [] {
@@ -5532,7 +5538,9 @@ static bool decode_lance_physical_column_rows_impl(const EncodingsIo& io, const 
                                                : encoded <= kSmallColumnBytes ? CacheFill::FirstTake
                                                : chunked                    ? CacheFill::Never
                                                : nested                     ? CacheFill::SecondTake
-                                                                            : CacheFill::FirstTake);
+                                               : rows.size() * kDenseTakeDivisor >= page_first.back()
+                                                                            ? CacheFill::FirstTake
+                                                                            : CacheFill::Never);
         if (whole == nullptr && !error.empty()) {
             return false;
         }

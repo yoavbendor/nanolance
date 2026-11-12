@@ -561,3 +561,27 @@ def test_an_indexed_in_decodes_each_dictionary_block_once_not_once_per_window(tm
     assert got == expected and stats["indexed_fragments"] > 0, (got, expected, stats)
     assert stats["index_page_cache_misses"] + stats["index_page_cache_hits"] >= 2, stats
     assert stats["dictionary_blocks_decoded"] <= 2, stats
+
+
+def test_a_dense_take_of_a_large_column_is_served_from_its_copy_the_second_time(tmp_path):
+    """A take that covers a large share of a column (a hub node's 30k edges of a million rows) reads and decodes most
+    of the column's pages. A column of more than 16 MB encoded used to be read again for every such take: the decoded
+    copy was only kept for columns under 16 MB. It is now kept up to 64 MB, so the second take reads none of the column.
+    The table is 600k rows of 64-character hex strings (about 19 MB encoded) and the take covers 30k of them."""
+    if _knob_overridden("NANOLANCE_TAKE_CACHE_MB"):
+        pytest.skip("NANOLANCE_TAKE_CACHE_MB is set in the environment")
+    rng = np.random.default_rng(3)
+    n = 600_000
+    values = [rng.bytes(32).hex() for _ in range(n)]
+    path = str(tmp_path / "wide.lance")
+    nl.write_dataset(pa.table({"source_id": pa.array(values)}), path, max_rows_per_file=1_000_000)
+    ours = nl.dataset(path)
+    encoded = _data_bytes(path)
+    assert encoded > 16 << 20, encoded
+    rows = sorted(rng.choice(n, 30_000, replace=False).tolist())
+    first_stats, first = _stats_of(lambda: ours.take(rows, columns=["source_id"]))
+    second_stats, second = _stats_of(lambda: ours.take(rows, columns=["source_id"]))
+    assert first.column("source_id").to_pylist() == [values[r] for r in rows]
+    assert second.equals(first)
+    assert second_stats["take_cache_hits"] >= 1, second_stats
+    assert second_stats["data_bytes_read"] * 10 < first_stats["data_bytes_read"], (first_stats, second_stats)
