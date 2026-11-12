@@ -599,12 +599,6 @@ bool map_field(const ArrowSchema& field,
 
     mapping.fields.push_back(out);
 
-    if (fsl_struct && parent_id >= 0) {
-        // The leaves count rows x N entries, which the layers above (a struct's rows, a list's offsets) do not
-        // scale to yet; neither reader reads that shape back from pylance's files either.
-        error = "column '" + out.name + "': a fixed_size_list of structs inside a struct or list is not written yet";
-        return false;
-    }
     if (is_struct && !map_struct_children(field, out.id, next_id, next_column, mapping, error)) {
         return false;
     }
@@ -751,6 +745,13 @@ bool refuse_unwritten_under_fixed_size_list(const LanceSchemaMapping& mapping, s
         if (field.parent_id >= 0 && field.logical_type.rfind("fixed_size_list:fixed_size_list:", 0) == 0) {
             error = "column '" + field.name +
                     "': a fixed_size_list of fixed_size_list under a struct or list is read but not written yet";
+            return false;
+        }
+        // The leaves of a fixed_size_list of structs count rows x N entries, which the layers above (a struct's rows,
+        // a list's offsets) do not scale to yet; neither reader reads that shape back from pylance's files either.
+        // Reads take it (the sparse layout's fixed-size-list layer, `list<fixed_size_list<struct>>`); writes do not.
+        if (field.parent_id >= 0 && field.logical_type.rfind("fixed_size_list:struct:", 0) == 0) {
+            error = "column '" + field.name + "': a fixed_size_list of structs inside a struct or list is not written yet";
             return false;
         }
     }

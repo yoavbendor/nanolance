@@ -3,11 +3,14 @@
 
 // Lance 2.3 sparse page layout (PageLayout field 5) with the shapes nanolance read last: a map, whose key column's page
 // carries an all-valid validity layer for the non-nullable key; a fixed-size list of structs, whose page carries a
-// fixed-size-list layer. The golden files in tests/golden/sparse are written by Lance's own encoder test
-// (test_explicit_sparse_map_and_fixed_size_list_roundtrip; NANOLANCE_RUST_KEEP_PASS keeps them). The values are the
-// test's own:
+// fixed-size-list layer; and a list of fixed-size lists of structs, whose page counts its fixed-size list's elements in
+// its rows. The golden files in tests/golden/sparse are written by Lance's own encoder tests
+// (test_explicit_sparse_map_and_fixed_size_list_roundtrip and test_explicit_sparse_list_fixed_size_list_struct_roundtrip;
+// NANOLANCE_RUST_KEEP_PASS keeps them). The values are the tests' own:
 //   map_keys_values.lance              Map<utf8 non-null, int32> of four rows: [a:1], null, [], [b:null, c:3].
 //   fixed_size_list_struct.lance       FixedSizeList<2 x Struct<value: int32>> of six rows, with null structs and null rows.
+//   list_fixed_size_list_struct.lance  List<FixedSizeList<2 x Struct<value: int32>>> of four rows: one fixed-size list, a
+//                                      null row, a null and a valid fixed-size list, an empty row.
 // Each file is read whole, by a row range and by a take, and every row is rendered and compared with its text.
 // Rust is not needed.
 
@@ -87,6 +90,8 @@ int main() {
     check_file(dir / "fixed_size_list_struct.lance",
                {"[{value:0},{value:1}]", "null", "[{value:4},{value:5}]", "[{value:null},null]", "null",
                 "[{value:10},{value:null}]"});
-    std::cout << "sparse map and fixed-size-list pages read back: 2 files, whole, by range and by take\n";
+    check_file(dir / "list_fixed_size_list_struct.lance",
+               {"[[{value:0},{value:null}]]", "null", "[null,[{value:null},{value:5}]]", "[]"});
+    std::cout << "sparse map, fixed-size-list and list-of-fixed-size-list pages read back: 3 files, whole, by range and by take\n";
     return 0;
 }

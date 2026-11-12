@@ -1510,7 +1510,7 @@ bool dataset_add_columns_nulls_once(const std::filesystem::path& dataset_path, c
     // Schema only, as Lance does it: no data file is written, and every fragment reads the new
     // columns as nulls because none of its files holds them.
     LanceSchemaMapping added;
-    if (!map_arrow_schema(schema, added, error)) {
+    if (!map_arrow_schema(schema, added, error) || !refuse_unwritten_under_fixed_size_list(added, error)) {
         return false;
     }
     const auto base = max_field_id(manifest) + 1;

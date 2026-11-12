@@ -957,6 +957,9 @@ bool fill_nested_nodes(ColumnPlan& plan, std::int64_t rows, std::map<ArrowArray*
                 continue;
             }
             auto& layer = layers[k];
+            if (layer.fsl_rows) {
+                continue;  // converted by the decoder already (a column cut by its layers; see convert_fixed_size_list)
+            }
             if (layer.is_list || node.items == 0U || layer.length % node.items != 0U) {
                 error = "nested column '" + name + "': a fixed_size_list layer of " + std::to_string(layer.length) +
                         " elements is not whole rows of " + std::to_string(node.items);
@@ -1337,7 +1340,10 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         plan.array = node_array;
         plan.field = field;
         plan.nodes = std::move(path);
-        if (plan.under_list() && !is_blob && field->column_index < 0) {
+        // A fixed_size_list of structs has no column of its own, and is read under a list as the W1k4 branch below
+        // reads it (a list's offsets count its rows, and the layer of its elements is the struct's).
+        const bool fsl_of_struct_under_list = is_fsl && fsl_element == "struct";
+        if (plan.under_list() && !is_blob && field->column_index < 0 && !fsl_of_struct_under_list) {
             collect_error = "column '" + field->name + "': a list of " + field->logical_type + " is not read yet";
             return false;
         }
@@ -1349,8 +1355,9 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
                 collect_error = "column '" + field->name + "': a " + field->logical_type + " is not read yet";
                 return false;
             }
-            path.push_back({ColumnPlan::Node::Kind::FixedSizeList, node_array, fsl_items});
-            return self(self, node_schema->children[0], node_array->children[0], field->id, std::move(path), 0U);
+            // The path so far is in plan.nodes (moved there above): the lists above this node stay on it.
+            plan.nodes.push_back({ColumnPlan::Node::Kind::FixedSizeList, node_array, fsl_items});
+            return self(self, node_schema->children[0], node_array->children[0], field->id, std::move(plan.nodes), 0U);
         }
         if (!is_blob && field->column_index < 0) {
             plan.kind = ColumnPlan::Kind::Skip;

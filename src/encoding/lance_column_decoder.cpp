@@ -6234,10 +6234,91 @@ bool decode_nested_blob_column(const EncodingsIo& io, const pb::Field& field,
 
 }  // namespace
 
+namespace {
+
+/// Converts each fixed-size-list layer's elements to its rows (one entry a row, valid when the row's first element is:
+/// Lance marks a null row's elements all null at that layer), as the reader does for a column it reads as its pages
+/// are. A column cut by its layers needs its rows first, so the fallback below converts it here and marks the layer
+/// done (`fsl_rows`).
+bool convert_fixed_size_list_layers(ColumnValues& values, std::string& error) {
+    for (auto& layer : values.layers) {
+        if (layer.is_list || layer.fsl_items == 0U || layer.fsl_rows) {
+            continue;
+        }
+        const std::uint64_t items = layer.fsl_items;
+        if (layer.length % items != 0U) {
+            error = "a fixed-size-list layer of " + std::to_string(layer.length) + " elements is not whole rows of " +
+                    std::to_string(items);
+            return false;
+        }
+        const std::uint64_t row_count = layer.length / items;
+        if (!layer.validity.empty()) {
+            std::vector<std::uint8_t> bits(static_cast<std::size_t>((row_count + 7U) / 8U), 0U);
+            std::uint64_t nulls = 0;
+            for (std::uint64_t r = 0; r < row_count; ++r) {
+                const auto e = r * items;
+                if (((layer.validity[static_cast<std::size_t>(e >> 3U)] >> (e & 7U)) & 1U) != 0U) {
+                    bits[static_cast<std::size_t>(r >> 3U)] |= static_cast<std::uint8_t>(1U << (r & 7U));
+                } else {
+                    ++nulls;
+                }
+            }
+            layer.validity = std::move(bits);
+            layer.null_count = nulls;
+        }
+        layer.length = row_count;
+        layer.fsl_rows = true;
+    }
+    return true;
+}
+
+/// Does a sparse column count its rows in something other than its nested layers' outer entries? A sparse page's rows
+/// are its outer layer's slots times the dimension of every fixed-size list in it, so a fixed-size list below a list
+/// (list<fixed_size_list<struct>>) makes the page hold more rows than the list has. The nested readers cut a column by
+/// its outer entries, so such a column is read whole and cut at the logical level instead.
+bool sparse_rows_are_not_outer_entries(const pb::ColumnMetadata& column_metadata) {
+    for (const auto& page : column_metadata.pages) {
+        page_layout::PageLayout layout;
+        std::string ignored;
+        if (!page_layout::decode_page_layout(page.encoding, layout, ignored) ||
+            layout.kind != page_layout::LayoutKind::kSparse || layout.sparse.layers.empty()) {
+            continue;
+        }
+        const auto& outer = layout.sparse.layers.front();
+        const std::uint64_t entries = outer.kind == page_layout::SparseLayer::Kind::kFixedSizeList
+                                          ? outer.num_slots * outer.dimension
+                                          : outer.num_slots;
+        if (entries != page.length) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
 bool decode_lance_physical_column_rows(const EncodingsIo& io, const pb::Field& on_disk_field,
                                        const pb::ColumnMetadata& column_metadata,
                                        const std::vector<std::uint64_t>& rows, std::size_t value_bytes,
                                        ColumnValues& out, std::string& error) {
+    if (sparse_rows_are_not_outer_entries(column_metadata)) {
+        // Read whole, and the rows picked out of it: the rows come ascending, as the readers ask them.
+        ColumnValues whole;
+        if (!decode_lance_physical_column(io, on_disk_field, column_metadata, whole, error) ||
+            !convert_fixed_size_list_layers(whole, error)) {
+            return false;
+        }
+        const std::uint64_t total = whole.layers.empty() ? whole.rows : whole.layers.front().length;
+        std::vector<std::uint8_t> keep(static_cast<std::size_t>(total), 0U);
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            if (rows[i] >= total || (i > 0U && rows[i] <= rows[i - 1U])) {
+                error = "rows of a sparse column must be ascending and inside it";
+                return false;
+            }
+            keep[static_cast<std::size_t>(rows[i])] = 1U;
+        }
+        return gather_column_values(whole, keep, total, value_bytes, out, error);
+    }
     bool blob = false;
     const bool ok = decode_nested_blob_column(io, on_disk_field, column_metadata, out, error, blob,
                                               [&](const pb::Field& f, ColumnValues& v) {
@@ -6271,6 +6352,19 @@ bool decode_lance_physical_column_range(const EncodingsIo& io, const pb::Field& 
                                         const pb::ColumnMetadata& column_metadata, std::uint64_t first,
                                         std::uint64_t count, std::size_t value_bytes, ColumnValues& out,
                                         std::string& error) {
+    if (sparse_rows_are_not_outer_entries(column_metadata)) {
+        ColumnValues whole;
+        if (!decode_lance_physical_column(io, on_disk_field, column_metadata, whole, error) ||
+            !convert_fixed_size_list_layers(whole, error)) {
+            return false;
+        }
+        const std::uint64_t total = whole.layers.empty() ? whole.rows : whole.layers.front().length;
+        if (!slice_column_values(whole, first, count, total, value_bytes, error)) {
+            return false;
+        }
+        out = std::move(whole);
+        return true;
+    }
     bool blob = false;
     const bool ok = decode_nested_blob_column(io, on_disk_field, column_metadata, out, error, blob,
                                               [&](const pb::Field& f, ColumnValues& v) {
