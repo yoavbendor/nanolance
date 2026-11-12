@@ -55,22 +55,18 @@ on any mismatch that `tests/rust_suite/known_mismatch.txt` does not name. That f
 
 ## Results
 
-`bench/results/rust_suite.json` holds the latest summary. From the run on this machine:
+`bench/results/rust_suite.json` holds the latest summary. From the run on this machine, against the
+Lance 12.0.0 crates:
 
 | | |
 |---|---|
-| tests run (lance-encoding 1,809, lance-file 177) | 1,986; each also passes in Rust |
-| tests with round trips that nanolance reads back, all equal | **1,028** (`expected_pass.txt`) |
-| tests where nanolance refuses some round trip | 435 |
+| tests run (lance-encoding and lance-file 12.0.0) | 1,986; each also passes in Rust |
+| tests with round trips that nanolance reads back, all equal | **1,446** (`expected_pass.txt`) |
+| tests where nanolance refuses some round trip | 17 |
 | tests with no round trip (unit tests of one component) | 523 |
-| round trips read back equal | **9,347** |
-| round trips refused | 1,640, of which 90 are format 2.0 (types refused in every format) |
+| round trips read back equal | **10,913** |
+| round trips refused | 74 (each under its first reason, below) |
 | round trips with different rows | **0** |
-
-By layout, nanolance reads 2,739 of lance-encoding's 2,926 round trips in the u16 mini-block
-layout, 2,789 of 3,456 in the u32 layout and 2,763 of 3,451 in the sparse layout. Of the files
-lance-file writes, it reads 10 of 10 in format 2.0, 13 of 14 in 2.1 and 5 of 7 in 2.2. Of the
-1,118 round trips in lance-encoding's `Array` test encoding, which is format 2.0, it reads 1,028.
 
 The runs so far found three bugs in nanolance, all fixed and pinned by tests that do not need Rust:
 
@@ -86,19 +82,32 @@ The runs so far found three bugs in nanolance, all fixed and pinned by tests tha
 
 Bare file names now also work: `LanceFileReader("x.lance")` used to look for `data/x.lance`.
 
+The later runs found and fixed these, each pinned by a test that does not need Rust:
+
+- **The sparse page layout** (Lance 12, format 2.3). Every such page was refused; they are read now.
+- **RLE chunks** with a run length of any width (u8, u16 or u32) and with framed values (zstd or lz4).
+- **Level counts** far larger than their compressed bytes. RLE and bitpacked levels compress well, and a
+  zero-width level encoding stores no bytes at all.
+- **Same-named struct children** (Arrow allows the empty name). Each takes the field of its occurrence.
+- **Format 2.3** files are read.
+- **Packed structs** (`lance-encoding:packed`) in formats 2.1 and 2.2, when their children are fixed-width.
+  A packed struct inside another struct is refused by name.
+- **Fixed-size lists of fixed-size lists** are read. Writing them is refused by name.
+- **Lists, large lists and maps under a fixed-size list of structs** are read (576 round trips), whole,
+  by row range and by take. Writing them is refused by name.
+- **Format 2.0 fixed-size lists of booleans** are read.
+- **Dictionaries inside lists and structs** are read with any integer index.
+
 What nanolance refuses, by round trips (each refused round trip is counted under its first reason):
 
-- **Fixed-size lists of structs or of booleans** (1,160). nanolance's schema mapping takes
-  fixed-size lists of numbers, decimals and temporal types.
-- **Format 2.3** (5 files). Format 2.0 is read since 2026-10-01: its 90 refusals are types
-  refused in every format (fixed-size lists of booleans, Arrow dictionaries, empty structs).
-- **Several fields in one column** (138 in the structural formats): packed structs
-  (`lance-encoding:packed`) and Lance's blob struct.
-- **Arrow dictionary types** (178). nanolance's schema mapping refuses the type rather than return
-  the values as another type.
-- **Lance's blob layout** for `lance-encoding:blob` binary columns (48 in the structural formats).
-  nanolance reads its own blob layout, not the one Lance writes.
-- **Empty structs** (48).
-- A tail of layouts nanolance does not decode yet. Each is named in the report: some FullZip
-  fixed-size lists, a few RLE and dictionary-RLE mini-blocks whose runs span chunks, and page
-  layouts it does not recognize.
+- **Legacy blob columns** (`lance-encoding:blob`) outside format 2.0 (48). The harness refuses them
+  there; nanolance reads its own blob layout, not the one Lance writes.
+- **Several fields in one column** (20): files with more columns than leaf fields. This is the
+  layout of blob v2 structs.
+- **Others** (6):
+  - Variable-width packed structs (`VariablePackedStruct`, 2 round trips). Their utf8 and blob v2
+    descriptor children are not read yet.
+  - A fixed-size list of structs inside a struct or list (write refusal, 1).
+  - A map's `keys` column in the sparse layout, decoded to a different shape than its schema (1).
+  - A sparse page with a fixed-size-list layer (1). The sparse layout is read, but this layer is not.
+  - A dict-RLE run count mismatch (1).

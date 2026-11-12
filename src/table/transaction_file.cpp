@@ -9,6 +9,7 @@
 // indices, config -- except where the change alone cannot say (an overwrite, a restore, a
 // compaction: the commit says so in Manifest::operation).
 
+#include "base/utf8_path.hpp"
 #include "base/uuid.hpp"
 #include "nanolance/work_stats.hpp"
 #include "table/transaction_file.hpp"
@@ -484,7 +485,7 @@ bool write_transaction_file(const std::filesystem::path& dataset_path, const pb:
     }
 
     file_name = std::to_string(read_version) + "-" + uuid + ".txn";
-    const auto path = (dataset_path / "_transactions" / file_name).string();
+    const auto path = utf8::string_of(dataset_path / "_transactions" / file_name);
     auto out = io::open_output(path, error);
     if (!out) {
         return false;
@@ -507,7 +508,7 @@ std::pair<std::uint32_t, std::vector<std::uint8_t>> derive_transaction_operation
 void remove_transaction_file(const std::filesystem::path& dataset_path, const std::string& file_name) {
     std::string ignored;  // best effort: an unreferenced transaction file is harmless (cleanup removes it)
     if (!file_name.empty()) {
-        io::remove_output((dataset_path / "_transactions" / file_name).string(), ignored);
+        io::remove_output(utf8::string_of(dataset_path / "_transactions" / file_name), ignored);
     }
 }
 

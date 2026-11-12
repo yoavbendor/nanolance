@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "table/index_location.hpp"
 
 #include "base/proto_wire.hpp"
@@ -34,7 +35,7 @@ void remove_remote_tree(const std::string& dir) {
 }  // namespace
 
 bool create_index_dir(const std::filesystem::path& dir, std::string& error) {
-    if (io::is_object_store_output(dir.string())) {
+    if (io::is_object_store_output(utf8::string_of(dir))) {
         return true;
     }
     std::error_code ec;
@@ -47,13 +48,13 @@ bool create_index_dir(const std::filesystem::path& dir, std::string& error) {
 }
 
 void remove_index_dir(const std::filesystem::path& dir) {
-    if (io::is_object_store_output(dir.string())) {
-        remove_remote_tree(dir.string());
+    if (io::is_object_store_output(utf8::string_of(dir))) {
+        remove_remote_tree(utf8::string_of(dir));
         return;
     }
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
-    close_data_files_under(dir.string());
+    close_data_files_under(utf8::string_of(dir));
 }
 
 const pb::Field* find_field(const pb::Manifest& manifest, const std::string& path, std::vector<std::string>& parts) {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/byte_sink.hpp"
 #include "nanolance/parallel.hpp"
@@ -167,8 +168,8 @@ OpenDataFile* find_or_open_data_file(const std::filesystem::path& path, std::str
     const std::int64_t filled_at = now_unix_ns();
     std::uint64_t file_size = 0;
     std::int64_t version = 0;
-    const bool local = !io::is_remote(path.string());
-    if (local && !io::stat_local(path.string(), file_size, version)) {
+    const bool local = !io::is_remote(utf8::string_of(path));
+    if (local && !io::stat_local(utf8::string_of(path), file_size, version)) {
         std::error_code ec;
         error = std::filesystem::exists(path, ec) ? "failed to stat data file " + path.string()
                                                   : "data file not found: " + path.string();
@@ -193,7 +194,7 @@ OpenDataFile* find_or_open_data_file(const std::filesystem::path& path, std::str
         }
     }
     OpenDataFile fresh;
-    fresh.source = io::open_source(path.string(), error);
+    fresh.source = io::open_source(utf8::string_of(path), error);
     if (fresh.source == nullptr) {
         return nullptr;
     }
@@ -245,7 +246,7 @@ void close_data_files_under(const std::string& path_or_prefix) {
     for (ThreadOpenFiles* cache : registry()) {
         const std::lock_guard<std::recursive_mutex> lock(cache->mutex);
         cache->files.remove_if([&](const auto& entry) {
-            const std::string p = entry.first.string();
+            const std::string p = utf8::string_of(entry.first);
             return p.size() >= path_or_prefix.size() && p.compare(0, path_or_prefix.size(), path_or_prefix) == 0;
         });
     }
@@ -327,17 +328,18 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
         error = "failed to read data file version";
         return false;
     }
-    // 2.1 and 2.2 share the structural page layouts; 2.2 adds encodings a 2.1 file never holds. 2.0
-    // (footer 0.3: ArrayEncoding pages, lance_v20_decoder.cpp) has the same container. 2.3 and the
-    // legacy v1 format are not read.
+    // 2.1 and 2.2 share the structural page layouts; 2.2 adds encodings a 2.1 file never holds. 2.3 adds
+    // the sparse page layout (nanolance/sparse_layout.hpp) and nested variable-width RLE, which the sparse
+    // and RLE decoders read as their own descriptors say. 2.0 (footer 0.3: ArrayEncoding pages,
+    // lance_v20_decoder.cpp) has the same container. The legacy v1 format is not read.
     const bool v2_0 = major == 0U && minor == 3U;
-    if (!v2_0 && (major != 2U || (minor != 1U && minor != 2U))) {
+    if (!v2_0 && (major != 2U || (minor != 1U && minor != 2U && minor != 3U))) {
         // The footer spells format 2.0 as 0.3, and the legacy (v1) format as 0.1 or 0.2.
         const std::string footer = std::to_string(major) + "." + std::to_string(minor);
         const std::string format = major == 0U && minor == 3U                  ? "2.0 (footer 0.3)"
                                    : major == 0U && (minor == 1U || minor == 2U) ? "legacy v1 (footer " + footer + ")"
                                                                                : footer;
-        error = "unsupported Lance file format " + format + " (nanolance reads 2.0, 2.1 and 2.2)";
+        error = "unsupported Lance file format " + format + " (nanolance reads 2.0, 2.1, 2.2 and 2.3)";
         return false;
     }
 

@@ -24,7 +24,7 @@ LAYERS = [
 # Every file of src/, by its layer (a path below the layer directory where it has a sub-directory).
 FILES = {
     "base": ["buffer_pool.cpp", "parallel.cpp", "version.cpp", "roaring_bitmap.cpp", "float16.hpp",
-             "float_text.hpp", "int128.hpp", "proto_wire.hpp", "fts_json.hpp", "shared_cache.hpp", "uuid.hpp",
+             "float_text.hpp", "int128.hpp", "proto_wire.hpp", "fts_json.hpp", "shared_cache.hpp", "uuid.hpp", "utf8_path.hpp",
              "uuid.cpp", "bytes.hpp", "unicode.hpp", "unicode.cpp", "unicode_tables.inc"],
     "io": ["byte_source.cpp", "byte_sink.cpp", "external_blob.cpp", "external_blob.hpp", "s3_byte_source.cpp", "s3_byte_source.hpp", "s3_byte_sink.cpp",
            "s3_byte_sink.hpp"],
@@ -38,7 +38,8 @@ FILES = {
                  "values/rle.cpp", "values/rle.hpp",
                  "values/dictionary.cpp", "values/dictionary.hpp",
                  "values/scalar_value.cpp", "values/scalar_value.hpp",
-                 "layout/miniblock.cpp", "layout/miniblock.hpp", "layout/full_zip.cpp", "layout/full_zip.hpp"],
+                 "layout/miniblock.cpp", "layout/miniblock.hpp", "layout/full_zip.cpp", "layout/full_zip.hpp",
+                 "layout/sparse.cpp", "values/child_block.cpp"],
     "file": ["data_file_reader.cpp", "data_file_writer.cpp", "lance_file_writer.cpp", "blob_v2_external.cpp"],
     "table": ["manifest_reader.cpp", "manifest_writer.cpp", "deletion_vector.cpp", "row_ids.cpp",
               "base_paths.cpp", "overlays.cpp", "transaction_file.cpp", "transaction_file.hpp",
@@ -69,7 +70,8 @@ HEADERS = {
     "io": ["byte_source", "byte_sink", "object_store", "path_safety"],
     "arrow": ["schema_mapper", "array_accessor", "column_values", "arrow_slice", "blob_builder", "jsonb"],
     "encoding": ["fsst", "lz4_block", "repdef", "page_layout", "column_slice",
-                 "lance_column_decoder", "lance_v20_decoder", "encodings_io", "blob_v2_layout"],
+                 "lance_column_decoder", "lance_v20_decoder", "encodings_io", "blob_v2_layout",
+                 "child_block", "sparse_layout"],
     "file": ["data_file_reader", "data_file_writer", "lance_file_writer", "blob_v2_external"],
     "table": ["manifest_reader", "manifest_writer", "deletion_vector", "row_ids", "base_paths", "overlays",
               "dataset_commit", "dataset_transaction", "mem_wal", "dataset_refs", "frag_reuse",

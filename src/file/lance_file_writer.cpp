@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "nanolance/lance_file_writer.hpp"
 
 #include "nanolance/array_accessor.hpp"
@@ -17,7 +18,8 @@ bool write_lance_file(const ArrowSchema& schema, const std::vector<const ArrowAr
         return false;
     }
     LanceSchemaMapping mapping;
-    if (!map_arrow_schema(schema, mapping, error, true)) {
+    if (!map_arrow_schema(schema, mapping, error, true) || !refuse_unwritten_nested_dictionaries(mapping, error) ||
+        !refuse_unwritten_lists_under_fixed_size_list(mapping, error)) {
         return false;
     }
     // Integers bit-packed when asked, as Lance's index files have them (row ids and counts take a few bits).
@@ -39,7 +41,7 @@ bool write_lance_file(const ArrowSchema& schema, const std::vector<const ArrowAr
         rows += static_cast<std::uint64_t>(batch->length);
     }
     DataFileResult result;
-    if (!write_lance_data_file(extras.path.parent_path(), extras.path.filename().string(), mapping, columns, rows, 0,
+    if (!write_lance_data_file(extras.path.parent_path(), utf8::string_of(extras.path.filename()), mapping, columns, rows, 0,
                                false, result, error, true, &extras)) {
         return false;
     }

@@ -31,6 +31,15 @@
 #include <thread>
 #include <vector>
 
+// popen / pclose are POSIX; the Windows CRT has _popen / _pclose with the same contract.
+#ifdef _WIN32
+inline FILE* nl_popen(const char* command, const char* mode) { return _popen(command, mode); }
+inline int nl_pclose(FILE* pipe) { return _pclose(pipe); }
+#else
+inline FILE* nl_popen(const char* command, const char* mode) { return popen(command, mode); }
+inline int nl_pclose(FILE* pipe) { return pclose(pipe); }
+#endif
+
 // Set by bench/layers.cmake. Without them the JSON header says "unknown".
 #ifndef NL_BENCH_SOURCE_DIR
 #define NL_BENCH_SOURCE_DIR "."
@@ -335,7 +344,7 @@ inline int fail(const std::string& message) {
 /// Standard output of one command, without its trailing newline; empty when it fails.
 inline std::string shell_output(const std::string& command) {
     std::string out;
-    FILE* pipe = popen(command.c_str(), "r");
+    FILE* pipe = nl_popen(command.c_str(), "r");
     if (pipe == nullptr) {
         return out;
     }
@@ -343,7 +352,7 @@ inline std::string shell_output(const std::string& command) {
     while (std::fgets(buffer, sizeof buffer, pipe) != nullptr) {
         out += buffer;
     }
-    pclose(pipe);
+    nl_pclose(pipe);
     while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) {
         out.pop_back();
     }

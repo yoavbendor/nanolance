@@ -53,14 +53,18 @@ Lifecycle rules:
   null field inside one), and a null in a `lance.blob.v2` external-reference column.
   `nano_lance_writer_set_ignore_nullability` is a no-op kept for compatibility; the manifest's
   nullable flag now mirrors the Arrow schema, as pylance's does.
-- Types nanolance cannot round-trip are refused at `write_batch` rather than written: Arrow
-  `dictionary` columns, a `timestamp` whose timezone is a UTC offset rather than an IANA name (Lance
-  panics on those), a list of `fixed_size_list`, and a null element inside a valid `fixed_size_list`
-  row. Everything else round-trips, including `list`/`large_list`/`map` at any nesting depth,
-  `large_utf8`/`large_binary`, `float16`, `duration` and `fixed_size_list` vectors -- README "Type
-  coverage" is the exact table.
+- Types nanolance cannot round-trip are refused at `write_batch` rather than written, each by name: a
+  `timestamp` whose timezone is a UTC offset rather than an IANA name (Lance panics on those), a list of
+  `fixed_size_list`, a list or map under a `fixed_size_list` of structs (`a list or map under a fixed_size_list is read but not written yet`), a null element inside a valid `fixed_size_list` row, a `fixed_size_list` of
+  `fixed_size_list` (`a fixed_size_list of fixed_size_list is read but not written yet`), a struct marked
+  `lance-encoding:packed` (`a packed struct is read but not written yet`), and a dictionary inside a struct
+  or list with non-int32 indices (`writing it is not supported unless its indices are int32`). Top-level
+  Arrow dictionaries with an integer index are written. Everything else round-trips, including
+  `list`/`large_list`/`map` at any nesting depth, `large_utf8`/`large_binary`, `float16`, `duration` and
+  `fixed_size_list` vectors -- README "Types" is the exact table.
 - nanolance reads back everything it writes, and the columns the Rust `lance` crate writes for those
-  types, nested ones included (README "What nanolance can read").
+  types, nested ones included, and reads more than it writes: format 2.0 to 2.3 files, packed structs,
+  the sparse page layout, and fixed-size lists of fixed-size lists (README "Types").
 - `commit(is_append=false)` creates; `commit(is_append=true)` (or `nano_lance_writer_init_append`)
   adds a fragment to an existing dataset.
 

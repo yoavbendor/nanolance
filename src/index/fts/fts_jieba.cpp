@@ -7,6 +7,7 @@
 // follow the Rust source step by step so the tokens are the same: Rust's max_by keeps a later element
 // unless the one kept is greater, and tuples compare their second field on a tie.
 
+#include "base/utf8_path.hpp"
 #include "nanolance/fts_jieba.hpp"
 
 #include "base/fts_json.hpp"
@@ -356,7 +357,7 @@ std::string file_stamp(const std::filesystem::path& p) {
     std::error_code ec;
     const auto size = std::filesystem::file_size(p, ec);
     const auto time = std::filesystem::last_write_time(p, ec);
-    return p.string() + "|" + std::to_string(ec ? 0U : size) + "|" +
+    return utf8::string_of(p) + "|" + std::to_string(ec ? 0U : size) + "|" +
            std::to_string(ec ? 0 : static_cast<long long>(time.time_since_epoch().count()));
 }
 

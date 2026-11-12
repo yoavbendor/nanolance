@@ -243,6 +243,94 @@ bool convert_variable_packed(const nm::unknown_fields& u, Compressive& out, bool
     return true;
 }
 
+/// CompressiveEncoding field 12, PackedStruct{ repeated uint64 bits_per_value = 1 (packed or not),
+/// CompressiveEncoding values = 2 }: a struct's fixed-width children, interleaved row by row. Not a member of
+/// nanom's CompressiveEncoding either (it is in `unknown`), so it is read here. The node keeps each child's
+/// width in packed_fields and the inner encoding in `values`; unwrap_packed_struct then takes it apart.
+bool convert_packed_fixed(const nm::unknown_fields& u, Compressive& out, bool& found, int depth,
+                          std::string& error) {
+    const std::span<const std::byte> all(u.bytes);
+    std::size_t at = 0;
+    while (at < all.size()) {
+        std::uint64_t key = 0;
+        if (!read_varint(all, at, key)) {
+            error = "page layout: malformed CompressiveEncoding";
+            return false;
+        }
+        const auto wt = static_cast<std::uint8_t>(key & 7U);
+        if (key >> 3U != 12U || wt != 2U) {
+            if (!skip_field(all, at, wt)) {
+                error = "page layout: malformed CompressiveEncoding";
+                return false;
+            }
+            continue;
+        }
+        std::uint64_t n = 0;
+        if (!read_varint(all, at, n) || n > all.size() - at) {
+            error = "page layout: malformed PackedStruct";
+            return false;
+        }
+        const auto payload = all.subspan(at, static_cast<std::size_t>(n));
+        at += static_cast<std::size_t>(n);
+        found = true;
+        out.kind = CompressiveKind::kPackedStruct;
+        out.wire_field = 12U;
+        out.packed_fields.clear();
+        std::size_t p = 0;
+        while (p < payload.size()) {
+            std::uint64_t pkey = 0;
+            if (!read_varint(payload, p, pkey)) {
+                error = "page layout: malformed PackedStruct";
+                return false;
+            }
+            const auto pwt = static_cast<std::uint8_t>(pkey & 7U);
+            if (pkey >> 3U == 1U && pwt == 2U) {  // packed repeated uint64: a length, then varints
+                std::uint64_t len = 0;
+                if (!read_varint(payload, p, len) || len > payload.size() - p) {
+                    error = "page layout: malformed PackedStruct bits_per_value";
+                    return false;
+                }
+                const std::size_t end = p + static_cast<std::size_t>(len);
+                while (p < end) {
+                    std::uint64_t bits = 0;
+                    if (!read_varint(payload, p, bits) || p > end) {
+                        error = "page layout: malformed PackedStruct bits_per_value";
+                        return false;
+                    }
+                    PackedField field;
+                    field.bits_per_value = bits;
+                    out.packed_fields.push_back(std::move(field));
+                }
+            } else if (pkey >> 3U == 1U && pwt == 0U) {  // unpacked: one varint per child
+                std::uint64_t bits = 0;
+                if (!read_varint(payload, p, bits)) {
+                    error = "page layout: malformed PackedStruct bits_per_value";
+                    return false;
+                }
+                PackedField field;
+                field.bits_per_value = bits;
+                out.packed_fields.push_back(std::move(field));
+            } else if (pkey >> 3U == 2U && pwt == 2U) {
+                std::uint64_t vlen = 0;
+                if (!read_varint(payload, p, vlen) || vlen > payload.size() - p) {
+                    error = "page layout: malformed PackedStruct values";
+                    return false;
+                }
+                nm::pb_lazy<wire::CompressiveEncoding> lazy;
+                lazy.set_region(payload.data() + p, static_cast<std::size_t>(vlen));
+                p += static_cast<std::size_t>(vlen);
+                if (!child(lazy, out.values, depth, error)) {
+                    return false;
+                }
+            } else if (!skip_field(payload, p, pwt)) {
+                error = "page layout: malformed PackedStruct";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 /// A child node: its bytes were only length-checked with the parent, so they are decoded (and
 /// fully checked) here, one level deeper.
 bool child(const nm::pb_lazy<wire::CompressiveEncoding>& lazy, std::unique_ptr<Compressive>& out, int depth,
@@ -358,6 +446,13 @@ bool convert(const wire::CompressiveEncoding& w, Compressive& out, int depth, st
     if (packed) {
         return true;
     }
+    bool packed_fixed = false;
+    if (!convert_packed_fixed(*w.unknown, out, packed_fixed, depth, error)) {
+        return false;
+    }
+    if (packed_fixed) {
+        return true;
+    }
     // Parsed, just not modeled. Recording the wire field lets the caller refuse by name instead of
     // misreading the page's buffers.
     out.kind = CompressiveKind::kUnknown;
@@ -369,6 +464,352 @@ bool convert(const wire::CompressiveEncoding& w, Compressive& out, int depth, st
 bool convert_root(const nm::pb_lazy<wire::CompressiveEncoding>& lazy, std::unique_ptr<Compressive>& out,
                   std::string& error) {
     return child(lazy, out, -1, error);
+}
+
+/// One field of a protobuf message: its number, its wire type, and its value -- the varint itself, or the
+/// bytes of a length-delimited field. Fixed-width fields are skipped and carry neither.
+struct WireField {
+    std::uint32_t number = 0;
+    std::uint8_t wt = 0;
+    std::uint64_t varint = 0;
+    std::span<const std::byte> bytes;
+};
+
+bool next_wire_field(std::span<const std::byte> b, std::size_t& at, WireField& f, std::string& error) {
+    std::uint64_t key = 0;
+    f = WireField{};
+    if (!read_varint(b, at, key)) {
+        error = "page layout: malformed sparse layout";
+        return false;
+    }
+    f.number = static_cast<std::uint32_t>(key >> 3U);
+    f.wt = static_cast<std::uint8_t>(key & 7U);
+    if (f.wt == 0U) {
+        if (!read_varint(b, at, f.varint)) {
+            error = "page layout: malformed sparse layout";
+            return false;
+        }
+        return true;
+    }
+    if (f.wt == 2U) {
+        std::uint64_t n = 0;
+        if (!read_varint(b, at, n) || n > b.size() - at) {
+            error = "page layout: malformed sparse layout";
+            return false;
+        }
+        f.bytes = b.subspan(at, static_cast<std::size_t>(n));
+        at += static_cast<std::size_t>(n);
+        return true;
+    }
+    if (!skip_field(b, at, f.wt)) {
+        error = "page layout: malformed sparse layout";
+        return false;
+    }
+    return true;
+}
+
+/// A CompressiveEncoding message (a sparse set's or the value's encoding), parsed as the mini-block
+/// descriptors are.
+bool parse_compressive(std::span<const std::byte> b, std::unique_ptr<Compressive>& out, std::string& error) {
+    nm::pb_lazy<wire::CompressiveEncoding> lazy;
+    lazy.set_region(b.data(), b.size());
+    if (!child(lazy, out, -1, error)) {
+        return false;
+    }
+    if (out == nullptr) {
+        error = "page layout: sparse layout has an empty encoding";
+        return false;
+    }
+    return true;
+}
+
+/// SparsePositionSet { oneof { CompressiveEncoding explicit = 1; SparsePositionRange range = 2;
+/// SparsePositionAll all = 3; SparsePositionEmpty empty = 4; } uint64 num_positions = 5; }
+bool parse_positions(std::span<const std::byte> b, SparsePositions& out, std::string& error) {
+    std::size_t at = 0;
+    std::uint32_t variants = 0;
+    while (at < b.size()) {
+        WireField f;
+        if (!next_wire_field(b, at, f, error)) {
+            return false;
+        }
+        if (f.number == 1U && f.wt == 2U) {
+            out.kind = SparsePositions::Kind::kExplicit;
+            if (!parse_compressive(f.bytes, out.encoding, error)) {
+                return false;
+            }
+            ++variants;
+        } else if (f.number == 2U && f.wt == 2U) {
+            out.kind = SparsePositions::Kind::kRange;
+            std::size_t r = 0;
+            while (r < f.bytes.size()) {
+                WireField rf;
+                if (!next_wire_field(f.bytes, r, rf, error)) {
+                    return false;
+                }
+                if (rf.number == 1U && rf.wt == 0U) {
+                    out.start = rf.varint;
+                } else if (rf.number == 2U && rf.wt == 0U) {
+                    out.length = rf.varint;
+                }
+            }
+            ++variants;
+        } else if (f.number == 3U && f.wt == 2U) {
+            out.kind = SparsePositions::Kind::kAll;
+            ++variants;
+        } else if (f.number == 4U && f.wt == 2U) {
+            out.kind = SparsePositions::Kind::kEmpty;
+            ++variants;
+        } else if (f.number == 5U && f.wt == 0U) {
+            out.num_positions = f.varint;
+        }
+    }
+    if (variants != 1U) {
+        error = "page layout: sparse position set must set exactly one variant";
+        return false;
+    }
+    return true;
+}
+
+/// SparseValiditySet { Meaning meaning = 1 (1 null positions, 2 valid positions); SparsePositionSet positions = 2 }.
+bool parse_validity(std::span<const std::byte> b, SparseValidity& out, std::string& error) {
+    std::size_t at = 0;
+    std::uint64_t meaning = 0;
+    bool have_positions = false;
+    while (at < b.size()) {
+        WireField f;
+        if (!next_wire_field(b, at, f, error)) {
+            return false;
+        }
+        if (f.number == 1U && f.wt == 0U) {
+            meaning = f.varint;
+        } else if (f.number == 2U && f.wt == 2U) {
+            if (!parse_positions(f.bytes, out.positions, error)) {
+                return false;
+            }
+            have_positions = true;
+        }
+    }
+    if (meaning != 1U && meaning != 2U) {
+        error = "page layout: sparse validity set has no meaning";
+        return false;
+    }
+    if (!have_positions) {
+        error = "page layout: sparse validity set has no positions";
+        return false;
+    }
+    out.null_positions = meaning == 1U;
+    return true;
+}
+
+/// SparseCountSet { oneof { CompressiveEncoding explicit = 1; SparseCountConstant constant = 2;
+/// SparseCountEmpty empty = 3; } }.
+bool parse_counts(std::span<const std::byte> b, SparseCounts& out, std::string& error) {
+    std::size_t at = 0;
+    std::uint32_t variants = 0;
+    while (at < b.size()) {
+        WireField f;
+        if (!next_wire_field(b, at, f, error)) {
+            return false;
+        }
+        if (f.number == 1U && f.wt == 2U) {
+            out.kind = SparseCounts::Kind::kExplicit;
+            if (!parse_compressive(f.bytes, out.encoding, error)) {
+                return false;
+            }
+            ++variants;
+        } else if (f.number == 2U && f.wt == 2U) {
+            out.kind = SparseCounts::Kind::kConstant;
+            std::size_t c = 0;
+            while (c < f.bytes.size()) {
+                WireField cf;
+                if (!next_wire_field(f.bytes, c, cf, error)) {
+                    return false;
+                }
+                if (cf.number == 1U && cf.wt == 0U) {
+                    out.value = cf.varint;
+                }
+            }
+            ++variants;
+        } else if (f.number == 3U && f.wt == 2U) {
+            out.kind = SparseCounts::Kind::kEmpty;
+            ++variants;
+        }
+    }
+    if (variants != 1U) {
+        error = "page layout: sparse count set must set exactly one variant";
+        return false;
+    }
+    return true;
+}
+
+/// One SparseStructuralLayer: a oneof of SparseValidityLayer / SparseListLayer / SparseFixedSizeListLayer.
+bool parse_layer(std::span<const std::byte> b, SparseLayer& out, std::string& error) {
+    std::size_t at = 0;
+    std::uint32_t variants = 0;
+    while (at < b.size()) {
+        WireField f;
+        if (!next_wire_field(b, at, f, error)) {
+            return false;
+        }
+        if (f.number != 1U && f.number != 2U && f.number != 3U) {
+            continue;
+        }
+        if (f.wt != 2U) {
+            error = "page layout: malformed sparse layer";
+            return false;
+        }
+        ++variants;
+        std::size_t m = 0;
+        bool have_validity = false;
+        if (f.number == 1U) {
+            out.kind = SparseLayer::Kind::kValidity;
+        } else if (f.number == 2U) {
+            out.kind = SparseLayer::Kind::kList;
+        } else {
+            out.kind = SparseLayer::Kind::kFixedSizeList;
+        }
+        while (m < f.bytes.size()) {
+            WireField mf;
+            if (!next_wire_field(f.bytes, m, mf, error)) {
+                return false;
+            }
+            if (mf.wt == 0U && mf.number == 1U) {
+                out.num_slots = mf.varint;
+            } else if (mf.wt == 0U && mf.number == 2U && out.kind == SparseLayer::Kind::kList) {
+                out.num_child_slots = mf.varint;
+            } else if (mf.wt == 0U && mf.number == 2U && out.kind == SparseLayer::Kind::kFixedSizeList) {
+                out.dimension = mf.varint;
+            } else if (mf.wt == 2U && mf.number == 3U && out.kind == SparseLayer::Kind::kList) {
+                if (!parse_positions(mf.bytes, out.non_empty, error)) {
+                    return false;
+                }
+            } else if (mf.wt == 2U && mf.number == 4U && out.kind == SparseLayer::Kind::kList) {
+                if (!parse_counts(mf.bytes, out.counts, error)) {
+                    return false;
+                }
+            } else if (mf.wt == 2U && ((mf.number == 2U && out.kind == SparseLayer::Kind::kValidity) ||
+                                       (mf.number == 5U && out.kind == SparseLayer::Kind::kList) ||
+                                       (mf.number == 3U && out.kind == SparseLayer::Kind::kFixedSizeList))) {
+                if (!parse_validity(mf.bytes, out.validity, error)) {
+                    return false;
+                }
+                have_validity = true;
+            }
+        }
+        if (!have_validity && out.kind != SparseLayer::Kind::kList) {
+            error = "page layout: sparse layer has no validity set";
+            return false;
+        }
+    }
+    if (variants != 1U) {
+        error = "page layout: sparse layer must set exactly one layer kind";
+        return false;
+    }
+    return true;
+}
+
+/// SparseLayout (PageLayout field 5). Its fields: 1 value_compression, 2 num_buffers, 3 num_items,
+/// 4 num_visible_items, 5 has_large_chunk, 6 structural_layers (repeated).
+bool parse_sparse_layout(std::span<const std::byte> b, SparseLayout& out, std::string& error) {
+    std::size_t at = 0;
+    bool have_value = false;
+    while (at < b.size()) {
+        WireField f;
+        if (!next_wire_field(b, at, f, error)) {
+            return false;
+        }
+        if (f.number == 1U && f.wt == 2U) {
+            out.value_compression_bytes.assign(reinterpret_cast<const std::uint8_t*>(f.bytes.data()),
+                                               reinterpret_cast<const std::uint8_t*>(f.bytes.data()) + f.bytes.size());
+            if (!parse_compressive(f.bytes, out.value_compression, error)) {
+                return false;
+            }
+            have_value = true;
+        } else if (f.number == 2U && f.wt == 0U) {
+            out.num_buffers = f.varint;
+        } else if (f.number == 3U && f.wt == 0U) {
+            out.num_items = f.varint;
+        } else if (f.number == 4U && f.wt == 0U) {
+            out.num_visible_items = f.varint;
+        } else if (f.number == 5U && f.wt == 0U) {
+            out.has_large_chunk = f.varint != 0U;
+        } else if (f.number == 6U && f.wt == 2U) {
+            SparseLayer layer;
+            if (!parse_layer(f.bytes, layer, error)) {
+                return false;
+            }
+            out.layers.push_back(std::move(layer));
+        }
+    }
+    if (!have_value) {
+        error = "page layout: sparse layout has no value compression";
+        return false;
+    }
+    // Lance 2.3 reads sparse pages only with the u32 chunk grammar (has_large_chunk); its validator
+    // refuses the u16 one, and nanolance does the same rather than guess the chunk sizes.
+    if (!out.has_large_chunk) {
+        error = "page layout: sparse pages require the u32 chunk grammar";
+        return false;
+    }
+    return true;
+}
+
+/// Finds PageLayout field 5 among the unknown fields. The payload stays a view into the descriptor.
+bool find_sparse_payload(const nm::unknown_fields& u, std::span<const std::byte>& payload, bool& found,
+                         std::string& error) {
+    const std::span<const std::byte> all(u.bytes);
+    std::size_t at = 0;
+    while (at < all.size()) {
+        WireField f;
+        if (!next_wire_field(all, at, f, error)) {
+            return false;
+        }
+        if (f.number == 5U && f.wt == 2U) {
+            if (found) {
+                error = "page layout: sparse layout appears twice";
+                return false;
+            }
+            payload = f.bytes;
+            found = true;
+        }
+    }
+    return true;
+}
+
+/// A value encoding that is a PackedStruct (2.1): replaced by its inner Flat, whose width is the children's sum.
+/// `bits` receives each child's width, in struct order. Only a Flat inside is read: anything else is refused by
+/// name, not decoded as if it were flat.
+bool unwrap_packed_struct(std::unique_ptr<Compressive>& node, std::vector<std::uint64_t>& bits,
+                          std::string& error) {
+    bits.clear();
+    if (node == nullptr || node->kind != CompressiveKind::kPackedStruct) {
+        return true;
+    }
+    if (node->values == nullptr || node->values->kind != CompressiveKind::kFlat) {
+        error = "page layout: a packed struct whose values are not flat";
+        return false;
+    }
+    if (node->packed_fields.empty()) {
+        error = "page layout: a packed struct with no children";
+        return false;
+    }
+    std::uint64_t total = 0;
+    for (const auto& field : node->packed_fields) {
+        if (field.bits_per_value == 0U || field.bits_per_value % 8U != 0U) {
+            error = "page layout: a packed struct child that is not a whole number of bytes";
+            return false;
+        }
+        bits.push_back(field.bits_per_value);
+        total += field.bits_per_value;
+    }
+    if (total != node->values->bits_per_value) {
+        error = "page layout: a packed struct's children do not add up to its row";
+        bits.clear();
+        return false;
+    }
+    node = std::move(node->values);
+    return true;
 }
 
 bool convert(const wire::MiniBlockLayout& w, MiniBlock& out, std::string& error) {
@@ -384,6 +825,7 @@ bool convert(const wire::MiniBlockLayout& w, MiniBlock& out, std::string& error)
     return convert_root(*w.rep_compression, out.rep_compression, error) &&
            convert_root(*w.def_compression, out.repdef_compression, error) &&
            convert_root(*w.value_compression, out.value_compression, error) &&
+           unwrap_packed_struct(out.value_compression, out.packed_bits, error) &&
            convert_root(*w.dictionary, out.dictionary, error);
 }
 
@@ -409,7 +851,8 @@ bool convert(const wire::FullZipLayout& w, FullZip& out, std::string& error) {
     out.num_items = *w.num_items;
     out.num_visible_items = *w.num_visible_items;
     out.layers = owned(*w.layers);
-    return convert_root(*w.value_compression, out.value_compression, error);
+    return convert_root(*w.value_compression, out.value_compression, error) &&
+           unwrap_packed_struct(out.value_compression, out.packed_bits, error);
 }
 
 template <class M>
@@ -461,9 +904,20 @@ bool decode_page_layout_into(const std::vector<std::uint8_t>& encoding, PageLayo
         out.kind = LayoutKind::kFullZip;
         return convert(*v, out.full_zip, error);
     }
-    // Field 4 (BlobLayout), 5 (SparseLayout, file version 2.3+) and whatever Lance adds later are
-    // parsed but not modeled: record the field so a caller refuses by name rather than misreading
-    // the page's buffers.
+    // Field 5, SparseLayout (file version 2.3+): read through the unknown fields, as the constant
+    // and packed-struct variants of CompressiveEncoding are. Its buffers and decoding are in
+    // nanolance/sparse.hpp.
+    std::span<const std::byte> sparse_bytes;
+    bool has_sparse = false;
+    if (!find_sparse_payload(*layout.unknown, sparse_bytes, has_sparse, error)) {
+        return false;
+    }
+    if (has_sparse) {
+        out.kind = LayoutKind::kSparse;
+        return parse_sparse_layout(sparse_bytes, out.sparse, error);
+    }
+    // Field 4 (BlobLayout) and whatever Lance adds later are parsed but not modeled: record the field
+    // so a caller refuses by name rather than misreading the page's buffers.
     out.kind = LayoutKind::kNone;
     out.unknown_layout_field = first_unknown_variant(*layout.unknown);
     return true;
@@ -593,6 +1047,36 @@ void describe_layers(const std::vector<std::uint8_t>& layers, std::string& out) 
 
 }  // namespace
 
+std::unique_ptr<Compressive> clone(const Compressive& node) {
+    auto out = std::make_unique<Compressive>();
+    out->kind = node.kind;
+    out->wire_field = node.wire_field;
+    out->bits_per_value = node.bits_per_value;
+    out->scheme = node.scheme;
+    out->wire_scheme = node.wire_scheme;
+    out->symbol_table = node.symbol_table;
+    out->items_per_value = node.items_per_value;
+    out->has_validity = node.has_validity;
+    out->has_constant_value = node.has_constant_value;
+    out->constant_value = node.constant_value;
+    if (node.values != nullptr) {
+        out->values = clone(*node.values);
+    }
+    if (node.lengths != nullptr) {
+        out->lengths = clone(*node.lengths);
+    }
+    for (const auto& field : node.packed_fields) {
+        PackedField copy;
+        if (field.value != nullptr) {
+            copy.value = clone(*field.value);
+        }
+        copy.bits_per_value = field.bits_per_value;
+        copy.bits_per_length = field.bits_per_length;
+        out->packed_fields.push_back(std::move(copy));
+    }
+    return out;
+}
+
 std::string describe_encoding(const Compressive& node) {
     std::string out;
     describe_compressive(&node, out);
@@ -674,6 +1158,26 @@ std::string describe(const PageLayout& layout) {
             }
             out += "}";
             return out;
+        case LayoutKind::kSparse: {
+            const auto& sp = layout.sparse;
+            out = "Sparse{values=";
+            describe_compressive(sp.value_compression.get(), out);
+            for (const auto& layer : sp.layers) {
+                switch (layer.kind) {
+                    case SparseLayer::Kind::kValidity:
+                        out += ",validity";
+                        break;
+                    case SparseLayer::Kind::kList:
+                        out += ",list";
+                        break;
+                    case SparseLayer::Kind::kFixedSizeList:
+                        out += ",fixed_size_list(" + std::to_string(layer.dimension) + ")";
+                        break;
+                }
+            }
+            out += ",visible=" + std::to_string(sp.num_visible_items) + "}";
+            return out;
+        }
         case LayoutKind::kNone:
         default:
             return layout.unknown_layout_field != 0U

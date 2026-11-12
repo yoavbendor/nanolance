@@ -13,6 +13,7 @@
 
 #include <nanoarrow/nanoarrow.h>  // defines the Arrow C structs lance.h would otherwise declare
 
+#include "base/utf8_path.hpp"
 #include "lance/lance.h"
 
 #include "nanolance/arrow_slice.hpp"
@@ -62,8 +63,13 @@
 #include <set>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <vector>
+
+#ifdef _WIN32
+#include <process.h>  // _getpid
+#else
+#include <unistd.h>  // getpid
+#endif
 
 struct LanceSession {
     uint64_t index_cache_size_bytes = 0;
@@ -269,9 +275,18 @@ R guarded(R on_error, F&& f) {
 
 // ── URIs ────────────────────────────────────────────────────────────────────────────────────────
 
+// The process id, to name the memory:// directory. getpid is POSIX; the Windows CRT has _getpid.
+int process_id() {
+#ifdef _WIN32
+    return _getpid();
+#else
+    return getpid();
+#endif
+}
+
 std::filesystem::path memory_root() {
     static const std::filesystem::path root = [] {
-        auto dir = std::filesystem::temp_directory_path() / ("nanolance-lance-c-memory-" + std::to_string(getpid()));
+        auto dir = std::filesystem::temp_directory_path() / ("nanolance-lance-c-memory-" + std::to_string(process_id()));
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
         return dir;
@@ -288,7 +303,7 @@ bool resolve_uri(const char* uri, std::filesystem::path& out, bool allow_object_
     }
     std::string text(uri);
     if (text.rfind("file://", 0) == 0) {
-        out = text.substr(7);
+        out = nano_lance::utf8::from_utf8(text.substr(7));
         return true;
     }
     if (text.rfind("memory://", 0) == 0) {
@@ -296,11 +311,11 @@ bool resolve_uri(const char* uri, std::filesystem::path& out, bool allow_object_
         while (!rest.empty() && rest.front() == '/') {
             rest.erase(rest.begin());
         }
-        out = memory_root() / (rest.empty() ? std::string("_root") : rest);
+        out = memory_root() / nano_lance::utf8::from_utf8(rest.empty() ? std::string("_root") : rest);
         return true;
     }
     if (allow_object_store && text.rfind("s3://", 0) == 0) {
-        out = text;
+        out = nano_lance::utf8::from_utf8(text);
         return true;
     }
     if (text.find("://") != std::string::npos) {
@@ -309,7 +324,7 @@ bool resolve_uri(const char* uri, std::filesystem::path& out, bool allow_object_
                                                : "nanolance writes local datasets only, not " + text);
         return false;
     }
-    out = text;
+    out = nano_lance::utf8::from_utf8(text);
     return true;
 }
 
@@ -328,7 +343,7 @@ LanceDataset* open_dataset(const char* uri, const char* const* storage_opts, uin
     if (!resolve_uri(uri, path, true)) {
         return nullptr;
     }
-    if (path.native().rfind("s3://", 0) == 0) {
+    if (path.string().rfind("s3://", 0) == 0) {
         std::vector<std::pair<std::string, std::string>> pairs;
         for (auto* kv = storage_opts; kv != nullptr && kv[0] != nullptr; kv += 2) {
             if (kv[1] == nullptr) {
@@ -343,7 +358,7 @@ LanceDataset* open_dataset(const char* uri, const char* const* storage_opts, uin
             invalid(error);
             return nullptr;
         }
-        if (!nano_lance::io::set_object_store_options(path.native(), options, error)) {
+        if (!nano_lance::io::set_object_store_options(nano_lance::utf8::string_of(path), options, error)) {
             set_error(code_for(error), error);
             return nullptr;
         }
@@ -1309,7 +1324,7 @@ int32_t write_impl(const WriteRequest& req) {
     options.stage_fragments = true;
     options.max_pending_bytes = max_bytes;
     NanoLanceWriter writer{};
-    if (nano_lance_writer_open(&writer, path.string().c_str(), &options) != NANO_LANCE_OK) {
+    if (nano_lance_writer_open(&writer, nano_lance::utf8::string_of(path).c_str(), &options) != NANO_LANCE_OK) {
         fail(writer.last_error);
         nano_lance_writer_close(&writer);
         return -1;

@@ -11,3 +11,4 @@ lance_c  implements compat/lance-c/include/lance/lance.h; tested by nano_lance_l
 nano_lance_external_blob  implements calls declared in nano_lance_reader.h; tested directly by nano_lance_external_blob_size and nano_lance_external_blob; no header named nano_lance_external_blob.h exists, so check_spec cannot match it
 nano_lance_table_reader_c  implements the nano_lance_table_* calls of nano_lance_reader.h; tested directly by nano_lance_table_reader_c, and by nano_lance_table_stream and the Python module; no header named nano_lance_table_reader_c.h exists, so check_spec cannot match it
 writer_cxx  implements writer.hpp; tested directly by nano_lance_writer_cxx, and by nano_lance_writer_api; no header named writer_cxx.hpp exists, so check_spec cannot match it
+sparse  no header of its own (src/encoding/layout/sparse.cpp; declared in nanolance/sparse_layout.hpp); tested by nano_lance_sparse_layout

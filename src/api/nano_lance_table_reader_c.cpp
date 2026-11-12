@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/parallel.hpp"
 #include "nanolance/work_stats.hpp"
@@ -115,9 +116,9 @@ int read_dataset_impl_unguarded(const char* dataset_path, bool trusted_input, co
     std::vector<ArrowArray> batches;
     std::string error;
     const bool ok = take != nullptr
-                        ? nano_lance::lance_table_take(std::filesystem::path(dataset_path), columns, *take, *out_schema,
+                        ? nano_lance::lance_table_take(nano_lance::utf8::from_utf8(dataset_path), columns, *take, *out_schema,
                                                        batches, error, trusted_input)
-                        : nano_lance::lance_table_read_dataset_range(std::filesystem::path(dataset_path), columns,
+                        : nano_lance::lance_table_read_dataset_range(nano_lance::utf8::from_utf8(dataset_path), columns,
                                                                      range, *out_schema, batches, error,
                                                                      trusted_input);
     if (!ok) {
@@ -344,7 +345,7 @@ int open_stream_impl(const char* dataset_path, const char* const* column_names, 
     auto self = std::make_unique<StreamPrivate>();
     std::string error;
     const int rc = guarded(error_message, error_message_capacity, [&] {
-        if (!nano_lance::LanceTableStream::open_range(std::filesystem::path(dataset_path),
+        if (!nano_lance::LanceTableStream::open_range(nano_lance::utf8::from_utf8(dataset_path),
                                                       columns.empty() ? nullptr : &columns, range,
                                                       self->schema, self->stream, error,
                                                       trusted_input != 0)) {
@@ -413,7 +414,7 @@ extern "C" int nano_lance_table_read_schema(const char* dataset_path, struct Arr
     }
     return guarded(error_message, error_message_capacity, [&] {
         std::string error;
-        if (!nano_lance::lance_table_read_schema(std::filesystem::path(dataset_path), *out_schema, error)) {
+        if (!nano_lance::lance_table_read_schema(nano_lance::utf8::from_utf8(dataset_path), *out_schema, error)) {
             // The C++ side leaves out_schema released on failure; zero it so the caller cannot be
             // tempted to release it a second time. Double-releasing a schema is what used to segfault
             // every failed read through this shim.
@@ -438,7 +439,7 @@ extern "C" int nano_lance_table_count_rows(const char* dataset_path, uint64_t* o
     }
     return guarded(error_message, error_message_capacity, [&] {
         std::string error;
-        if (!nano_lance::lance_table_count_rows(std::filesystem::path(dataset_path), *out_rows, error)) {
+        if (!nano_lance::lance_table_count_rows(nano_lance::utf8::from_utf8(dataset_path), *out_rows, error)) {
             set_error(error_message, error_message_capacity, error);
             return map_status(error);
         }
@@ -485,6 +486,9 @@ void nano_lance_work_stats(NanoLanceWorkStats* out) {
     out->take_cache_hits = get(c.take_cache_hits);
     out->indexed_fragments = get(c.indexed_fragments);
     out->index_evaluations = get(c.index_evaluations);
+    out->dict_rows_expanded = get(c.dict_rows_expanded);
+    out->index_page_cache_hits = get(c.index_page_cache_hits);
+    out->index_page_cache_misses = get(c.index_page_cache_misses);
 }
 
 void nano_lance_reset_work_stats(void) { nano_lance::work_stats::reset(); }

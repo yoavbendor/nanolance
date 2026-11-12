@@ -9,13 +9,16 @@
 // that does not exist or is a file, a dictionary whose metadata.json is not Lindera's, and a config read
 // through LINDERA_CONFIG_PATH.
 
+#include "../posix_env.hpp"
 #include "nanolance/fts_lindera.hpp"
 
 #include "index_test_util.hpp"
 
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <string>
 
 using index_test::require;
@@ -41,7 +44,8 @@ std::filesystem::path model(const std::filesystem::path& root, const std::string
 
 }  // namespace
 
-int main() {
+int main() try {
+    std::cout << "running nano_lance_fts_lindera\n" << std::flush;
     ::unsetenv("LINDERA_CONFIG_PATH");
     const auto root = index_test::scratch("nano_lance_fts_lindera_test");
     std::filesystem::create_directories(root);
@@ -64,11 +68,13 @@ int main() {
             "a config that is not a mapping: " + error);
     require(refused(model(root, "nodict", "segmenter:\n  mode: normal\n"), "dictionary field is missing", error),
             "no dictionary field: " + error);
-    require(refused(model(root, "nopath", "segmenter:\n  dictionary: \"" + (root / "nowhere").string() + "\"\n"),
+    // The paths go into double-quoted YAML scalars, where a backslash starts an escape: "/" separators (which
+    // Windows' std::filesystem accepts) keep "C:\Users" from reading as one.
+    require(refused(model(root, "nopath", "segmenter:\n  dictionary: \"" + (root / "nowhere").generic_string() + "\"\n"),
                     "Dictionary path does not exist", error),
             "a dictionary path that does not exist: " + error);
     write(root / "afile", "x");
-    require(refused(model(root, "file", "segmenter:\n  dictionary: \"" + (root / "afile").string() + "\"\n"),
+    require(refused(model(root, "file", "segmenter:\n  dictionary: \"" + (root / "afile").generic_string() + "\"\n"),
                     "is not a directory", error),
             "a dictionary path that is a file: " + error);
 
@@ -81,7 +87,7 @@ int main() {
                               "dict.words"}) {
             write(dict / f, "");
         }
-        require(refused(model(root, "meta", "segmenter:\n  dictionary: \"" + dict.string() + "\"\n"),
+        require(refused(model(root, "meta", "segmenter:\n  dictionary: \"" + dict.generic_string() + "\"\n"),
                         "Failed to deserialize metadata", error),
                 "a malformed metadata.json: " + error);
     }
@@ -99,4 +105,7 @@ int main() {
     std::filesystem::remove_all(root);
     std::cout << "fts_lindera: ok (config and dictionary refusals)\n";
     return 0;
+} catch (const std::exception& e) {
+    std::cerr << "FAIL: uncaught exception: " << e.what() << '\n';
+    return 1;
 }

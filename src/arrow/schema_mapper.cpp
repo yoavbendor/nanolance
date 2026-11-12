@@ -372,6 +372,27 @@ ParsedFormat parse_fixed_size_list(const ArrowSchema& field) {
         out.rejection = "a fixed_size_list needs one child and a non-zero size";
         return out;
     }
+    // fixed_size_list<fixed_size_list<T, a>, b> (W1a): the element is itself a fixed-width list of a plain
+    // fixed-width T. Its logical type nests as pylance's does: "fixed_size_list:fixed_size_list:T:a:b".
+    if (starts_with(field.children[0]->format, "+w:")) {
+        if (field.children[0]->n_children != 1 || field.children[0]->children == nullptr ||
+            field.children[0]->children[0] == nullptr) {
+            out.rejection = "a fixed_size_list needs one child and a non-zero size";
+            return out;
+        }
+        const ParsedFormat inner = parse_fixed_size_list(*field.children[0]);
+        const char* leaf_format = field.children[0]->children[0]->format;
+        const bool leaf_bool = leaf_format != nullptr && std::strcmp(leaf_format, "b") == 0;
+        if (!inner.supported || leaf_bool || inner.logical_type.rfind("fixed_size_list:struct:", 0) == 0 ||
+            inner.logical_type.rfind("fixed_size_list:bool:", 0) == 0) {
+            out.rejection = std::string("fixed_size_list of '") + field.children[0]->format +
+                            "' is not supported; a fixed_size_list inside one must hold fixed-width numbers";
+            return out;
+        }
+        out.logical_type = "fixed_size_list:" + inner.logical_type + ":" + std::to_string(items);
+        out.supported = true;
+        return out;
+    }
     const auto element = parse_format(field.children[0]->format);
     // bool elements are written bit-packed, FixedSizeList{N x Flat(1)}, as pylance writes them.
     // A struct element (fixed_size_list<struct>, W1k4) is written as pylance writes it: the struct's leaves, rows x N
@@ -518,10 +539,12 @@ bool map_field(const ArrowSchema& field,
         const ArrowSchema& values = *field.dictionary;
         auto value_type = parse_format(values.format == nullptr ? "" : values.format);
         const std::string index_format = format;
-        // Under a struct or list (W1k2) only int32 indices over string or binary values are written: the
-        // shape pylance 12 writes (InlineBitpacking(32) indices, a General{LZ4} dictionary). Other
-        // nested dictionaries keep the refusal.
-        const bool nested_shape = parent_id >= 0 && index_format == "i" && value_type.supported &&
+        // Under a struct or list (W1k2) any integer index over string or binary values is read, as at the top
+        // level. Writing is narrower: only int32 indices (the shape pylance 12 writes: InlineBitpacking(32)
+        // indices, a General{LZ4} dictionary), refused by name in the file writer. Other nested dictionaries
+        // keep the refusal.
+        const bool nested_shape = parent_id >= 0 && !lance_integer_name_of_format(index_format).empty() &&
+                                  value_type.supported &&
                                   (value_type.logical_type == "utf8" || value_type.logical_type == "large_utf8" ||
                                    value_type.logical_type == "binary" || value_type.logical_type == "large_binary") &&
                                   values.dictionary == nullptr;
@@ -584,19 +607,6 @@ bool map_field(const ArrowSchema& field,
     }
     if (is_struct && !map_struct_children(field, out.id, next_id, next_column, mapping, error)) {
         return false;
-    }
-    if (fsl_struct) {
-        // Lance 12 cannot read a list under a fixed_size_list ("Not yet supported FSL<...List<...>>"), so it is
-        // refused rather than written.
-        const auto first_child = std::find_if(mapping.fields.begin(), mapping.fields.end(),
-                                              [&](const LanceField& f) { return f.id == out.id; });
-        for (auto it = first_child; it != mapping.fields.end(); ++it) {
-            if (it->id != out.id && lance_logical_type_is_list(it->logical_type)) {
-                error = "column '" + out.name + "': a list or map under a fixed_size_list (field '" + it->name +
-                        "') cannot be read by Lance 12 and is not written";
-                return false;
-            }
-        }
     }
     return true;
 }
@@ -722,6 +732,40 @@ bool check_primary_keys(const LanceSchemaMapping& mapping, std::string& error) {
 }
 
 }  // namespace
+
+bool refuse_unwritten_nested_dictionaries(const LanceSchemaMapping& mapping, std::string& error) {
+    for (const auto& field : mapping.fields) {
+        if (field.parent_id >= 0 && !field.dictionary_index_format.empty() && field.dictionary_index_format != "i") {
+            error = "dictionary column '" + field.name + "' inside a struct or list is read, but writing it is not supported "
+                    "unless its indices are int32 (it is written only with int32 indices); cast its indices to int32 first";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool refuse_unwritten_lists_under_fixed_size_list(const LanceSchemaMapping& mapping, std::string& error) {
+    for (const auto& field : mapping.fields) {
+        if (!lance_logical_type_is_list(field.logical_type)) {
+            continue;
+        }
+        for (auto parent = field.parent_id; parent >= 0;) {
+            const auto up = std::find_if(mapping.fields.begin(), mapping.fields.end(),
+                                         [&](const LanceField& f) { return f.id == parent; });
+            if (up == mapping.fields.end()) {
+                break;
+            }
+            std::string element;
+            std::uint64_t items = 0;
+            if (lance_fixed_size_list_parts(up->logical_type, element, items) && element == "struct") {
+                error = "column '" + field.name + "': a list or map under a fixed_size_list is read but not written yet";
+                return false;
+            }
+            parent = up->parent_id;
+        }
+    }
+    return true;
+}
 
 bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, std::string& error,
                       bool /*ignore_nullability*/) {

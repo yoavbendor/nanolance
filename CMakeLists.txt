@@ -116,6 +116,12 @@ else()
     set(NANOLANCE_WARNING_FLAGS)
 endif()
 
+# MSVC reads a source file in the system code page unless told it is UTF-8. The sources hold UTF-8 literals
+# (the FTS tokenizer test's "Café" line, for one), which would otherwise compile to other bytes.
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 include(FetchContent)
 # NANOLANCE_GIT_BASE and NANOLANCE_GIT_URL_*: where the dependencies below are cloned from (GitHub, or a mirror).
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/NanolanceDeps.cmake")
@@ -242,7 +248,7 @@ set(NANO_LANCE_BLOB_V2_GOLDEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/golden/blob_v2")
 # them (C++23), so nanolance's public headers stay C++20.
 FetchContent_Declare(nanom
     GIT_REPOSITORY ${NANOLANCE_GIT_URL_NANOM}
-    GIT_TAG 0c6cbabe94e669cad2ca17e4c94a731ed9517907
+    GIT_TAG 7f9a76a1a52feb597d68a13950571fabc6441aab
     GIT_SHALLOW FALSE)
 FetchContent_GetProperties(nanom)
 if(NOT nanom_POPULATED)
@@ -250,6 +256,8 @@ if(NOT nanom_POPULATED)
 endif()
 add_library(nanolance_nanom INTERFACE)
 target_include_directories(nanolance_nanom SYSTEM INTERFACE "${nanom_SOURCE_DIR}/include")
+# MSVC's default preprocessor passes __VA_ARGS__ on as one argument, which NANOM_DESCRIBE needs split.
+target_compile_options(nanolance_nanom INTERFACE $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>)
 
 add_library(nanolance_proto STATIC generated/lance_minimal.pb.cpp src/base/roaring_bitmap.cpp src/encoding/page_layout.cpp)
 target_compile_features(nanolance_proto PUBLIC cxx_std_20 PRIVATE cxx_std_23)
@@ -385,10 +393,12 @@ add_library(nanolance STATIC
     src/encoding/values/general.cpp
     src/encoding/values/byte_stream_split.cpp
     src/encoding/values/rle.cpp
+    src/encoding/values/child_block.cpp
     src/encoding/values/dictionary.cpp
     src/encoding/values/scalar_value.cpp
     src/encoding/layout/miniblock.cpp
     src/encoding/layout/full_zip.cpp
+    src/encoding/layout/sparse.cpp
     src/dataset/write_session.cpp
     src/dataset/dataset_scan.cpp
     src/api/nano_lance_writer.cpp
@@ -773,6 +783,18 @@ add_executable(nano_lance_schema_change_error_test tests/api/test_schema_change_
 target_compile_features(nano_lance_schema_change_error_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_schema_change_error_test PRIVATE nanolance)
 
+add_executable(nano_lance_fsl_of_fsl_write_refused_test tests/api/test_fsl_of_fsl_write_refused.cpp)
+target_compile_features(nano_lance_fsl_of_fsl_write_refused_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_fsl_of_fsl_write_refused_test PRIVATE nanolance)
+
+add_executable(nano_lance_fsl_struct_list_write_refused_test tests/api/test_fsl_struct_list_write_refused.cpp)
+target_compile_features(nano_lance_fsl_struct_list_write_refused_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_fsl_struct_list_write_refused_test PRIVATE nanolance)
+
+add_executable(nano_lance_nested_dictionary_write_refused_test tests/api/test_nested_dictionary_write_refused.cpp)
+target_compile_features(nano_lance_nested_dictionary_write_refused_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_nested_dictionary_write_refused_test PRIVATE nanolance)
+
 add_executable(nano_lance_read_safety_test tests/base/test_read_safety.cpp)
 target_compile_features(nano_lance_read_safety_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_read_safety_test PRIVATE nanolance)
@@ -1056,6 +1078,16 @@ target_link_libraries(nano_lance_lance_file_writer_test PRIVATE nanolance)
 add_test(NAME nano_lance_lance_file_writer COMMAND $<TARGET_FILE:nano_lance_lance_file_writer_test>)
 set_tests_properties(nano_lance_lance_file_writer PROPERTIES LABELS "smoke")
 
+# Lance 2.1 / 2.2 packed structs read from pylance's files (tests/generate_golden_packed_struct.py writes them).
+add_executable(nano_lance_packed_struct_read_test tests/file/test_packed_struct_read.cpp)
+target_compile_features(nano_lance_packed_struct_read_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_packed_struct_read_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_compile_definitions(nano_lance_packed_struct_read_test PRIVATE
+    NANO_LANCE_PACKED_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/packed_struct")
+target_link_libraries(nano_lance_packed_struct_read_test PRIVATE nanolance)
+add_test(NAME nano_lance_packed_struct_read COMMAND $<TARGET_FILE:nano_lance_packed_struct_read_test>)
+set_tests_properties(nano_lance_packed_struct_read PROPERTIES LABELS "smoke")
+
 # Live S3 integration test (only with the nanos3reader provider): range GETs against a real S3-compatible
 # endpoint; skips unless NANOLANCE_S3_TEST_URI (+ AWS_* env) is set. tests/s3_minio_integration.sh wires
 # this up against a throwaway MinIO. The SigV4 signer vectors now live in the nanos3reader repo's own tests.
@@ -1141,6 +1173,18 @@ set_tests_properties(nano_lance_structural_default PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_schema_change_error COMMAND $<TARGET_FILE:nano_lance_schema_change_error_test>)
 set_tests_properties(nano_lance_schema_change_error PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_fsl_of_fsl_write_refused COMMAND $<TARGET_FILE:nano_lance_fsl_of_fsl_write_refused_test>)
+set_tests_properties(nano_lance_fsl_of_fsl_write_refused PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_fsl_struct_list_write_refused COMMAND $<TARGET_FILE:nano_lance_fsl_struct_list_write_refused_test>)
+set_tests_properties(nano_lance_fsl_struct_list_write_refused PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_nested_dictionary_write_refused COMMAND $<TARGET_FILE:nano_lance_nested_dictionary_write_refused_test>)
+set_tests_properties(nano_lance_nested_dictionary_write_refused PROPERTIES LABELS "smoke")
+
+add_executable(nano_lance_packed_struct_write_refused_test tests/api/test_packed_struct_write_refused.cpp)
+target_compile_features(nano_lance_packed_struct_write_refused_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_packed_struct_write_refused_test PRIVATE nanolance)
+add_test(NAME nano_lance_packed_struct_write_refused COMMAND $<TARGET_FILE:nano_lance_packed_struct_write_refused_test>)
+set_tests_properties(nano_lance_packed_struct_write_refused PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_read_safety COMMAND $<TARGET_FILE:nano_lance_read_safety_test>)
 set_tests_properties(nano_lance_read_safety PROPERTIES LABELS "smoke")
@@ -1412,6 +1456,28 @@ if(NANOLANCE_BUILD_TOOLS)
         )
         set_tests_properties(pcapng2lance_stitch_schema_mismatch PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
     endif()
+endif()
+
+# The smoke tests above that run a bash script (add_test COMMAND bash ...) cannot run on Windows: the
+# runner has no bash on the test path, and the scripts call POSIX tools. They stay registered on every
+# platform, so the Linux and macOS test lists do not change. On WIN32 they are marked DISABLED, which ctest
+# lists as "Disabled" rather than running or failing them.
+if(WIN32)
+    set(_nl_bash_smoke_tests
+        app_nanolance_cli
+        app_pagelayout_pylance_interop_smoke
+        app_arrowipc2lance_blob_v2_smoke
+        app_arrowipc2lance_nonnull_smoke
+        app_arrowipc2lance_ignore_nullability_smoke
+        app_arrowipc2lance_inspect_smoke
+        app_arrowipc2lance_append_smoke
+        app_dict_pylance_interop_smoke
+        app_bss_zstd_pylance_interop_smoke
+        app_bool_pylance_interop_smoke
+        app_deletion_append_pylance_smoke)
+    set_tests_properties(${_nl_bash_smoke_tests} PROPERTIES
+        DISABLED TRUE)
+    message(STATUS "nanolance: bash smoke tests disabled on Windows (no bash on the test path): ${_nl_bash_smoke_tests}")
 endif()
 
 # Each layer's later tests (tests/<layer>/tests.cmake), in this directory's scope so they are labelled below.

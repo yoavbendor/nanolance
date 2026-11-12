@@ -57,6 +57,11 @@ enum class CompressiveKind {
     /// f13 VariablePackedStruct{ repeated FieldEncoding fields = 1 }: a struct's fields packed side by side per
     /// row (how Lance stores a blob v2 descriptor), each with its own encoding. See Compressive::packed_fields.
     kVariablePackedStruct = 13,
+    /// f12 PackedStruct{ repeated uint64 bits_per_value = 1, CompressiveEncoding values = 2 }: a struct's
+    /// fixed-width children, interleaved row by row (Lance 2.1). Only ever seen as a page's top-level value
+    /// encoding: the layout unwraps it (see MiniBlock::packed_bits) and keeps the inner Flat as the value
+    /// encoding, so the page decodes as one fixed-width value a row.
+    kPackedStruct = 12,
 };
 
 /// Buffer-compression schemes inside `General`, numbered as Lance's `CompressionScheme` enum does.
@@ -122,6 +127,10 @@ struct Compressive {
 /// dictionary-encoded pages, with `num_dictionary_items` entries.
 struct MiniBlock {
     std::unique_ptr<Compressive> value_compression;
+    /// A packed struct's children, in struct order: each one's width in bits, as PackedStruct gives them. Empty
+    /// unless the value encoding was PackedStruct, which the layout unwraps into its Flat (whose width is their
+    /// sum), so every decoder reads the page as one fixed-width value a row.
+    std::vector<std::uint64_t> packed_bits;
     std::unique_ptr<Compressive> dictionary;
     /// f2: how the repetition/definition layer is stored, when there is one. A simple nullable
     /// column uses `CompressiveEncoding` field 4 (bit-width wrapper) around `Flat(1)`; a column whose
@@ -196,16 +205,72 @@ struct FullZip {
     std::uint64_t num_items = 0;
     std::uint64_t num_visible_items = 0;
     std::unique_ptr<Compressive> value_compression;
+    /// See MiniBlock::packed_bits.
+    std::vector<std::uint64_t> packed_bits;
     std::vector<std::uint8_t> layers;
 };
 
-enum class LayoutKind { kNone, kMiniBlock, kConstant, kFullZip };
+/// One position set of a sparse layout (SparsePositionSet): which slots of a domain are set. `kAll` and
+/// `kRange` carry no bytes; `kExplicit` stores the set's delta-coded u64 positions in a buffer.
+struct SparsePositions {
+    enum class Kind { kEmpty, kAll, kRange, kExplicit };
+    Kind kind = Kind::kEmpty;
+    std::uint64_t start = 0;            ///< kRange
+    std::uint64_t length = 0;           ///< kRange
+    std::uint64_t num_positions = 0;    ///< the set's cardinality, as declared
+    std::unique_ptr<Compressive> encoding;  ///< kExplicit: how the u64 deltas are stored
+};
+
+/// SparseCountSet: the child count of each non-empty list slot.
+struct SparseCounts {
+    enum class Kind { kEmpty, kConstant, kExplicit };
+    Kind kind = Kind::kEmpty;
+    std::uint64_t value = 0;                ///< kConstant: the one count every non-empty slot has
+    std::unique_ptr<Compressive> encoding;  ///< kExplicit: how the u64 counts are stored
+};
+
+/// SparseValiditySet: `null_positions` says whether `positions` lists the null slots (else the valid ones).
+struct SparseValidity {
+    bool null_positions = true;
+    SparsePositions positions;
+};
+
+/// One SparseStructuralLayer: a nullable item or struct (`kValidity`), a list (`kList`) or a
+/// fixed-size list (`kFixedSizeList`). Outermost first in SparseLayout::layers.
+struct SparseLayer {
+    enum class Kind { kValidity, kList, kFixedSizeList };
+    Kind kind = Kind::kValidity;
+    std::uint64_t num_slots = 0;        ///< the parent domain's size
+    std::uint64_t num_child_slots = 0;  ///< kList: the child domain's size
+    std::uint64_t dimension = 0;        ///< kFixedSizeList: children per slot
+    SparsePositions non_empty;          ///< kList: the slots with children
+    SparseCounts counts;                ///< kList: those slots' child counts
+    SparseValidity validity;
+};
+
+/// PageLayout f5, SparseLayout (file version 2.3). The values are mini-block chunks, as in MiniBlock,
+/// with their own 8-byte chunk metadata; the structure is one layer per Arrow level that has a
+/// validity or list. See nanolance/sparse.hpp.
+struct SparseLayout {
+    std::unique_ptr<Compressive> value_compression;
+    /// The value_compression message's raw bytes, so a MiniBlock descriptor for the value chunks can be
+    /// rebuilt around them.
+    std::vector<std::uint8_t> value_compression_bytes;
+    std::uint64_t num_buffers = 0;
+    std::uint64_t num_items = 0;
+    std::uint64_t num_visible_items = 0;
+    bool has_large_chunk = false;
+    std::vector<SparseLayer> layers;
+};
+
+enum class LayoutKind { kNone, kMiniBlock, kConstant, kFullZip, kSparse };
 
 struct PageLayout {
     LayoutKind kind = LayoutKind::kNone;
     MiniBlock mini_block;
     Constant constant;
     FullZip full_zip;
+    SparseLayout sparse;
     /// Set when the descriptor named a layout this build does not model (Blob, Sparse, ...), so
     /// the caller can refuse by name rather than misinterpret the page's buffers.
     std::uint32_t unknown_layout_field = 0;
@@ -216,6 +281,9 @@ struct PageLayout {
 /// `out.kind` stays kNone so callers can fall back (older nanolance files predate the descriptor
 /// being read, and it costs nothing to keep reading them).
 bool decode_page_layout(const std::vector<std::uint8_t>& encoding, PageLayout& out, std::string& error);
+
+/// A deep copy of one encoding subtree, for a caller that keeps part of a descriptor past the layout's life.
+std::unique_ptr<Compressive> clone(const Compressive& node);
 
 /// Human-readable one-line summary, for error messages and the differential test's diagnostics.
 std::string describe(const PageLayout& layout);

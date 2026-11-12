@@ -10,11 +10,13 @@
 // daachorse 2.1 double array they embed, from their layouts in those crates' sources. Edges are added and
 // compared in Lindera's order, so ties between equal-cost paths fall the same way.
 
+#include "base/utf8_path.hpp"
 #include "nanolance/fts_lindera.hpp"
 
 #include "base/fts_json.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -86,7 +88,7 @@ std::string file_stamp(const std::filesystem::path& p) {
     std::error_code ec;
     const auto size = std::filesystem::file_size(p, ec);
     const auto time = std::filesystem::last_write_time(p, ec).time_since_epoch().count();
-    return p.string() + ":" + std::to_string(ec ? 0ULL : static_cast<unsigned long long>(size)) + ":" +
+    return utf8::string_of(p) + ":" + std::to_string(ec ? 0ULL : static_cast<unsigned long long>(size)) + ":" +
            std::to_string(static_cast<long long>(time));
 }
 
@@ -1401,6 +1403,14 @@ bool resolve_uri(const std::string& uri, std::filesystem::path& out, bool user, 
             decoded.push_back(path[i]);
         }
     }
+#ifdef _WIN32
+    // file:///C:/models/x: the path after the authority is "/C:/models/x", and the leading slash is not part
+    // of a drive path (it would make a root-relative path, not a drive one).
+    if (decoded.size() >= 3 && decoded[0] == '/' && std::isalpha(static_cast<unsigned char>(decoded[1])) != 0 &&
+        decoded[2] == ':') {
+        decoded.erase(0, 1);
+    }
+#endif
     out = decoded;
     return true;
 }

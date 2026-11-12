@@ -20,6 +20,8 @@ target_compile_features(pcapng2lance_nanom_convert PRIVATE cxx_std_23)
 target_include_directories(pcapng2lance_nanom_convert PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include" "${PCAPNG2LANCE_NANOM_DIR}/examples/nanotins_parity")
 target_link_libraries(pcapng2lance_nanom_convert PRIVATE nanom::nanom nanolance)
+# nanom's NANOM_DESCRIBE needs the conforming preprocessor on MSVC (see nanolance_nanom in the top-level CMakeLists).
+target_compile_options(pcapng2lance_nanom_convert PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>)
 
 add_executable(pcapng2lance src/pcapng2lance.cpp)
 target_include_directories(pcapng2lance PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -35,6 +37,7 @@ foreach(_nm_dpar_tool dpar2lance lldp2lance)
     target_include_directories(${_nm_dpar_tool} PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/include" "${PCAPNG2LANCE_NANOM_DIR}/examples/nanotins_parity")
     target_link_libraries(${_nm_dpar_tool} PRIVATE nanom::nanom nanolance)
+    target_compile_options(${_nm_dpar_tool} PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>)
 endforeach()
 
 if(NANOLANCE_BUILD_TESTS)

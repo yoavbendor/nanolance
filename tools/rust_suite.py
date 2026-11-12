@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import fcntl
 import io
 import json
 import os
@@ -151,12 +152,22 @@ def run(crate: str, src: Path, shim_dir: Path, log: Path, name_filter: str | Non
         threads: int | None) -> dict[str, str]:
     """cargo test; the Rust result of each test that ran ("ok", "FAILED", "ignored")."""
     env = dict(os.environ)
-    env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") + f" -L native={shim_dir}").strip()
+    # The test binary links against a copy of the shim at a path fixed by the cache, so RUSTFLAGS -- and
+    # with them every compiled crate -- stay the same whichever checkout builds the shim. Which shim
+    # runs is LD_LIBRARY_PATH's: this checkout's. Two worktrees can share one --cache that way.
+    link_dir = src.parent / "shim-link"
+    link_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(shim_dir / "libnanolance_rust_shim.so", link_dir / "libnanolance_rust_shim.so")
+    env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") + f" -L native={link_dir}").strip()
     env["LD_LIBRARY_PATH"] = f"{shim_dir}:{env.get('LD_LIBRARY_PATH', '')}"
     env["NANOLANCE_RUST_LOG"] = str(log)
     env["NANOLANCE_RUST_CRATE"] = crate
     # Outside the crate directory, which fetch() recreates: a rerun rebuilds only the patched crate.
     env.setdefault("CARGO_TARGET_DIR", str(src.parent / "target"))
+    # No debug info and no incremental state: the crates' test build is about half the size on disk.
+    # Every run must agree on these, or cargo rebuilds everything.
+    for key, value in (("CARGO_PROFILE_DEV_DEBUG", "0"), ("CARGO_PROFILE_TEST_DEBUG", "0"), ("CARGO_INCREMENTAL", "0")):
+        env.setdefault(key, value)
     tmp = Path(tempfile.mkdtemp(prefix="nanolance-rust-"))
     env["NANOLANCE_RUST_TMP"] = str(tmp)
     cmd = ["cargo", "test", "--lib", "--"]
@@ -235,10 +246,14 @@ def main() -> int:
     log = args.log.resolve() if args.log else Path(tempfile.mkstemp(suffix=".jsonl")[1])
     log.write_text("")
     results: dict[str, str] = {}
-    for crate in args.crates:
-        src = fetch(crate, args.cache)
-        patch(crate, src)
-        results.update(run(crate, src, shim_dir, log, args.filter, args.threads))
+    # fetch() recreates the crates' sources, so runs that share a --cache take turns.
+    args.cache.mkdir(parents=True, exist_ok=True)
+    with open(args.cache / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        for crate in args.crates:
+            src = fetch(crate, args.cache)
+            patch(crate, src)
+            results.update(run(crate, src, shim_dir, log, args.filter, args.threads))
     summary, per_test, mismatches = summarize(results, log)
     if not args.log:
         log.unlink()

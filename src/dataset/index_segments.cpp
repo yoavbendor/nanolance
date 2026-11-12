@@ -4,6 +4,7 @@
 // Committing index segments built apart (lance/src/index.rs, commit_existing_index_segments), and
 // listing a logical index's segments.
 
+#include "base/utf8_path.hpp"
 #include "nanolance/index_segments.hpp"
 #include "nanolance/byte_sink.hpp"
 #include "nanolance/byte_source.hpp"
@@ -95,7 +96,7 @@ bool list_remote_files(const std::string& dir, const std::string& prefix, bool i
 /// Every file under `dir`, relative to it, with its size; Lance's committed segment files
 /// (staging/ left out for an INVERTED index).
 bool list_files(const std::filesystem::path& dir, bool inverted, std::vector<pb::IndexMetadata::File>& out) {
-    if (io::is_object_store_output(dir.string())) {
+    if (io::is_object_store_output(utf8::string_of(dir))) {
         std::string error;
         if (!list_remote_files(dir.string(), "", inverted, out, error) || out.empty()) {
             out.clear();  // an index prefix with no objects is no segment, as a missing directory is not
@@ -112,7 +113,7 @@ bool list_files(const std::filesystem::path& dir, bool inverted, std::vector<pb:
         if (!it->is_regular_file(ec)) {
             continue;
         }
-        const auto rel = std::filesystem::relative(it->path(), dir, ec).generic_string();
+        const auto rel = utf8::generic_of(std::filesystem::relative(it->path(), dir, ec));
         if (inverted && rel.rfind("staging/", 0) == 0) {
             continue;
         }
@@ -445,7 +446,7 @@ bool is_staged_part(const std::string& name) {
 
 bool dataset_write_staged_part(const std::filesystem::path& dataset_path, const std::string& uuid_text,
                                const std::string& name, const std::vector<std::uint8_t>& bytes, std::string& error) {
-    auto out = io::open_output((dataset_path / "_indices" / uuid_text / name).string(), error);
+    auto out = io::open_output(utf8::string_of(dataset_path / "_indices" / uuid_text / name), error);
     if (!out) {
         return false;
     }
@@ -457,7 +458,7 @@ bool dataset_read_staged_parts(const std::filesystem::path& dataset_path, const 
                                std::vector<std::pair<std::string, std::vector<std::uint8_t>>>& parts,
                                std::string& error) {
     parts.clear();
-    const auto dir = (dataset_path / "_indices" / uuid_text).string();
+    const auto dir = utf8::string_of(dataset_path / "_indices" / uuid_text);
     std::vector<io::DirEntry> entries;
     if (!io::list_dir(dir, entries, error)) {
         return false;
@@ -482,7 +483,7 @@ bool dataset_read_staged_parts(const std::filesystem::path& dataset_path, const 
 bool dataset_remove_staged_parts(const std::filesystem::path& dataset_path, const std::string& uuid_text,
                                  const std::vector<std::string>& names, std::string& error) {
     for (const auto& name : names) {
-        if (!io::remove_output((dataset_path / "_indices" / uuid_text / name).string(), error)) {
+        if (!io::remove_output(utf8::string_of(dataset_path / "_indices" / uuid_text / name), error)) {
             return false;
         }
     }
@@ -983,7 +984,7 @@ bool infer_index_segment_details(const std::filesystem::path& dataset_path, cons
                                  const std::array<std::uint8_t, 16>& uuid, std::string& type_url,
                                  std::vector<std::uint8_t>& value, std::string& error) {
     const auto dir = dataset_path / "_indices" / pb::uuid_string(uuid);
-    const auto has = [&](const char* name) { return io::exists((dir / name).string()); };
+    const auto has = [&](const char* name) { return io::exists(utf8::string_of(dir / name)); };
     value.clear();
     if (has("bitmap_page_lookup.lance")) {
         pb::Manifest manifest;

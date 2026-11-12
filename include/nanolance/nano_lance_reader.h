@@ -126,6 +126,9 @@ typedef struct NanoLanceWorkStats {
     uint64_t take_cache_hits;
     uint64_t indexed_fragments; /* fragments a scalar index narrowed a filter to */
     uint64_t index_evaluations; /* predicate evaluations over index values (one bind each) */
+    uint64_t dict_rows_expanded; /* rows a dictionary page copied its values out for */
+    uint64_t index_page_cache_hits; /* BTREE index windows served from the decoded-window cache */
+    uint64_t index_page_cache_misses; /* BTREE index windows read from the index file */
 } NanoLanceWorkStats;
 
 void nano_lance_work_stats(NanoLanceWorkStats* out);

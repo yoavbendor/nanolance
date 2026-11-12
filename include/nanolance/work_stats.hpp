@@ -31,6 +31,9 @@ struct Counters {
     std::atomic<std::uint64_t> take_cache_hits{0};      // take() columns served from a decoded copy
     std::atomic<std::uint64_t> indexed_fragments{0};    // fragments a scalar index narrowed a filter to
     std::atomic<std::uint64_t> index_evaluations{0};    // predicate evaluations over index values (one bind each)
+    std::atomic<std::uint64_t> dict_rows_expanded{0};   // rows a dictionary page copied its values out for
+    std::atomic<std::uint64_t> index_page_cache_hits{0};    // BTREE windows served from the decoded-window cache
+    std::atomic<std::uint64_t> index_page_cache_misses{0};  // BTREE windows read from the index file
 };
 
 inline Counters& counters() {
@@ -52,7 +55,8 @@ inline void reset() {
     auto& c = counters();
     for (auto* x : {&c.data_bytes_read, &c.data_reads, &c.largest_read, &c.page_windows, &c.read_morsels,
                     &c.fragment_reads, &c.parallel_column_writes, &c.write_buffered_bytes, &c.buffer_pool_hits,
-                    &c.buffer_pool_misses, &c.take_cache_hits, &c.indexed_fragments, &c.index_evaluations}) {
+                    &c.buffer_pool_misses, &c.take_cache_hits, &c.indexed_fragments, &c.index_evaluations,
+                    &c.dict_rows_expanded, &c.index_page_cache_hits, &c.index_page_cache_misses}) {
         x->store(0, std::memory_order_relaxed);
     }
 }

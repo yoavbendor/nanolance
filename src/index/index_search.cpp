@@ -36,6 +36,7 @@
 #include "index/index_files.hpp"
 #include "table/index_location.hpp"
 
+#include "nanolance/arrow_slice.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/fts_tokenizer.hpp"
 #include "nanolance/frag_reuse.hpp"
@@ -53,11 +54,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <iterator>
+#include <list>
 #include <set>
 #include <system_error>
 #include <unordered_map>
@@ -524,10 +527,51 @@ bool prune_by_bounds(const expr::Predicate& p, const FileTable& bounds, const st
                 return false;
             }
             break;
-        case Test::In:
+        case Test::In: {
+            // Each constant is compared with each unit's bounds through a ValueComparer (one per bounds column
+            // and batch, built once): no predicate is bound per constant. The same rule value_range applies:
+            // max >= c and min <= c, where a NULL or NaN min says nothing below and a NaN max nothing above, and
+            // a unit whose max is NULL holds no value. A constant the comparison does not take (or a NULL
+            // constant, which matches nothing) is handled as value_range handles it.
+            std::vector<std::unique_ptr<expr::ValueComparer>> min_cmp;
+            std::vector<std::unique_ptr<expr::ValueComparer>> max_cmp;
+            const auto comparers = [&](std::size_t column, std::vector<std::unique_ptr<expr::ValueComparer>>& out) {
+                for (const auto& b : bounds.batches) {
+                    out.push_back(std::make_unique<expr::ValueComparer>(bounds.type(column), *b.children[column]));
+                    if (!out.back()->ok()) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            const bool compared = comparers(0, min_cmp) && comparers(1, max_cmp);
+            // ways of constant k over every unit, batch by batch; false when the comparison does not take k.
+            const auto ways_of = [&](std::vector<std::unique_ptr<expr::ValueComparer>>& cs, std::size_t k,
+                                     std::vector<std::int8_t>& ways) {
+                ways.clear();
+                std::vector<std::int8_t> part;
+                for (std::size_t bi = 0; bi < cs.size(); ++bi) {
+                    if (!cs[bi]->compare(p, k, 0, bounds.batches[bi].length, part)) {
+                        return false;
+                    }
+                    ways.insert(ways.end(), part.begin(), part.end());
+                }
+                return true;
+            };
+            std::vector<std::int8_t> min_ways;
+            std::vector<std::int8_t> max_ways;
             for (std::size_t k = 0; k < p.constants(); ++k) {
-                std::vector<std::uint8_t> one;
-                if (!value_range(k, ">=", k, "<=", one)) {
+                if (p.constant_is_null(k)) {
+                    continue;  // x = NULL is never TRUE: no unit holds it
+                }
+                std::vector<std::uint8_t> one(pages, 0);
+                if (compared && ways_of(min_cmp, k, min_ways) && ways_of(max_cmp, k, max_ways)) {
+                    for (std::size_t i = 0; i < pages; ++i) {
+                        const bool max_reaches = max_nan[i] != 0 || max_ways[i] >= 0;  // max >= c
+                        const bool min_reaches = min_null[i] != 0 || min_nan[i] != 0 || min_ways[i] <= 0;  // min <= c
+                        one[i] = static_cast<std::uint8_t>(max_reaches && min_reaches && max_null[i] == 0);
+                    }
+                } else if (!value_range(k, ">=", k, "<=", one)) {
                     return false;
                 }
                 for (std::size_t i = 0; i < pages; ++i) {
@@ -535,6 +579,7 @@ bool prune_by_bounds(const expr::Predicate& p, const FileTable& bounds, const st
                 }
             }
             break;
+        }
         default:
             handled = false;
             return true;
@@ -555,6 +600,203 @@ bool compare_bounds(const expr::Predicate& p, std::size_t k, const FileTable& bo
             return false;
         }
         ways.insert(ways.end(), part.begin(), part.end());
+    }
+    return true;
+}
+
+/// Decoded windows of a BTREE's page_data.lance, kept across searches: process-wide, bounded in bytes by
+/// NANOLANCE_INDEX_PAGE_CACHE_MB (default 64; 0 turns it off), least recently used windows first out. A key is
+/// the file's path, size and modification time and the window: an index file is never rewritten in place, and
+/// a file written anew has a new key. A window's bytes are estimated from its types (see decoded_bytes).
+class WindowCache {
+public:
+    std::shared_ptr<const FileTable> find(const std::string& key) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = entries_.find(key);
+        if (it == entries_.end()) {
+            return nullptr;
+        }
+        lru_.splice(lru_.begin(), lru_, it->second.at);
+        return it->second.table;
+    }
+
+    void put(const std::string& key, std::shared_ptr<const FileTable> table, std::uint64_t bytes) {
+        const auto budget = budget_bytes();
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (bytes > budget || entries_.find(key) != entries_.end()) {
+            return;
+        }
+        while (held_ + bytes > budget && !lru_.empty()) {
+            const auto victim = entries_.find(lru_.back());
+            held_ -= victim->second.bytes;
+            entries_.erase(victim);
+            lru_.pop_back();
+        }
+        lru_.push_front(key);
+        entries_.emplace(key, Entry{std::move(table), bytes, lru_.begin()});
+        held_ += bytes;
+    }
+
+private:
+    struct Entry {
+        std::shared_ptr<const FileTable> table;
+        std::uint64_t bytes = 0;
+        std::list<std::string>::iterator at;
+    };
+
+    static std::uint64_t budget_bytes() {
+        static const std::uint64_t budget = [] {
+            const char* env = std::getenv("NANOLANCE_INDEX_PAGE_CACHE_MB");
+            if (env == nullptr || *env == '\0') {
+                return std::uint64_t{64} << 20U;
+            }
+            return static_cast<std::uint64_t>(std::strtoull(env, nullptr, 10)) << 20U;
+        }();
+        return budget;
+    }
+
+    std::mutex mutex_;
+    std::list<std::string> lru_;  // most recently used first
+    std::unordered_map<std::string, Entry> entries_;
+    std::uint64_t held_ = 0;
+};
+
+WindowCache& index_page_cache() {
+    static WindowCache cache;
+    return cache;
+}
+
+std::string window_key(const std::string& file, std::uint64_t window) {
+    return file + "#" + std::to_string(window);
+}
+
+/// The decoded size of a window, for the cache's budget: each value's and row id's width (a string's bytes
+/// from its offsets). An estimate: validity bits and the schema are left out.
+std::uint64_t decoded_bytes(const FileTable& table) {
+    std::uint64_t bytes = 256;
+    for (const auto& b : table.batches) {
+        for (std::int64_t c = 0; c < b.n_children; ++c) {
+            const ArrowArray* a = b.children[c];
+            const std::string format = table.schema.children[c]->format == nullptr ? "" : table.schema.children[c]->format;
+            if (format == "u" || format == "z") {
+                const auto* o = static_cast<const std::int32_t*>(a->buffers[1]) + a->offset;
+                bytes += static_cast<std::uint64_t>(o[a->length] - o[0]) + 4U * static_cast<std::uint64_t>(a->length + 1);
+            } else if (format == "U" || format == "Z") {
+                const auto* o = static_cast<const std::int64_t*>(a->buffers[1]) + a->offset;
+                bytes += static_cast<std::uint64_t>(o[a->length] - o[0]) + 8U * static_cast<std::uint64_t>(a->length + 1);
+            } else {
+                const std::uint64_t width = (format == "c" || format == "C" || format == "b") ? 1U
+                                            : (format == "s" || format == "S" || format == "e") ? 2U
+                                            : (format == "i" || format == "I" || format == "f" || format == "tdD") ? 4U
+                                                                                                                   : 8U;
+                bytes += width * static_cast<std::uint64_t>(a->length);
+            }
+        }
+    }
+    return bytes;
+}
+
+/// Splits `run`, a read of `count` consecutive windows of `batch` rows (the last may be shorter), into one table per
+/// window. Each is a zero-copy view of the run's batches, which stay alive while any window does. `run` is emptied.
+bool split_windows(FileTable& run, std::uint64_t batch, std::size_t count,
+                   std::vector<std::shared_ptr<const FileTable>>& out, std::string& error) {
+    std::vector<std::shared_ptr<SharedBatch>> bases;
+    std::vector<std::int64_t> starts;  // first row of each batch of the run
+    std::int64_t total = 0;
+    for (auto& b : run.batches) {
+        starts.push_back(total);
+        total += b.length;
+        bases.push_back(std::make_shared<SharedBatch>(std::move(b)));
+    }
+    run.batches.clear();
+    const auto step = static_cast<std::int64_t>(batch);
+    for (std::size_t w = 0; w < count; ++w) {
+        const std::int64_t lo = static_cast<std::int64_t>(w) * step;
+        const std::int64_t hi = std::min(total, lo + step);
+        auto table = std::make_shared<FileTable>();
+        if (ArrowSchemaDeepCopy(&run.schema, &table->schema) != NANOARROW_OK) {
+            error = "btree index: out of memory";
+            return false;
+        }
+        for (std::size_t k = 0; k < bases.size() && lo < hi; ++k) {
+            const std::int64_t s = std::max(lo, starts[k]);
+            const std::int64_t e = std::min(hi, starts[k] + bases[k]->array.length);
+            if (s < e) {
+                table->batches.push_back(slice_batch(bases[k], s - starts[k], e - s));
+            }
+        }
+        out.push_back(std::move(table));
+    }
+    return true;
+}
+
+/// The rows of one window that match the IN list. `values` holds the window's values (column 0) and row ids
+/// (column 1). Each constant of `constants` is binary-searched in each batch's sorted non-null values, and the
+/// rows equal to it match; when the filter cannot compare a constant (`all_compared` false), the window is
+/// evaluated whole. The matching rows' ids are appended to `addrs`.
+bool match_window(const expr::Predicate& p, const FileTable& values, const std::vector<std::size_t>& constants,
+                  bool all_compared, std::vector<std::uint64_t>& addrs, std::string& error) {
+    std::int64_t total = 0;
+    for (const auto& b : values.batches) {
+        total += b.length;
+    }
+    std::vector<std::uint8_t> pass(static_cast<std::size_t>(total), 0U);
+    if (!all_compared) {
+        if (!evaluate(p, values, 0, pass, error)) {
+            return false;
+        }
+    } else {
+        std::vector<std::int64_t> live;  // a batch's non-null rows, ascending
+        std::vector<std::int8_t> ways;
+        std::int64_t first = 0;
+        for (const auto& b : values.batches) {
+            expr::ValueComparer column(values.type(0), *b.children[0]);
+            if (!column.ok()) {
+                error = "btree index: page values do not compare with the IN list";
+                return false;
+            }
+            live.clear();
+            for (std::int64_t r = 0; r < b.length; ++r) {
+                if (!column.is_null(r)) {
+                    live.push_back(r);
+                }
+            }
+            for (const auto k : constants) {
+                // The first live row not below the constant, then the rows equal to it.
+                std::size_t lo_at = 0;
+                std::size_t hi_at = live.size();
+                while (lo_at < hi_at) {
+                    const std::size_t mid = lo_at + (hi_at - lo_at) / 2;
+                    if (!column.compare(p, k, live[mid], 1, ways)) {
+                        error = "btree index: IN constant does not compare with the values";
+                        return false;
+                    }
+                    if (ways[0] < 0) {
+                        lo_at = mid + 1;
+                    } else {
+                        hi_at = mid;
+                    }
+                }
+                for (std::size_t t = lo_at; t < live.size(); ++t) {
+                    column.compare(p, k, live[t], 1, ways);
+                    if (ways[0] != 0) {
+                        break;
+                    }
+                    pass[static_cast<std::size_t>(first + live[t])] = 1;
+                }
+            }
+            first += b.length;
+        }
+    }
+    std::size_t r = 0;
+    for (const auto& b : values.batches) {
+        const ArrowArray* ids = b.children[1];
+        const auto* v = static_cast<const std::uint64_t*>(ids->buffers[1]) + ids->offset;
+        for (std::int64_t k = 0; k < ids->length; ++k, ++r) {
+            if (pass[r] != 0) {
+                addrs.push_back(v[k]);
+            }
+        }
     }
     return true;
 }
@@ -599,101 +841,59 @@ bool search_btree_in(const BTreeIndex& index, const expr::Predicate& p, RowSet& 
         }
     }
 
-    std::vector<std::uint64_t> addrs;
-    std::vector<std::uint8_t> pass;
-    std::vector<std::int64_t> live;  // a segment's non-null rows, ascending
-    std::vector<std::int8_t> ways;
-    for (std::size_t i = 0; i < pages;) {
-        if (constants_of[i].empty()) {
-            ++i;
-            continue;
+    // The windows holding a constant: each is taken from the cache of decoded windows when it is there. The others are
+    // read, a run of adjacent ones in one read, and cached. Matching rows are collected in window order.
+    std::vector<std::size_t> touched;  // positions in the lookup of the windows holding a constant
+    for (std::size_t i = 0; i < pages; ++i) {
+        if (!constants_of[i].empty()) {
+            touched.push_back(i);
         }
-        std::size_t j = i;
-        while (j + 1 < pages && !constants_of[j + 1].empty() && page_idx[j + 1] == page_idx[j] + 1U) {
-            ++j;
+    }
+    const std::string file = file_key(index.page_data);
+    std::vector<std::shared_ptr<const FileTable>> windows(pages);
+    std::vector<std::size_t> missing;
+    for (const auto i : touched) {
+        windows[i] = index_page_cache().find(window_key(file, page_idx[i]));
+        work_stats::add(work_stats::counters().index_page_cache_hits, windows[i] != nullptr ? 1U : 0U);
+        work_stats::add(work_stats::counters().index_page_cache_misses, windows[i] == nullptr ? 1U : 0U);
+        if (windows[i] == nullptr) {
+            missing.push_back(i);
+        }
+    }
+    for (std::size_t a = 0; a < missing.size();) {
+        std::size_t b = a;
+        while (b + 1 < missing.size() && missing[b + 1] == missing[b] + 1U &&
+               page_idx[missing[b + 1]] == page_idx[missing[b]] + 1U) {
+            ++b;
         }
         LanceRowRange range;
-        range.offset = static_cast<std::uint64_t>(page_idx[i]) * index.batch_size;
-        range.length = static_cast<std::uint64_t>(page_idx[j] - page_idx[i] + 1U) * index.batch_size;
-        FileTable values;
-        if (!read_table(index.page_data, nullptr, range, values, error)) {
+        range.offset = static_cast<std::uint64_t>(page_idx[missing[a]]) * index.batch_size;
+        range.length = static_cast<std::uint64_t>(page_idx[missing[b]] - page_idx[missing[a]] + 1U) * index.batch_size;
+        FileTable run;
+        if (!read_table(index.page_data, nullptr, range, run, error)) {
             return false;
         }
-        if (values.schema.n_children != 2 || values.schema.children[1]->format == nullptr ||
-            std::string(values.schema.children[1]->format) != "L") {
+        if (run.schema.n_children != 2 || run.schema.children[1]->format == nullptr ||
+            std::string(run.schema.children[1]->format) != "L") {
             error = "btree index: page_data.lance is not values, ids (uint64)";
             return false;
         }
-        std::int64_t total = 0;
-        for (const auto& b : values.batches) {
-            total += b.length;
+        std::vector<std::shared_ptr<const FileTable>> parts;
+        if (!split_windows(run, index.batch_size, b - a + 1U, parts, error)) {
+            return false;
         }
-        pass.assign(static_cast<std::size_t>(total), 0U);
-        if (!all_compared) {
-            if (!evaluate(p, values, 0, pass, error)) {
-                return false;
-            }
-        } else {
-            // Page i + q of the run holds rows [q * batch, (q + 1) * batch) of the read.
-            const auto batch = static_cast<std::int64_t>(index.batch_size);
-            std::int64_t first = 0;
-            for (const auto& b : values.batches) {
-                expr::ValueComparer column(values.type(0), *b.children[0]);
-                if (!column.ok()) {
-                    error = "btree index: page values do not compare with the IN list";
-                    return false;
-                }
-                for (std::size_t q = 0; q <= j - i; ++q) {
-                    const std::int64_t lo = std::max(first, static_cast<std::int64_t>(q) * batch);
-                    const std::int64_t hi = std::min(first + b.length, static_cast<std::int64_t>(q + 1) * batch);
-                    if (lo >= hi) {
-                        continue;
-                    }
-                    live.clear();
-                    for (std::int64_t r = lo; r < hi; ++r) {
-                        if (!column.is_null(r - first)) {
-                            live.push_back(r - first);
-                        }
-                    }
-                    for (const auto k : constants_of[i + q]) {
-                        // The first live row not below the constant, then the rows equal to it.
-                        std::size_t lo_at = 0;
-                        std::size_t hi_at = live.size();
-                        while (lo_at < hi_at) {
-                            const std::size_t mid = lo_at + (hi_at - lo_at) / 2;
-                            if (!column.compare(p, k, live[mid], 1, ways)) {
-                                error = "btree index: IN constant does not compare with the values";
-                                return false;
-                            }
-                            if (ways[0] < 0) {
-                                lo_at = mid + 1;
-                            } else {
-                                hi_at = mid;
-                            }
-                        }
-                        for (std::size_t t = lo_at; t < live.size(); ++t) {
-                            column.compare(p, k, live[t], 1, ways);
-                            if (ways[0] != 0) {
-                                break;
-                            }
-                            pass[static_cast<std::size_t>(first + live[t])] = 1;
-                        }
-                    }
-                }
-                first += b.length;
-            }
+        for (std::size_t w = 0; w < parts.size(); ++w) {
+            const auto i = missing[a + w];
+            index_page_cache().put(window_key(file, page_idx[i]), parts[w], decoded_bytes(*parts[w]));
+            windows[i] = parts[w];
         }
-        std::size_t r = 0;
-        for (const auto& b : values.batches) {
-            const ArrowArray* ids = b.children[1];
-            const auto* v = static_cast<const std::uint64_t*>(ids->buffers[1]) + ids->offset;
-            for (std::int64_t k = 0; k < ids->length; ++k, ++r) {
-                if (pass[r] != 0) {
-                    addrs.push_back(v[k]);
-                }
-            }
+        a = b + 1U;
+    }
+    std::vector<std::uint64_t> addrs;
+    for (const auto i : touched) {
+        if (!match_window(p, *windows[i], constants_of[i], all_compared, addrs, error)) {
+            return false;
         }
-        i = j + 1;
     }
     add_addresses(out, addrs);
     return true;

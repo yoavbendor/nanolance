@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "nanolance/base_paths.hpp"
 #include "nanolance/frag_reuse.hpp"
 
@@ -306,7 +307,7 @@ bool FragReuse::from_details(const std::filesystem::path& dataset_path, const pb
             }
             std::vector<std::uint8_t> file;
             const auto file_path = index_dir / path;
-            if (e.bad() || path.empty() || !io::read_all(file_path.string(), file, error)) {
+            if (e.bad() || path.empty() || !io::read_all(utf8::string_of(file_path), file, error)) {
                 error = error.empty() ? "fragment reuse index: unreadable external details" : error;
                 return false;
             }
@@ -353,7 +354,7 @@ bool FragReuse::load(const std::filesystem::path& dataset_path, const pb::Manife
     }
     // Immutable per index (a new FRI gets a new uuid), so cached by dataset and uuid.
     static SharedCache<FragReuse> cache;
-    const auto key = dataset_path.string() + "\n" + pb::uuid_string(newest->uuid);
+    const auto key = utf8::string_of(dataset_path) + "\n" + pb::uuid_string(newest->uuid);
     if ((out = cache.find(key)) != nullptr) {
         return true;
     }

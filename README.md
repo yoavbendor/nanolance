@@ -179,10 +179,10 @@ test exists and that every module has a test of its own.
 <!-- spec-summary:start -->
 | layer | done | partial | missing | n/a | modules with a test in their layer |
 |---|---|---|---|---|---|
-| [base](src/base/README.md#spec-coverage) | 14 | 0 | 0 | 1 | 16/16 |
+| [base](src/base/README.md#spec-coverage) | 14 | 0 | 0 | 1 | 17/17 |
 | [io](src/io/README.md#spec-coverage) | 7 | 2 | 2 | 0 | 5/7 |
 | [arrow](src/arrow/README.md#spec-coverage) | 18 | 3 | 0 | 1 | 8/8 |
-| [encoding](src/encoding/README.md#spec-coverage) | 22 | 6 | 6 | 1 | 19/19 |
+| [encoding](src/encoding/README.md#spec-coverage) | 22 | 6 | 6 | 1 | 21/22 |
 | [file](src/file/README.md#spec-coverage) | 14 | 3 | 3 | 1 | 4/4 |
 | [table](src/table/README.md#spec-coverage) | 37 | 16 | 13 | 1 | 18/18 |
 | [expr](src/expr/README.md#spec-coverage) | 17 | 1 | 3 | 0 | 1/1 |
@@ -208,11 +208,15 @@ nanolance or Lance cannot read back.
 | `struct` (any depth, null structs included), `list`, `large_list`, `map`, `fixed_size_list` | round-trips, with null and empty lists and null items at any level |
 | `null` | round-trips (Lance's all-null page) |
 | `lance.blob.v2` | external references written; inline, packed, dedicated and external blobs read |
-| Arrow `dictionary` | refused: cast to the value type (low-cardinality strings are dictionary-encoded on disk anyway) |
+| Arrow `dictionary` with an integer index over a string, binary or fixed-width type, at the top level | round-trips, stored as Lance stores one (low-cardinality strings are dictionary-encoded on disk anyway) |
+| Arrow `dictionary` inside a `struct` or `list` | read with any integer index; written only with int32 indices (`writing it is not supported unless its indices are int32`). Other dictionary shapes are refused: cast to the value type |
+| `list`, `large_list` or `map` under a `fixed_size_list` of structs | read, from pylance-written 2.2 files, whole, by row range and by take; written refused (`a list or map under a fixed_size_list is read but not written yet`) |
+| `fixed_size_list` of `fixed_size_list` | read, from pylance-written files; written refused (`a fixed_size_list of fixed_size_list is read but not written yet`) |
+| `struct` marked `lance-encoding:packed` | read in 2.1 and 2.2 files when its children are fixed-width; written refused (`a packed struct is read but not written yet`) |
 | `timestamp` with a UTC-offset zone (`+05:30`) | refused: Lance supports IANA names only |
 | a null element inside a valid `fixed_size_list` row | refused |
 
-Nulls are stored in every column kind.
+Nulls are stored in every column kind. Files in formats 2.0 to 2.3 are read; nanolance writes 2.2.
 
 ## Things to know
 

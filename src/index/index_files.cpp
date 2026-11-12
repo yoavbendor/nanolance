@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "index/index_files.hpp"
 
 #include "nanolance/bloom_filter.hpp"
@@ -53,7 +54,7 @@ std::string file_key(const std::filesystem::path& path) {
     std::uint64_t size = 0;
     std::int64_t mtime = 0;
     data_file_identity(path, size, mtime);  // one stat per read scope; a missing file keys as size 0
-    return path.string() + "|" + std::to_string(size) + "|" + std::to_string(mtime);
+    return utf8::string_of(path) + "|" + std::to_string(size) + "|" + std::to_string(mtime);
 }
 
 bool schema_metadata(const std::filesystem::path& path, const std::string& key, std::string& value, bool& found,

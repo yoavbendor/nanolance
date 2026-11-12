@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import glob
 import os
+import random
 import shutil
 
 import pyarrow as pa
@@ -417,3 +418,57 @@ def test_bloomfilter_parameters_match_pylance(lance, tmp_path, items, probabilit
     assert ours.to_pylist() == theirs.to_pylist()
     assert ours_meta == theirs_meta
     assert ours_meta["bloomfilter_item"] == str(items)
+
+
+# ── IN lists over a zonemap and a bloom filter: the zones and filters keep every row the list names ──
+
+def _in_list(values):
+    return ", ".join("NULL" if v is None else (f"'{v}'" if isinstance(v, str) else str(v)) for v in values)
+
+
+@pytest.mark.parametrize("kind", ["ZONEMAP", "BLOOMFILTER"])
+@pytest.mark.parametrize("n", [1, 8, 9, 300, 1000])
+def test_in_lists_over_indexed_columns_answer_what_a_scan_answers(tmp_path, kind, n):
+    """An IN list over a zonemap or bloom filter (its ids, and its strings) returns the rows the list names, as
+    a Python reference over the full scan does; a zonemap also answers an IN list with the zones it keeps."""
+    path = _fresh(tmp_path, f"in_{kind}_{n}.lance")
+    table = _table(10000)
+    nl.write_dataset(table.slice(0, 5000), path)
+    nl.write_dataset(table.slice(5000), path, mode="append")
+    nl.dataset(path).delete("id % 101 = 3")
+    nl.dataset(path).create_scalar_index("id", kind, name="ix_id")
+    nl.dataset(path).create_scalar_index("s", kind, name="ix_s")
+    scan = nl.dataset(path).to_table(columns=["id", "s"]).to_pylist()
+    rng = random.Random(n)
+    all_ids = [r["id"] for r in scan]
+    all_strings = [r["s"] for r in scan if r["s"] is not None]
+    # Half the values are present in the data, half are not (and the strings include one that is not).
+    ids = [rng.choice(all_ids) if i % 2 else rng.randrange(-50, 20000) for i in range(n)]
+    strings = [rng.choice(all_strings) if i % 2 else f"zz{i}" for i in range(n)]
+    if n > 8:
+        ids.append(None)  # a NULL item makes its non-matches NULL, not FALSE
+    for column, values in (("id", ids), ("s", strings)):
+        flt = f"{column} IN ({_in_list(values)})"
+        wanted = {v for v in values if v is not None}
+        expected = sorted(r["id"] for r in scan if r[column] is not None and r[column] in wanted)
+        assert sorted(r["id"] for r in nl.dataset(path).to_table(filter=flt, columns=["id"]).to_pylist()) == \
+            expected, flt
+        if kind == "ZONEMAP" and column == "id":
+            plan = nl.dataset(path).scanner(filter=flt, columns=["id"]).explain_plan()
+            assert "ZoneMap" in plan, flt
+
+
+def test_zonemap_in_list_binds_no_predicate_per_value(tmp_path):
+    """The zonemap compares each value with the zones' bounds in one pass (no predicate bind per value): a list
+    of 300 values binds no predicate over the zones (index_evaluations counts the binds)."""
+    import nanolance
+
+    path = _fresh(tmp_path, "zone_binds.lance")
+    nl.write_dataset(_table(20000), path, max_rows_per_file=5000)
+    nl.dataset(path).create_scalar_index("id", "ZONEMAP", name="zm")
+    wanted = list(range(0, 20000, 67))[:300]
+    nanolance._reset_work_stats()
+    got = nl.dataset(path).to_table(filter=f"id IN ({_in_list(wanted)})", columns=["id"]).num_rows
+    stats = nanolance._work_stats()
+    assert got == len(wanted)
+    assert stats["index_evaluations"] <= 2, stats

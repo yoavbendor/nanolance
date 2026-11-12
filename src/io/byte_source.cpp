@@ -3,7 +3,9 @@
 #include "nanolance/byte_source.hpp"
 
 #include "nanolance/object_store.hpp"
+#include "base/utf8_path.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <filesystem>
@@ -129,6 +131,21 @@ bool is_unbuilt_s3(const std::string& path_or_uri) {
     return path_or_uri.rfind("s3://", 0) == 0 && !is_remote(path_or_uri);
 }
 
+/// A URI built from a native path. On Windows the reader joins components with "\", so "mem://C:/ds" plus
+/// "_versions" arrives as "mem://C:/ds\_versions": object keys are "/"-separated, so the separators after the
+/// scheme are made "/". Local paths (no "://") are returned as they are.
+std::string canonical_uri(const std::string& path_or_uri) {
+#ifdef _WIN32
+    const auto colon = path_or_uri.find("://");
+    if (colon != std::string::npos && colon > 0) {
+        std::string uri = path_or_uri;
+        std::replace(uri.begin() + static_cast<std::ptrdiff_t>(colon + 3), uri.end(), '\\', '/');
+        return uri;
+    }
+#endif
+    return path_or_uri;
+}
+
 }  // namespace
 
 std::unique_ptr<ByteSource> open_local_file(const std::string& path, std::string& error) {
@@ -223,7 +240,8 @@ void register_source_factory(const std::string& scheme, SourceFactory factory) {
     }
 }
 
-std::unique_ptr<ByteSource> open_source(const std::string& path_or_uri, std::string& error) {
+std::unique_ptr<ByteSource> open_source(const std::string& path_or_uri_arg, std::string& error) {
+    const std::string path_or_uri = canonical_uri(path_or_uri_arg);
     const auto colon = path_or_uri.find("://");
     if (colon != std::string::npos && colon > 0) {
         SourceFactory factory;
@@ -262,7 +280,7 @@ bool read_all(const std::string& path_or_uri, std::vector<std::uint8_t>& out, st
 bool exists(const std::string& path_or_uri) {
     if (!is_remote(path_or_uri)) {
         std::error_code ec;
-        return std::filesystem::exists(std::filesystem::path(path_or_uri), ec);
+        return std::filesystem::exists(utf8::from_utf8(path_or_uri), ec);
     }
     std::string ignored;
     return open_source(path_or_uri, ignored) != nullptr;
@@ -374,7 +392,8 @@ bool set_object_store_options(const std::string& uri, const ObjectStoreOptions& 
 }
 #endif
 
-bool list_dir(const std::string& path_or_uri, std::vector<DirEntry>& out, std::string& error, bool with_sizes) {
+bool list_dir(const std::string& path_or_uri_arg, std::vector<DirEntry>& out, std::string& error, bool with_sizes) {
+    const std::string path_or_uri = canonical_uri(path_or_uri_arg);
     out.clear();
     error.clear();
     const auto colon = path_or_uri.find("://");
@@ -402,7 +421,7 @@ bool list_dir(const std::string& path_or_uri, std::vector<DirEntry>& out, std::s
             return false;
         }
     }
-    const std::filesystem::path dir(path_or_uri);
+    const std::filesystem::path dir = utf8::from_utf8(path_or_uri);
     std::error_code ec;
     std::filesystem::directory_iterator it(dir, ec);
     const std::filesystem::directory_iterator end;
@@ -420,7 +439,7 @@ bool list_dir(const std::string& path_or_uri, std::vector<DirEntry>& out, std::s
             return false;
         }
         DirEntry entry;
-        entry.name = it->path().filename().string();
+        entry.name = utf8::string_of(it->path().filename());
         std::error_code entry_ec;
         entry.is_dir = it->is_directory(entry_ec);
         if (with_sizes && !entry.is_dir) {

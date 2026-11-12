@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/base_paths.hpp"
 #include "nanolance/row_ids.hpp"
@@ -44,17 +45,36 @@ namespace {
 
 /// Same lookup scoped to one parent, so a struct child named `id` does not resolve to a top-level
 /// `id`. `parent_id` is -1 for top-level fields, matching LanceField::parent_id.
+/// `occurrence` picks among siblings that share a name (a struct may have several children named "",
+/// which Arrow allows and Lance writes): the k-th such sibling in the Arrow array is the k-th such field.
 const LanceField* find_mapping_field_by_name_under(const LanceSchemaMapping& mapping, const char* name,
-                                                   std::int32_t parent_id) {
+                                                   std::int32_t parent_id, std::size_t occurrence = 0) {
     if (name == nullptr) {
         return nullptr;
     }
+    std::size_t seen = 0;
     for (const auto& field : mapping.fields) {
         if (field.parent_id == parent_id && field.name == name) {
-            return &field;
+            if (seen == occurrence) {
+                return &field;
+            }
+            ++seen;
         }
     }
     return nullptr;
+}
+
+/// How many of the siblings before child `index` have the same name as it: its occurrence among them.
+std::size_t same_name_occurrence(const ArrowSchema* parent, std::int64_t index) {
+    std::size_t count = 0;
+    for (std::int64_t j = 0; j < index; ++j) {
+        if (parent->children[j] != nullptr && parent->children[index] != nullptr &&
+            parent->children[j]->name != nullptr && parent->children[index]->name != nullptr &&
+            std::strcmp(parent->children[j]->name, parent->children[index]->name) == 0) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 const LanceField* find_mapping_field(const LanceSchemaMapping& mapping, std::int32_t id) {
@@ -1244,12 +1264,13 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
 
     std::string collect_error;
     const auto collect = [&](auto&& self, const ArrowSchema* node_schema, ArrowArray* node_array,
-                             std::int32_t parent_id, std::vector<ColumnPlan::Node> path) -> bool {
+                             std::int32_t parent_id, std::vector<ColumnPlan::Node> path,
+                             std::size_t occurrence) -> bool {
         if (node_schema == nullptr || node_schema->name == nullptr || node_array == nullptr) {
             collect_error = "batch schema child is missing";
             return false;
         }
-        const auto* field = find_mapping_field_by_name_under(mapping, node_schema->name, parent_id);
+        const auto* field = find_mapping_field_by_name_under(mapping, node_schema->name, parent_id, occurrence);
         if (field == nullptr) {
             collect_error = "mapping field not found for schema child ";
             collect_error += node_schema->name;
@@ -1272,7 +1293,7 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
             path.push_back({lance_logical_type_is_large_list(field->logical_type) ? ColumnPlan::Node::Kind::LargeList
                                                                                   : ColumnPlan::Node::Kind::List,
                             node_array});
-            return self(self, node_schema->children[0], node_array->children[0], field->id, std::move(path));
+            return self(self, node_schema->children[0], node_array->children[0], field->id, std::move(path), 0U);
         }
 
         if (is_struct && node_schema->n_children == 0) {  // an empty struct: valid in every row
@@ -1298,7 +1319,8 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
                     collect_error += field->name;
                     return false;
                 }
-                if (!self(self, node_schema->children[i], node_array->children[i], field->id, path)) {
+                if (!self(self, node_schema->children[i], node_array->children[i], field->id, path,
+                          same_name_occurrence(node_schema, i))) {
                     return false;
                 }
             }
@@ -1322,7 +1344,7 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
                 return false;
             }
             path.push_back({ColumnPlan::Node::Kind::FixedSizeList, node_array, fsl_items});
-            return self(self, node_schema->children[0], node_array->children[0], field->id, std::move(path));
+            return self(self, node_schema->children[0], node_array->children[0], field->id, std::move(path), 0U);
         }
         if (!is_blob && field->column_index < 0) {
             plan.kind = ColumnPlan::Kind::Skip;
@@ -1383,7 +1405,8 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
     };
 
     for (int64_t c = 0; c < batch_schema.n_children; ++c) {
-        if (!collect(collect, batch_schema.children[c], batch.children[c], -1, {})) {
+        if (!collect(collect, batch_schema.children[c], batch.children[c], -1, {},
+                     same_name_occurrence(&batch_schema, c))) {
             error = collect_error;
             ArrowArrayRelease(&batch);
             return false;
@@ -1759,26 +1782,44 @@ struct ColumnSource {
     /// Format 2.0, a leaf below a list (or a string stored as list<uint8>): the columns it needs
     /// besides its own. Null otherwise.
     std::shared_ptr<const v20::LeafContext> v20;
+    /// Lance 2.1+ packed struct: a child of a struct whose fixed-width children are one column. The struct's
+    /// on-disk field (its column is `metadata`) and this child's index among the struct's children. Null otherwise.
+    const pb::Field* packed_parent = nullptr;
+    std::size_t packed_child = 0;
+    std::vector<std::uint64_t> packed_widths;  // every child's width in bytes, in struct order
     /// A leaf under fixed_size_list<struct>s and structs alone (W1k4): its elements a row, the product of the
     /// lists' sizes. A take picks those elements for each row; 1 otherwise.
     std::uint64_t elements_per_row = 1;
 };
 
-/// The elements a row of `field` holds when every ancestor is a struct or a fixed_size_list (their sizes
-/// multiplied); 1 when there is none, or a list above makes the count vary by row.
+/// The leaf rows a row of `field` holds: the sizes of the fixed_size_lists above it (multiplied), so a leaf
+/// under fixed_size_list<struct> holds that many. Only the fixed_size_lists above the outermost list count: a
+/// list makes the count of the items below it vary by row, and the pages of a column under a list count its
+/// rows in the space the list's own layers are in. A fixed_size_list below a list is inside its items, so it
+/// does not count. 1 when there is none.
 std::uint64_t fixed_elements_per_row(const LanceSchemaMapping& mapping, const LanceField& field) {
-    std::uint64_t per_row = 1;
+    std::vector<const LanceField*> ancestors;  // innermost first
     for (auto parent = field.parent_id; parent >= 0;) {
         const auto* up = find_mapping_field(mapping, parent);
-        if (up == nullptr || lance_logical_type_is_list(up->logical_type)) {
+        if (up == nullptr) {
             return 1;
         }
+        ancestors.push_back(up);
+        parent = up->parent_id;
+    }
+    std::size_t above = 0;  // ancestors up to and including the outermost list are not counted
+    for (std::size_t k = 0; k < ancestors.size(); ++k) {
+        if (lance_logical_type_is_list(ancestors[k]->logical_type)) {
+            above = k + 1U;
+        }
+    }
+    std::uint64_t per_row = 1;
+    for (std::size_t k = above; k < ancestors.size(); ++k) {
         std::string element;
         std::uint64_t items = 0;
-        if (lance_fixed_size_list_parts(up->logical_type, element, items)) {
+        if (lance_fixed_size_list_parts(ancestors[k]->logical_type, element, items)) {
             per_row *= items;
         }
-        parent = up->parent_id;
     }
     return per_row;
 }
@@ -1890,6 +1931,112 @@ bool v20_packed_struct_sources(const LanceSchemaMapping& mapping, const LanceFie
         out.push_back(std::move(source));
     }
     return true;
+}
+
+/// Lance 2.1+: a struct whose fixed-width children its writer packed into one column (`lance-encoding:packed`,
+/// the column's pages PackedStruct). Each child is read out of the struct's column (decode_lance_packed_struct_child*).
+/// A non-packed parent, or a column that is not packed, adds nothing: its leaves are read on their own.
+bool column_is_packed_struct_v21(const EncodingsIo& io, const pb::ColumnMetadata& column,
+                                 const std::string& logical_type, const std::vector<std::uint64_t>& child_bytes) {
+    // Only a struct can be packed: a list has an item child too, and a constant list page can hold a value the
+    // size of that child by chance (test_constant_layout_list_repdef_v2_2).
+    return logical_type == "struct" && packed_struct_column(io, column, child_bytes);
+}
+
+/// Each direct child of a struct in the file's descriptor, in order: its width in bytes when it is fixed-width, 0
+/// when it is not (or is itself a struct).
+std::vector<std::uint64_t> descriptor_child_widths(const pb::FileDescriptor& descriptor, std::int32_t parent_id) {
+    std::vector<std::uint64_t> widths;
+    for (const auto& f : descriptor.fields) {
+        if (f.parent_id != parent_id) {
+            continue;
+        }
+        // lance_logical_type_value_bytes falls back to 8 for a type it does not know (a struct, a list), so only the
+        // plain fixed-width primitives count as packable: anything else is 0, which makes the struct not packed.
+        const auto& t = f.logical_type;
+        std::string element;
+        std::uint64_t items = 0;
+        const bool plain = !t.empty() && t != "struct" && t != "bool" && !lance_logical_type_is_list(t) &&
+                           !lance_field_is_variable_width(t) && !lance_fixed_size_list_parts(t, element, items);
+        widths.push_back(plain ? static_cast<std::uint64_t>(lance_logical_type_value_bytes(t)) : 0U);
+    }
+    return widths;
+}
+
+bool v21_packed_struct_sources(const LanceSchemaMapping& mapping, const LanceField& parent,
+                               const std::filesystem::path& path, const pb::FileDescriptor& descriptor,
+                               const pb::Field& parent_on_disk, const pb::ColumnMetadata& column,
+                               const std::vector<std::uint64_t>& child_bytes,
+                               const std::unordered_set<std::int32_t>* allowed_field_ids,
+                               std::vector<ColumnSource>& out, std::string& error) {
+    int k = 0;
+    for (const auto& child : mapping.fields) {
+        if (child.parent_id != parent.id) {
+            continue;
+        }
+        const std::size_t slot = static_cast<std::size_t>(k++);
+        if (allowed_field_ids != nullptr && allowed_field_ids->count(child.id) == 0U) {
+            continue;
+        }
+        if (is_parent_field(mapping, child.id)) {
+            error = "packed struct '" + parent.name + "': its field '" + child.name + "' has fields of its own";
+            return false;
+        }
+        const auto* on_disk = find_descriptor_field(descriptor, child.id);
+        if (on_disk == nullptr) {
+            error = "data file references unknown field id";
+            return false;
+        }
+        ColumnSource source;
+        source.path = path;
+        source.on_disk = on_disk;
+        source.metadata = &column;
+        source.field_id = child.id;
+        source.value_bytes = lance_logical_type_value_bytes(child.logical_type);
+        source.packed_parent = &parent_on_disk;
+        source.packed_child = slot;
+        source.packed_widths = child_bytes;
+        for (const auto& page : column.pages) {
+            for (const auto size : page.buffer_sizes) {
+                source.encoded_bytes += size;
+            }
+        }
+        out.push_back(std::move(source));
+    }
+    return true;
+}
+
+/// Format 2.1+, one data file field: when it is a struct whose column is packed, its children's sources go into
+/// `out` and `packed` is set. A struct that is not packed is left to its leaves (`packed` clear, nothing added).
+bool v21_packed_parent_sources(const LanceSchemaMapping& mapping, const pb::FileDescriptor& descriptor,
+                               const std::filesystem::path& path, const std::vector<pb::ColumnMetadata>& metas,
+                               std::int32_t field_id, std::int32_t column_index,
+                               const std::unordered_set<std::int32_t>* allowed_field_ids,
+                               std::vector<ColumnSource>& out, bool& packed, std::string& error) {
+    packed = false;
+    const auto* parent = find_mapping_field(mapping, field_id);
+    if (parent == nullptr || !is_parent_field(mapping, field_id) || column_index < 0 ||
+        static_cast<std::size_t>(column_index) >= metas.size()) {
+        return true;
+    }
+    const auto widths = descriptor_child_widths(descriptor, field_id);
+    if (!column_is_packed_struct_v21(DataFileIo(path), metas[static_cast<std::size_t>(column_index)],
+                                   parent->logical_type, widths)) {
+        return true;
+    }
+    packed = true;
+    if (parent->parent_id >= 0) {
+        error = "packed struct '" + parent->name + "' inside another struct is not read yet";
+        return false;
+    }
+    const auto* on_disk_parent = find_descriptor_field(descriptor, field_id);
+    if (on_disk_parent == nullptr) {
+        error = "data file references unknown field id";
+        return false;
+    }
+    return v21_packed_struct_sources(mapping, *parent, path, descriptor, *on_disk_parent,
+                                     metas[static_cast<std::size_t>(column_index)], widths, allowed_field_ids, out,
+                                     error);
 }
 
 /// A parallel read cuts a fragment into row ranges ("morsels") of at least this many encoded bytes,
@@ -2614,13 +2761,24 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
             // Skip columns not in the projection (if one is set), and columns the schema no longer
             // has: a dropped column's data stays in the files it was written to.
             if (find_mapping_field(mapping, field_id) == nullptr) continue;
-            if (v20_file && is_parent_field(mapping, field_id)) {  // read through its leaves
-                if (!v20_packed_struct_sources(mapping, *find_mapping_field(mapping, field_id), column_of, path,
-                                               open.descriptor, open.columns, data_file.column_indices[i],
-                                               allowed_field_ids, columns, error)) {
+            if (is_parent_field(mapping, field_id)) {  // read through its leaves
+                if (v20_file) {
+                    if (!v20_packed_struct_sources(mapping, *find_mapping_field(mapping, field_id), column_of, path,
+                                                   open.descriptor, open.columns, data_file.column_indices[i],
+                                                   allowed_field_ids, columns, error)) {
+                        return false;
+                    }
+                    continue;
+                }
+                bool packed = false;
+                if (!v21_packed_parent_sources(mapping, open.descriptor, path, open.columns, field_id,
+                                               data_file.column_indices[i], allowed_field_ids, columns, packed,
+                                               error)) {
                     return false;
                 }
-                continue;
+                if (packed) {
+                    continue;
+                }
             }
             if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
             if (lance_field_is_empty_struct(*find_mapping_field(mapping, field_id), mapping)) continue;  // nothing to decode
@@ -2749,6 +2907,15 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
             } else {
                 v20::decode_column_range(io, *c.on_disk, *c.metadata, c.v20.get(), morsel.first,
                                          morsel.second - morsel.first, c.value_bytes, decoded[t], errors[t]);
+            }
+        } else if (c.packed_parent != nullptr) {
+            if (whole) {
+                decode_lance_packed_struct_child(io, *c.packed_parent, *c.metadata, c.packed_widths, c.packed_child,
+                                                 decoded[t], errors[t]);
+            } else {
+                decode_lance_packed_struct_child_range(io, *c.packed_parent, *c.metadata, c.packed_widths,
+                                                       c.packed_child, morsel.first, morsel.second - morsel.first,
+                                                       c.value_bytes, decoded[t], errors[t]);
             }
         } else if (whole) {
             decode_lance_physical_column(io, *c.on_disk, *c.metadata, decoded[t], errors[t]);
@@ -2898,7 +3065,7 @@ bool cached_file_metadata(const std::filesystem::path& path, std::shared_ptr<con
     std::uint64_t size = 0;
     std::int64_t mtime = 0;
     const bool known = data_file_identity(path, size, mtime);
-    const auto key = path.string();
+    const auto key = utf8::string_of(path);
     if (known) {
         const std::lock_guard<std::mutex> lock(mutex);
         const auto it = cache.find(key);
@@ -3012,13 +3179,24 @@ bool decode_data_file_rows(const std::filesystem::path& dataset_path, const Plan
         for (std::size_t i = 0; i < data_file.fields.size(); ++i) {
             const auto field_id = data_file.fields[i];
             if (find_mapping_field(mapping, field_id) == nullptr) continue;
-            if (v20_file && is_parent_field(mapping, field_id)) {  // read through its leaves
-                if (!v20_packed_struct_sources(mapping, *find_mapping_field(mapping, field_id), column_of, path,
-                                               descriptor, column_metadatas, data_file.column_indices[i],
-                                               allowed_field_ids, columns, error)) {
+            if (is_parent_field(mapping, field_id)) {  // read through its leaves
+                if (v20_file) {
+                    if (!v20_packed_struct_sources(mapping, *find_mapping_field(mapping, field_id), column_of, path,
+                                                   descriptor, column_metadatas, data_file.column_indices[i],
+                                                   allowed_field_ids, columns, error)) {
+                        return false;
+                    }
+                    continue;
+                }
+                bool packed = false;
+                if (!v21_packed_parent_sources(mapping, descriptor, path, column_metadatas, field_id,
+                                               data_file.column_indices[i], allowed_field_ids, columns, packed,
+                                               error)) {
                     return false;
                 }
-                continue;
+                if (packed) {
+                    continue;
+                }
             }
             if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
             if (lance_field_is_empty_struct(*find_mapping_field(mapping, field_id), mapping)) continue;  // nothing to decode
@@ -3058,6 +3236,10 @@ bool decode_data_file_rows(const std::filesystem::path& dataset_path, const Plan
         if (source.v20 != nullptr) {
             v20::decode_column_rows(io, *source.on_disk, *source.metadata, source.v20.get(), physical,
                                     source.value_bytes, decoded[c], errors[c]);
+        } else if (source.packed_parent != nullptr) {
+            decode_lance_packed_struct_child_rows(io, *source.packed_parent, *source.metadata, source.packed_widths,
+                                                  source.packed_child, physical, source.value_bytes, decoded[c],
+                                                  errors[c]);
         } else if (source.elements_per_row > 1U) {
             // Each picked row is its elements in the leaf column (W1k4).
             std::vector<std::uint64_t> elements;
@@ -3698,7 +3880,7 @@ bool open_file_plan(const std::filesystem::path& file_path, const LanceScanReque
     pb::Manifest manifest;
     manifest.fields = descriptor.fields;
     pb::DataFile file;
-    file.path = file_path.filename().string();
+    file.path = utf8::string_of(file_path.filename());
     std::unordered_set<std::int32_t> parents;
     for (const auto& f : descriptor.fields) {
         if (f.parent_id >= 0) {
@@ -3733,11 +3915,30 @@ bool open_file_plan(const std::filesystem::path& file_path, const LanceScanReque
             column += bytes_as_list ? 2 : 1;
         }
     } else {
+        // Format 2.1+: a struct is no column of its own, except a packed one (one column for all its children,
+        // read out of it). A packed struct's children are not columns.
+        std::vector<pb::ColumnMetadata> metas;
+        if (!read_lance_data_file_column_metadatas(file_path, layout, metas, error)) {
+            release_schema_if_held(out_schema);
+            return false;
+        }
+        std::unordered_set<std::int32_t> packed;
         for (const auto& f : descriptor.fields) {
-            if (parents.count(f.id) == 0U) {
-                file.fields.push_back(f.id);
-                file.column_indices.push_back(column++);
+            if (packed.count(f.parent_id) != 0U) {
+                packed.insert(f.id);
+                continue;
             }
+            const bool is_parent = parents.count(f.id) != 0U;
+            if (is_parent && !(static_cast<std::size_t>(column) < metas.size() &&
+                               column_is_packed_struct_v21(DataFileIo(file_path), metas[static_cast<std::size_t>(column)],
+                                                           f.logical_type, descriptor_child_widths(descriptor, f.id)))) {
+                continue;
+            }
+            if (is_parent) {
+                packed.insert(f.id);
+            }
+            file.fields.push_back(f.id);
+            file.column_indices.push_back(column++);
         }
     }
     if (static_cast<std::uint32_t>(column) != layout.num_columns) {

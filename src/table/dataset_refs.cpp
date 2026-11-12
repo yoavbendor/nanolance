@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "base/uuid.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/work_stats.hpp"
@@ -82,7 +83,7 @@ void json_string(std::ostringstream& out, const std::string& s) {
 bool read_text(const fs::path& path, std::string& out) {
     std::vector<std::uint8_t> bytes;
     std::string io_error;
-    if (!io::read_all(path.string(), bytes, io_error)) {
+    if (!io::read_all(utf8::string_of(path), bytes, io_error)) {
         return false;
     }
     out.assign(bytes.begin(), bytes.end());
@@ -94,7 +95,7 @@ bool read_text(const fs::path& path, std::string& out) {
 // An object store (s3://) has no directories: a directory is the set of objects under its prefix, and
 // removing or copying one is one request per object. Local paths keep their filesystem calls.
 
-bool on_object_store(const fs::path& path) { return io::is_object_store_output(path.string()); }
+bool on_object_store(const fs::path& path) { return io::is_object_store_output(utf8::string_of(path)); }
 
 /// Whether anything is at `path`: an object, or any object under it as a prefix. A listing that fails
 /// counts as present, so nothing is removed on a doubt.
@@ -103,22 +104,22 @@ bool path_exists(const fs::path& path) {
         std::error_code ec;
         return fs::exists(path, ec);
     }
-    if (io::exists(path.string())) {
+    if (io::exists(utf8::string_of(path))) {
         return true;
     }
     std::vector<io::DirEntry> entries;
     std::string error;
-    return !io::list_dir(path.string(), entries, error) || !entries.empty();
+    return !io::list_dir(utf8::string_of(path), entries, error) || !entries.empty();
 }
 
 /// Every object under `dir` on a store, walking its sub-prefixes (a listing is one level).
 bool objects_under(const fs::path& dir, std::vector<fs::path>& out, std::string& error) {
     std::vector<io::DirEntry> entries;
-    if (!io::list_dir(dir.string(), entries, error)) {
+    if (!io::list_dir(utf8::string_of(dir), entries, error)) {
         return false;
     }
     for (const auto& entry : entries) {
-        const fs::path child = dir / entry.name;
+        const fs::path child = dir / utf8::from_utf8(entry.name);
         if (!entry.is_dir) {
             out.push_back(child);
         } else if (!objects_under(child, out, error)) {
@@ -134,7 +135,7 @@ bool remove_tree(const fs::path& dir, std::string& error) {
     if (!on_object_store(dir)) {
         std::error_code ec;
         fs::remove_all(dir, ec);
-        close_data_files_under(dir.string());
+        close_data_files_under(utf8::string_of(dir));
         if (ec) {
             error = ec.message();
             return false;
@@ -146,7 +147,7 @@ bool remove_tree(const fs::path& dir, std::string& error) {
         return false;
     }
     for (const auto& object : objects) {
-        if (!io::remove_output(object.string(), error)) {
+        if (!io::remove_output(utf8::string_of(object), error)) {
             return false;
         }
     }
@@ -156,11 +157,11 @@ bool remove_tree(const fs::path& dir, std::string& error) {
 /// Removes one file (a ref); a missing one is not an error.
 bool remove_file_at(const fs::path& path, std::string& error) {
     if (on_object_store(path)) {
-        return io::remove_output(path.string(), error);
+        return io::remove_output(utf8::string_of(path), error);
     }
     std::error_code ec;
     fs::remove(path, ec);
-    close_data_files_under(path.string());
+    close_data_files_under(utf8::string_of(path));
     if (ec) {
         error = ec.message();
         return false;
@@ -179,11 +180,11 @@ void make_local_dir(const fs::path& dir) {
 /// Copies one object (or file, either side) in chunks, so no whole file sits in memory.
 bool copy_stream(const fs::path& src, const fs::path& dst, std::string& error) {
     constexpr std::uint64_t kChunk = 8ULL << 20;
-    const auto source = io::open_source(src.string(), error);
+    const auto source = io::open_source(utf8::string_of(src), error);
     if (!source) {
         return false;
     }
-    auto out = io::open_output(dst.string(), error);
+    auto out = io::open_output(utf8::string_of(dst), error);
     if (!out) {
         return false;
     }
@@ -244,7 +245,7 @@ bool write_file(const fs::path& path, const std::string& bytes, bool replace, bo
     std::error_code ec;
     fs::create_directories(path.parent_path(), ec);
     static std::atomic<std::uint64_t> counter{0};
-    const auto temp = path.parent_path() / ("." + path.filename().string() + "." +
+    const auto temp = path.parent_path() / ("." + utf8::string_of(path.filename()) + "." +
                                             std::to_string(std::random_device{}()) + "-" +
                                             std::to_string(counter.fetch_add(1U)) + ".tmp");
     {
@@ -254,7 +255,7 @@ bool write_file(const fs::path& path, const std::string& bytes, bool replace, bo
         work_stats::count_written_file(temp);
         if (!out) {
             fs::remove(temp, ec);
-            error = "failed to write " + path.string();
+            error = "failed to write " + utf8::string_of(path);
             return false;
         }
     }
@@ -262,7 +263,7 @@ bool write_file(const fs::path& path, const std::string& bytes, bool replace, bo
         fs::rename(temp, path, ec);
         if (ec) {
             fs::remove(temp, ec);
-            error = "failed to write " + path.string() + ": " + ec.message();
+            error = "failed to write " + utf8::string_of(path) + ": " + ec.message();
             return false;
         }
         return true;
@@ -281,7 +282,7 @@ bool write_file(const fs::path& path, const std::string& bytes, bool replace, bo
     fs::rename(temp, path, ec);  // no hard links here
     if (ec) {
         fs::remove(temp, ignored);
-        error = "failed to write " + path.string() + ": " + ec.message();
+        error = "failed to write " + utf8::string_of(path) + ": " + ec.message();
         return false;
     }
     return true;
@@ -291,12 +292,12 @@ bool write_file(const fs::path& path, const std::string& bytes, bool replace, bo
 /// the file; without `replace` the PUT is create-only (If-None-Match), as write_file's hard link is locally.
 bool write_ref_file(const fs::path& path, const std::string& bytes, bool replace, bool& existed,
                     std::string& error) {
-    if (!io::is_object_store_output(path.string())) {
+    if (!io::is_object_store_output(utf8::string_of(path))) {
         return write_file(path, bytes, replace, existed, error);
     }
     existed = false;
     if (replace) {
-        auto out = io::open_output(path.string(), error);
+        auto out = io::open_output(utf8::string_of(path), error);
         if (!out) {
             return false;
         }
@@ -304,20 +305,20 @@ bool write_ref_file(const fs::path& path, const std::string& bytes, bool replace
         return out->commit(error);
     }
     const std::vector<std::uint8_t> data(bytes.begin(), bytes.end());
-    return io::put_if_absent(path.string(), data, existed, error);
+    return io::put_if_absent(utf8::string_of(path), data, existed, error);
 }
 
 /// The `_versions` file of `version`, and its size; false when there is none.
 bool manifest_file_of(const fs::path& dataset_path, std::uint64_t version, fs::path& path, std::uint64_t& size) {
     std::vector<io::DirEntry> entries;
     std::string error;
-    if (!io::list_dir((dataset_path / "_versions").string(), entries, error, true)) {
+    if (!io::list_dir(utf8::string_of(dataset_path / "_versions"), entries, error, true)) {
         return false;
     }
     for (const auto& entry : entries) {
         std::uint64_t v = 0;
         if (!entry.is_dir && parse_manifest_version(entry.name, v) && v == version) {
-            path = dataset_path / "_versions" / entry.name;
+            path = dataset_path / "_versions" / utf8::from_utf8(entry.name);
             size = entry.size;
             return true;
         }
@@ -392,7 +393,7 @@ std::string tag_json(const TagInfo& tag) {
 
 bool read_tag(const fs::path& dataset_path, const std::string& name, TagInfo& out, std::string& error) {
     std::string text;
-    if (!read_text(tags_dir(dataset_path) / (name + ".json"), text)) {
+    if (!read_text(tags_dir(dataset_path) / utf8::from_utf8(name + ".json"), text)) {
         error = "Ref not found error: tag " + name + " does not exist";
         return false;
     }
@@ -503,7 +504,7 @@ struct BranchScope {
 std::string canonical_text(const fs::path& path) {
     std::error_code ec;
     const auto canonical = fs::weakly_canonical(path, ec);
-    return (ec ? path.lexically_normal() : canonical).generic_string();
+    return utf8::generic_of(ec ? path.lexically_normal() : canonical);
 }
 
 bool branch_scope_of(const fs::path& dataset_path, const std::string& branch, BranchScope& out, std::string& error) {
@@ -512,13 +513,13 @@ bool branch_scope_of(const fs::path& dataset_path, const std::string& branch, Br
     if (branch.empty()) {
         return true;
     }
-    std::string text = dataset_path.lexically_normal().generic_string();
+    std::string text = utf8::generic_of(dataset_path.lexically_normal());
     while (text.size() > 1 && text.back() == '/') {
         text.pop_back();
     }
     const std::string suffix = "/tree/" + branch;
     if (text.size() <= suffix.size() || text.compare(text.size() - suffix.size(), suffix.size(), suffix) != 0) {
-        error = "branch " + branch + " is not at " + dataset_path.string() + ", where a branch lives: <root>/tree/" +
+        error = "branch " + branch + " is not at " + utf8::string_of(dataset_path) + ", where a branch lives: <root>/tree/" +
                 branch;
         return false;
     }
@@ -544,7 +545,7 @@ bool forked_branches(const BranchScope& scope, std::vector<ForkedBranch>& out, s
         const auto self = std::find_if(branches.begin(), branches.end(),
                                        [&](const BranchInfo& b) { return b.name == scope.branch; });
         if (self == branches.end()) {
-            error = "branch " + scope.branch + " has no reference file under " + (scope.root / "_refs").string();
+            error = "branch " + scope.branch + " has no reference file under " + utf8::string_of(scope.root / "_refs");
             return false;
         }
         own = self->identifier;
@@ -556,7 +557,7 @@ bool forked_branches(const BranchScope& scope, std::vector<ForkedBranch>& out, s
         }
         const auto version = b.identifier[own.size()].first;
         if (version != 0) {
-            out.push_back({b.name, scope.root / "tree" / b.name, version});
+            out.push_back({b.name, scope.root / "tree" / utf8::from_utf8(b.name), version});
         }
     }
     return true;
@@ -573,10 +574,10 @@ bool names_dataset_dir(const std::vector<BasePath>& bases, const std::optional<s
             // pylance records the root as it was opened: a relative path cannot be resolved from here
             // (it was relative to that process's directory), so it is taken to name this one -- keeping
             // files another directory's branch uses costs space; removing this one's loses data.
-            if (base.is_dataset_root && !fs::path(base.path).is_absolute()) {
+            if (base.is_dataset_root && !utf8::from_utf8(base.path).is_absolute()) {
                 return true;
             }
-            return base.is_dataset_root && canonical_text(base.path) == dir_text;
+            return base.is_dataset_root && canonical_text(utf8::from_utf8(base.path)) == dir_text;
         }
     }
     return false;
@@ -601,13 +602,13 @@ bool version_files(const fs::path& versions_dir, std::vector<VersionFile>& out, 
     out.clear();
     if (on_object_store(versions_dir)) {
         std::vector<io::DirEntry> entries;
-        if (!io::list_dir(versions_dir.string(), entries, error, true)) {
-            error = "failed to list " + versions_dir.string() + ": " + error;
+        if (!io::list_dir(utf8::string_of(versions_dir), entries, error, true)) {
+            error = "failed to list " + utf8::string_of(versions_dir) + ": " + error;
             return false;
         }
         for (const auto& entry : entries) {
             if (!entry.is_dir) {
-                out.push_back({versions_dir / entry.name, entry.name, entry.size});
+                out.push_back({versions_dir / utf8::from_utf8(entry.name), entry.name, entry.size});
             }
         }
         return true;
@@ -618,11 +619,11 @@ bool version_files(const fs::path& versions_dir, std::vector<VersionFile>& out, 
         if (!entry.is_regular_file(entry_ec)) {
             continue;
         }
-        out.push_back({entry.path(), entry.path().filename().string(),
+        out.push_back({entry.path(), utf8::string_of(entry.path().filename()),
                        static_cast<std::uint64_t>(entry.file_size(entry_ec))});
     }
     if (ec) {
-        error = "failed to list " + versions_dir.string() + ": " + ec.message();
+        error = "failed to list " + utf8::string_of(versions_dir) + ": " + ec.message();
         return false;
     }
     return true;
@@ -817,7 +818,7 @@ bool list_tags(const fs::path& dataset_path, std::vector<TagInfo>& out, std::str
     error.clear();
     out.clear();
     std::vector<io::DirEntry> entries;
-    if (!io::list_dir(tags_dir(dataset_path).string(), entries, error)) {
+    if (!io::list_dir(utf8::string_of(tags_dir(dataset_path)), entries, error)) {
         return false;
     }
     for (const auto& entry : entries) {
@@ -856,7 +857,7 @@ bool list_branches(const fs::path& dataset_path, std::vector<BranchInfo>& out, s
     out.clear();
     const fs::path dir = dataset_path / "_refs" / "branches";
     std::vector<io::DirEntry> entries;
-    if (!io::list_dir(dir.string(), entries, error)) {
+    if (!io::list_dir(utf8::string_of(dir), entries, error)) {
         return false;
     }
     for (const auto& entry : entries) {
@@ -866,7 +867,7 @@ bool list_branches(const fs::path& dataset_path, std::vector<BranchInfo>& out, s
         }
         const std::string name = decode_branch_file_name(file.substr(0, file.size() - 5));
         std::string text;
-        if (!read_text(dir / file, text)) {
+        if (!read_text(dir / utf8::from_utf8(file), text)) {
             error = "failed to read branch " + name;
             return false;
         }
@@ -920,7 +921,7 @@ bool list_branches(const fs::path& dataset_path, std::vector<BranchInfo>& out, s
 }
 
 fs::path branch_location(const fs::path& root, const std::string& branch) {
-    return branch.empty() ? root : root / "tree" / branch;
+    return branch.empty() ? root : root / "tree" / utf8::from_utf8(branch);
 }
 
 namespace {
@@ -951,7 +952,9 @@ bool check_valid_branch(const std::string& name, std::string& error) {
             return fail("Branch name cannot have empty segments between '/'");
         }
         for (const char c : segment) {
-            if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '.' && c != '-' && c != '_') {
+            // Non-ASCII bytes are allowed, as in check_valid_tag (Lance's rule is Unicode alphanumeric).
+            const auto u = static_cast<unsigned char>(c);
+            if (!(std::isalnum(u) != 0 || u >= 0x80 || c == '.' || c == '-' || c == '_')) {
                 return fail("Branch segment '" + segment +
                             "' contains invalid characters. Only alphanumeric, '.', '-', '_' are allowed.");
             }
@@ -977,7 +980,7 @@ fs::path branch_ref_path(const fs::path& root, const std::string& name) {
             file.push_back(c);
         }
     }
-    return root / "_refs" / "branches" / (file + ".json");
+    return root / "_refs" / "branches" / utf8::from_utf8(file + ".json");
 }
 
 /// The branch's reference as Lance writes it (serde_json, pretty), its key order too.
@@ -1084,7 +1087,7 @@ bool shallow_manifest(const fs::path& source_dir, const std::string& source_bran
                       pb::Manifest& manifest, std::uint64_t& manifest_size, std::string& error) {
     fs::path manifest_path;
     if (version == 0 || !manifest_file_of(source_dir, version, manifest_path, manifest_size)) {
-        error = "Version not found error: Manifest file " + (source_dir / "_versions").string() + " for version " +
+        error = "Version not found error: Manifest file " + utf8::string_of(source_dir / "_versions") + " for version " +
                 std::to_string(version) + " does not exist";
         return false;
     }
@@ -1133,7 +1136,7 @@ bool shallow_manifest(const fs::path& source_dir, const std::string& source_bran
     inherited.name = source_branch;
     inherited.has_name = !source_branch.empty();
     inherited.is_dataset_root = true;
-    inherited.path = source_dir.string();
+    inherited.path = utf8::string_of(source_dir);
     bases.push_back(inherited);
     write_base_paths(manifest, bases);
     manifest.reader_feature_flags |= pb::kFlagMultipleBasePaths;
@@ -1195,7 +1198,7 @@ bool holds_dataset(const fs::path& target) {
     if (on_object_store(target)) {
         std::vector<io::DirEntry> entries;
         std::string error;
-        if (!io::list_dir((target / "_versions").string(), entries, error)) {
+        if (!io::list_dir(utf8::string_of(target / "_versions"), entries, error)) {
             return true;  // unknown: refuse the clone rather than write over a dataset that may be there
         }
         for (const auto& entry : entries) {
@@ -1209,7 +1212,7 @@ bool holds_dataset(const fs::path& target) {
     std::error_code ec;
     for (const auto& entry : fs::directory_iterator(target / "_versions", ec)) {
         std::uint64_t v = 0;
-        if (entry.is_regular_file(ec) && parse_manifest_version(entry.path().filename().string(), v)) {
+        if (entry.is_regular_file(ec) && parse_manifest_version(utf8::string_of(entry.path().filename()), v)) {
             return true;
         }
     }
@@ -1223,7 +1226,7 @@ bool deep_manifest(const fs::path& source_dir, std::uint64_t version, const fs::
     fs::path manifest_path;
     std::uint64_t manifest_size = 0;
     if (version == 0 || !manifest_file_of(source_dir, version, manifest_path, manifest_size)) {
-        error = "Version not found error: Manifest file " + (source_dir / "_versions").string() + " for version " +
+        error = "Version not found error: Manifest file " + utf8::string_of(source_dir / "_versions") + " for version " +
                 std::to_string(version) + " does not exist";
         return false;
     }
@@ -1255,7 +1258,7 @@ bool deep_manifest(const fs::path& source_dir, std::uint64_t version, const fs::
             const auto name = fs::path(deletion_file_name(fragment)).filename();
             make_local_dir(target / "_deletions");
             if (!copy_one(dir / name, target / "_deletions" / name, error)) {
-                error = "failed to copy deletion file " + name.string() + ": " + error;
+                error = "failed to copy deletion file " + utf8::string_of(name) + ": " + error;
                 return false;
             }
         }
@@ -1298,12 +1301,12 @@ bool clone_version(const fs::path& root, const std::string& source_branch, std::
     std::uint64_t source_size = 0;
     if (version == 0 || !manifest_file_of(source_dir, version, source_manifest, source_size)) {
         // pylance's words for a version that is not there (an OSError there, as for a missing tag).
-        error = "Dataset at path " + (source_dir / "_versions" / (std::to_string(version) + ".manifest")).string() +
+        error = "Dataset at path " + utf8::string_of(source_dir / "_versions" / (std::to_string(version) + ".manifest")) +
                 " was not found";
         return false;
     }
     if (holds_dataset(target)) {
-        error = "Dataset already exists: " + target.string();
+        error = "Dataset already exists: " + utf8::string_of(target);
         return false;
     }
     const bool target_existed = path_exists(target);
@@ -1317,7 +1320,7 @@ bool clone_version(const fs::path& root, const std::string& source_branch, std::
         return false;
     }
     write_manifest_branch(manifest, "");  // a clone is a dataset of its own, not a branch
-    finish_clone(manifest, version, clone_operation(source_branch, version, source_dir.string(), "", !deep));
+    finish_clone(manifest, version, clone_operation(source_branch, version, utf8::string_of(source_dir), "", !deep));
     if (!publish_manifest(target, manifest, error)) {
         undo_clone(target, target_existed, dirs);
         return false;
@@ -1367,7 +1370,7 @@ bool create_branch(const fs::path& root, const std::string& name, const std::str
         return false;
     }
     write_manifest_branch(manifest, name);
-    finish_clone(manifest, version, clone_operation(source_branch, version, source_dir.string(), name, true));
+    finish_clone(manifest, version, clone_operation(source_branch, version, utf8::string_of(source_dir), name, true));
     if (!publish_manifest(branch_location(root, name), manifest, error)) {
         return false;
     }
@@ -1409,8 +1412,8 @@ std::string pairs_text(const std::vector<std::pair<std::string, std::uint64_t>>&
 void remove_branch_dirs(const fs::path& dir, const fs::path& stop) {
     std::error_code ec;
     fs::remove_all(dir, ec);
-    close_data_files_under(dir.string());
-    for (auto up = dir.parent_path(); up.generic_string().size() > stop.generic_string().size(); up = up.parent_path()) {
+    close_data_files_under(utf8::string_of(dir));
+    for (auto up = dir.parent_path(); utf8::generic_of(up).size() > utf8::generic_of(stop).size(); up = up.parent_path()) {
         if (!fs::is_directory(up, ec) || !fs::is_empty(up, ec) || ec) {
             break;
         }
@@ -1557,14 +1560,14 @@ bool delete_tag(const fs::path& dataset_path, const std::string& name, std::stri
     if (!check_valid_tag(name, error)) {
         return false;
     }
-    const auto path = tags_dir(dataset_path) / (name + ".json");
-    if (io::is_object_store_output(path.string())) {
+    const auto path = tags_dir(dataset_path) / utf8::from_utf8(name + ".json");
+    if (io::is_object_store_output(utf8::string_of(path))) {
         // Lance's delete: a HEAD, then the DELETE. A missing tag is the same "not found" as locally.
-        if (!io::exists(path.string())) {
+        if (!io::exists(utf8::string_of(path))) {
             error = "Ref not found error: tag " + name + " does not exist";
             return false;
         }
-        return io::remove_output(path.string(), error);
+        return io::remove_output(utf8::string_of(path), error);
     }
     std::error_code ec;
     if (!fs::remove(path, ec)) {
@@ -1599,7 +1602,7 @@ bool cleanup_retain_versions(const fs::path& dataset_path, std::uint64_t n, Clea
     const auto versions = list_manifest_versions(dataset_path, error);
     if (versions.empty()) {
         if (error.empty()) {
-            error = "no manifest found in " + (dataset_path / "_versions").string();
+            error = "no manifest found in " + utf8::string_of(dataset_path / "_versions");
         }
         return false;
     }
@@ -1623,7 +1626,7 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
         read_version = highest_manifest_version(dataset_path, error);
         if (read_version == 0) {
             if (error.empty()) {
-                error = "no manifest found in " + (dataset_path / "_versions").string();
+                error = "no manifest found in " + utf8::string_of(dataset_path / "_versions");
             }
             return false;
         }
@@ -1717,11 +1720,11 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
             if (attached && version < read_version && !path_exists(entry.path)) {
                 continue;  // another cleanup removed it after the listing
             }
-            error = "cannot clean up: " + entry.path.string() + ": " + read_error;
+            error = "cannot clean up: " + utf8::string_of(entry.path) + ": " + read_error;
             return false;
         }
         if (!manifest.index_section_error.empty()) {
-            error = "cannot clean up: the indices of " + entry.path.string() +
+            error = "cannot clean up: the indices of " + utf8::string_of(entry.path) +
                     " could not be read: " + manifest.index_section_error;
             return false;
         }
@@ -1797,8 +1800,8 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
                 const auto rel_dir = pending.back();
                 pending.pop_back();
                 std::vector<io::DirEntry> entries;
-                if (!io::list_dir((dataset_path / rel_dir).string(), entries, error, true)) {
-                    error = "failed to list " + (dataset_path / rel_dir).string() + ": " + error;
+                if (!io::list_dir(utf8::string_of(dataset_path / rel_dir), entries, error, true)) {
+                    error = "failed to list " + utf8::string_of(dataset_path / rel_dir) + ": " + error;
                     return false;
                 }
                 for (auto& entry : entries) {
@@ -1831,19 +1834,24 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
                 continue;
             }
             File file;
-            file.relative = fs::relative(it->path(), dataset_path, entry_ec).generic_string();
+            file.relative = utf8::generic_of(fs::relative(it->path(), dataset_path, entry_ec));
             file.size = static_cast<std::uint64_t>(it->file_size(entry_ec));
             const auto modified = it->last_write_time(entry_ec);
             const auto age = std::chrono::duration_cast<std::chrono::nanoseconds>(file_now - modified).count();
-            const auto modified_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                         fs::file_time_type::clock::to_sys(modified).time_since_epoch())
-                                         .count();
+#ifdef _MSC_VER
+            // MSVC's file_clock has no to_sys; clock_cast is its spelling (libstdc++ before 13 lacks it).
+            const auto modified_sys = std::chrono::clock_cast<std::chrono::system_clock>(modified);
+#else
+            const auto modified_sys = fs::file_time_type::clock::to_sys(modified);
+#endif
+            const auto modified_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(modified_sys.time_since_epoch()).count();
             if (!entry_ec) {
                 consider(std::move(file), age, modified_ns);
             }
         }
         if (walk_ec) {
-            error = "failed to list " + (dataset_path / dir).string() + ": " + walk_ec.message();
+            error = "failed to list " + utf8::string_of(dataset_path / dir) + ": " + walk_ec.message();
             return false;
         }
     }
@@ -1869,23 +1877,23 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
         }
         if (object_store) {
             std::string remove_error;
-            if (!io::remove_output((dataset_path / file.path).string(), remove_error)) {
-                error = "failed to remove " + (dataset_path / file.path).string() + ": " + remove_error;
+            if (!io::remove_output(utf8::string_of(dataset_path / utf8::from_utf8(file.path)), remove_error)) {
+                error = "failed to remove " + utf8::string_of(dataset_path / utf8::from_utf8(file.path)) + ": " + remove_error;
                 return false;
             }
             return true;  // no directories to tidy on a store
         }
         std::error_code remove_ec;
-        fs::remove(dataset_path / file.path, remove_ec);
-        close_data_files_under((dataset_path / file.path).string());
+        fs::remove(dataset_path / utf8::from_utf8(file.path), remove_ec);
+        close_data_files_under(utf8::string_of(dataset_path / utf8::from_utf8(file.path)));
         if (remove_ec) {
-            error = "failed to remove " + (dataset_path / file.path).string() + ": " + remove_ec.message();
+            error = "failed to remove " + utf8::string_of(dataset_path / utf8::from_utf8(file.path)) + ": " + remove_ec.message();
             return false;
         }
         if (file.kind == "index") {
-            for (auto dir = (dataset_path / file.path).parent_path(); dir != dataset_path / "_indices" &&
-                                                                     starts_with(dir.generic_string(),
-                                                                                 (dataset_path / "_indices").generic_string());
+            for (auto dir = (dataset_path / utf8::from_utf8(file.path)).parent_path(); dir != dataset_path / "_indices" &&
+                                                                     starts_with(utf8::generic_of(dir),
+                                                                                 utf8::generic_of(dataset_path / "_indices"));
                  dir = dir.parent_path()) {
                 index_dirs.insert(dir);
             }
@@ -2020,7 +2028,7 @@ namespace {
 
 /// The refusal of a drop whose path holds no manifest that reads (a parent directory given by mistake).
 std::string not_a_dataset_error(const fs::path& dataset_path) {
-    return "Invalid user input: Refusing to drop '" + dataset_path.generic_string() +
+    return "Invalid user input: Refusing to drop '" + utf8::generic_of(dataset_path) +
            "': no readable Lance manifest was found under '_versions', so this is not a dataset root. "
            "Check that the path points at a dataset and not at a parent directory, and check the logs for "
            "manifests that could not be read. A path holding only data files, or only manifests that cannot "
@@ -2039,13 +2047,13 @@ bool drop_object_store_dataset(const fs::path& dataset_path, bool ignore_not_fou
         if (ignore_not_found) {
             return true;
         }
-        error = "Dataset at path " + dataset_path.string() + " was not found";
+        error = "Dataset at path " + utf8::string_of(dataset_path) + " was not found";
         return false;
     }
     bool qualifies = path_exists(dataset_path / ".lance-reserved") ||
                      path_exists(dataset_path / ".lance-deregistered");
     std::vector<io::DirEntry> entries;
-    if (!qualifies && !io::list_dir((dataset_path / "_versions").string(), entries, error)) {
+    if (!qualifies && !io::list_dir(utf8::string_of(dataset_path / "_versions"), entries, error)) {
         return false;
     }
     for (const auto& entry : entries) {
@@ -2066,7 +2074,7 @@ bool drop_object_store_dataset(const fs::path& dataset_path, bool ignore_not_fou
         return false;
     }
     if (!remove_tree(dataset_path, error)) {
-        error = "failed to drop " + dataset_path.string() + ": " + error;
+        error = "failed to drop " + utf8::string_of(dataset_path) + ": " + error;
         return false;
     }
     return true;
@@ -2084,7 +2092,7 @@ bool drop_dataset(const fs::path& dataset_path, bool ignore_not_found, std::stri
         if (ignore_not_found) {
             return true;
         }
-        error = "Dataset at path " + dataset_path.string() + " was not found";
+        error = "Dataset at path " + utf8::string_of(dataset_path) + " was not found";
         return false;
     }
     // Positive evidence only: a manifest that reads, or a namespace marker; or nothing there at all.
@@ -2095,7 +2103,7 @@ bool drop_dataset(const fs::path& dataset_path, bool ignore_not_found, std::stri
         if (qualifies) {
             break;
         }
-        const auto name = entry.path().filename().string();
+        const auto name = utf8::string_of(entry.path().filename());
         std::uint64_t version = 0;
         if (!entry.is_regular_file(ec) ||
             !(parse_manifest_version(name, version) || (starts_with(name, "d") && ends_with(name, ".manifest")))) {
@@ -2109,10 +2117,11 @@ bool drop_dataset(const fs::path& dataset_path, bool ignore_not_found, std::stri
         error = not_a_dataset_error(dataset_path);
         return false;
     }
+    // Close this process's cached handles first: Windows cannot delete a file that is open.
+    close_data_files_under(utf8::string_of(dataset_path));
     fs::remove_all(dataset_path, ec);
-    close_data_files_under(dataset_path.string());
     if (ec) {
-        error = "failed to drop " + dataset_path.string() + ": " + ec.message();
+        error = "failed to drop " + utf8::string_of(dataset_path) + ": " + ec.message();
         return false;
     }
     return true;

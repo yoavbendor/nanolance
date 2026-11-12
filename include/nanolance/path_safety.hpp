@@ -16,11 +16,27 @@
 
 #include "nanolance/byte_source.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <filesystem>
 #include <optional>
 #include <string>
 
 namespace nano_lance {
+
+namespace path_safety_detail {
+// A path from UTF-8 bytes and back, as nano_lance::utf8 has them (that header is private to the library, so this
+// one is repeated here). std::filesystem::path(std::string) and path::string() go through the ANSI code page on
+// Windows; a URI built from a manifest's names must keep its UTF-8.
+inline std::filesystem::path from_utf8(const std::string& s) {
+    return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(s.data()), s.size()));
+}
+inline std::string utf8_of(const std::filesystem::path& p) {
+    const auto text = p.u8string();
+    return std::string(reinterpret_cast<const char*>(text.data()), text.size());
+}
+}  // namespace path_safety_detail
 
 // Confine an untrusted, dataset-relative path under `base`.
 //
@@ -45,18 +61,55 @@ namespace nano_lance {
         if (part.has_root_name() || part.has_root_directory()) {
             return std::nullopt;
         }
-    }
-
-    if (io::is_remote(base.string())) {
-        // A URI is not a file-system path: lexical normalization would collapse its "//" (mem:///x to
-        // mem:/x). The components were checked above, so the URI is only joined.
-        std::filesystem::path joined = base;
-        for (const auto& part : relative) {
-            if (part != ".") {
-                joined /= part;
+        // A backslash separates components on Windows, so a name carrying one would walk a path there.
+        // Refused on every platform, so a dataset means the same thing wherever it is read.
+        const std::string name = path_safety_detail::utf8_of(part);
+        if (name.find('\\') != std::string::npos) {
+            return std::nullopt;
+        }
+#ifdef _WIN32
+        // A drive-relative name ("C:x"), an NTFS alternate data stream ("a:stream") or a reserved device
+        // name ("CON", "nul.txt"): each opens something other than the file the name says.
+        if (name.find(':') != std::string::npos) {
+            return std::nullopt;
+        }
+        std::string stem = name.substr(0, name.find('.'));
+        while (!stem.empty() && stem.back() == ' ') {
+            stem.pop_back();
+        }
+        for (auto& c : stem) {
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+        static constexpr std::array<const char*, 22> reserved{
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"};
+        for (const char* device : reserved) {
+            if (stem == device) {
+                return std::nullopt;
             }
         }
-        return joined;
+#endif
+    }
+
+    if (io::is_remote(path_safety_detail::utf8_of(base))) {
+        // A URI is not a file-system path: lexical normalization would collapse its "//" (mem:///x to
+        // mem:/x). The components were checked above, so the URI is only joined, with "/" whatever the
+        // platform's separator: object keys are "/"-separated, and std::filesystem would add a "\" on Windows.
+        // (UTF-8 text, not generic_string(): the latter rebuilds the path from its elements and drops the "//".)
+        std::string joined = path_safety_detail::utf8_of(base);
+#ifdef _WIN32
+        std::replace(joined.begin(), joined.end(), '\\', '/');
+#endif
+        for (const auto& part : relative) {
+            if (part == ".") {
+                continue;
+            }
+            if (joined.empty() || joined.back() != '/') {
+                joined += '/';
+            }
+            joined += path_safety_detail::utf8_of(part);
+        }
+        return path_safety_detail::from_utf8(joined);
     }
     const std::filesystem::path base_norm = base.lexically_normal();
     const std::filesystem::path joined = (base_norm / relative).lexically_normal();
