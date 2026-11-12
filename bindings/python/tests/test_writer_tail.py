@@ -96,6 +96,19 @@ def test_fixed_size_list_null_elements_layout_matches_pylance(tmp_path, dim, typ
     assert _layout(Path(ours)) == _layout(Path(theirs)), width
 
 
+@pytest.mark.parametrize("typ", [pa.list_(pa.float32()), pa.large_list(pa.float32()), pa.map_(pa.utf8(), pa.int32())])
+def test_fixed_size_list_of_list_refused_as_pylance_refuses(tmp_path, typ):
+    """A fixed_size_list of a list (or map) is refused by both writers. nanolance used to write it, and neither
+    reader could open the file."""
+    lance = require_pylance()
+    values = [[[("a", 1)], None]] if pa.types.is_map(typ) else [[[1.0], [2.0, 3.0]]]
+    table = pa.table({"v": pa.array(values, pa.list_(typ, 2))})
+    with pytest.raises(Exception, match="fixed_size_list"):
+        nl.write_dataset(table, str(tmp_path / "nanolance"))
+    with pytest.raises(Exception):
+        lance.write_dataset(table, str(tmp_path / "pylance"))
+
+
 def test_fixed_size_list_null_elements_from_a_later_batch(tmp_path):
     lance = require_pylance()
     first = pa.array([[1.0, 2.0]] * 5, pa.list_(pa.float32(), 2))

@@ -398,7 +398,10 @@ ParsedFormat parse_fixed_size_list(const ArrowSchema& field) {
     // A struct element (fixed_size_list<struct>, W1k4) is written as pylance writes it: the struct's leaves, rows x N
     // elements each; the struct needs fields.
     const bool struct_element = element.supported && element.logical_type == "struct" && field.children[0]->n_children > 0;
+    // A list or map element (fixed_size_list<list<T>>) is refused too: pylance refuses the type ("Unsupported data
+    // type: FixedSizeList(List(...))"), and a file written with it cannot be read back by either reader.
     if (!element.supported || (element.logical_type == "struct" && !struct_element) || element.logical_type == "null" ||
+        element.logical_type == "list" || element.logical_type == "large_list" || element.logical_type == "map" ||
         lance_field_is_variable_width(element.logical_type)) {
         out.rejection = std::string("fixed_size_list of '") +
                         (field.children[0]->format == nullptr ? "?" : field.children[0]->format) +
