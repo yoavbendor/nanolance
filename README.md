@@ -214,7 +214,7 @@ nanolance or Lance cannot read back.
 | `fixed_size_list` of `fixed_size_list` of fixed-width items, at the top level | round-trips, with null rows, inner lists and leaves, whole, by take and by row range; written as pylance 12 writes it (mini-block at any width, so rows of 256 bytes or more are not FullZip). Under a struct or list: written refused (`a fixed_size_list of fixed_size_list under a struct or list is read but not written yet`) |
 | `struct` marked `lance-encoding:packed` | read in 2.1 and 2.2 files when its children are fixed-width; written refused (`a packed struct is read but not written yet`) |
 | `timestamp` with a UTC-offset zone (`+05:30`) | refused: Lance supports IANA names only |
-| a null element inside a valid `fixed_size_list` row | refused |
+| `fixed_size_list` with null elements inside valid rows, at the top level or under a list or struct | round-trips, with nulls at every level, whole, by take and by row range. At the top level the page layout is pylance's (mini-block with element validity under 256 bytes, FullZip from 256 bytes; `test_writer_tail.py` compares it with pylance's file); under a list the page layout can differ from pylance's (the rep/def encoding, and where pages are cut), and both readers still read it back equal |
 
 Nulls are stored in every column kind. Files in formats 2.0 to 2.3 are read; nanolance writes 2.2.
 
