@@ -1099,6 +1099,17 @@ target_link_libraries(nano_lance_variable_packed_struct_read_test PRIVATE nanola
 add_test(NAME nano_lance_variable_packed_struct_read COMMAND $<TARGET_FILE:nano_lance_variable_packed_struct_read_test>)
 set_tests_properties(nano_lance_variable_packed_struct_read PROPERTIES LABELS "smoke")
 
+# A dictionary whose indices are run-length encoded, with u8 and u16 run lengths, from Lance's own encoder test
+# (tests/golden/dict_rle, written with NANOLANCE_RUST_KEEP_PASS): read whole, by range and by take.
+add_executable(nano_lance_dict_rle_read_test tests/file/test_dict_rle_read.cpp)
+target_compile_features(nano_lance_dict_rle_read_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_dict_rle_read_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_compile_definitions(nano_lance_dict_rle_read_test PRIVATE
+    NANO_LANCE_DICT_RLE_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/dict_rle")
+target_link_libraries(nano_lance_dict_rle_read_test PRIVATE nanolance)
+add_test(NAME nano_lance_dict_rle_read COMMAND $<TARGET_FILE:nano_lance_dict_rle_read_test>)
+set_tests_properties(nano_lance_dict_rle_read PROPERTIES LABELS "smoke")
+
 # A legacy blob (`lance-encoding:blob`) in a Lance 2.1 file, read from pylance's file (tests/generate_golden_legacy_blob.py
 # writes it): whole, by a row range and by a take, as the bytes of each row.
 add_executable(nano_lance_legacy_blob_v21_read_test tests/file/test_legacy_blob_v21_read.cpp)

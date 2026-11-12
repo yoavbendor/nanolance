@@ -1452,16 +1452,20 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
     switch (inner->kind) {
         case page_layout::CompressiveKind::kRle:
             out.kind = has_dictionary ? ColumnEncodingKind::kDictRle : ColumnEncodingKind::kRle;
-            if (!has_dictionary && inner->values != nullptr && inner->lengths != nullptr) {
+            // Both children are kept, for a plain RLE chunk and a dictionary's RLE indices alike: each buffer's encoding
+            // and the run-length width come from the page, as Lance's writer picks them (decode_rle_chunk).
+            if (inner->values != nullptr && inner->lengths != nullptr) {
                 out.rle_values = page_layout::clone(*inner->values);
                 out.rle_lengths = page_layout::clone(*inner->lengths);
                 const auto bits = child_block::value_bits(*inner->lengths);
                 out.rle_length_bits = bits != 0U ? bits : 8U;
             }
-            if (has_dictionary && inner->values != nullptr && inner->values->kind == page_layout::CompressiveKind::kFlat &&
-                (inner->values->bits_per_value == 8U || inner->values->bits_per_value == 16U ||
-                 inner->values->bits_per_value == 32U || inner->values->bits_per_value == 64U)) {
-                out.dict_index_bits = inner->values->bits_per_value;
+            if (has_dictionary && inner->values != nullptr) {
+                // The indices' width: the uncompressed bits of a Flat or bitpacked index run (8, 16, 32 or 64).
+                const auto index_bits = child_block::value_bits(*inner->values);
+                if (index_bits == 8U || index_bits == 16U || index_bits == 32U || index_bits == 64U) {
+                    out.dict_index_bits = index_bits;
+                }
             }
             return true;
         case page_layout::CompressiveKind::kInlineBitpacking:
@@ -2493,7 +2497,7 @@ bool decode_dict_rle_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
     std::shared_ptr<const DictionaryBlock> dict_block;
     Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
     auto& chunks = chunks_scratch.get();
-    std::vector<std::pair<std::uint32_t, std::uint8_t>> runs;  // (dictionary index, run length)
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> runs;  // (dictionary index, run length)
     std::uint64_t validity_rows = 0;
     for (const auto& page : column_metadata.pages) {
         if (page.buffer_offsets.size() < 3U || page.buffer_sizes.size() < 3U) {
@@ -2515,23 +2519,47 @@ bool decode_dict_rle_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
             return false;
         }
         runs.clear();
+        const std::size_t iw = encoding_plan.dict_index_bits / 8U;
+        if (iw == 0U) {
+            error = "dict-rle indices of no supported width";
+            return false;
+        }
         for (const auto& chunk : chunks) {
             if (chunk.extra_buffers.empty()) {
                 error = "dict-rle chunk is missing its run-lengths buffer";
                 return false;
             }
-            const auto& values = chunk.values;    // one dictionary index per run (u32 unless declared)
-            const auto& lengths = chunk.extra_buffers[0];  // one u8 run length per run
-            const std::size_t iw = encoding_plan.dict_index_bits / 8U;
-            if (values.size() % iw != 0U || values.size() / iw != lengths.size()) {
+            // The run values (one dictionary index per run) and the run lengths, as the chunk's RLE children give them
+            // when the page says what they are (Lance's writer; each buffer's encoding and the length width come from the
+            // page, as for a plain RLE chunk). Otherwise nanolance's own layout: u-index values and one u8 length a run.
+            std::vector<std::uint8_t> decoded_indices;
+            std::vector<std::uint64_t> run_lengths;
+            const std::vector<std::uint8_t>* index_bytes = &chunk.values;
+            if (encoding_plan.rle_values != nullptr && encoding_plan.rle_lengths != nullptr) {
+                if (!child_block::decode_rle_runs(*encoding_plan.rle_values, *encoding_plan.rle_lengths, chunk.values,
+                                                  chunk.extra_buffers[0], encoding_plan.value_scheme,
+                                                  encoding_plan.dict_index_bits, encoding_plan.rle_length_bits,
+                                                  decoded_indices, run_lengths, error)) {
+                    return false;
+                }
+                index_bytes = &decoded_indices;
+            } else {
+                const auto& lengths = chunk.extra_buffers[0];
+                if (chunk.values.size() % iw != 0U || chunk.values.size() / iw != lengths.size()) {
+                    error = "dict-rle run count mismatch between indices and lengths";
+                    return false;
+                }
+                run_lengths.assign(lengths.begin(), lengths.end());
+            }
+            const std::size_t num_runs = run_lengths.size();
+            if (index_bytes->size() != num_runs * iw) {
                 error = "dict-rle run count mismatch between indices and lengths";
                 return false;
             }
-            const std::size_t num_runs = lengths.size();
             reserve_more(runs, num_runs);
             for (std::size_t r = 0; r < num_runs; ++r) {
                 std::uint64_t wide = 0;
-                std::memcpy(&wide, values.data() + r * iw, iw);  // little-endian
+                std::memcpy(&wide, index_bytes->data() + r * iw, iw);  // little-endian
                 if (wide > std::numeric_limits<std::uint32_t>::max()) {
                     error = "dict-rle index out of range";
                     return false;
@@ -2541,7 +2569,7 @@ bool decode_dict_rle_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
                     error = "dict-rle index out of range";
                     return false;
                 }
-                runs.emplace_back(index, lengths[r]);
+                runs.emplace_back(index, run_lengths[r]);
             }
         }
 
@@ -2588,7 +2616,7 @@ bool decode_dict_rle_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
             std::uint8_t* dest = out.fixed.data() + base;
             for (const auto& [index, run] : runs) {
                 const std::uint8_t* src = dict.entry(index);
-                for (std::uint8_t c = 0; c < run; ++c) {
+                for (std::uint64_t c = 0; c < run; ++c) {
                     std::memcpy(dest, src, dict.value_bytes);
                     dest += dict.value_bytes;
                 }
@@ -2622,7 +2650,7 @@ bool decode_dict_rle_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
                 if (!append_repeated_value(out.variable.data, dict.entry(index), len, run)) {
                     return false;
                 }
-                for (std::uint8_t c = 0; c < run; ++c) {
+                for (std::uint64_t c = 0; c < run; ++c) {
                     cumulative += len;
                     put(cumulative);
                 }
