@@ -1169,6 +1169,35 @@ bool full_zip_page_params(const page_layout::PageLayout& layout, std::uint64_t p
         }
         return true;
     } else if (values->kind == page_layout::CompressiveKind::kFixedSizeList && values->values != nullptr &&
+               values->values->kind == page_layout::CompressiveKind::kFixedSizeList &&
+               values->values->items_per_value != 0U && values->values->values != nullptr &&
+               values->values->values->kind == page_layout::CompressiveKind::kFlat && values->items_per_value != 0U &&
+               values->values->values->bits_per_value != 0U && values->values->values->bits_per_value % 8U == 0U) {
+        // fixed_size_list<fixed_size_list<T, a>, b> of a flat T (FullZip: pylance writes it for rows of 256 bytes or
+        // more): the slot is [outer validity, ceil(b/8) bytes, when the outer level has validity][leaf validity,
+        // ceil(a*b/8) bytes, when the leaves have it][the a*b leaves], the layout the W1a constant case reads too.
+        const std::uint64_t outer = values->items_per_value;
+        const std::uint64_t inner = values->values->items_per_value;
+        std::uint64_t leaves = 0;
+        std::uint64_t leaf_bits = 0;
+        if (!checked_mul(outer, inner, leaves) || leaves == 0U ||
+            !checked_mul(leaves, values->values->values->bits_per_value, leaf_bits)) {
+            why = "unsupported FullZip value compression";
+            return false;
+        }
+        const std::uint64_t outer_bytes = values->has_validity ? (outer + 7U) / 8U : 0U;
+        const std::uint64_t leaf_bytes = values->values->has_validity ? (leaves + 7U) / 8U : 0U;
+        if (outer_bytes * 8U + leaf_bytes * 8U + leaf_bits != fz.bits_per_value) {
+            why = "unsupported FullZip value compression";
+            return false;
+        }
+        out.outer_items = outer;
+        out.outer_validity_bytes = static_cast<std::size_t>(outer_bytes);
+        out.items = leaves;
+        out.item_validity_bytes = static_cast<std::size_t>(outer_bytes + leaf_bytes);
+        out.out_row_bytes = static_cast<std::size_t>(leaf_bits / 8U);
+        return true;
+    } else if (values->kind == page_layout::CompressiveKind::kFixedSizeList && values->values != nullptr &&
                values->values->kind == page_layout::CompressiveKind::kConstant && values->items_per_value != 0U) {
         // Constant items: the slot carries the value's bytes per item when there is a value, none when
         // there is not (the items are all null). The output's item width is the value's, or the
@@ -2971,8 +3000,9 @@ bool decode_full_zip_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
         // Fixed width with no control word, no element validity and no constant items: the page is its rows
         // back to back (the size check above proved it), so it is copied whole rather than row by row. A
         // 768-float vector column scanned 33% slower than mini-block before this.
+        // A fixed_size_list of fixed_size_list (no validity) still needs its outer item count set, so it is not copied whole.
         const bool whole_page = !variable && params.control_bytes == 0U && params.item_validity_bytes == 0U &&
-                                !params.constant_items && params.length_bytes == 0U;
+                                !params.constant_items && params.length_bytes == 0U && params.outer_items == 0U;
         if (whole_page) {
             if (params.items != 0U) {
                 append_item_validity(out, nullptr, rows * params.items, rows_so_far * params.items);
@@ -4598,7 +4628,19 @@ bool take_full_zip_fixed_rows(const EncodingsIo& io, const std::string& column,
             std::uint32_t word = 0;
             std::memcpy(&word, at, params.control_bytes);  // little-endian
             at += params.control_bytes;
-            if (params.items != 0U) {
+            if (params.outer_items != 0U) {
+                // fixed_size_list<fixed_size_list> (see the page decoder): the outer validity leads the slot, the
+                // leaf validity follows it.
+                out.outer_items_per_row = params.outer_items;
+                append_element_bits(out.outer_item_validity, out.outer_item_null_count,
+                                    params.outer_validity_bytes != 0U ? at : nullptr, params.outer_items,
+                                    out_row * params.outer_items);
+                const std::uint8_t* leaf_bits = params.item_validity_bytes > params.outer_validity_bytes
+                                                    ? at + params.outer_validity_bytes
+                                                    : nullptr;
+                append_element_bits(out.item_validity, out.item_null_count, leaf_bits, params.items,
+                                    out_row * params.items);
+            } else if (params.items != 0U) {
                 append_item_validity(out, params.item_validity_bytes != 0U ? at : nullptr, params.items,
                                      out_row * params.items);
             }
