@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "nanolance/byte_source.hpp"
 #include "nanolance/work_stats.hpp"
 #include "nanolance/manifest_reader.hpp"
@@ -105,11 +106,11 @@ std::unique_ptr<io::ByteSource> open_version_manifest(const std::filesystem::pat
     }
     for (const auto& candidate : candidates) {
         std::string open_error;
-        auto source = io::open_source(candidate.string(), open_error);
+        auto source = io::open_source(utf8::string_of(candidate), open_error);
         if (source) {
             return source;
         }
-        if (io::exists(candidate.string())) {
+        if (io::exists(utf8::string_of(candidate))) {
             error = "failed to open manifest file";
             return nullptr;
         }
@@ -147,7 +148,7 @@ bool parse_manifest_version(const std::string& name, std::uint64_t& version_out)
 std::uint64_t highest_manifest_version(const std::filesystem::path& dataset_path, std::string& error) {
     error.clear();
     std::vector<io::DirEntry> entries;
-    if (!io::list_dir((dataset_path / "_versions").string(), entries, error)) {
+    if (!io::list_dir(utf8::string_of(dataset_path / "_versions"), entries, error)) {
         return 0;
     }
     std::uint64_t max_version = 0;
@@ -210,7 +211,7 @@ bool read_manifest_file(const std::filesystem::path& manifest_path, std::vector<
                         std::string& error) {
     error.clear();
     protobuf_body.clear();
-    const auto source = io::open_source(manifest_path.string(), error);
+    const auto source = io::open_source(utf8::string_of(manifest_path), error);
     if (!source) {
         error = "failed to open manifest file";
         return false;
@@ -222,7 +223,7 @@ std::vector<std::uint64_t> list_manifest_versions(const std::filesystem::path& d
     error.clear();
     std::vector<std::uint64_t> versions;
     std::vector<io::DirEntry> entries;
-    if (!io::list_dir((dataset_path / "_versions").string(), entries, error)) {
+    if (!io::list_dir(utf8::string_of(dataset_path / "_versions"), entries, error)) {
         return {};
     }
     for (const auto& entry : entries) {
@@ -297,7 +298,7 @@ bool load_manifest_source(io::ByteSource& src, pb::Manifest& out, std::string& e
 }  // namespace
 
 bool load_manifest_file(const std::filesystem::path& manifest_path, pb::Manifest& out, std::string& error) {
-    const auto source = io::open_source(manifest_path.string(), error);
+    const auto source = io::open_source(utf8::string_of(manifest_path), error);
     if (!source) {
         error = "failed to open manifest file";
         out = pb::Manifest{};
@@ -308,7 +309,7 @@ bool load_manifest_file(const std::filesystem::path& manifest_path, pb::Manifest
 
 bool load_manifest_file_unchecked(const std::filesystem::path& manifest_path, pb::Manifest& out,
                                   std::string& error) {
-    const auto source = io::open_source(manifest_path.string(), error);
+    const auto source = io::open_source(utf8::string_of(manifest_path), error);
     if (!source) {
         error = "failed to open manifest file";
         out = pb::Manifest{};
@@ -374,7 +375,7 @@ bool read_inline_transaction(const std::filesystem::path& dataset_path, std::uin
 bool migrate_manifest_names_v2(const std::filesystem::path& dataset_path, std::string& error) {
     error.clear();
     std::vector<io::DirEntry> entries;
-    if (!io::list_dir((dataset_path / "_versions").string(), entries, error)) {
+    if (!io::list_dir(utf8::string_of(dataset_path / "_versions"), entries, error)) {
         return false;
     }
     for (const auto& entry : entries) {

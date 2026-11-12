@@ -10,6 +10,7 @@
 // daachorse 2.1 double array they embed, from their layouts in those crates' sources. Edges are added and
 // compared in Lindera's order, so ties between equal-cost paths fall the same way.
 
+#include "base/utf8_path.hpp"
 #include "nanolance/fts_lindera.hpp"
 
 #include "base/fts_json.hpp"
@@ -87,7 +88,7 @@ std::string file_stamp(const std::filesystem::path& p) {
     std::error_code ec;
     const auto size = std::filesystem::file_size(p, ec);
     const auto time = std::filesystem::last_write_time(p, ec).time_since_epoch().count();
-    return p.string() + ":" + std::to_string(ec ? 0ULL : static_cast<unsigned long long>(size)) + ":" +
+    return utf8::string_of(p) + ":" + std::to_string(ec ? 0ULL : static_cast<unsigned long long>(size)) + ":" +
            std::to_string(static_cast<long long>(time));
 }
 

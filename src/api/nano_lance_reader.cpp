@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "nanolance/nano_lance_reader.h"
 
 #include "lance_minimal.pb.hpp"
@@ -261,7 +262,7 @@ int nano_lance_dataset_read_latest(const char* dataset_path, NanoLanceDatasetMet
     std::string err;
     nano_lance::pb::Manifest manifest;
     std::uint64_t version = 0;
-    if (!nano_lance::load_latest_manifest(dataset_path, manifest, version, err)) {
+    if (!nano_lance::load_latest_manifest(nano_lance::utf8::from_utf8(dataset_path), manifest, version, err)) {
         set_error(error_message, error_message_capacity, err);
         return NANO_LANCE_READER_IO_ERROR;
     }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "nanolance/work_stats.hpp"
 #include "nanolance/deletion_vector.hpp"
 #include "nanolance/byte_source.hpp"
@@ -680,7 +681,7 @@ bool read_deletion_vector(const std::filesystem::path& deletions_dir, std::uint6
     const auto path = deletions_dir / name;
 
     std::string io_error;
-    const auto source = io::open_source(path.string(), io_error);
+    const auto source = io::open_source(utf8::string_of(path), io_error);
     if (!source) {
         error = "failed to open deletion file " + name;
         return false;
@@ -819,7 +820,7 @@ bool write_deletion_file(const std::filesystem::path& dataset_path, std::uint64_
     }
     std::unique_ptr<io::OutputFile> file;
     if (ok) {
-        file = io::open_output(path.string(), error);
+        file = io::open_output(utf8::string_of(path), error);
         if (!file) {
             cleanup();
             return false;
@@ -847,7 +848,7 @@ bool write_deletion_file(const std::filesystem::path& dataset_path, std::uint64_
         file.reset();
         if (opened) {
             std::string ignored;
-            io::remove_output(path.string(), ignored);
+            io::remove_output(utf8::string_of(path), ignored);
         }
         return false;
     }

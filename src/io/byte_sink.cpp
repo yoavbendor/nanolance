@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/byte_sink.hpp"
+#include "base/utf8_path.hpp"
 
 #include <atomic>
 #include <filesystem>
@@ -91,7 +92,7 @@ std::unique_ptr<OutputFile> open_output(const std::string& path_or_uri, std::str
                 ":// are not supported (nanolance writes local paths and s3:// URIs): " + path_or_uri;
         return nullptr;
     }
-    const std::filesystem::path path(path_or_uri);
+    const std::filesystem::path path = utf8::from_utf8(path_or_uri);
     std::error_code ec;
     if (path.has_parent_path()) {
         std::filesystem::create_directories(path.parent_path(), ec);
@@ -116,7 +117,7 @@ bool put_if_absent(const std::string& path_or_uri, const std::vector<std::uint8_
     if (backend_for(path_or_uri, backend)) {
         return backend.put_if_absent(path_or_uri, bytes, already_exists, error);
     }
-    const std::filesystem::path final_path(path_or_uri);
+    const std::filesystem::path final_path = utf8::from_utf8(path_or_uri);
     std::error_code ec;
     std::filesystem::create_directories(final_path.parent_path(), ec);
     if (ec) {
@@ -127,7 +128,7 @@ bool put_if_absent(const std::string& path_or_uri, const std::vector<std::uint8_
     // link could publish the other's bytes (and report success for a change it lost).
     static std::atomic<std::uint64_t> counter{0};
     const auto unique = std::to_string(std::random_device{}()) + "-" + std::to_string(counter.fetch_add(1U));
-    const auto temp_path = final_path.parent_path() / (final_path.filename().string() + "." + unique + ".tmp");
+    const auto temp_path = final_path.parent_path() / (utf8::string_of(final_path.filename()) + "." + unique + ".tmp");
     {
         std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
         if (!out) {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/base_paths.hpp"
 #include "nanolance/row_ids.hpp"
@@ -3064,7 +3065,7 @@ bool cached_file_metadata(const std::filesystem::path& path, std::shared_ptr<con
     std::uint64_t size = 0;
     std::int64_t mtime = 0;
     const bool known = data_file_identity(path, size, mtime);
-    const auto key = path.string();
+    const auto key = utf8::string_of(path);
     if (known) {
         const std::lock_guard<std::mutex> lock(mutex);
         const auto it = cache.find(key);
@@ -3879,7 +3880,7 @@ bool open_file_plan(const std::filesystem::path& file_path, const LanceScanReque
     pb::Manifest manifest;
     manifest.fields = descriptor.fields;
     pb::DataFile file;
-    file.path = file_path.filename().string();
+    file.path = utf8::string_of(file_path.filename());
     std::unordered_set<std::int32_t> parents;
     for (const auto& f : descriptor.fields) {
         if (f.parent_id >= 0) {

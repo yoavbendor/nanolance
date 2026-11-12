@@ -5,6 +5,7 @@
 // machinery (filters, row addresses), write new data through the staged writer, and commit the
 // latest manifest with the changed fragments and schema.
 
+#include "base/utf8_path.hpp"
 #include "nanolance/frag_reuse.hpp"
 #include "nanolance/dataset_ops.hpp"
 #include "nanolance/row_ids.hpp"
@@ -213,7 +214,7 @@ public:
         WriteOptions options;
         options.append = append;
         options.stage_fragments = true;
-        if (writer_.open(path.string(), options) != WriteStatus::Ok) {
+        if (writer_.open(utf8::string_of(path), options) != WriteStatus::Ok) {
             error = writer_.error();
             return false;
         }

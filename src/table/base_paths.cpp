@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "nanolance/base_paths.hpp"
 
 #include "base/proto_wire.hpp"
@@ -244,7 +245,7 @@ bool data_file_dir(const std::filesystem::path& dataset_path, const std::vector<
         error = "data file " + error;
         return false;
     }
-    out = base->is_dataset_root ? std::filesystem::path(base->path) / "data" : std::filesystem::path(base->path);
+    out = base->is_dataset_root ? utf8::from_utf8(base->path) / "data" : utf8::from_utf8(base->path);
     return true;
 }
 
@@ -263,7 +264,7 @@ bool deletion_dir(const std::filesystem::path& dataset_path, const std::vector<B
         error = "deletion file names base path " + std::to_string(*base_id) + ", which is not a dataset root";
         return false;
     }
-    out = std::filesystem::path(base->path) / "_deletions";
+    out = utf8::from_utf8(base->path) / "_deletions";
     return true;
 }
 
@@ -321,7 +322,7 @@ bool indices_dir(const std::filesystem::path& dataset_path, const std::vector<Ba
         error = "index " + error;
         return false;
     }
-    out = base->is_dataset_root ? std::filesystem::path(base->path) / "_indices" : std::filesystem::path(base->path);
+    out = base->is_dataset_root ? utf8::from_utf8(base->path) / "_indices" : utf8::from_utf8(base->path);
     return true;
 }
 

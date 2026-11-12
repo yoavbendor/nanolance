@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "dataset/write_session.hpp"
 
 #include "nanolance/byte_sink.hpp"
@@ -291,7 +292,7 @@ WriteStatus WriteSession::open(const std::string& path, const WriteOptions& opts
     if (opts.append) {
         std::error_code ec;
         // An object store has no directories: loading the latest manifest below checks it there.
-        if (!io::is_object_store_output(state->dataset_path.string()) &&
+        if (!io::is_object_store_output(utf8::string_of(state->dataset_path)) &&
             !std::filesystem::exists(state->dataset_path / "_versions", ec)) {
             return fail(WriteStatus::IoError, "init_append requires an existing dataset with _versions");
         }
@@ -568,7 +569,7 @@ WriteStatus WriteSession::commit_pending(bool is_append) {
     }
 
     std::error_code error;
-    const bool object_store = io::is_object_store_output(state->dataset_path.string());
+    const bool object_store = io::is_object_store_output(utf8::string_of(state->dataset_path));
     if (is_append && !object_store && !std::filesystem::exists(state->dataset_path, error)) {
         return fail(WriteStatus::IoError, "append requested but dataset path does not exist");
     }
@@ -1025,7 +1026,7 @@ WriteStatus WriteSession::finish(int mode, uint64_t* version_out) {
     extras.transaction_properties = state->transaction_properties;
     extras.stable_row_ids = state->stable_row_ids;
     extras.initial_bases = state->initial_bases.empty() ? nullptr : &state->initial_bases;
-    if (!io::is_object_store_output(state->dataset_path.string())) {
+    if (!io::is_object_store_output(utf8::string_of(state->dataset_path))) {
         std::filesystem::create_directories(state->dataset_path / "data", ec);
     }
     if (!commit_dataset_version(state->dataset_path, mapping, state->staged, commit_mode, version, error,
@@ -1115,7 +1116,7 @@ WriteStatus WriteSession::set_fragment_targets(size_t count, const char* const* 
         if (dirs[i] == nullptr || dirs[i][0] == '\0') {
             return fail(WriteStatus::InvalidArgument, "a fragment target directory is empty");
         }
-        targets.push_back(State::FragmentTarget{std::filesystem::path(dirs[i]), base_ids[i]});
+        targets.push_back(State::FragmentTarget{utf8::from_utf8(dirs[i]), base_ids[i]});
     }
     state->fragment_targets = std::move(targets);
     error_.clear();

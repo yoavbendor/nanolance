@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "nanolance/byte_sink.hpp"
 #include "nanolance/data_file_writer.hpp"
 
@@ -4145,11 +4146,11 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
     }
 
     const auto relative_path =
-        extras != nullptr && !extras->path.empty() ? extras->path : std::filesystem::path("data") / file_name;
+        extras != nullptr && !extras->path.empty() ? extras->path : std::filesystem::path("data") / utf8::from_utf8(file_name);
     const auto full_path = extras != nullptr && !extras->path.empty() ? extras->path : dataset_path / relative_path;
     work_stats::WrittenFileTally tally(full_path);
     // A local file (its directory created), or an object uploaded on commit() (io::open_output).
-    auto output = io::open_output(full_path.string(), error);
+    auto output = io::open_output(utf8::string_of(full_path), error);
     if (!output) {
         return false;
     }
