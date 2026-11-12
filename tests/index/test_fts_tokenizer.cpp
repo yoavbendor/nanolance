@@ -6,13 +6,30 @@
 
 #include "nanolance/fts_tokenizer.hpp"
 
+#include <exception>
 #include <fstream>
 #include <cstdint>
 #include <iostream>
 #include <string>
 #include <vector>
 
-int main(int argc, char** argv) {
+namespace {
+
+/// The next line of `in`, without a trailing CR: a Windows checkout with core.autocrlf ends each line in CRLF.
+bool next_line(std::istream& in, std::string& line) {
+    if (!std::getline(in, line)) {
+        return false;
+    }
+    if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+    }
+    return true;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) try {
+    std::cout << "running nano_lance_fts_tokenizer\n" << std::flush;
     if (argc < 2) {
         std::cerr << "usage: test_fts_tokenizer <cases.txt>\n";
         return 2;
@@ -29,12 +46,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::string line;
-    std::getline(in, line);  // the header
+    next_line(in, line);  // the header
     std::string expected;
     std::size_t cases = 0;
     std::size_t failed = 0;
     std::vector<nano_lance::fts::Token> tokens;
-    while (std::getline(in, line)) {
+    while (next_line(in, line)) {
         if (line.rfind("@@code ", 0) == 0) {
             // A section of code-analyzer cases: "@@code ops=1 split=1 preserve=1 numerics=1".
             const auto flag = [&line](const std::string& key) {
@@ -75,7 +92,7 @@ int main(int argc, char** argv) {
             }
             continue;
         }
-        if (!std::getline(in, expected)) {
+        if (!next_line(in, expected)) {
             break;
         }
         tokens.clear();
@@ -141,4 +158,7 @@ int main(int argc, char** argv) {
     }
     std::cout << cases - failed << " of " << cases << " cases tokenized as Lance does\n";
     return failed == 0 ? 0 : 1;
+} catch (const std::exception& e) {
+    std::cerr << "FAIL: uncaught exception: " << e.what() << '\n';
+    return 1;
 }
