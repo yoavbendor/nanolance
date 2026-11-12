@@ -15,6 +15,8 @@ python tools/rust_suite.py --update             # ... and rewrite the list of te
 python tools/rust_suite.py --filter bitpack     # only tests whose name contains "bitpack"
 python tools/rust_suite.py --crates lance-file  # one crate
 NANOLANCE_RUST_KEEP=/tmp/keep python tools/rust_suite.py --filter ...   # keep each mismatching file
+NANOLANCE_RUST_KEEP=/tmp/keep NANOLANCE_RUST_KEEP_PASS=1 python tools/rust_suite.py --filter ...  # keep every round trip
+                                                                        # (the small files tests/golden are written from)
 ```
 
 The work happens in these steps:
@@ -61,11 +63,11 @@ Lance 12.0.0 crates:
 | | |
 |---|---|
 | tests run (lance-encoding and lance-file 12.0.0) | 1,986; each also passes in Rust |
-| tests with round trips that nanolance reads back, all equal | **1,458** (`expected_pass.txt`) |
-| tests where nanolance refuses some round trip | 5 |
+| tests with round trips that nanolance reads back, all equal | **1,463** (`expected_pass.txt`) |
+| tests where nanolance refuses some round trip | 0 |
 | tests with no round trip (unit tests of one component) | 523 |
-| round trips read back equal | **10,977** |
-| round trips refused | 10 (each under its first reason, below) |
+| round trips read back equal | **10,987** |
+| round trips refused | 0 |
 | round trips with different rows | **0** |
 
 The runs so far found three bugs in nanolance, all fixed and pinned by tests that do not need Rust:
@@ -84,6 +86,15 @@ Bare file names now also work: `LanceFileReader("x.lance")` used to look for `da
 
 The later runs found and fixed these, each pinned by a test that does not need Rust:
 
+- **Variable-width packed structs** (`lance-encoding:packed` with utf8 or binary children, a FullZip
+  `VariablePackedStruct` page), also inside a sparse list of them (6 round trips). Each row holds the children
+  back to back, a variable child as a length prefix. `tests/file/test_variable_packed_struct_read.cpp`.
+- **Dictionary run-length indices** with u8, u16 or u32 run lengths (`test_miniblock_bitpack`, 1 round trip).
+  The lengths' width comes from the page, as for a plain RLE chunk. `tests/file/test_dict_rle_read.cpp`.
+- **Sparse map keys and sparse fixed-size-list layers** (the map's key layer is all-valid and is not counted;
+  a fixed-size list's layer counts its elements). `tests/file/test_sparse_page_read.cpp`.
+- **Lists of fixed-size lists of structs** (`list<fixed_size_list<struct>>`) are read, whole, by range and by
+  take. Writing them is refused by name.
 - **The sparse page layout** (Lance 12, format 2.3). Every such page was refused; they are read now.
 - **RLE chunks** with a run length of any width (u8, u16 or u32) and with framed values (zstd or lz4).
 - **Level counts** far larger than their compressed bytes. RLE and bitpacked levels compress well, and a
@@ -105,12 +116,7 @@ The later runs found and fixed these, each pinned by a test that does not need R
   column: a struct marked `lance-encoding:blob` whose five descriptor children have no ids. The file reader counted
   each child as a column. It now links the children to their parent and counts the struct as one column.
 
-What nanolance refuses, by round trips (each refused round trip is counted under its first reason):
-
-- **Variable-width packed structs** (`lance-encoding:packed` with utf8 children, 4 round trips, "1 columns for 3
-  leaf fields") and a `VariablePackedStruct` page inside a sparse list of them (2 round trips). Fixed-width packed
-  structs are read; these are not.
-- **A fixed-size list of structs inside a list** (write refusal, 1).
-- **A map's `keys` column in the sparse layout**, decoded to a different shape than its schema (1).
-- **A sparse page with a fixed-size-list layer** (1). The sparse layout is read, but this layer is not.
-- **A dict-RLE run count mismatch** (1).
+What nanolance refuses: none of the round trips. Writing is still refused by name for the shapes that
+were read but not written: a packed struct, a fixed-size list of fixed-size lists under a struct or list, and
+a fixed-size list of structs under a struct or list (`a fixed_size_list of structs inside a struct or list is
+not written yet`).
