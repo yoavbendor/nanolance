@@ -5429,8 +5429,13 @@ static bool decode_lance_physical_column_rows_impl(const EncodingsIo& io, const 
     // A few chunks are read even when the column is cached: picking rows out of the copy walks all
     // of its rows (a list column's layers among them).
     if (!rows.empty() && !full_zip_lists && !few_chunks && take_cache_budget() != 0U && encoded <= kCacheColumnBytes) {
+        // A dictionary column is small on disk but expands many times over when decoded whole: its first
+        // take (an indexed query's few rows) reads only their chunks, and its second fills the copy.
+        const bool small_dictionary =
+            encoded <= kSmallColumnBytes && !nested && has_dictionary_page(on_disk_field, column_metadata);
         const auto whole = cached_whole_column(io, on_disk_field, column_metadata, error,
-                                               encoded <= kSmallColumnBytes ? CacheFill::FirstTake
+                                               small_dictionary              ? CacheFill::SecondTake
+                                               : encoded <= kSmallColumnBytes ? CacheFill::FirstTake
                                                : chunked                    ? CacheFill::Never
                                                : nested                     ? CacheFill::SecondTake
                                                                             : CacheFill::FirstTake);

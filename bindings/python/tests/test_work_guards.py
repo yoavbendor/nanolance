@@ -475,3 +475,39 @@ def test_an_or_of_two_in_lists_is_answered_by_both_indexes(keyed_dataset):
     assert got == expected
     assert stats["indexed_fragments"] > 0, stats
     assert stats["index_evaluations"] <= 2, stats
+
+
+# ── an indexed IN over a dictionary column: its rows, not a copy of the column ───────────────────────
+
+_REL_NAMES = [f"REL_{i:02d}" for i in range(30)]
+
+
+def _edges_like(n=200_000, keys=20_000, seed=9):
+    """Edges' shape at small size: a key with about ten rows each, a 30-value dictionary column (small on
+    disk, several times its size once decoded) and a payload that keeps the file honest."""
+    rng = np.random.default_rng(seed)
+    src = [f"k{v:07d}" for v in rng.integers(0, keys, n)]
+    rel = pa.array([_REL_NAMES[v] for v in rng.integers(0, 30, n)]).dictionary_encode()
+    return pa.table({"source_id": pa.array(src), "relationship_name": rel,
+                     "properties": pa.array([f"{{\"w\": {k}}}" + "x" * 60 for k in range(n)])})
+
+
+def test_an_indexed_in_on_a_dictionary_column_expands_its_rows_not_the_column(tmp_path):
+    """An IN an index answers returns a few dozen rows; its dictionary column is expanded for those rows (and
+    whole chunks where the encoding forces it). A column's first take used to decode the whole column for the
+    take cache: a million rows expanded for 169 rows on the edges benchmark."""
+    table = _edges_like()
+    path = str(tmp_path / "edges_like.lance")
+    nl.write_dataset(table, path, max_rows_per_file=1_000_000)
+    ds = nl.dataset(path)
+    ds.create_scalar_index("source_id", "BTREE", name="source_bt")
+    wanted = ["k0000003", "k0009999", "k0015000", "k0019999"]
+    expected = sum(1 for s in table.column("source_id").to_pylist() if s in wanted)
+    flt = _in_sql("source_id", wanted)
+    stats, got = _stats_of(lambda: ds.to_table(columns=["source_id", "relationship_name"], filter=flt).num_rows)
+    assert got == expected
+    assert stats["indexed_fragments"] > 0, stats
+    # Measured with the fix: 100 rows expanded for 50 returned (the chunk each row sits in, 4096 rows, is
+    # expanded whole only where a chunk is taken; this file's chunks are small). Without the fix the first
+    # take decoded the whole 200k-row column for the take cache.
+    assert stats["dict_rows_expanded"] <= 2 * got + 4096, stats
