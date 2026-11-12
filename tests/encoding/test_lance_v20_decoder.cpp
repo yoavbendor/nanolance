@@ -12,6 +12,7 @@
 #include "nanolance/encodings_io.hpp"
 #include "nanolance/lance_v20_decoder.hpp"
 
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -96,6 +97,10 @@ Bytes some_nulls(const Bytes& validity, const Bytes& values) {
 }
 // ArrayEncoding { nullable = 2 { all_nulls = 3 {} } }.
 Bytes all_nulls() { return message_field(2, message_field(3, Bytes{})); }
+// ArrayEncoding { fixed_size_list = 3 { dimension = 1, items = 2 } }.
+Bytes fixed_size_list(const Bytes& items, std::uint64_t dimension) {
+    return message_field(3, cat({message_field(2, items), uint_field(1, dimension)}));
+}
 
 Bytes any(const std::string& url, const Bytes& value) {
     return cat({message_field(1, Bytes(url.begin(), url.end())), message_field(2, value)});
@@ -168,6 +173,37 @@ void check_rows(const nano_lance::ColumnValues& got, const std::vector<std::size
     require(got.null_count == nulls, what + ": null count");
 }
 
+/// The bool column's rows: each row's three items, and whether the row is valid.
+struct BoolRow {
+    bool valid;
+    std::array<std::uint8_t, 3> items;
+};
+const std::vector<BoolRow> kBoolRows = {{true, {1, 0, 1}}, {true, {0, 0, 1}}, {true, {1, 1, 0}},
+                                        {true, {0, 1, 1}}, {false, {0, 0, 0}}};
+
+void check_bool_rows(const nano_lance::ColumnValues& got, const std::vector<std::size_t>& which,
+                     const std::string& what) {
+    require(got.kind == nano_lance::ColumnValues::Kind::FixedWidth && got.rows == which.size(),
+            what + ": " + std::to_string(which.size()) + " rows, got " + std::to_string(got.rows));
+    require(got.items_per_row == 3 && got.fixed.size() == which.size() * 3U,
+            what + ": one byte per item, three a row");
+    require(got.item_validity.empty() && got.item_null_count == 0U, what + ": no item is null");
+    std::uint64_t nulls = 0;
+    for (std::size_t k = 0; k < which.size(); ++k) {
+        const auto& want = kBoolRows[which[k]];
+        require(valid_at(got, k) == want.valid, what + ": row " + std::to_string(which[k]) + " validity");
+        if (want.valid) {
+            for (std::size_t j = 0; j < 3; ++j) {
+                require(got.fixed[k * 3U + j] == want.items[j],
+                        what + ": row " + std::to_string(which[k]) + " item " + std::to_string(j));
+            }
+        } else {
+            ++nulls;
+        }
+    }
+    require(got.null_count == nulls, what + ": null count");
+}
+
 }  // namespace
 
 int main() {
@@ -225,6 +261,38 @@ int main() {
     unknown.pages.push_back(page_of(io, message_field(99, Bytes{}), 3, {ints({1, 2, 3})}));
     error.clear();
     require(!nano_lance::v20::decode_column(io, field, unknown, nullptr, refused, error), "an unknown variant is refused");
+
+    // fixed_size_list<bool, 3> in format 2.0: its items are one Flat(1) bitmap, row r's three bits at
+    // [3r, 3r + 3). Page A: rows 0..2 with no nulls, nine bits LSB first. Page B: a nullable page whose
+    // row 1 is null (validity 0b01), with its own items bitmap of 2 rows.
+    MemoryIo bools;
+    bools.bytes.assign(16, 0xEE);
+    nano_lance::pb::ColumnMetadata bool_column;
+    bool_column.pages.push_back(page_of(bools, fixed_size_list(flat(1, 0), 3), 3, {Bytes{0xE5, 0x00}}));
+    bool_column.pages.push_back(page_of(bools, some_nulls(flat(1, 0), fixed_size_list(flat(1, 1), 3)), 2,
+                                        {Bytes{0b01}, Bytes{0x06}}));
+    nano_lance::pb::Field bool_field;
+    bool_field.name = "b";
+    bool_field.logical_type = "fixed_size_list:bool:3";
+    require(nano_lance::v20::is_v20_column(bool_column), "a bool fixed_size_list column is 2.0");
+
+    nano_lance::ColumnValues bool_all;
+    error.clear();
+    bool ok = nano_lance::v20::decode_column(bools, bool_field, bool_column, nullptr, bool_all, error);
+    require(ok, "decode_column of fixed_size_list<bool>: " + error);
+    check_bool_rows(bool_all, {0, 1, 2, 3, 4}, "bool whole column");
+
+    nano_lance::ColumnValues bool_range;
+    error.clear();
+    ok = nano_lance::v20::decode_column_range(bools, bool_field, bool_column, nullptr, 1, 3, 3, bool_range, error);
+    require(ok, "decode_column_range of fixed_size_list<bool>: " + error);
+    check_bool_rows(bool_range, {1, 2, 3}, "bool rows 1..4, across both pages");
+
+    nano_lance::ColumnValues bool_rows;
+    error.clear();
+    ok = nano_lance::v20::decode_column_rows(bools, bool_field, bool_column, nullptr, {0, 3, 4}, 3, bool_rows, error);
+    require(ok, "decode_column_rows of fixed_size_list<bool>: " + error);
+    check_bool_rows(bool_rows, {0, 3, 4}, "bool rows 0, 3, 4");
 
     std::cout << "lance_v20_decoder: ok\n";
     return 0;

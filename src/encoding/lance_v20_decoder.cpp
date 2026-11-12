@@ -873,6 +873,16 @@ bool decode(const Enc& enc, std::uint64_t start, std::uint64_t count, PageReader
                 error = "format 2.0 fixed_size_list whose every item is null is not read";
                 return false;
             }
+            if (child.shape == Arr::Shape::kBits && child.dimension == 0U) {
+                // fixed_size_list<bool>: the items are one bitmap, the bits of row r at [r * N, (r + 1) * N).
+                out.shape = Arr::Shape::kBits;
+                out.n = count;
+                out.dimension = enc.dimension;
+                out.bytes = std::move(child.bytes);
+                out.item_validity = std::move(child.validity);
+                out.item_nulls = child.nulls;
+                return true;
+            }
             if (child.shape != Arr::Shape::kFixed || child.dimension != 0U) {
                 error = "format 2.0 fixed_size_list of this item type is not read";
                 return false;
@@ -986,6 +996,7 @@ struct LeafType {
     bool variable = false;
     bool large = false;
     bool boolean = false;
+    bool bool_items = false;  // fixed_size_list<bool>: one byte per item, as the writer holds them
     bool null_type = false;   // Arrow's null type: every page is all-null
     std::uint64_t items = 0;  // fixed_size_list
     std::size_t value_bytes = 0;
@@ -1000,10 +1011,11 @@ bool leaf_type(const pb::Field& field, LeafType& t, std::string& error) {
     }
     std::string element;
     if (lance_fixed_size_list_parts(type, element, t.items)) {
-        if (element == "bool" || lance_field_is_variable_width(element)) {
+        if (lance_field_is_variable_width(element)) {
             error = "column '" + field.name + "': a fixed_size_list of " + element + " is not read";
             return false;
         }
+        t.bool_items = element == "bool";
     }
     t.boolean = type == "bool";
     t.null_type = type == "null";
@@ -1057,6 +1069,27 @@ bool append_page(ColumnValues& out, const LeafType& t, Arr& a, const std::string
             return false;
         }
         out.fixed.resize(out.fixed.size() + static_cast<std::size_t>(a.n) * t.value_bytes, 0U);
+    } else if (t.bool_items) {
+        // fixed_size_list<bool>: one byte per item (N a row), as the writer and the 2.2 reader hold them.
+        const auto base = out.fixed.size();
+        const auto items = a.n * t.items;
+        out.fixed.resize(base + static_cast<std::size_t>(items), 0U);
+        if (!all_null) {
+            if (a.shape != Arr::Shape::kBits || a.dimension != t.items) {
+                error = "column '" + name + "': format 2.0 fixed_size_list of booleans decoded to another shape";
+                return false;
+            }
+            for (std::uint64_t i = 0; i < items; ++i) {
+                out.fixed[base + static_cast<std::size_t>(i)] = bit_at(a.bytes, i) ? 1U : 0U;
+            }
+        }
+        out.items_per_row = t.items;
+        const auto item_at = at * t.items;
+        if (all_null) {
+            append_bits(out.item_validity, out.item_null_count, item_at, nullptr, items, true);
+        } else {
+            append_bits(out.item_validity, out.item_null_count, item_at, &a.item_validity, items, false);
+        }
     } else if (t.boolean) {
         const auto base = out.fixed.size();
         out.fixed.resize(base + static_cast<std::size_t>(a.n), 0U);
