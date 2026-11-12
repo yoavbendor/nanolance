@@ -1786,7 +1786,7 @@ struct ColumnSource {
     /// on-disk field (its column is `metadata`) and this child's index among the struct's children. Null otherwise.
     const pb::Field* packed_parent = nullptr;
     std::size_t packed_child = 0;
-    std::vector<std::uint64_t> packed_widths;  // every child's width in bytes, in struct order
+    std::vector<PackedChild> packed_widths;  // every child's layout in the packed struct, in struct order
     /// A leaf under fixed_size_list<struct>s and structs alone (W1k4): its elements a row, the product of the
     /// lists' sizes. A take picks those elements for each row; 1 otherwise.
     std::uint64_t elements_per_row = 1;
@@ -1937,16 +1937,17 @@ bool v20_packed_struct_sources(const LanceSchemaMapping& mapping, const LanceFie
 /// the column's pages PackedStruct). Each child is read out of the struct's column (decode_lance_packed_struct_child*).
 /// A non-packed parent, or a column that is not packed, adds nothing: its leaves are read on their own.
 bool column_is_packed_struct_v21(const EncodingsIo& io, const pb::ColumnMetadata& column,
-                                 const std::string& logical_type, const std::vector<std::uint64_t>& child_bytes) {
+                                 const std::string& logical_type, const std::vector<PackedChild>& children) {
     // Only a struct can be packed: a list has an item child too, and a constant list page can hold a value the
     // size of that child by chance (test_constant_layout_list_repdef_v2_2).
-    return logical_type == "struct" && packed_struct_column(io, column, child_bytes);
+    return logical_type == "struct" && packed_struct_column(io, column, children);
 }
 
-/// Each direct child of a struct in the file's descriptor, in order: its width in bytes when it is fixed-width, 0
-/// when it is not (or is itself a struct).
-std::vector<std::uint64_t> descriptor_child_widths(const pb::FileDescriptor& descriptor, std::int32_t parent_id) {
-    std::vector<std::uint64_t> widths;
+/// Each direct child of a struct in the file's descriptor, in order: its layout in a packed struct. A fixed-width
+/// child has its width in bytes; a variable-width one (utf8, binary) is variable, with 64-bit offsets when large.
+/// A struct, a list or a fixed-size list is neither, which makes the parent not packed.
+std::vector<PackedChild> descriptor_child_widths(const pb::FileDescriptor& descriptor, std::int32_t parent_id) {
+    std::vector<PackedChild> widths;
     for (const auto& f : descriptor.fields) {
         if (f.parent_id != parent_id) {
             continue;
@@ -1958,7 +1959,14 @@ std::vector<std::uint64_t> descriptor_child_widths(const pb::FileDescriptor& des
         std::uint64_t items = 0;
         const bool plain = !t.empty() && t != "struct" && t != "bool" && !lance_logical_type_is_list(t) &&
                            !lance_field_is_variable_width(t) && !lance_fixed_size_list_parts(t, element, items);
-        widths.push_back(plain ? static_cast<std::uint64_t>(lance_logical_type_value_bytes(t)) : 0U);
+        PackedChild child;
+        if (plain) {
+            child.bytes = static_cast<std::uint64_t>(lance_logical_type_value_bytes(t));
+        } else if (lance_field_is_variable_width(t)) {
+            child.variable = true;
+            child.large = lance_logical_type_has_large_offsets(t);
+        }
+        widths.push_back(child);
     }
     return widths;
 }
@@ -1966,7 +1974,7 @@ std::vector<std::uint64_t> descriptor_child_widths(const pb::FileDescriptor& des
 bool v21_packed_struct_sources(const LanceSchemaMapping& mapping, const LanceField& parent,
                                const std::filesystem::path& path, const pb::FileDescriptor& descriptor,
                                const pb::Field& parent_on_disk, const pb::ColumnMetadata& column,
-                               const std::vector<std::uint64_t>& child_bytes,
+                               const std::vector<PackedChild>& child_bytes,
                                const std::unordered_set<std::int32_t>* allowed_field_ids,
                                std::vector<ColumnSource>& out, std::string& error) {
     int k = 0;
@@ -2025,9 +2033,15 @@ bool v21_packed_parent_sources(const LanceSchemaMapping& mapping, const pb::File
         return true;
     }
     packed = true;
-    if (parent->parent_id >= 0) {
-        error = "packed struct '" + parent->name + "' inside another struct is not read yet";
-        return false;
+    // A packed struct under lists (list<struct>) is read: the lists are its column's layers, as for any leaf below
+    // them. One under a struct, or a map (a list of structs under a name), is not read yet.
+    for (auto ancestor_id = parent->parent_id; ancestor_id >= 0;) {
+        const auto* ancestor = find_mapping_field(mapping, ancestor_id);
+        if (ancestor == nullptr || ancestor->logical_type == "map" || !lance_logical_type_is_list(ancestor->logical_type)) {
+            error = "packed struct '" + parent->name + "' inside another struct is not read yet";
+            return false;
+        }
+        ancestor_id = ancestor->parent_id;
     }
     const auto* on_disk_parent = find_descriptor_field(descriptor, field_id);
     if (on_disk_parent == nullptr) {

@@ -172,8 +172,11 @@ pub(crate) fn check(
         }
     }
     // NANOLANCE_RUST_KEEP=<dir> keeps the file of every mismatch there, to reproduce it outside Rust.
+    // NANOLANCE_RUST_KEEP_PASS=1 with it keeps the file of every round trip, whatever its outcome: the small
+    // files a golden test (tests/golden) is written from.
+    let keep_all = std::env::var("NANOLANCE_RUST_KEEP_PASS").is_ok();
     match std::env::var("NANOLANCE_RUST_KEEP") {
-        Ok(keep) if outcome.status == "mismatch" => {
+        Ok(keep) if outcome.status == "mismatch" || keep_all => {
             let _ = std::fs::rename(&path, format!("{keep}/{}-{case}.lance", std::process::id()));
         }
         _ => {

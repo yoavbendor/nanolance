@@ -1088,6 +1088,17 @@ target_link_libraries(nano_lance_packed_struct_read_test PRIVATE nanolance)
 add_test(NAME nano_lance_packed_struct_read COMMAND $<TARGET_FILE:nano_lance_packed_struct_read_test>)
 set_tests_properties(nano_lance_packed_struct_read PROPERTIES LABELS "smoke")
 
+# Lance 2.2 packed structs with variable-width children (a VariablePackedStruct page), from Lance's own encoder tests:
+# the small files NANOLANCE_RUST_KEEP_PASS keeps (tests/golden/variable_packed), read whole, by range and by take.
+add_executable(nano_lance_variable_packed_struct_read_test tests/file/test_variable_packed_struct_read.cpp)
+target_compile_features(nano_lance_variable_packed_struct_read_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_variable_packed_struct_read_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_compile_definitions(nano_lance_variable_packed_struct_read_test PRIVATE
+    NANO_LANCE_VARIABLE_PACKED_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/variable_packed")
+target_link_libraries(nano_lance_variable_packed_struct_read_test PRIVATE nanolance)
+add_test(NAME nano_lance_variable_packed_struct_read COMMAND $<TARGET_FILE:nano_lance_variable_packed_struct_read_test>)
+set_tests_properties(nano_lance_variable_packed_struct_read PROPERTIES LABELS "smoke")
+
 # A legacy blob (`lance-encoding:blob`) in a Lance 2.1 file, read from pylance's file (tests/generate_golden_legacy_blob.py
 # writes it): whole, by a row range and by a take, as the bytes of each row.
 add_executable(nano_lance_legacy_blob_v21_read_test tests/file/test_legacy_blob_v21_read.cpp)
