@@ -511,3 +511,31 @@ def test_an_indexed_in_on_a_dictionary_column_expands_its_rows_not_the_column(tm
     # expanded whole only where a chunk is taken; this file's chunks are small). Without the fix the first
     # take decoded the whole 200k-row column for the take cache.
     assert stats["dict_rows_expanded"] <= 2 * got + 4096, stats
+
+
+def test_a_repeated_indexed_in_on_a_btree_string_column_reads_no_index_bytes_the_second_time(tmp_path):
+    """A BTREE's decoded windows (4096 index rows each) are kept across queries, bounded by
+    NANOLANCE_INDEX_PAGE_CACHE_MB (64 MiB by default), so the same IN again reads none of page_data.lance. The
+    values are absent from the table but lie within windows, so every byte read is an index byte. Without the cache
+    each call read every window again: about 0.5 to 1.5 MB per window of a million-row edges table."""
+    table = _edges_like()
+    path = str(tmp_path / "edges_like.lance")
+    nl.write_dataset(table, path, max_rows_per_file=1_000_000)
+    ds = nl.dataset(path)
+    ds.create_scalar_index("source_id", "BTREE", name="source_bt")
+    present = table.column("source_id").to_pylist()
+    absent = [present[k] + "!" for k in (0, 40_000, 80_000, 120_000, 160_000, 199_000)]
+    flt = _in_sql("source_id", absent)
+    first_stats, first = _stats_of(lambda: ds.to_table(columns=["source_id"], filter=flt).num_rows)
+    second_stats, second = _stats_of(lambda: ds.to_table(columns=["source_id"], filter=flt).num_rows)
+    assert first == second == 0
+    assert first_stats["index_page_cache_misses"] > 0 and first_stats["data_bytes_read"] > 0, first_stats
+    assert second_stats["index_page_cache_misses"] == 0, second_stats
+    assert second_stats["index_page_cache_hits"] == first_stats["index_page_cache_misses"], (first_stats, second_stats)
+    assert second_stats["data_bytes_read"] * 20 < first_stats["data_bytes_read"], (first_stats, second_stats)
+    # Values that are present: the same windows are answered from the cache, and the rows are the same.
+    wanted = [present[k] for k in (3, 40_000, 199_999)]
+    expected = sum(1 for s in present if s in frozenset(wanted))
+    flt = _in_sql("source_id", wanted)
+    stats, got = _stats_of(lambda: ds.to_table(columns=["source_id"], filter=flt).num_rows)
+    assert got == expected and stats["index_page_cache_hits"] > 0, (got, expected, stats)
