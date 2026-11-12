@@ -6129,4 +6129,192 @@ bool decode_lance_physical_column_range(const EncodingsIo& io, const pb::Field& 
            attach_dictionary(io, on_disk_field, column_metadata, out, error);
 }
 
+// ---- Lance 2.1 packed structs ----
+//
+// The writer stores a struct whose children are all fixed-width as ONE column: each row's child values, in
+// struct order, back to back (row-major), with the descriptor's PackedStruct giving each child's width. The
+// page layout unwraps that into its Flat (page_layout.hpp: MiniBlock::packed_bits), so the column decodes as
+// one fixed-width value a row, `row_bytes` wide. A child is then its byte range inside every row.
+
+bool packed_struct_column(const EncodingsIo& io, const pb::ColumnMetadata& column,
+                          const std::vector<std::uint64_t>& child_bytes) {
+    if (column.pages.empty() || child_bytes.empty()) {
+        return false;
+    }
+    std::uint64_t row_bytes = 0;
+    for (const auto b : child_bytes) {
+        if (b == 0U) {
+            return false;  // a child that is not fixed-width is not packed with the others
+        }
+        row_bytes += b;
+    }
+    // A page that is all null carries no packed row, so it says nothing about the widths and is accepted as is. A
+    // non-packed struct whose leaves are all null is then taken as packed here, but the file's column count does
+    // not match (its leaves are two columns, the parent one), so the reader refuses it rather than misread it.
+    for (const auto& page : column.pages) {
+        page_layout::PageLayout layout;
+        std::string ignored;
+        if (!page_layout::decode_page_layout(page.encoding, layout, ignored)) {
+            return false;
+        }
+        if (layout.kind == page_layout::LayoutKind::kConstant) {
+            // Every row the same: the packed row is the value -- inline in the descriptor, or (too wide to inline)
+            // the page's one scalar buffer.
+            if (layout.constant.inline_value.has_value()) {
+                if (layout.constant.inline_value->size() != row_bytes) {
+                    return false;
+                }
+                continue;
+            }
+            if (page.buffer_offsets.empty() || page.buffer_sizes.empty()) {
+                continue;  // all null
+            }
+            std::vector<std::uint8_t> scalar;
+            std::vector<std::uint8_t> value;
+            if (!io.read(page.buffer_offsets[0], page.buffer_sizes[0], scalar, ignored) ||
+                !scalar_value::decode_variable(scalar, value, ignored) || value.size() != row_bytes) {
+                return false;
+            }
+            continue;
+        }
+        const std::vector<std::uint64_t>* bits = nullptr;
+        if (layout.kind == page_layout::LayoutKind::kMiniBlock) {
+            bits = &layout.mini_block.packed_bits;
+        } else if (layout.kind == page_layout::LayoutKind::kFullZip) {
+            bits = &layout.full_zip.packed_bits;
+        }
+        if (bits == nullptr || bits->size() != child_bytes.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < bits->size(); ++i) {
+            if ((*bits)[i] != child_bytes[i] * 8U) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+namespace {
+
+/// The struct's column as one fixed-width column of `row_bytes` a row, which the ordinary decoders read.
+bool packed_struct_raw_field(const EncodingsIo& io, const pb::Field& struct_field, const pb::ColumnMetadata& column,
+                             const std::vector<std::uint64_t>& child_bytes, pb::Field& raw, std::uint64_t& row_bytes,
+                             std::string& error) {
+    if (!packed_struct_column(io, column, child_bytes)) {
+        error = "a column that is not a packed struct of these children (" + struct_field.name + ")";
+        return false;
+    }
+    row_bytes = 0;
+    for (const auto b : child_bytes) {
+        row_bytes += b;
+    }
+    raw = struct_field;
+    raw.logical_type = "fixed_size_binary:" + std::to_string(row_bytes);
+    return true;
+}
+
+/// Child `child`'s bytes out of each row of the decoded packed column.
+bool take_packed_child(ColumnValues& raw, const std::vector<std::uint64_t>& child_bytes, std::uint64_t row_bytes,
+                       std::uint64_t expected_rows, std::size_t child, ColumnValues& out, std::string& error) {
+    if (child >= child_bytes.size()) {
+        error = "packed struct child " + std::to_string(child) + " of " + std::to_string(child_bytes.size());
+        return false;
+    }
+    // One row per row asked for, each row_bytes wide: a constant whose value is not the packed row is refused here.
+    if (raw.kind != ColumnValues::Kind::FixedWidth || raw.fixed_size() != expected_rows * row_bytes) {
+        error = "packed struct rows do not decode as " + std::to_string(expected_rows) + " rows of " +
+                std::to_string(row_bytes) + " bytes";
+        return false;
+    }
+    std::uint64_t offset = 0;
+    for (std::size_t i = 0; i < child; ++i) {
+        offset += child_bytes[i];
+    }
+    const std::uint64_t width = child_bytes[child];
+    const std::uint64_t rows = expected_rows;
+    const std::uint8_t* src = raw.fixed_data();
+    out = ColumnValues{};
+    out.kind = ColumnValues::Kind::FixedWidth;
+    out.fixed.resize(static_cast<std::size_t>(rows * width));
+    for (std::uint64_t r = 0; r < rows; ++r) {
+        std::memcpy(out.fixed.data() + r * width, src + r * row_bytes + offset, static_cast<std::size_t>(width));
+    }
+    if (!raw.layers.empty()) {
+        error = "packed struct rows with levels of their own are not read yet";
+        return false;
+    }
+    // The struct's own nulls (its rows' definition levels) are the struct above the child, as a nested leaf's
+    // are: one struct layer, not the child's validity. The children of a packed struct are never null themselves.
+    if (!raw.validity.empty()) {
+        ColumnValues::NestedLayer layer;
+        layer.is_list = false;
+        layer.validity = std::move(raw.validity);
+        layer.null_count = raw.null_count;
+        layer.length = rows;
+        out.layers.push_back(std::move(layer));
+    }
+    out.rows = rows;
+    return true;
+}
+
+}  // namespace
+
+bool decode_lance_packed_struct_child(const EncodingsIo& io, const pb::Field& struct_field,
+                                      const pb::ColumnMetadata& column, const std::vector<std::uint64_t>& child_bytes,
+                                      std::size_t child, ColumnValues& out, std::string& error) {
+    pb::Field raw;
+    std::uint64_t row_bytes = 0;
+    if (!packed_struct_raw_field(io, struct_field, column, child_bytes, raw, row_bytes, error)) {
+        return false;
+    }
+    std::uint64_t rows = 0;
+    for (const auto& page : column.pages) {
+        rows += page.length;
+    }
+    ColumnValues values;
+    return decode_lance_physical_column(io, raw, column, values, error) &&
+           take_packed_child(values, child_bytes, row_bytes, rows, child, out, error);
+}
+
+bool decode_lance_packed_struct_child_range(const EncodingsIo& io, const pb::Field& struct_field,
+                                            const pb::ColumnMetadata& column,
+                                            const std::vector<std::uint64_t>& child_bytes, std::size_t child,
+                                            std::uint64_t first, std::uint64_t count, std::size_t value_bytes,
+                                            ColumnValues& out, std::string& error) {
+    pb::Field raw;
+    std::uint64_t row_bytes = 0;
+    if (!packed_struct_raw_field(io, struct_field, column, child_bytes, raw, row_bytes, error)) {
+        return false;
+    }
+    if (child >= child_bytes.size() || child_bytes[child] != value_bytes) {
+        error = "packed struct child width does not match the field's";
+        return false;
+    }
+    ColumnValues values;
+    return decode_lance_physical_column_range(io, raw, column, first, count, static_cast<std::size_t>(row_bytes),
+                                              values, error) &&
+           take_packed_child(values, child_bytes, row_bytes, count, child, out, error);
+}
+
+bool decode_lance_packed_struct_child_rows(const EncodingsIo& io, const pb::Field& struct_field,
+                                           const pb::ColumnMetadata& column,
+                                           const std::vector<std::uint64_t>& child_bytes, std::size_t child,
+                                           const std::vector<std::uint64_t>& rows, std::size_t value_bytes,
+                                           ColumnValues& out, std::string& error) {
+    pb::Field raw;
+    std::uint64_t row_bytes = 0;
+    if (!packed_struct_raw_field(io, struct_field, column, child_bytes, raw, row_bytes, error)) {
+        return false;
+    }
+    if (child >= child_bytes.size() || child_bytes[child] != value_bytes) {
+        error = "packed struct child width does not match the field's";
+        return false;
+    }
+    ColumnValues values;
+    return decode_lance_physical_column_rows(io, raw, column, rows, static_cast<std::size_t>(row_bytes), values,
+                                             error) &&
+           take_packed_child(values, child_bytes, row_bytes, rows.size(), child, out, error);
+}
+
 }  // namespace nano_lance

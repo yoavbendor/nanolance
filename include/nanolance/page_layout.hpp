@@ -57,6 +57,11 @@ enum class CompressiveKind {
     /// f13 VariablePackedStruct{ repeated FieldEncoding fields = 1 }: a struct's fields packed side by side per
     /// row (how Lance stores a blob v2 descriptor), each with its own encoding. See Compressive::packed_fields.
     kVariablePackedStruct = 13,
+    /// f12 PackedStruct{ repeated uint64 bits_per_value = 1, CompressiveEncoding values = 2 }: a struct's
+    /// fixed-width children, interleaved row by row (Lance 2.1). Only ever seen as a page's top-level value
+    /// encoding: the layout unwraps it (see MiniBlock::packed_bits) and keeps the inner Flat as the value
+    /// encoding, so the page decodes as one fixed-width value a row.
+    kPackedStruct = 12,
 };
 
 /// Buffer-compression schemes inside `General`, numbered as Lance's `CompressionScheme` enum does.
@@ -122,6 +127,10 @@ struct Compressive {
 /// dictionary-encoded pages, with `num_dictionary_items` entries.
 struct MiniBlock {
     std::unique_ptr<Compressive> value_compression;
+    /// A packed struct's children, in struct order: each one's width in bits, as PackedStruct gives them. Empty
+    /// unless the value encoding was PackedStruct, which the layout unwraps into its Flat (whose width is their
+    /// sum), so every decoder reads the page as one fixed-width value a row.
+    std::vector<std::uint64_t> packed_bits;
     std::unique_ptr<Compressive> dictionary;
     /// f2: how the repetition/definition layer is stored, when there is one. A simple nullable
     /// column uses `CompressiveEncoding` field 4 (bit-width wrapper) around `Flat(1)`; a column whose
@@ -196,6 +205,8 @@ struct FullZip {
     std::uint64_t num_items = 0;
     std::uint64_t num_visible_items = 0;
     std::unique_ptr<Compressive> value_compression;
+    /// See MiniBlock::packed_bits.
+    std::vector<std::uint64_t> packed_bits;
     std::vector<std::uint8_t> layers;
 };
 
