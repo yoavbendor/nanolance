@@ -162,3 +162,24 @@ copy that change first made); and the BTREE index-window cache. The `in_unindexe
   workloads. The two runs differed by up to 2 times on nanolance rows (`edges_in_batch_500`, and
   `one_hop_hub` at 515 ms p50 in the other run) and up to 2.5 times on Ladybug rows. Treat differences
   smaller than that as noise.
+
+## Known gaps
+
+**Hub 1-hop (deferred, 2026-11-12).** On the default graph, `one_hop_hub` takes 144 ms p50 against
+Ladybug's 70 ms (pylance: 424 ms). Fetching a hub's edges is no longer the cost: it takes 5 to 8 ms
+warm, since the take cache keeps a dense take's column copy (up to 64 MB) and BTREE dictionary blocks
+are decoded once. What remains is fetching the hub's ~20.8k neighbour nodes. A
+`to_table(filter="id IN (...)")` over those ids costs about 170 ms, while a `take` of the same row ids
+costs 5 ms. Measured phases: filter parse 8 to 13 ms, index candidates 45 to 55 ms, candidate decode
+and filter about 6 ms. About 100 ms is not located yet.
+
+Next steps, in order:
+
+1. In nanolance, take an index-resolved IN's candidate rows directly instead of decoding them
+   through the scan path, then find the unlocated ~100 ms.
+2. Re-measure cppognee's `cognee_nanograph` adapter through the index. The adapter reads edges by
+   node id with `pc.is_in` over cached `source_id` / `target_id` columns. An indexed filter is 3x
+   faster for single nodes (7 ms against 22 ms), but `get_neighborhood` was 1.6 to 3.4x slower that
+   way, because its induced-edge step issues IN lists of thousands of ids. Step 1 should change that.
+   The adapter test `test_node_edge_lookups_read_both_directions_with_quoted_ids` pins the behaviour
+   the switch must keep.
