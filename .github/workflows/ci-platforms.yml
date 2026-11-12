@@ -131,3 +131,9 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure -j2
+
+      - name: Rerun the failed tests verbosely
+        # A test that dies without printing (an uncaught exception, an abort) shows nothing under
+        # --output-on-failure; -V shows every line each failed test printed, one at a time.
+        if: failure()
+        run: ctest --test-dir build -C Release --rerun-failed --output-on-failure -V

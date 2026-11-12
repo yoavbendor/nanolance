@@ -116,6 +116,12 @@ else()
     set(NANOLANCE_WARNING_FLAGS)
 endif()
 
+# MSVC reads a source file in the system code page unless told it is UTF-8. The sources hold UTF-8 literals
+# (the FTS tokenizer test's "Café" line, for one), which would otherwise compile to other bytes.
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 include(FetchContent)
 # NANOLANCE_GIT_BASE and NANOLANCE_GIT_URL_*: where the dependencies below are cloned from (GitHub, or a mirror).
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/NanolanceDeps.cmake")

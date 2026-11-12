@@ -2114,8 +2114,9 @@ bool drop_dataset(const fs::path& dataset_path, bool ignore_not_found, std::stri
         error = not_a_dataset_error(dataset_path);
         return false;
     }
-    fs::remove_all(dataset_path, ec);
+    // Close this process's cached handles first: Windows cannot delete a file that is open.
     close_data_files_under(dataset_path.string());
+    fs::remove_all(dataset_path, ec);
     if (ec) {
         error = "failed to drop " + dataset_path.string() + ": " + ec.message();
         return false;

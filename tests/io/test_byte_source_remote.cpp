@@ -9,6 +9,7 @@
 // and listings, per kind of file (manifests, data, deletion files, index files), so the test also shows
 // each kind of file was read through the interface.
 #include "nanolance/byte_source.hpp"
+#include "nanolance/data_file_reader.hpp"
 #include "nanolance/dataset_ops.hpp"
 #include "nanolance/index_search.hpp"
 #include "nanolance/index_segments.hpp"
@@ -21,6 +22,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -253,7 +255,8 @@ Reads read_all_ways(const std::string& dataset, std::uint64_t latest_version) {
 
 }  // namespace
 
-int main() {
+int main() try {
+    std::cout << "running nano_lance_byte_source_remote\n" << std::flush;
     // Factories, and a scheme with a source but no lister (to check the error path).
     io::register_source_factory("mem", [](const std::string& uri, std::string& error) {
         return mem_open(uri, error);
@@ -302,6 +305,9 @@ int main() {
 
     // ── 3. Move the dataset into the object store and remove its local directory. ──────────────────────
     snapshot(ds);
+    // The local reads above left their data-file handles open in this process: Windows cannot delete an open
+    // file, so they are closed first (as the library does before it deletes a dataset).
+    nano_lance::close_data_files_under(ds.string());
     fs::remove_all(ds, ec);
     require(!fs::exists(ds), "the local dataset directory is gone");
     require(!io::exists(ds.string() + "/_versions"), "io::exists sees no local dataset");
@@ -356,4 +362,7 @@ int main() {
     io::register_source_factory("nolist", nullptr);
     std::cout << "byte_source remote test passed\n";
     return 0;
+} catch (const std::exception& e) {
+    std::cerr << "FAILED: uncaught exception: " << e.what() << '\n';
+    return 1;
 }
