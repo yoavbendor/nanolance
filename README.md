@@ -237,6 +237,48 @@ Nulls are stored in every column kind. Files in formats 2.0 to 2.3 are read; nan
   IMDSv2); SSO and assume-role profiles are not: export their credentials first
   ([docs/s3_reader_notes.md](docs/s3_reader_notes.md)).
 
+## Configuration
+
+nanolance reads these environment variables; none is needed. An unset or empty variable takes the default. "Once"
+means the value is read the first time the code needs it and kept for the process, so setting it later has no
+effect. "Per call" means it is read each time the code path runs. Defaults are quoted from the code
+(`src/`, `include/`).
+
+| Variable | Default | Effect | Change it when | Read |
+|---|---|---|---|---|
+| `NANOLANCE_THREADS` | the CPUs in the process's affinity mask | Threads for reads and writes, the calling thread included; `1` starts no worker. Files do not depend on it. | Sharing a machine, or profiling one thread. | Once, when the thread count is first decided (again on `set_threads(0)`). |
+| `NANOLANCE_INDEX_PAGE_CACHE_MB` | `64` | Budget for decoded BTREE index windows, least recently used first out. `0` keeps none. | A lookup over a large index keeps missing (`index_page_cache_misses`). | Once. |
+| `NANOLANCE_TAKE_CACHE_MB` | `256` | Budget for decoded columns that `take` keeps. A column is cached only if its encoded pages are at most 16 MB; entries unused for 10 s are dropped when a new one would not fit. `0` turns the cache off. | Repeated takes (say, training epochs) decode again each time, or memory is tight. | Once. |
+| `NANOLANCE_BUFFER_POOL_MB` | `128` | Budget for idle decoded output buffers reused across calls; buffers idle for 2 s are dropped. `0` turns the pool off. | Allocation dominates a workload, or memory is tight. | Once. |
+| `NANOLANCE_LIST_WINDOW_KB` | `4096` | Size of the chunk windows a MiniBlock list page is decoded in; a window is what a decode holds at once, not the whole page. | Peak memory on very large list pages. | Once. |
+| `NANOLANCE_MORSEL_KB` | `4096` | Smallest row range (in encoded bytes) that a parallel read is cut into. | Parallel reads of small amounts of data are slower than a single thread. | Once. |
+| `NANOLANCE_FTS_EXHAUSTIVE` | unset | Exactly `1` turns off top-k pruning in full-text search, so every document is scored. | Checking a ranking against the exhaustive answer. | Once. |
+| `NANOLANCE_NO_AVX2` | unset | Any value other than `0` uses the baseline (non-AVX2) dot-product kernel for vector search. | Ruling out the AVX2 kernel when debugging a vector result. | Once. |
+| `NANOLANCE_COMMIT_ATTEMPTS` | `20` on a local path, `200` on an object store | Attempts at one commit before it gives up on conflicts, from `1` to `100000`. | Many writers commit to one dataset at once. | Per call. |
+| `NANO_LANCE_BLOB_BASE_DIR` | unset (no limit) | `file://` blob reads must lie under this directory. A `..` component is refused either way. | Blob descriptors come from data you do not trust. | Per call. |
+| `NANOLANCE_TMPDIR` | the system temporary directory, else `/tmp` | Where an S3 write spills to a temporary file once it passes its in-memory limit. | The system temporary directory is small. | Per temporary file. |
+| `LANCE_CPU_THREADS` | unset | Compute threads for an HNSW vector query. Set, it replaces the default below. | Limiting vector search CPU use. | Per query. |
+| `LANCE_IO_CORE_RESERVATION` | `2` | Cores kept back from HNSW query compute when `LANCE_CPU_THREADS` is unset. | Leaving more or fewer cores for I/O. | Per query. |
+| `LANCE_LANGUAGE_MODEL_HOME` | `$XDG_DATA_HOME/lance/language_models` (when `XDG_DATA_HOME` is an absolute path), else `~/.local/share/lance/language_models`; macOS `~/Library/Application Support/lance/language_models`; Windows `%LOCALAPPDATA%\lance\language_models` | Where the jieba and lindera dictionaries are read from. nanolance never downloads them. | The models are installed elsewhere. | Per tokenizer setup. |
+| `LINDERA_CONFIG_PATH` | unset (an empty config, with no dictionary) | Lindera config file, used for a model directory that has no `config.yml` of its own. | A lindera model directory without its own config. | Per model load. |
+
+### Work counters
+
+Tests and diagnostics read process-wide counters of the work nanolance did. Python returns them from
+`nanolance._work_stats()` (a dict) and `nanolance._reset_work_stats()` zeroes them; C has `nano_lance_work_stats()`
+(a `NanoLanceWorkStats`) and `nano_lance_reset_work_stats()`. The fields have the same names in both. They are not a
+stable API. The five below are the cache and index counters; the rest (`data_bytes_read`, `data_reads`,
+`largest_read`, `page_windows`, `read_morsels`, `fragment_reads`, and the write and buffer-pool counters) are listed
+in [include/nanolance/work_stats.hpp](include/nanolance/work_stats.hpp).
+
+| Counter | Counts |
+|---|---|
+| `index_page_cache_hits` | BTREE index windows served from the decoded-window cache (`NANOLANCE_INDEX_PAGE_CACHE_MB`). |
+| `index_page_cache_misses` | BTREE index windows read from the index file. |
+| `take_cache_hits` | `take` columns served from a decoded copy (`NANOLANCE_TAKE_CACHE_MB`). |
+| `dict_rows_expanded` | Rows a dictionary page copied its values out for. |
+| `index_evaluations` | Predicate evaluations over index values, one bind each. |
+
 ## Testing
 
 | What | Where |

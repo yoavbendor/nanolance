@@ -26,7 +26,8 @@ only the standard library; the Lance format's own structures start in `io` and `
   `ReadLimits` budget, load integers from bytes with the byte-assembly loads (never `reinterpret_cast` file
   bytes), and grow buffers in loops with `reserve_more`, not `reserve` (which is quadratic in a loop).
 - **Work counters** (`include/nanolance/work_stats.hpp`): process-wide relaxed atomics for tests that check
-  how a result was produced (bytes read, page windows). Not a stable API.
+  how a result was produced (bytes read, page windows). Not a stable API. The cache counters are listed in the
+  top-level README's Configuration section.
 - **Buffer pool** (`include/nanolance/buffer_pool.hpp`): `take(bytes)` / `give(std::move(v))` reuse large
   decoded buffers across threads; bounded by `NANOLANCE_BUFFER_POOL_MB` (0 turns it off). A taken vector is
   empty: resize it before writing.
