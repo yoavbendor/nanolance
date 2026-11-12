@@ -2,6 +2,11 @@ lance-encoding::array_encoding::logical::blob::tests::test_basic_blob::encoding_
 lance-encoding::array_encoding::logical::blob::tests::test_basic_blob::encoding_1_TestEncoding__Array::page_size_1_4096::use_slicing_2_true
 lance-encoding::array_encoding::logical::blob::tests::test_basic_blob::encoding_1_TestEncoding__Array::page_size_2_1024_1024::use_slicing_1_false
 lance-encoding::array_encoding::logical::blob::tests::test_basic_blob::encoding_1_TestEncoding__Array::page_size_2_1024_1024::use_slicing_2_true
+lance-encoding::array_encoding::logical::blob::tests::test_basic_blob::encoding_2_TestEncoding__StructuralU16::page_size_1_4096::use_slicing_1_false
+lance-encoding::array_encoding::logical::blob::tests::test_basic_blob::encoding_2_TestEncoding__StructuralU16::page_size_1_4096::use_slicing_2_true
+lance-encoding::array_encoding::logical::blob::tests::test_basic_blob::encoding_2_TestEncoding__StructuralU16::page_size_2_1024_1024::use_slicing_1_false
+lance-encoding::array_encoding::logical::blob::tests::test_basic_blob::encoding_2_TestEncoding__StructuralU16::page_size_2_1024_1024::use_slicing_2_true
+lance-encoding::array_encoding::logical::blob::tests::test_simple_blob
 lance-encoding::array_encoding::physical::bitmap::tests::test_bitmap_boolean
 lance-encoding::array_encoding::physical::bitmap::tests::test_fsl_bitmap_boolean
 lance-encoding::array_encoding::physical::bitmap::tests::test_simple_boolean
@@ -383,6 +388,13 @@ lance-encoding::encodings::fuzz_tests::test_fixed_size_list_encoding::encoding_2
 lance-encoding::encodings::fuzz_tests::test_fixed_size_list_encoding::encoding_3_TestEncoding__StructuralSparse
 lance-encoding::encodings::fuzz_tests::test_list_dict_empty_batch
 lance-encoding::encodings::fuzz_tests::test_list_repdef_handling
+lance-encoding::encodings::logical::blob::tests::test_blob_round_trip
+lance-encoding::encodings::logical::blob::tests::test_blob_round_trip_empty_values
+lance-encoding::encodings::logical::blob::tests::test_blob_round_trip_varying_chunk_nullability
+lance-encoding::encodings::logical::blob::tests::test_blob_v2_dedicated_round_trip
+lance-encoding::encodings::logical::blob::tests::test_blob_v2_external_round_trip
+lance-encoding::encodings::logical::blob::tests::test_blob_v2_external_with_range_round_trip
+lance-encoding::encodings::logical::blob::tests::test_blob_v2_packed_round_trip
 lance-encoding::encodings::logical::fixed_size_list::tests::test_fsl_struct_random::case_1_simple::structural_encoding_1_STRUCTURAL_ENCODING_MINIBLOCK::encoding_1_TestEncoding__StructuralU32::page_size_1_4096::use_slicing_1_false::ingest_batch_count_1_1
 lance-encoding::encodings::logical::fixed_size_list::tests::test_fsl_struct_random::case_1_simple::structural_encoding_1_STRUCTURAL_ENCODING_MINIBLOCK::encoding_1_TestEncoding__StructuralU32::page_size_1_4096::use_slicing_1_false::ingest_batch_count_2_5
 lance-encoding::encodings::logical::fixed_size_list::tests::test_fsl_struct_random::case_1_simple::structural_encoding_1_STRUCTURAL_ENCODING_MINIBLOCK::encoding_1_TestEncoding__StructuralU32::page_size_1_4096::use_slicing_1_false::ingest_batch_count_3_10

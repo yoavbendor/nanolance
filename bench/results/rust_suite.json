@@ -7,20 +7,16 @@
   "rust_failed": [],
   "nanolance": {
     "no round trip": 523,
-    "pass": 1446,
-    "refused": 17
+    "pass": 1458,
+    "refused": 5
   },
   "round_trips": {
-    "pass": 10913,
-    "refused": 74
+    "pass": 10977,
+    "refused": 10
   },
   "top_refusals": [
     {
-      "count": 48,
-      "reason": "file: schema: a legacy blob column (\"lance-encoding:blob\") is read from format N.N only"
-    },
-    {
-      "count": 20,
+      "count": 4,
       "reason": "read: the file has N columns for N leaf fields; nanolance reads files whose every leaf field is one column"
     },
     {
