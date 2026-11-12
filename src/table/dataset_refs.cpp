@@ -1255,7 +1255,7 @@ bool deep_manifest(const fs::path& source_dir, std::uint64_t version, const fs::
             if (!deletion_file_dir(source_dir, bases, fragment.deletion_file, dir, error)) {
                 return false;
             }
-            const auto name = fs::path(deletion_file_name(fragment)).filename();
+            const auto name = utf8::from_utf8(deletion_file_name(fragment)).filename();
             make_local_dir(target / "_deletions");
             if (!copy_one(dir / name, target / "_deletions" / name, error)) {
                 error = "failed to copy deletion file " + utf8::string_of(name) + ": " + error;
@@ -1528,7 +1528,7 @@ bool create_tag(const fs::path& root, const std::string& name, const std::string
     tag.name = name;
     tag.created_at = tag.updated_at = rfc3339(now_ns());
     bool existed = false;
-    if (!write_ref_file(tags_dir(root) / (name + ".json"), tag_json(tag), false, existed, error)) {
+    if (!write_ref_file(tags_dir(root) / utf8::from_utf8(name + ".json"), tag_json(tag), false, existed, error)) {
         if (existed) {
             error = "Ref conflict error: tag " + name + " already exists";
         }
@@ -1552,7 +1552,7 @@ bool update_tag(const fs::path& root, const std::string& name, const std::string
     }
     tag.updated_at = rfc3339(now_ns());
     bool existed = false;
-    return write_ref_file(tags_dir(root) / (name + ".json"), tag_json(tag), true, existed, error);
+    return write_ref_file(tags_dir(root) / utf8::from_utf8(name + ".json"), tag_json(tag), true, existed, error);
 }
 
 bool delete_tag(const fs::path& dataset_path, const std::string& name, std::string& error) {
@@ -1587,7 +1587,8 @@ bool replace_tag_metadata(const fs::path& dataset_path, const std::string& name,
     }
     tag.metadata = metadata;
     bool existed = false;
-    return write_ref_file(tags_dir(dataset_path) / (name + ".json"), tag_json(tag), true, existed, error);
+    return write_ref_file(tags_dir(dataset_path) / utf8::from_utf8(name + ".json"), tag_json(tag), true, existed,
+                          error);
 }
 
 // ── cleanup ────────────────────────────────────────────────────────────────────────────────────────

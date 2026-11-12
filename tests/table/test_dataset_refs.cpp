@@ -241,38 +241,81 @@ void test_branches() {
 
 // Names that are not ASCII: a tag and a branch are created, listed (their exact UTF-8 names back), read and
 // deleted. On Windows the names become file names, which must be UTF-8 there too, not the ANSI code page.
+// A name as the log shows it: bytes above 0x7F as \xHH, so a mangled name (an ANSI round trip) reads as such.
+std::string shown(const std::string& name) {
+    std::string out;
+    for (const char c : name) {
+        const auto u = static_cast<unsigned char>(c);
+        if (u >= 0x80) {
+            static const char hex[] = "0123456789abcdef";
+            out += std::string("\\x") + hex[u >> 4] + hex[u & 15];
+        } else {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+std::string shown_tags(const std::vector<TagInfo>& tags) {
+    std::string out = "[";
+    for (const auto& t : tags) {
+        out += (out.size() > 1 ? ", " : "") + shown(t.name);
+    }
+    return out + "]";
+}
+
+std::string shown_branches(const std::vector<BranchInfo>& branches) {
+    std::string out = "[";
+    for (const auto& b : branches) {
+        out += (out.size() > 1 ? ", " : "") + shown(b.name);
+    }
+    return out + "]";
+}
+
 void test_unicode_names() {
     const auto ds = make_dataset("unicode_names", 2);
     std::string err;
     const std::string cafe = "caf\xC3\xA9";                        // café
     const std::string japan = "\xE6\x97\xA5\xE6\x9C\xAC";            // 日本
 
-    require(create_tag(ds, cafe, "", 1, err), "create tag café: " + err);
-    require(create_tag(ds, japan, "", 2, err), "create tag 日本: " + err);
-    require(create_branch(ds, japan, "", 2, err), "create branch 日本: " + err);
+    // Each step names itself in its failure message, so the CI log says where a name went wrong.
+    require(create_tag(ds, cafe, "", 1, err), "unicode step 1 (create tag " + shown(cafe) + "): " + err);
+    require(create_tag(ds, japan, "", 2, err), "unicode step 2 (create tag " + shown(japan) + "): " + err);
+    require(create_branch(ds, japan, "", 2, err), "unicode step 3 (create branch " + shown(japan) + "): " + err);
 
     std::vector<TagInfo> tags;
-    require(list_tags(ds, tags, err) && tags.size() == 2U && find_tag(tags, cafe) != nullptr &&
-                find_tag(tags, japan) != nullptr,
-            "tags listed with their UTF-8 names: " + err);
+    require(list_tags(ds, tags, err), "unicode step 4 (list tags): " + err);
+    require(tags.size() == 2U && find_tag(tags, cafe) != nullptr && find_tag(tags, japan) != nullptr,
+            "unicode step 4 (list tags): expected [" + shown(cafe) + ", " + shown(japan) + "], listed " +
+                shown_tags(tags));
     std::vector<BranchInfo> branches;
-    require(list_branches(ds, branches, err) && branches.size() == 1U && find_branch(branches, japan) != nullptr,
-            "branch listed with its UTF-8 name: " + err);
-    require(fs::exists(branch_location(ds, japan) / "_versions"), "the branch's directory is named in UTF-8");
+    require(list_branches(ds, branches, err), "unicode step 5 (list branches): " + err);
+    require(branches.size() == 1U && find_branch(branches, japan) != nullptr,
+            "unicode step 5 (list branches): expected [" + shown(japan) + "], listed " + shown_branches(branches));
+    require(fs::exists(branch_location(ds, japan) / "_versions"),
+            "unicode step 6 (the branch " + shown(japan) + " has its directory named in UTF-8, with _versions)");
 
     TagInfo got;
-    require(get_tag(ds, japan, got, err) && got.name == japan && got.version == 2U, "get tag 日本: " + err);
+    require(get_tag(ds, japan, got, err), "unicode step 7 (get tag " + shown(japan) + "): " + err);
+    require(got.name == japan && got.version == 2U, "unicode step 7 (get tag " + shown(japan) + "): got " +
+                                                        shown(got.name) + " at version " +
+                                                        std::to_string(got.version));
     pb::Manifest manifest;
     std::uint64_t latest = 0;
-    require(load_latest_manifest(branch_location(ds, japan), manifest, latest, err) && manifest.fragments.size() == 2U,
-            "read the 日本 branch: " + err);
+    require(load_latest_manifest(branch_location(ds, japan), manifest, latest, err),
+            "unicode step 8 (read the " + shown(japan) + " branch's manifest): " + err);
+    require(manifest.fragments.size() == 2U, "unicode step 8 (read the " + shown(japan) +
+                                                 " branch's manifest): " + std::to_string(manifest.fragments.size()) +
+                                                 " fragments, expected 2");
 
-    require(delete_tag(ds, cafe, err), "delete tag café: " + err);
-    require(delete_tag(ds, japan, err), "delete tag 日本: " + err);
-    require(delete_branch(ds, japan, err), "delete branch 日本: " + err);
-    require(list_tags(ds, tags, err) && tags.empty(), "no tags left");
-    require(list_branches(ds, branches, err) && branches.empty(), "no branches left");
-    require(!fs::exists(branch_location(ds, japan)), "the 日本 branch's directory is gone");
+    require(delete_tag(ds, cafe, err), "unicode step 9 (delete tag " + shown(cafe) + "): " + err);
+    require(delete_tag(ds, japan, err), "unicode step 10 (delete tag " + shown(japan) + "): " + err);
+    require(delete_branch(ds, japan, err), "unicode step 11 (delete branch " + shown(japan) + "): " + err);
+    require(list_tags(ds, tags, err) && tags.empty(),
+            "unicode step 12 (list tags after delete): " + err + " listed " + shown_tags(tags));
+    require(list_branches(ds, branches, err) && branches.empty(),
+            "unicode step 13 (list branches after delete): " + err + " listed " + shown_branches(branches));
+    require(!fs::exists(branch_location(ds, japan)), "unicode step 14 (the branch's directory is gone)");
     fs::remove_all(ds);
 }
 
