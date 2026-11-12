@@ -439,7 +439,8 @@ WriteStatus WriteSession::write_batch(struct ArrowArray* batch, struct ArrowSche
 
     LanceSchemaMapping batch_mapping;
     if (!map_arrow_schema(*schema, batch_mapping, error, state->ignore_nullability) ||
-        !refuse_unwritten_nested_dictionaries(batch_mapping, error)) {
+        !refuse_unwritten_nested_dictionaries(batch_mapping, error) ||
+        !refuse_unwritten_lists_under_fixed_size_list(batch_mapping, error)) {
         return fail(WriteStatus::Unsupported, error);
     }
     // A struct marked `lance-encoding:packed` is read as one packed column (Lance 2.1+), but this writer

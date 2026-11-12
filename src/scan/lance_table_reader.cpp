@@ -1791,21 +1791,34 @@ struct ColumnSource {
     std::uint64_t elements_per_row = 1;
 };
 
-/// The elements a row of `field` holds when every ancestor is a struct or a fixed_size_list (their sizes
-/// multiplied); 1 when there is none, or a list above makes the count vary by row.
+/// The leaf rows a row of `field` holds: the sizes of the fixed_size_lists above it (multiplied), so a leaf
+/// under fixed_size_list<struct> holds that many. Only the fixed_size_lists above the outermost list count: a
+/// list makes the count of the items below it vary by row, and the pages of a column under a list count its
+/// rows in the space the list's own layers are in. A fixed_size_list below a list is inside its items, so it
+/// does not count. 1 when there is none.
 std::uint64_t fixed_elements_per_row(const LanceSchemaMapping& mapping, const LanceField& field) {
-    std::uint64_t per_row = 1;
+    std::vector<const LanceField*> ancestors;  // innermost first
     for (auto parent = field.parent_id; parent >= 0;) {
         const auto* up = find_mapping_field(mapping, parent);
-        if (up == nullptr || lance_logical_type_is_list(up->logical_type)) {
+        if (up == nullptr) {
             return 1;
         }
+        ancestors.push_back(up);
+        parent = up->parent_id;
+    }
+    std::size_t above = 0;  // ancestors up to and including the outermost list are not counted
+    for (std::size_t k = 0; k < ancestors.size(); ++k) {
+        if (lance_logical_type_is_list(ancestors[k]->logical_type)) {
+            above = k + 1U;
+        }
+    }
+    std::uint64_t per_row = 1;
+    for (std::size_t k = above; k < ancestors.size(); ++k) {
         std::string element;
         std::uint64_t items = 0;
-        if (lance_fixed_size_list_parts(up->logical_type, element, items)) {
+        if (lance_fixed_size_list_parts(ancestors[k]->logical_type, element, items)) {
             per_row *= items;
         }
-        parent = up->parent_id;
     }
     return per_row;
 }
