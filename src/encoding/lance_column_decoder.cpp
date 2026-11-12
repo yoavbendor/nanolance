@@ -3714,9 +3714,25 @@ bool append_leaf_values(ColumnValues& dst, ColumnValues& src, std::string& error
 /// Decode `count` levels stored as raw u16 (no compression declared) or through `encoding`.
 bool decode_level_buffer(const std::vector<std::uint8_t>& bytes, const page_layout::Compressive* encoding,
                          std::uint64_t count, std::vector<std::uint16_t>& out, std::string& error) {
-    if (count > std::numeric_limits<std::uint32_t>::max() || count > bytes.size() * 8U * 4096U + 65536U) {
+    // Levels are u16, so the decoded size bounds the count. The count is not bounded by the bytes the
+    // levels take: RLE and bitpacked levels compress well, and a zero-width encoding stores none at all
+    // (every level is 0). A raw buffer that is empty holds no levels (a constant page with no repetition
+    // stores an empty buffer for them).
+    if (count > std::numeric_limits<std::uint32_t>::max() || count > default_read_limits().max_uncompressed_bytes / 2U) {
         error = "a page declares an implausible " + std::to_string(count) + " levels";
         return false;
+    }
+    if (encoding != nullptr && zero_width_levels(*encoding)) {
+        if (!bytes.empty()) {
+            error = "0-bit levels carry " + std::to_string(bytes.size()) + " bytes";
+            return false;
+        }
+        out.assign(static_cast<std::size_t>(count), std::uint16_t{0});
+        return true;
+    }
+    if (encoding == nullptr && bytes.empty()) {
+        out.clear();
+        return true;
     }
     if (encoding == nullptr && count == 0U) {
         // Raw u16 levels: pylance leaves the count out (proto3's 0) and the buffer size says it.
