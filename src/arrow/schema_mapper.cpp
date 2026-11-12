@@ -749,8 +749,8 @@ bool check_primary_keys(const LanceSchemaMapping& mapping, std::string& error) {
 bool refuse_unwritten_nested_dictionaries(const LanceSchemaMapping& mapping, std::string& error) {
     for (const auto& field : mapping.fields) {
         if (field.parent_id >= 0 && !field.dictionary_index_format.empty() && field.dictionary_index_format != "i") {
-            error = "dictionary column '" + field.name + "' inside a struct or list is read, but written only with int32 "
-                    "indices; cast its indices to int32 first";
+            error = "dictionary column '" + field.name + "' inside a struct or list is read, but writing it is not supported "
+                    "unless its indices are int32 (it is written only with int32 indices); cast its indices to int32 first";
             return false;
         }
     }
