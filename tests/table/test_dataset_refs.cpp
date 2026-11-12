@@ -239,6 +239,43 @@ void test_branches() {
     fs::remove_all(ds);
 }
 
+// Names that are not ASCII: a tag and a branch are created, listed (their exact UTF-8 names back), read and
+// deleted. On Windows the names become file names, which must be UTF-8 there too, not the ANSI code page.
+void test_unicode_names() {
+    const auto ds = make_dataset("unicode_names", 2);
+    std::string err;
+    const std::string cafe = "caf\xC3\xA9";                        // café
+    const std::string japan = "\xE6\x97\xA5\xE6\x9C\xAC";            // 日本
+
+    require(create_tag(ds, cafe, "", 1, err), "create tag café: " + err);
+    require(create_tag(ds, japan, "", 2, err), "create tag 日本: " + err);
+    require(create_branch(ds, japan, "", 2, err), "create branch 日本: " + err);
+
+    std::vector<TagInfo> tags;
+    require(list_tags(ds, tags, err) && tags.size() == 2U && find_tag(tags, cafe) != nullptr &&
+                find_tag(tags, japan) != nullptr,
+            "tags listed with their UTF-8 names: " + err);
+    std::vector<BranchInfo> branches;
+    require(list_branches(ds, branches, err) && branches.size() == 1U && find_branch(branches, japan) != nullptr,
+            "branch listed with its UTF-8 name: " + err);
+    require(fs::exists(branch_location(ds, japan) / "_versions"), "the branch's directory is named in UTF-8");
+
+    TagInfo got;
+    require(get_tag(ds, japan, got, err) && got.name == japan && got.version == 2U, "get tag 日本: " + err);
+    pb::Manifest manifest;
+    std::uint64_t latest = 0;
+    require(load_latest_manifest(branch_location(ds, japan), manifest, latest, err) && manifest.fragments.size() == 2U,
+            "read the 日本 branch: " + err);
+
+    require(delete_tag(ds, cafe, err), "delete tag café: " + err);
+    require(delete_tag(ds, japan, err), "delete tag 日本: " + err);
+    require(delete_branch(ds, japan, err), "delete branch 日本: " + err);
+    require(list_tags(ds, tags, err) && tags.empty(), "no tags left");
+    require(list_branches(ds, branches, err) && branches.empty(), "no branches left");
+    require(!fs::exists(branch_location(ds, japan)), "the 日本 branch's directory is gone");
+    fs::remove_all(ds);
+}
+
 void test_drop() {
     std::string err;
     const auto missing = fresh_dir("drop_missing");
@@ -291,6 +328,7 @@ int main() try {
     std::cout << "running nano_lance_dataset_refs\n" << std::flush;
     test_tags();
     test_branches();
+    test_unicode_names();
     test_drop();
     test_duration();
     std::cout << "dataset_refs: ok\n";

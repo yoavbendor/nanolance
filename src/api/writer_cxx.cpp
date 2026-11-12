@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "nanolance/writer.hpp"
 
 #include <utility>
@@ -52,7 +53,7 @@ bool Writer::open(const std::filesystem::path& path, const WriteOptions& options
     c_options.max_pending_bytes = options.max_pending_bytes;
 
     append_ = options.append;
-    status_ = nano_lance_writer_open(&handle_, path.string().c_str(), &c_options);
+    status_ = nano_lance_writer_open(&handle_, utf8::string_of(path).c_str(), &c_options);
     return status_ == NANO_LANCE_OK;
 }
 

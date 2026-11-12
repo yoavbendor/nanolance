@@ -24,7 +24,7 @@ LAYERS = [
 # Every file of src/, by its layer (a path below the layer directory where it has a sub-directory).
 FILES = {
     "base": ["buffer_pool.cpp", "parallel.cpp", "version.cpp", "roaring_bitmap.cpp", "float16.hpp",
-             "float_text.hpp", "int128.hpp", "proto_wire.hpp", "fts_json.hpp", "shared_cache.hpp", "uuid.hpp",
+             "float_text.hpp", "int128.hpp", "proto_wire.hpp", "fts_json.hpp", "shared_cache.hpp", "uuid.hpp", "utf8_path.hpp",
              "uuid.cpp", "bytes.hpp", "unicode.hpp", "unicode.cpp", "unicode_tables.inc"],
     "io": ["byte_source.cpp", "byte_sink.cpp", "external_blob.cpp", "external_blob.hpp", "s3_byte_source.cpp", "s3_byte_source.hpp", "s3_byte_sink.cpp",
            "s3_byte_sink.hpp"],

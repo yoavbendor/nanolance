@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "nanolance/byte_sink.hpp"
 #include "nanolance/commit_backoff.hpp"
 #include "nanolance/byte_source.hpp"
@@ -78,7 +79,7 @@ std::string retryable_error(std::uint64_t version, const std::string& ours, cons
 /// The whole of a transaction file: `_transactions/{name}`. False when it cannot be read.
 bool read_transaction_file(const std::filesystem::path& dataset_path, const std::string& name, OpBytes& bytes) {
     std::string io_error;
-    return io::read_all((dataset_path / "_transactions" / name).string(), bytes, io_error);
+    return io::read_all(utf8::string_of(dataset_path / "_transactions" / name), bytes, io_error);
 }
 
 /// The bytes of the transaction that made `version`, as Lance reads it: its transaction file when that
@@ -323,7 +324,7 @@ bool commit_next_version(const std::filesystem::path& dataset_path, pb::Manifest
         error = first_error;
         return false;
     }
-    const bool object_store = io::is_object_store_output(dataset_path.string());
+    const bool object_store = io::is_object_store_output(utf8::string_of(dataset_path));
     const int attempts = commit_attempts(object_store);
     for (int attempt = 0; attempt < attempts; ++attempt) {
         pb::Manifest latest;

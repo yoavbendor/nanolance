@@ -7,6 +7,7 @@
 // scalar segment (rebuild_scalar_segment) and, for a vector index, with the existing model, as its
 // default (non-retraining) merge assigns new rows to the existing partitions.
 
+#include "base/utf8_path.hpp"
 #include "nanolance/frag_reuse.hpp"
 #include "nanolance/index_optimize.hpp"
 
@@ -87,7 +88,7 @@ Kind kind_of(const std::filesystem::path& dataset_path, const pb::IndexMetadata&
         return Kind::Inverted;
     }
     if (ends_with(url, "VectorIndexDetails") ||
-        (url.empty() && io::exists((segment_dir(dataset_path, index) / "index.idx").string()))) {
+        (url.empty() && io::exists(utf8::string_of(segment_dir(dataset_path, index) / "index.idx")))) {
         return Kind::Vector;
     }
     return Kind::Other;

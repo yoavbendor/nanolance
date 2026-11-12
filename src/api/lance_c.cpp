@@ -13,6 +13,7 @@
 
 #include <nanoarrow/nanoarrow.h>  // defines the Arrow C structs lance.h would otherwise declare
 
+#include "base/utf8_path.hpp"
 #include "lance/lance.h"
 
 #include "nanolance/arrow_slice.hpp"
@@ -302,7 +303,7 @@ bool resolve_uri(const char* uri, std::filesystem::path& out, bool allow_object_
     }
     std::string text(uri);
     if (text.rfind("file://", 0) == 0) {
-        out = text.substr(7);
+        out = nano_lance::utf8::from_utf8(text.substr(7));
         return true;
     }
     if (text.rfind("memory://", 0) == 0) {
@@ -310,11 +311,11 @@ bool resolve_uri(const char* uri, std::filesystem::path& out, bool allow_object_
         while (!rest.empty() && rest.front() == '/') {
             rest.erase(rest.begin());
         }
-        out = memory_root() / (rest.empty() ? std::string("_root") : rest);
+        out = memory_root() / nano_lance::utf8::from_utf8(rest.empty() ? std::string("_root") : rest);
         return true;
     }
     if (allow_object_store && text.rfind("s3://", 0) == 0) {
-        out = text;
+        out = nano_lance::utf8::from_utf8(text);
         return true;
     }
     if (text.find("://") != std::string::npos) {
@@ -323,7 +324,7 @@ bool resolve_uri(const char* uri, std::filesystem::path& out, bool allow_object_
                                                : "nanolance writes local datasets only, not " + text);
         return false;
     }
-    out = text;
+    out = nano_lance::utf8::from_utf8(text);
     return true;
 }
 
@@ -357,7 +358,7 @@ LanceDataset* open_dataset(const char* uri, const char* const* storage_opts, uin
             invalid(error);
             return nullptr;
         }
-        if (!nano_lance::io::set_object_store_options(path.string(), options, error)) {
+        if (!nano_lance::io::set_object_store_options(nano_lance::utf8::string_of(path), options, error)) {
             set_error(code_for(error), error);
             return nullptr;
         }
@@ -1323,7 +1324,7 @@ int32_t write_impl(const WriteRequest& req) {
     options.stage_fragments = true;
     options.max_pending_bytes = max_bytes;
     NanoLanceWriter writer{};
-    if (nano_lance_writer_open(&writer, path.string().c_str(), &options) != NANO_LANCE_OK) {
+    if (nano_lance_writer_open(&writer, nano_lance::utf8::string_of(path).c_str(), &options) != NANO_LANCE_OK) {
         fail(writer.last_error);
         nano_lance_writer_close(&writer);
         return -1;

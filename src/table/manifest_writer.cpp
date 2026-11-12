@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "nanolance/commit_backoff.hpp"
 #include "nanolance/work_stats.hpp"
 #include "nanolance/manifest_writer.hpp"
@@ -79,7 +80,7 @@ std::uint64_t next_version(const std::filesystem::path& versions_dir, bool& v2_o
     // A local directory or an object-store prefix (one LIST); a missing one lists as empty.
     std::vector<io::DirEntry> entries;
     std::string list_error;
-    if (!io::list_dir(versions_dir.string(), entries, list_error)) {
+    if (!io::list_dir(utf8::string_of(versions_dir), entries, list_error)) {
         return 1;
     }
     for (const auto& entry : entries) {
@@ -176,7 +177,7 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
     error.clear();
     // Local paths and registered object stores (s3://); any other URI would otherwise become a local
     // directory named after its scheme.
-    const bool object_store = io::is_object_store_output(dataset_path.string());
+    const bool object_store = io::is_object_store_output(utf8::string_of(dataset_path));
     if (!object_store && dataset_path.string().find("://") != std::string::npos) {
         error = "writes to " + dataset_path.string().substr(0, dataset_path.string().find("://")) +
                 ":// are not supported (nanolance writes local paths and s3:// URIs): " + dataset_path.string();
@@ -251,7 +252,7 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
     // Publish without replacing (io::put_if_absent: a hard link locally, a create-only PUT on an object
     // store), so a version another writer committed meanwhile is never overwritten.
     bool taken = false;
-    if (!io::put_if_absent(final_path.string(), bytes, taken, error)) {
+    if (!io::put_if_absent(utf8::string_of(final_path), bytes, taken, error)) {
         if (!taken) {
             return false;
         }
@@ -305,7 +306,7 @@ pb::Field manifest_field(const LanceField& mapped_field) {
 
 pb::DataFile manifest_data_file(const LanceSchemaMapping& mapping, const DataFileResult& data_file) {
     pb::DataFile file;
-    file.path = data_file.relative_path.filename().generic_string();
+    file.path = utf8::generic_of(data_file.relative_path.filename());
     file.file_major_version = 2;
     file.file_minor_version = 2;
     file.file_size_bytes = data_file.file_size_bytes;
@@ -381,7 +382,7 @@ bool commit_dataset_version(const std::filesystem::path& dataset_path, const Lan
     // An append reads nothing of the dataset but its schema, and an overwrite nothing at all, so
     // when another writer commits first either still applies after it: built again on the newer
     // version and retried, as Lance retries compatible transactions.
-    const bool object_store = io::is_object_store_output(dataset_path.string());
+    const bool object_store = io::is_object_store_output(utf8::string_of(dataset_path));
     const int attempts = commit_attempts(object_store);
     for (int attempt = 0;; ++attempt) {
         if (commit_dataset_version_once(dataset_path, mapping, fragments, mode, version, error, extras)) {

@@ -3,6 +3,7 @@
 #include "nanolance/byte_source.hpp"
 
 #include "nanolance/object_store.hpp"
+#include "base/utf8_path.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -279,7 +280,7 @@ bool read_all(const std::string& path_or_uri, std::vector<std::uint8_t>& out, st
 bool exists(const std::string& path_or_uri) {
     if (!is_remote(path_or_uri)) {
         std::error_code ec;
-        return std::filesystem::exists(std::filesystem::path(path_or_uri), ec);
+        return std::filesystem::exists(utf8::from_utf8(path_or_uri), ec);
     }
     std::string ignored;
     return open_source(path_or_uri, ignored) != nullptr;
@@ -420,7 +421,7 @@ bool list_dir(const std::string& path_or_uri_arg, std::vector<DirEntry>& out, st
             return false;
         }
     }
-    const std::filesystem::path dir(path_or_uri);
+    const std::filesystem::path dir = utf8::from_utf8(path_or_uri);
     std::error_code ec;
     std::filesystem::directory_iterator it(dir, ec);
     const std::filesystem::directory_iterator end;
@@ -438,7 +439,7 @@ bool list_dir(const std::string& path_or_uri_arg, std::vector<DirEntry>& out, st
             return false;
         }
         DirEntry entry;
-        entry.name = it->path().filename().string();
+        entry.name = utf8::string_of(it->path().filename());
         std::error_code entry_ec;
         entry.is_dir = it->is_directory(entry_ec);
         if (with_sizes && !entry.is_dir) {

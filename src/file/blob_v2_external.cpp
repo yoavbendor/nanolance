@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "base/utf8_path.hpp"
 #include "nanolance/work_stats.hpp"
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/byte_source.hpp"
@@ -359,7 +360,7 @@ bool blob_v2_thresholds(const LanceField& field, BlobV2Thresholds& out, std::str
 bool BlobV2Placer::write_sidecar(const std::uint32_t id, const std::uint8_t* data, const std::uint64_t n,
                                  std::string& error) {
     const auto path = blob_v2_sidecar_path(data_file_, id);
-    auto file = io::open_output(path.string(), error);
+    auto file = io::open_output(utf8::string_of(path), error);
     if (!file) {
         error = "cannot create blob file " + path.string() + ": " + error;
         return false;
@@ -429,7 +430,7 @@ bool BlobV2Placer::place(const ColumnValues& values, const BlobV2Thresholds& thr
                 pack_size_ = 0;
                 pack_max_ = pack_max;
                 const auto path = blob_v2_sidecar_path(data_file_, pack_id_);
-                pack_ = io::open_output(path.string(), error);
+                pack_ = io::open_output(utf8::string_of(path), error);
                 if (!pack_) {
                     error = "cannot create blob file " + path.string() + ": " + error;
                     return false;
@@ -1003,15 +1004,15 @@ bool blob_v2_locate(const BlobV2ExternalDescriptor& descriptor, const std::files
     out.size = descriptor.size;
     switch (descriptor.kind) {
         case kBlobKindInline:
-            out.file = data_file.string();
+            out.file = utf8::string_of(data_file);
             out.position = descriptor.position;
             return true;
         case kBlobKindPacked:
-            out.file = blob_v2_sidecar_path(data_file, descriptor.blob_id).string();
+            out.file = utf8::string_of(blob_v2_sidecar_path(data_file, descriptor.blob_id));
             out.position = descriptor.position;
             return true;
         case kBlobKindDedicated:
-            out.file = blob_v2_sidecar_path(data_file, descriptor.blob_id).string();
+            out.file = utf8::string_of(blob_v2_sidecar_path(data_file, descriptor.blob_id));
             return true;
         case kBlobKindExternal:
             out.file = descriptor.blob_uri;

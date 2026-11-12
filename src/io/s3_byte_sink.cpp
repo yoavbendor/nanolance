@@ -111,7 +111,11 @@ private:
         static std::atomic<std::uint64_t> counter{0};
         file_path_ = temp_dir() / ("nanolance-upload-" + std::to_string(std::random_device{}()) + "-" +
                                    std::to_string(counter.fetch_add(1U)) + ".tmp");
-        file_ = std::fopen(file_path_.string().c_str(), "wb");
+#if defined(_WIN32)
+        file_ = _wfopen(file_path_.c_str(), L"wb");  // the path is UTF-8 text: wide, not the ANSI page
+#else
+        file_ = std::fopen(file_path_.c_str(), "wb");
+#endif
         if (file_ == nullptr) {
             fail("failed to create a temporary file for the upload: " + file_path_.string());
             return false;

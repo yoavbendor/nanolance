@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/work_stats.hpp"
+#include "base/utf8_path.hpp"
 #include "io/external_blob.hpp"
 
 #include <algorithm>
@@ -63,7 +64,7 @@ std::string file_uri_to_path(const std::string& suri) {
 //   * an OPTIONAL jail: when NANO_LANCE_BLOB_BASE_DIR is set, confine every fetch under that directory.
 // Returns false and fills `reason` when the path is rejected.
 bool file_blob_path_allowed(const std::string& path, std::string& reason) {
-    const std::filesystem::path fs_path(path);
+    const std::filesystem::path fs_path = nano_lance::utf8::from_utf8(path);
     for (const auto& part : fs_path) {
         if (part == "..") {
             reason = "file:// blob path contains a '..' traversal component";
