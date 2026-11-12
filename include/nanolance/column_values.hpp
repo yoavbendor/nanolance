@@ -129,6 +129,9 @@ struct ColumnValues {
         // A fixed_size_list<struct> layer (W1k4): N, the elements a row holds. Its entries -- `length`, `validity`
         // -- are then elements, each row's validity bit repeated N times, as Lance's FSL layer counts them.
         std::uint64_t fsl_items = 0;
+        // Set once a fixed-size-list layer's entries are its rows (the decoder converted its elements, so the layers
+        // above it, which a sparse page counts in rows, can be cut): the reader then does not convert it again.
+        bool fsl_rows = false;
     };
     std::vector<NestedLayer> layers;
     /// Does this column need nested pages (repetition/definition levels per layer)? Only a list, or a

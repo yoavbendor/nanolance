@@ -939,39 +939,45 @@ bool fill_nested_nodes(ColumnPlan& plan, std::int64_t rows, std::map<ArrowArray*
                        std::string& error) {
     auto& layers = plan.values->layers;
     const auto& name = plan.field->name;
+    // A sparse page carries an all-valid validity layer for each Arrow level that has a validity, and for a leaf
+    // that is not nullable as well (a map's keys: the entries struct's layer and the key's own), which the plan does
+    // not count. An all-valid struct layer says nothing about any row, so the innermost ones go while the layers
+    // outnumber the plan's levels; the count is checked below as before.
+    while (layers.size() > plan.nodes.size() && !layers.back().is_list && layers.back().null_count == 0U) {
+        layers.pop_back();
+    }
     // A fixed_size_list node's layer counts its elements (every row's `items`): it becomes one entry a row, valid
-    // when the row's first element says so (Lance marks a null row's elements all null at that layer). Each layer
-    // above it counts elements too, so it shrinks by the same factor.
+    // when the row's first element says so (Lance marks a null row's elements all null at that layer). Only that layer
+    // changes: the layers above it count the fixed-size list's rows (a list's offsets index them, a struct's validity
+    // is one entry a row), which the layer's rows are once it is converted.
     if (layers.size() == plan.nodes.size()) {
         for (std::size_t k = layers.size(); k-- > 0;) {
             const auto& node = plan.nodes[k];
             if (node.kind != ColumnPlan::Node::Kind::FixedSizeList) {
                 continue;
             }
-            for (std::size_t up = 0; up <= k; ++up) {
-                auto& layer = layers[up];
-                if (layer.is_list || node.items == 0U || layer.length % node.items != 0U) {
-                    error = "nested column '" + name + "': a fixed_size_list layer of " + std::to_string(layer.length) +
-                            " elements is not whole rows of " + std::to_string(node.items);
-                    return false;
-                }
-                const auto row_count = layer.length / node.items;
-                if (!layer.validity.empty()) {
-                    std::vector<std::uint8_t> bits(static_cast<std::size_t>((row_count + 7U) / 8U), 0U);
-                    std::uint64_t nulls = 0;
-                    for (std::uint64_t r = 0; r < row_count; ++r) {
-                        const auto e = r * node.items;
-                        if (((layer.validity[static_cast<std::size_t>(e >> 3U)] >> (e & 7U)) & 1U) != 0U) {
-                            bits[static_cast<std::size_t>(r >> 3U)] |= static_cast<std::uint8_t>(1U << (r & 7U));
-                        } else {
-                            ++nulls;
-                        }
-                    }
-                    layer.validity = std::move(bits);
-                    layer.null_count = nulls;
-                }
-                layer.length = row_count;
+            auto& layer = layers[k];
+            if (layer.is_list || node.items == 0U || layer.length % node.items != 0U) {
+                error = "nested column '" + name + "': a fixed_size_list layer of " + std::to_string(layer.length) +
+                        " elements is not whole rows of " + std::to_string(node.items);
+                return false;
             }
+            const auto row_count = layer.length / node.items;
+            if (!layer.validity.empty()) {
+                std::vector<std::uint8_t> bits(static_cast<std::size_t>((row_count + 7U) / 8U), 0U);
+                std::uint64_t nulls = 0;
+                for (std::uint64_t r = 0; r < row_count; ++r) {
+                    const auto e = r * node.items;
+                    if (((layer.validity[static_cast<std::size_t>(e >> 3U)] >> (e & 7U)) & 1U) != 0U) {
+                        bits[static_cast<std::size_t>(r >> 3U)] |= static_cast<std::uint8_t>(1U << (r & 7U));
+                    } else {
+                        ++nulls;
+                    }
+                }
+                layer.validity = std::move(bits);
+                layer.null_count = nulls;
+            }
+            layer.length = row_count;
         }
     }
     if (layers.size() != plan.nodes.size() || layers.empty() ||

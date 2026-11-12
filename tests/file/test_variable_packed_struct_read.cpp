@@ -11,13 +11,10 @@
 // Each file is read whole, by a row range and by a take, and every row is rendered as text and compared with the
 // text the values give. Rust is not needed.
 
+#include "golden_render.hpp"
 #include "nanolance/lance_table_reader.hpp"
 
-#include <nanoarrow/nanoarrow.h>
-
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -29,118 +26,11 @@
 
 namespace {
 
-void require(bool ok, const std::string& message) {
-    if (!ok) {
-        std::cerr << "FAIL: " << message << "\n";
-        std::exit(1);
-    }
-}
+using golden::release;
+using golden::render_rows;
+using golden::require;
 
-bool valid_at(const ArrowArray& array, std::int64_t i) {
-    if (array.null_count == 0 || array.buffers[0] == nullptr) {
-        return true;
-    }
-    const auto* bits = static_cast<const std::uint8_t*>(array.buffers[0]);
-    const std::int64_t at = array.offset + i;
-    return ((bits[at >> 3] >> (at & 7)) & 1U) != 0U;
-}
-
-/// Renders element `i` of `array` (of `schema`) as text: a struct as {name:value,...}, a list as [a,b,...], strings
-/// quoted, integers as numbers, a null as null. Only the types these golden files hold are rendered; any other is a
-/// failure, so a shape the test does not know cannot pass by accident.
-std::string render(const ArrowSchema& schema, const ArrowArray& array, std::int64_t i) {
-    const std::string format = schema.format;
-    if (!valid_at(array, i)) {
-        return "null";
-    }
-    if (format == "+s") {
-        std::string out = "{";
-        for (std::int64_t c = 0; c < array.n_children; ++c) {
-            if (c > 0) {
-                out += ",";
-            }
-            // A struct's children are indexed at the struct's own offset, plus the row.
-            out += std::string(schema.children[c]->name) + ":" +
-                   render(*schema.children[c], *array.children[c], array.offset + i);
-        }
-        return out + "}";
-    }
-    if (format == "+l" || format == "+L") {
-        const bool large = format == "+L";
-        const auto* offsets = static_cast<const std::uint8_t*>(array.buffers[1]);
-        const auto at = [&](std::int64_t k) -> std::int64_t {
-            if (large) {
-                std::int64_t v = 0;
-                std::memcpy(&v, offsets + k * 8, 8);
-                return v;
-            }
-            std::int32_t v = 0;
-            std::memcpy(&v, offsets + k * 4, 4);
-            return v;
-        };
-        const std::int64_t first = at(array.offset + i);
-        const std::int64_t last = at(array.offset + i + 1);
-        std::string out = "[";
-        for (std::int64_t k = first; k < last; ++k) {
-            if (k > first) {
-                out += ",";
-            }
-            out += render(*schema.children[0], *array.children[0], k);
-        }
-        return out + "]";
-    }
-    if (format == "u" || format == "U") {
-        const bool large = format == "U";
-        const auto* offsets = static_cast<const std::uint8_t*>(array.buffers[1]);
-        const auto* data = static_cast<const char*>(array.buffers[2]);
-        const auto at = [&](std::int64_t k) -> std::int64_t {
-            if (large) {
-                std::int64_t v = 0;
-                std::memcpy(&v, offsets + k * 8, 8);
-                return v;
-            }
-            std::int32_t v = 0;
-            std::memcpy(&v, offsets + k * 4, 4);
-            return v;
-        };
-        const std::int64_t begin = at(array.offset + i);
-        const std::int64_t end = at(array.offset + i + 1);
-        return "\"" + std::string(data + begin, static_cast<std::size_t>(end - begin)) + "\"";
-    }
-    if (format == "I") {
-        std::uint32_t v = 0;
-        std::memcpy(&v, static_cast<const std::uint8_t*>(array.buffers[1]) + (array.offset + i) * 4, 4);
-        return std::to_string(v);
-    }
-    require(false, "the golden check does not render Arrow format '" + format + "'");
-    return "";
-}
-
-/// The rows of one read, each rendered. A file whose top level is one column is rendered as that column; one whose
-/// top level holds several (the utf8 file: id, uri, long_text) is rendered as the struct they make.
-std::vector<std::string> render_rows(const ArrowSchema& schema, const std::vector<ArrowArray>& batches) {
-    std::vector<std::string> rows;
-    const bool one_column = schema.n_children == 1;
-    for (const auto& batch : batches) {
-        for (std::int64_t i = 0; i < batch.length; ++i) {
-            rows.push_back(one_column ? render(*schema.children[0], *batch.children[0], i) : render(schema, batch, i));
-        }
-    }
-    return rows;
-}
-
-void release(ArrowSchema& schema, std::vector<ArrowArray>& batches) {
-    for (auto& batch : batches) {
-        if (batch.release != nullptr) {
-            ArrowArrayRelease(&batch);
-        }
-    }
-    if (schema.release != nullptr) {
-        ArrowSchemaRelease(&schema);
-    }
-}
-
-/// Expected row text for each of `wanted` rows of a file, given the row's text as the file defines it.
+/// Expected row text for each row of a file.
 using RowText = std::string (*)(std::uint64_t row);
 
 std::string utf8_row(std::uint64_t row) {

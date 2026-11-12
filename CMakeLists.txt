@@ -1110,6 +1110,17 @@ target_link_libraries(nano_lance_dict_rle_read_test PRIVATE nanolance)
 add_test(NAME nano_lance_dict_rle_read COMMAND $<TARGET_FILE:nano_lance_dict_rle_read_test>)
 set_tests_properties(nano_lance_dict_rle_read PROPERTIES LABELS "smoke")
 
+# Lance 2.3 sparse pages of a map (its all-valid key layer) and of a fixed-size list of structs (its fixed-size-list
+# layer), from Lance's own encoder test (tests/golden/sparse, written with NANOLANCE_RUST_KEEP_PASS).
+add_executable(nano_lance_sparse_page_read_test tests/file/test_sparse_page_read.cpp)
+target_compile_features(nano_lance_sparse_page_read_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_sparse_page_read_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_compile_definitions(nano_lance_sparse_page_read_test PRIVATE
+    NANO_LANCE_SPARSE_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/sparse")
+target_link_libraries(nano_lance_sparse_page_read_test PRIVATE nanolance)
+add_test(NAME nano_lance_sparse_page_read COMMAND $<TARGET_FILE:nano_lance_sparse_page_read_test>)
+set_tests_properties(nano_lance_sparse_page_read PROPERTIES LABELS "smoke")
+
 # A legacy blob (`lance-encoding:blob`) in a Lance 2.1 file, read from pylance's file (tests/generate_golden_legacy_blob.py
 # writes it): whole, by a row range and by a take, as the bytes of each row.
 add_executable(nano_lance_legacy_blob_v21_read_test tests/file/test_legacy_blob_v21_read.cpp)

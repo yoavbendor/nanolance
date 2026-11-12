@@ -4215,6 +4215,7 @@ bool decode_nested_page_shape(NestedDecodeState& st, const std::vector<repdef::U
         for (std::size_t k = 1; k < shape.size(); ++k) {
             auto& layer = layers[layers.size() - k];
             layer.is_list = shape[k];
+            layer.fsl_items = unraveled[k].fsl_items;
             if (layer.is_list) {
                 layer.offsets.push_back(0);
             }
@@ -4222,6 +4223,13 @@ bool decode_nested_page_shape(NestedDecodeState& st, const std::vector<repdef::U
     } else if (page_shape != shape) {
         error = where + "its list layers differ from the column's first page";
         return false;
+    } else {
+        for (std::size_t k = 1; k < shape.size(); ++k) {
+            if (layers[layers.size() - k].fsl_items != unraveled[k].fsl_items) {
+                error = where + "its fixed-size-list layers differ from the column's first page";
+                return false;
+            }
+        }
     }
     return true;
 }
