@@ -1446,6 +1446,28 @@ if(NANOLANCE_BUILD_TOOLS)
     endif()
 endif()
 
+# The smoke tests above that run a bash script (add_test COMMAND bash ...) cannot run on Windows: the
+# runner has no bash on the test path, and the scripts call POSIX tools. They stay registered on every
+# platform, so the Linux and macOS test lists do not change. On WIN32 they are marked DISABLED, which ctest
+# lists as "Disabled" rather than running or failing them.
+if(WIN32)
+    set(_nl_bash_smoke_tests
+        app_nanolance_cli
+        app_pagelayout_pylance_interop_smoke
+        app_arrowipc2lance_blob_v2_smoke
+        app_arrowipc2lance_nonnull_smoke
+        app_arrowipc2lance_ignore_nullability_smoke
+        app_arrowipc2lance_inspect_smoke
+        app_arrowipc2lance_append_smoke
+        app_dict_pylance_interop_smoke
+        app_bss_zstd_pylance_interop_smoke
+        app_bool_pylance_interop_smoke
+        app_deletion_append_pylance_smoke)
+    set_tests_properties(${_nl_bash_smoke_tests} PROPERTIES
+        DISABLED TRUE)
+    message(STATUS "nanolance: bash smoke tests disabled on Windows (no bash on the test path): ${_nl_bash_smoke_tests}")
+endif()
+
 # Each layer's later tests (tests/<layer>/tests.cmake), in this directory's scope so they are labelled below.
 foreach(_nl_layer_dir IN ITEMS base io arrow encoding file table expr scan index dataset api integration)
     include("${CMAKE_CURRENT_SOURCE_DIR}/tests/${_nl_layer_dir}/tests.cmake")
