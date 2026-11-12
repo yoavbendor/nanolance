@@ -5,7 +5,7 @@
 // nanolance_hook.rs and tools/rust_suite.py). Built only for that run, as a shared library.
 //
 // nanolance_rust_write_file wraps the Rust encoder's output -- its data bytes, positioned as the start
-// of a file, and its page tables -- into a Lance 2.2 file (2.0 for 2.0 pages): the schema (a file descriptor), each
+// of a file, and its page tables -- into a Lance 2.2 file (2.0 for 2.0 pages, 2.1 for a legacy blob column): the schema (a file descriptor), each
 // column's metadata, and the footer, laid out as Lance's file writer lays them out.
 // nanolance_rust_read then reads that file as a nanolance user would.
 
@@ -20,6 +20,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -170,14 +171,25 @@ __attribute__((visibility("default"))) int nanolance_rust_write_file(const char*
         }
     }
 
-    if (!legacy_blob.empty() && !v2_0) {
-        set_message(msg, msg_cap, "schema: a legacy blob column (\"lance-encoding:blob\") is read from format 2.0 only");
-        return 1;
-    }
+    // A legacy blob's structural pages (Lance 2.1+: a BlobLayout over a packed (position, size) descriptor)
+    // are a 2.1 file: Lance refuses the legacy marker from 2.2 on (pylance 12 says so), so the footer says 2.1.
+    const bool v2_1_blob = !legacy_blob.empty() && !v2_0;
 
     nano_lance::pb::FileDescriptor descriptor;
     descriptor.length = num_rows;
+    // A Blob v2 field is written as Lance writes it (data_file_writer.cpp, build_file_descriptor): the file's
+    // schema has the descriptor struct, marked blob and packed, with children kind, position, size, blob_id and
+    // blob_uri that have no ids of their own. The logical children of the field are not in the file.
+    std::set<std::int32_t> blob_v2_parents;
     for (const auto& f : mapping.fields) {
+        if (f.parent_id < 0 && f.logical_type == "struct" && f.extension_name == "lance.blob.v2") {
+            blob_v2_parents.insert(f.id);
+        }
+    }
+    for (const auto& f : mapping.fields) {
+        if (blob_v2_parents.count(f.parent_id) != 0U) {
+            continue;
+        }
         nano_lance::pb::Field field;
         field.name = f.name;
         // As the manifest writer declares it: an Arrow dictionary column keeps its "dict:" type and
@@ -195,7 +207,29 @@ __attribute__((visibility("default"))) int nanolance_rust_write_file(const char*
         if (const auto blob = legacy_blob.find(f.name); f.parent_id < 0 && blob != legacy_blob.end()) {
             field.metadata[kBlobKey] = std::vector<std::uint8_t>(blob->second.begin(), blob->second.end());
         }
+        if (blob_v2_parents.count(f.id) != 0U) {
+            field.type = 0;
+            field.encoding = 0;
+            field.metadata["lance-encoding:blob"] = std::vector<std::uint8_t>{'t', 'r', 'u', 'e'};
+            field.metadata["lance-encoding:packed"] = std::vector<std::uint8_t>{'t', 'r', 'u', 'e'};
+        }
         descriptor.fields.push_back(std::move(field));
+        if (blob_v2_parents.count(f.id) != 0U) {
+            const std::pair<const char*, const char*> children[] = {
+                {"kind", "uint8"}, {"position", "uint64"}, {"size", "uint64"}, {"blob_id", "uint32"},
+                {"blob_uri", "string"}};
+            for (const auto& [name, type] : children) {
+                nano_lance::pb::Field child;
+                child.name = name;
+                child.logical_type = type;
+                child.id = -1;
+                child.parent_id = -1;
+                child.type = 0;
+                child.nullable = false;
+                child.encoding = nano_lance::lance_on_disk_field_encoding(type);
+                descriptor.fields.push_back(std::move(child));
+            }
+        }
     }
 
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
@@ -228,7 +262,7 @@ __attribute__((visibility("default"))) int nanolance_rust_write_file(const char*
     write_le(out, 1, 4);
     write_le(out, metadata.size(), 4);
     write_le(out, v2_0 ? 0 : 2, 2);  // major (2.0's footer says 0.3)
-    write_le(out, v2_0 ? 3 : 2, 2);  // minor
+    write_le(out, v2_0 ? 3 : (v2_1_blob ? 1 : 2), 2);  // minor
     out.write("LANC", 4);
     out.close();
     if (!out) {
@@ -239,8 +273,11 @@ __attribute__((visibility("default"))) int nanolance_rust_write_file(const char*
 }
 
 __attribute__((visibility("default"))) int nanolance_rust_read(const char* path, std::uint64_t offset, std::uint64_t length, const std::uint64_t* indices,
-                        std::size_t n_indices, int take, ArrowArrayStream* out, char* msg, std::size_t msg_cap) {
+                        std::size_t n_indices, int take, int descriptions, ArrowArrayStream* out, char* msg, std::size_t msg_cap) {
     nano_lance::LanceScanRequest request;
+    // A blob v2 column is read as Lance describes it (kind, position, size, blob_id, blob_uri), the shape the Rust
+    // round trip compares with; every other column is read as nanolance reads it.
+    request.blob_handling = descriptions != 0 ? nano_lance::BlobHandling::Descriptions : nano_lance::BlobHandling::Ingest;
     ArrowSchema schema{};
     std::vector<ArrowArray> batches;
     std::string error;

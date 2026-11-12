@@ -38,6 +38,7 @@ unsafe extern "C" {
         indices: *const u64,
         n_indices: usize,
         take: c_int,
+        descriptions: c_int,
         out: *mut FFI_ArrowArrayStream,
         msg: *mut c_char,
         msg_cap: usize,
@@ -50,12 +51,14 @@ pub(crate) fn message(buf: &[u8]) -> String {
         .unwrap_or_default()
 }
 
-/// One read by nanolance: each column's rows as one array, or why not.
+/// One read by nanolance: each column's rows as one array, or why not. `descriptions` reads a blob v2 column as
+/// Lance describes it (kind, position, size, blob_id, blob_uri), which is what the Rust round trip expects of it.
 pub(crate) fn read_columns(
     path: &CStr,
     offset: u64,
     length: u64,
     indices: Option<&[u64]>,
+    descriptions: bool,
 ) -> Result<Vec<ArrayRef>, String> {
     let mut msg = vec![0u8; 4096];
     let mut stream = FFI_ArrowArrayStream::empty();
@@ -65,7 +68,7 @@ pub(crate) fn read_columns(
     };
     let rc = unsafe {
         nanolance_rust_read(
-            path.as_ptr(), offset, length, ptr, n, take, &mut stream,
+            path.as_ptr(), offset, length, ptr, n, take, descriptions as c_int, &mut stream,
             msg.as_mut_ptr() as *mut c_char, msg.len(),
         )
     };
@@ -95,8 +98,14 @@ pub(crate) fn read_columns(
 }
 
 /// One read of a one-column file: its rows as one array, or why not.
-pub(crate) fn read(path: &CStr, offset: u64, length: u64, indices: Option<&[u64]>) -> Result<ArrayRef, String> {
-    read_columns(path, offset, length, indices)?
+pub(crate) fn read(
+    path: &CStr,
+    offset: u64,
+    length: u64,
+    indices: Option<&[u64]>,
+    descriptions: bool,
+) -> Result<ArrayRef, String> {
+    read_columns(path, offset, length, indices, descriptions)?
         .into_iter()
         .next()
         .ok_or_else(|| "the file read back has no column".to_string())
