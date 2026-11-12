@@ -608,19 +608,6 @@ bool map_field(const ArrowSchema& field,
     if (is_struct && !map_struct_children(field, out.id, next_id, next_column, mapping, error)) {
         return false;
     }
-    if (fsl_struct) {
-        // Lance 12 cannot read a list under a fixed_size_list ("Not yet supported FSL<...List<...>>"), so it is
-        // refused rather than written.
-        const auto first_child = std::find_if(mapping.fields.begin(), mapping.fields.end(),
-                                              [&](const LanceField& f) { return f.id == out.id; });
-        for (auto it = first_child; it != mapping.fields.end(); ++it) {
-            if (it->id != out.id && lance_logical_type_is_list(it->logical_type)) {
-                error = "column '" + out.name + "': a list or map under a fixed_size_list (field '" + it->name +
-                        "') cannot be read by Lance 12 and is not written";
-                return false;
-            }
-        }
-    }
     return true;
 }
 
@@ -752,6 +739,29 @@ bool refuse_unwritten_nested_dictionaries(const LanceSchemaMapping& mapping, std
             error = "dictionary column '" + field.name + "' inside a struct or list is read, but writing it is not supported "
                     "unless its indices are int32 (it is written only with int32 indices); cast its indices to int32 first";
             return false;
+        }
+    }
+    return true;
+}
+
+bool refuse_unwritten_lists_under_fixed_size_list(const LanceSchemaMapping& mapping, std::string& error) {
+    for (const auto& field : mapping.fields) {
+        if (!lance_logical_type_is_list(field.logical_type)) {
+            continue;
+        }
+        for (auto parent = field.parent_id; parent >= 0;) {
+            const auto up = std::find_if(mapping.fields.begin(), mapping.fields.end(),
+                                         [&](const LanceField& f) { return f.id == parent; });
+            if (up == mapping.fields.end()) {
+                break;
+            }
+            std::string element;
+            std::uint64_t items = 0;
+            if (lance_fixed_size_list_parts(up->logical_type, element, items) && element == "struct") {
+                error = "column '" + field.name + "': a list or map under a fixed_size_list is read but not written yet";
+                return false;
+            }
+            parent = up->parent_id;
         }
     }
     return true;
