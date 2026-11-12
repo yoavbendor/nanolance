@@ -1062,6 +1062,16 @@ target_link_libraries(nano_lance_lance_file_writer_test PRIVATE nanolance)
 add_test(NAME nano_lance_lance_file_writer COMMAND $<TARGET_FILE:nano_lance_lance_file_writer_test>)
 set_tests_properties(nano_lance_lance_file_writer PROPERTIES LABELS "smoke")
 
+# Lance 2.1 / 2.2 packed structs read from pylance's files (tests/generate_golden_packed_struct.py writes them).
+add_executable(nano_lance_packed_struct_read_test tests/file/test_packed_struct_read.cpp)
+target_compile_features(nano_lance_packed_struct_read_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_packed_struct_read_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_compile_definitions(nano_lance_packed_struct_read_test PRIVATE
+    NANO_LANCE_PACKED_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/packed_struct")
+target_link_libraries(nano_lance_packed_struct_read_test PRIVATE nanolance)
+add_test(NAME nano_lance_packed_struct_read COMMAND $<TARGET_FILE:nano_lance_packed_struct_read_test>)
+set_tests_properties(nano_lance_packed_struct_read PROPERTIES LABELS "smoke")
+
 # Live S3 integration test (only with the nanos3reader provider): range GETs against a real S3-compatible
 # endpoint; skips unless NANOLANCE_S3_TEST_URI (+ AWS_* env) is set. tests/s3_minio_integration.sh wires
 # this up against a throwaway MinIO. The SigV4 signer vectors now live in the nanos3reader repo's own tests.
@@ -1149,6 +1159,12 @@ add_test(NAME nano_lance_schema_change_error COMMAND $<TARGET_FILE:nano_lance_sc
 set_tests_properties(nano_lance_schema_change_error PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_fsl_of_fsl_write_refused COMMAND $<TARGET_FILE:nano_lance_fsl_of_fsl_write_refused_test>)
 set_tests_properties(nano_lance_fsl_of_fsl_write_refused PROPERTIES LABELS "smoke")
+
+add_executable(nano_lance_packed_struct_write_refused_test tests/api/test_packed_struct_write_refused.cpp)
+target_compile_features(nano_lance_packed_struct_write_refused_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_packed_struct_write_refused_test PRIVATE nanolance)
+add_test(NAME nano_lance_packed_struct_write_refused COMMAND $<TARGET_FILE:nano_lance_packed_struct_write_refused_test>)
+set_tests_properties(nano_lance_packed_struct_write_refused PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_read_safety COMMAND $<TARGET_FILE:nano_lance_read_safety_test>)
 set_tests_properties(nano_lance_read_safety PROPERTIES LABELS "smoke")

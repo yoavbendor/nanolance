@@ -62,4 +62,28 @@ bool lance_column_dictionary_entries(const EncodingsIo& io, const pb::Field& on_
                                      const pb::ColumnMetadata& column_metadata, std::vector<std::string>& out,
                                      std::string& error);
 
+/// Lance 2.1 packed struct (`lance-encoding:packed`): a struct whose fixed-width children are one column, their
+/// bytes interleaved row by row. `struct_field` is the struct's on-disk field and `column` its one column;
+/// `child_bytes` is every child's width in bytes, in struct order, from the file's descriptor. `child` is the
+/// struct's child index; the child's values come out as a fixed-width column of its own width, which the caller
+/// passes as `value_bytes` as for the other decoders. Each of these reads the whole packed column for that one
+/// child, as the 2.0 packed readers do; the rows, row range and row list are the same as the other decoders'.
+/// `packed_struct_column` says whether a column is such a packed struct: its pages are constant rows of the
+/// children's total width, or mini-block / full-zip rows whose PackedStruct gives those widths.
+bool packed_struct_column(const EncodingsIo& io, const pb::ColumnMetadata& column,
+                          const std::vector<std::uint64_t>& child_bytes);
+bool decode_lance_packed_struct_child(const EncodingsIo& io, const pb::Field& struct_field,
+                                      const pb::ColumnMetadata& column, const std::vector<std::uint64_t>& child_bytes,
+                                      std::size_t child, ColumnValues& out, std::string& error);
+bool decode_lance_packed_struct_child_range(const EncodingsIo& io, const pb::Field& struct_field,
+                                            const pb::ColumnMetadata& column,
+                                            const std::vector<std::uint64_t>& child_bytes, std::size_t child,
+                                            std::uint64_t first, std::uint64_t count, std::size_t value_bytes,
+                                            ColumnValues& out, std::string& error);
+bool decode_lance_packed_struct_child_rows(const EncodingsIo& io, const pb::Field& struct_field,
+                                           const pb::ColumnMetadata& column,
+                                           const std::vector<std::uint64_t>& child_bytes, std::size_t child,
+                                           const std::vector<std::uint64_t>& rows, std::size_t value_bytes,
+                                           ColumnValues& out, std::string& error);
+
 }  // namespace nano_lance

@@ -441,6 +441,17 @@ WriteStatus WriteSession::write_batch(struct ArrowArray* batch, struct ArrowSche
     if (!map_arrow_schema(*schema, batch_mapping, error, state->ignore_nullability)) {
         return fail(WriteStatus::Unsupported, error);
     }
+    // A struct marked `lance-encoding:packed` is read as one packed column (Lance 2.1+), but this writer
+    // writes its children as ordinary columns. Writing the marker over them would make another reader decode
+    // them as one packed column, so the marker is refused here rather than written.
+    for (const auto& f : batch_mapping.fields) {
+        const auto packed = f.metadata.find("lance-encoding:packed");
+        if (f.logical_type == "struct" && packed != f.metadata.end() && packed->second != "false" &&
+            packed->second != "0" && f.metadata.count("lance-encoding:blob") == 0U) {
+            return fail(WriteStatus::Unsupported,
+                        "column '" + f.name + "': a packed struct is read but not written yet");
+        }
+    }
 
     if (!state->has_schema) {
         ArrowMetadataReader reader;

@@ -243,6 +243,94 @@ bool convert_variable_packed(const nm::unknown_fields& u, Compressive& out, bool
     return true;
 }
 
+/// CompressiveEncoding field 12, PackedStruct{ repeated uint64 bits_per_value = 1 (packed or not),
+/// CompressiveEncoding values = 2 }: a struct's fixed-width children, interleaved row by row. Not a member of
+/// nanom's CompressiveEncoding either (it is in `unknown`), so it is read here. The node keeps each child's
+/// width in packed_fields and the inner encoding in `values`; unwrap_packed_struct then takes it apart.
+bool convert_packed_fixed(const nm::unknown_fields& u, Compressive& out, bool& found, int depth,
+                          std::string& error) {
+    const std::span<const std::byte> all(u.bytes);
+    std::size_t at = 0;
+    while (at < all.size()) {
+        std::uint64_t key = 0;
+        if (!read_varint(all, at, key)) {
+            error = "page layout: malformed CompressiveEncoding";
+            return false;
+        }
+        const auto wt = static_cast<std::uint8_t>(key & 7U);
+        if (key >> 3U != 12U || wt != 2U) {
+            if (!skip_field(all, at, wt)) {
+                error = "page layout: malformed CompressiveEncoding";
+                return false;
+            }
+            continue;
+        }
+        std::uint64_t n = 0;
+        if (!read_varint(all, at, n) || n > all.size() - at) {
+            error = "page layout: malformed PackedStruct";
+            return false;
+        }
+        const auto payload = all.subspan(at, static_cast<std::size_t>(n));
+        at += static_cast<std::size_t>(n);
+        found = true;
+        out.kind = CompressiveKind::kPackedStruct;
+        out.wire_field = 12U;
+        out.packed_fields.clear();
+        std::size_t p = 0;
+        while (p < payload.size()) {
+            std::uint64_t pkey = 0;
+            if (!read_varint(payload, p, pkey)) {
+                error = "page layout: malformed PackedStruct";
+                return false;
+            }
+            const auto pwt = static_cast<std::uint8_t>(pkey & 7U);
+            if (pkey >> 3U == 1U && pwt == 2U) {  // packed repeated uint64: a length, then varints
+                std::uint64_t len = 0;
+                if (!read_varint(payload, p, len) || len > payload.size() - p) {
+                    error = "page layout: malformed PackedStruct bits_per_value";
+                    return false;
+                }
+                const std::size_t end = p + static_cast<std::size_t>(len);
+                while (p < end) {
+                    std::uint64_t bits = 0;
+                    if (!read_varint(payload, p, bits) || p > end) {
+                        error = "page layout: malformed PackedStruct bits_per_value";
+                        return false;
+                    }
+                    PackedField field;
+                    field.bits_per_value = bits;
+                    out.packed_fields.push_back(std::move(field));
+                }
+            } else if (pkey >> 3U == 1U && pwt == 0U) {  // unpacked: one varint per child
+                std::uint64_t bits = 0;
+                if (!read_varint(payload, p, bits)) {
+                    error = "page layout: malformed PackedStruct bits_per_value";
+                    return false;
+                }
+                PackedField field;
+                field.bits_per_value = bits;
+                out.packed_fields.push_back(std::move(field));
+            } else if (pkey >> 3U == 2U && pwt == 2U) {
+                std::uint64_t vlen = 0;
+                if (!read_varint(payload, p, vlen) || vlen > payload.size() - p) {
+                    error = "page layout: malformed PackedStruct values";
+                    return false;
+                }
+                nm::pb_lazy<wire::CompressiveEncoding> lazy;
+                lazy.set_region(payload.data() + p, static_cast<std::size_t>(vlen));
+                p += static_cast<std::size_t>(vlen);
+                if (!child(lazy, out.values, depth, error)) {
+                    return false;
+                }
+            } else if (!skip_field(payload, p, pwt)) {
+                error = "page layout: malformed PackedStruct";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 /// A child node: its bytes were only length-checked with the parent, so they are decoded (and
 /// fully checked) here, one level deeper.
 bool child(const nm::pb_lazy<wire::CompressiveEncoding>& lazy, std::unique_ptr<Compressive>& out, int depth,
@@ -358,6 +446,13 @@ bool convert(const wire::CompressiveEncoding& w, Compressive& out, int depth, st
     if (packed) {
         return true;
     }
+    bool packed_fixed = false;
+    if (!convert_packed_fixed(*w.unknown, out, packed_fixed, depth, error)) {
+        return false;
+    }
+    if (packed_fixed) {
+        return true;
+    }
     // Parsed, just not modeled. Recording the wire field lets the caller refuse by name instead of
     // misreading the page's buffers.
     out.kind = CompressiveKind::kUnknown;
@@ -369,6 +464,41 @@ bool convert(const wire::CompressiveEncoding& w, Compressive& out, int depth, st
 bool convert_root(const nm::pb_lazy<wire::CompressiveEncoding>& lazy, std::unique_ptr<Compressive>& out,
                   std::string& error) {
     return child(lazy, out, -1, error);
+}
+
+/// A value encoding that is a PackedStruct (2.1): replaced by its inner Flat, whose width is the children's sum.
+/// `bits` receives each child's width, in struct order. Only a Flat inside is read: anything else is refused by
+/// name, not decoded as if it were flat.
+bool unwrap_packed_struct(std::unique_ptr<Compressive>& node, std::vector<std::uint64_t>& bits,
+                          std::string& error) {
+    bits.clear();
+    if (node == nullptr || node->kind != CompressiveKind::kPackedStruct) {
+        return true;
+    }
+    if (node->values == nullptr || node->values->kind != CompressiveKind::kFlat) {
+        error = "page layout: a packed struct whose values are not flat";
+        return false;
+    }
+    if (node->packed_fields.empty()) {
+        error = "page layout: a packed struct with no children";
+        return false;
+    }
+    std::uint64_t total = 0;
+    for (const auto& field : node->packed_fields) {
+        if (field.bits_per_value == 0U || field.bits_per_value % 8U != 0U) {
+            error = "page layout: a packed struct child that is not a whole number of bytes";
+            return false;
+        }
+        bits.push_back(field.bits_per_value);
+        total += field.bits_per_value;
+    }
+    if (total != node->values->bits_per_value) {
+        error = "page layout: a packed struct's children do not add up to its row";
+        bits.clear();
+        return false;
+    }
+    node = std::move(node->values);
+    return true;
 }
 
 bool convert(const wire::MiniBlockLayout& w, MiniBlock& out, std::string& error) {
@@ -384,6 +514,7 @@ bool convert(const wire::MiniBlockLayout& w, MiniBlock& out, std::string& error)
     return convert_root(*w.rep_compression, out.rep_compression, error) &&
            convert_root(*w.def_compression, out.repdef_compression, error) &&
            convert_root(*w.value_compression, out.value_compression, error) &&
+           unwrap_packed_struct(out.value_compression, out.packed_bits, error) &&
            convert_root(*w.dictionary, out.dictionary, error);
 }
 
@@ -409,7 +540,8 @@ bool convert(const wire::FullZipLayout& w, FullZip& out, std::string& error) {
     out.num_items = *w.num_items;
     out.num_visible_items = *w.num_visible_items;
     out.layers = owned(*w.layers);
-    return convert_root(*w.value_compression, out.value_compression, error);
+    return convert_root(*w.value_compression, out.value_compression, error) &&
+           unwrap_packed_struct(out.value_compression, out.packed_bits, error);
 }
 
 template <class M>
