@@ -486,6 +486,8 @@ void nano_lance_work_stats(NanoLanceWorkStats* out) {
     out->indexed_fragments = get(c.indexed_fragments);
     out->index_evaluations = get(c.index_evaluations);
     out->dict_rows_expanded = get(c.dict_rows_expanded);
+    out->index_page_cache_hits = get(c.index_page_cache_hits);
+    out->index_page_cache_misses = get(c.index_page_cache_misses);
 }
 
 void nano_lance_reset_work_stats(void) { nano_lance::work_stats::reset(); }
