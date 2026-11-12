@@ -7,22 +7,14 @@
   "rust_failed": [],
   "nanolance": {
     "no round trip": 523,
-    "pass": 1254,
-    "refused": 209
+    "pass": 1446,
+    "refused": 17
   },
   "round_trips": {
-    "pass": 10337,
-    "refused": 650
+    "pass": 10913,
+    "refused": 74
   },
   "top_refusals": [
-    {
-      "count": 432,
-      "reason": "file: schema: column 'c': a list or map under a fixed_size_list (field 'values') cannot be read by Lance N and is not written"
-    },
-    {
-      "count": 144,
-      "reason": "file: schema: column 'c': a list or map under a fixed_size_list (field 'props') cannot be read by Lance N and is not written"
-    },
     {
       "count": 48,
       "reason": "file: schema: a legacy blob column (\"lance-encoding:blob\") is read from format N.N only"

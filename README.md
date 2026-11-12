@@ -210,6 +210,7 @@ nanolance or Lance cannot read back.
 | `lance.blob.v2` | external references written; inline, packed, dedicated and external blobs read |
 | Arrow `dictionary` with an integer index over a string, binary or fixed-width type, at the top level | round-trips, stored as Lance stores one (low-cardinality strings are dictionary-encoded on disk anyway) |
 | Arrow `dictionary` inside a `struct` or `list` | read with any integer index; written only with int32 indices (`writing it is not supported unless its indices are int32`). Other dictionary shapes are refused: cast to the value type |
+| `list`, `large_list` or `map` under a `fixed_size_list` of structs | read, from pylance-written 2.2 files, whole, by row range and by take; written refused (`a list or map under a fixed_size_list is read but not written yet`) |
 | `fixed_size_list` of `fixed_size_list` | read, from pylance-written files; written refused (`a fixed_size_list of fixed_size_list is read but not written yet`) |
 | `struct` marked `lance-encoding:packed` | read in 2.1 and 2.2 files when its children are fixed-width; written refused (`a packed struct is read but not written yet`) |
 | `timestamp` with a UTC-offset zone (`+05:30`) | refused: Lance supports IANA names only |
