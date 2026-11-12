@@ -27,8 +27,6 @@ def lance_mod():
 
 
 ALL = {**SHAPES, **{f"null_struct_{k}": v for k, v in NULL_STRUCTS.items()}}
-# Not writable yet, and refused by name: a list of vectors (a FixedSizeList under a list layer).
-NOT_WRITABLE = {"null_struct_vectors"}
 
 
 def _both_readers_agree(lance_mod, path, table):
@@ -38,7 +36,7 @@ def _both_readers_agree(lance_mod, path, table):
     assert lance_mod.dataset(str(path)).to_table().to_pydict() == table.to_pydict(), "stock Lance re-read mismatch"
 
 
-@pytest.mark.parametrize("name", sorted(set(ALL) - NOT_WRITABLE))
+@pytest.mark.parametrize("name", sorted(ALL))
 def test_nested_column_round_trips(lance_mod, tmp_path, name):
     table = pa.table({"id": pa.array(range(len(ALL[name]())), pa.int64()), "c": ALL[name]()})
     path = tmp_path / f"{name}.lance"
@@ -46,7 +44,7 @@ def test_nested_column_round_trips(lance_mod, tmp_path, name):
     _both_readers_agree(lance_mod, path, table)
 
 
-@pytest.mark.parametrize("name", sorted(set(ALL) - NOT_WRITABLE))
+@pytest.mark.parametrize("name", sorted(ALL))
 def test_nested_column_survives_sliced_batches_and_fragments(lance_mod, tmp_path, name):
     column = ALL[name]()
     table = pa.table({"id": pa.array(range(len(column)), pa.int64()), "c": column})

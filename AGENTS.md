@@ -49,14 +49,19 @@ Lifecycle rules:
   `write_batch` and only says so at runtime (`INVALID_STATE`).
 - **Nulls are stored** via Lance's definition-level layer, and stock Lance reads them back: in
   fixed-width columns (int, float, bool, timestamp/date/time, decimal, `fixed_size_binary`) and in
-  variable-width ones (`utf8`, `binary`). Still refused, by name: a null **struct** (as opposed to a
-  null field inside one), and a null in a `lance.blob.v2` external-reference column.
+  variable-width ones (`utf8`, `binary`). A null **struct** (as opposed to a null field inside one) is stored
+  as its own definition level, at any depth and under lists, as Lance stores it (`test_lance_parity.py`,
+  `test_lance_list_writes.py`). A null row in a `lance.blob.v2` column is stored too, external references
+  included, with pylance's page layout (`test_blob_kinds.py::test_null_external_references_written_as_pylance_writes_them`).
   `nano_lance_writer_set_ignore_nullability` is a no-op kept for compatibility; the manifest's
   nullable flag now mirrors the Arrow schema, as pylance's does.
 - Types nanolance cannot round-trip are refused at `write_batch` rather than written, each by name: a
-  `timestamp` whose timezone is a UTC offset rather than an IANA name (Lance panics on those), a list of
-  `fixed_size_list`, a null element inside a valid `fixed_size_list` row, a `fixed_size_list` of
-  `fixed_size_list` under a struct or list (`a fixed_size_list of fixed_size_list under a struct or list is read but not written yet`; at the top level it is written, with nulls at both levels), a struct marked
+  `timestamp` whose timezone is a UTC offset rather than an IANA name (Lance panics on those), a
+  `fixed_size_list` of a list, large list or map (`fixed_size_list of '+l' is not supported`; pylance refuses
+  the type too), a `fixed_size_list` of `fixed_size_list` under a struct or list (`a fixed_size_list of fixed_size_list under a
+  struct or list is read but not written yet`; at the top level it is written, with nulls at both levels), a
+  `fixed_size_list` of structs under a struct or list (`a fixed_size_list of structs inside a struct or list is
+  not written yet`), a struct marked
   `lance-encoding:packed` (`a packed struct is read but not written yet`), and a dictionary inside a struct
   or list with non-int32 indices (`writing it is not supported unless its indices are int32`). Top-level
   Arrow dictionaries with an integer index are written. Everything else round-trips, including

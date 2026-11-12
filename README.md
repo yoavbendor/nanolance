@@ -207,14 +207,15 @@ nanolance or Lance cannot read back.
 | `timestamp` (with or without an IANA time zone), `date32/64`, `time32/64`, `duration`, `decimal128/256` | round-trips |
 | `struct` (any depth, null structs included), `list`, `large_list`, `map`, `fixed_size_list` | round-trips, with null and empty lists and null items at any level |
 | `null` | round-trips (Lance's all-null page) |
-| `lance.blob.v2` | external references written; inline, packed, dedicated and external blobs read |
+| `lance.blob.v2` | external references written, with null rows (page layout as pylance's, `test_blob_kinds.py`); inline, packed, dedicated and external blobs read |
 | Arrow `dictionary` with an integer index over a string, binary or fixed-width type, at the top level | round-trips, stored as Lance stores one (low-cardinality strings are dictionary-encoded on disk anyway) |
 | Arrow `dictionary` inside a `struct` or `list` | read with any integer index; written only with int32 indices (`writing it is not supported unless its indices are int32`). Other dictionary shapes are refused: cast to the value type |
 | `list`, `large_list` or `map` under a `fixed_size_list` of structs | round-trips at format 2.2, with nulls at every level, whole, by row range and by take; pylance 12 reads it back (`test_fsl_struct_list_write.py`) |
-| `fixed_size_list` of `fixed_size_list` of fixed-width items, at the top level | round-trips, with null rows, inner lists and leaves, whole, by take and by row range; written as pylance 12 writes it (mini-block at any width, so rows of 256 bytes or more are not FullZip). Under a struct or list: written refused (`a fixed_size_list of fixed_size_list under a struct or list is read but not written yet`) |
+| `fixed_size_list` of `fixed_size_list` of fixed-width items, at the top level | round-trips, with null rows, inner lists and leaves, whole, by take and by row range; written as pylance 12 writes it: mini-block under 256 bytes of leaves, FullZip from 256 bytes (`test_fsl_of_fsl_wide_layout_matches_pylance`). Pylance's FullZip pages are read too (`test_fsl_of_fsl_fullzip_read.py`); a pylance page with no nulls at all is refused by name, since pylance cannot read that page either. Under a struct or list: written refused (`a fixed_size_list of fixed_size_list under a struct or list is read but not written yet`) |
 | `struct` marked `lance-encoding:packed` | read in 2.1 and 2.2 files when its children are fixed-width; written refused (`a packed struct is read but not written yet`) |
 | `timestamp` with a UTC-offset zone (`+05:30`) | refused: Lance supports IANA names only |
-| a null element inside a valid `fixed_size_list` row | refused |
+| `fixed_size_list` of a `list`, `large_list` or `map` | refused by name (`fixed_size_list of '+l' is not supported`): pylance 12 refuses the type too, and nanolance used to write a file neither reader could open |
+| `fixed_size_list` with null elements inside valid rows, at the top level or under a list or struct | round-trips, with nulls at every level, whole, by take and by row range. At the top level the page layout is pylance's (mini-block with element validity under 256 bytes, FullZip from 256 bytes; `test_writer_tail.py` compares it with pylance's file); under a list the page layout can differ from pylance's (the rep/def encoding, and where pages are cut), and both readers still read it back equal |
 
 Nulls are stored in every column kind. Files in formats 2.0 to 2.3 are read; nanolance writes 2.2.
 

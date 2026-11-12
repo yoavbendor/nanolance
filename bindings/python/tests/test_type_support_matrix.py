@@ -101,8 +101,8 @@ ROUNDTRIPS = {
 }
 
 # Arrow dictionary columns (written as Lance's dict:<value>:<index> pages, read back with their
-# dictionary) and null elements inside valid vectors (FixedSizeList.has_validity): refused until
-# the writer tail (docs/ROADMAP.md) wrote them as pylance does.
+# dictionary) and null elements inside valid vectors (FixedSizeList.has_validity), both written as
+# pylance writes them (docs/ROADMAP.md, writer tail).
 ROUNDTRIPS["dictionary"] = pa.table({"c": pa.array([f"d{i % 5}" for i in range(N)]).dictionary_encode()})
 ROUNDTRIPS["fixed_size_list_item_nulls"] = _t(pa.list_(pa.float32(), 2),
                                               [[None, 1.0] if i % 5 == 0 else [1.0, 2.0] for i in range(N)])
