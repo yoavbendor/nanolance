@@ -248,6 +248,7 @@ effect. "Per call" means it is read each time the code path runs. Defaults are q
 |---|---|---|---|---|
 | `NANOLANCE_THREADS` | the CPUs in the process's affinity mask | Threads for reads and writes, the calling thread included; `1` starts no worker. Files do not depend on it. | Sharing a machine, or profiling one thread. | Once, when the thread count is first decided (again on `set_threads(0)`). |
 | `NANOLANCE_INDEX_PAGE_CACHE_MB` | `64` | Budget for decoded BTREE index windows, least recently used first out. `0` keeps none. | A lookup over a large index keeps missing (`index_page_cache_misses`). | Once. |
+| `NANOLANCE_DICT_CACHE_MB` | `64` | Budget for decoded dictionary blocks, least recently used first out. `0` decodes every block again. | A lookup over dictionary pages keeps decoding blocks (`dictionary_blocks_decoded`). | Once. |
 | `NANOLANCE_TAKE_CACHE_MB` | `256` | Budget for decoded columns that `take` keeps. A column is cached only if its encoded pages are at most 16 MB; entries unused for 10 s are dropped when a new one would not fit. `0` turns the cache off. | Repeated takes (say, training epochs) decode again each time, or memory is tight. | Once. |
 | `NANOLANCE_BUFFER_POOL_MB` | `128` | Budget for idle decoded output buffers reused across calls; buffers idle for 2 s are dropped. `0` turns the pool off. | Allocation dominates a workload, or memory is tight. | Once. |
 | `NANOLANCE_LIST_WINDOW_KB` | `4096` | Size of the chunk windows a MiniBlock list page is decoded in; a window is what a decode holds at once, not the whole page. | Peak memory on very large list pages. | Once. |
@@ -274,6 +275,8 @@ in [include/nanolance/work_stats.hpp](include/nanolance/work_stats.hpp).
 | Counter | Counts |
 |---|---|
 | `index_page_cache_hits` | BTREE index windows served from the decoded-window cache (`NANOLANCE_INDEX_PAGE_CACHE_MB`). |
+| `dictionary_blocks_decoded` | Dictionary blocks decompressed and parsed (not served from `NANOLANCE_DICT_CACHE_MB`). |
+| `dictionary_cache_hits` | Dictionary blocks served from the decoded-block cache. |
 | `index_page_cache_misses` | BTREE index windows read from the index file. |
 | `take_cache_hits` | `take` columns served from a decoded copy (`NANOLANCE_TAKE_CACHE_MB`). |
 | `dict_rows_expanded` | Rows a dictionary page copied its values out for. |

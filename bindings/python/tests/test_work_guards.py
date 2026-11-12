@@ -539,3 +539,25 @@ def test_a_repeated_indexed_in_on_a_btree_string_column_reads_no_index_bytes_the
     flt = _in_sql("source_id", wanted)
     stats, got = _stats_of(lambda: ds.to_table(columns=["source_id"], filter=flt).num_rows)
     assert got == expected and stats["index_page_cache_hits"] > 0, (got, expected, stats)
+
+
+def test_an_indexed_in_decodes_each_dictionary_block_once_not_once_per_window(tmp_path):
+    """An indexed IN on a BTREE's dictionary-coded values reads its windows' dictionary blocks (zstd, about 1 MB
+    decoded each). Each read used to decode its page's block again: 27 decodes for five windows of one fixture,
+    the dictionary of one page decoded for every chunk piece a window reads. Decoded blocks are now kept
+    (NANOLANCE_DICT_CACHE_MB, 64 MiB by default), so the query decodes only the blocks not yet kept. The five values
+    lie in two pages of the index. Skipped when the cache is tuned, since with it off every read decodes again."""
+    if _knob_overridden("NANOLANCE_DICT_CACHE_MB"):
+        pytest.skip("NANOLANCE_DICT_CACHE_MB is set in the environment")
+    table = _edges_like()
+    path = str(tmp_path / "edges_like.lance")
+    nl.write_dataset(table, path, max_rows_per_file=1_000_000)
+    ds = nl.dataset(path)
+    ds.create_scalar_index("source_id", "BTREE", name="source_bt")
+    keys = sorted(set(table.column("source_id").to_pylist()))
+    wanted = [keys[k] for k in (100, 5_000, 9_000, 13_000, 17_000)]  # sorted: the first windows of the index
+    expected = sum(1 for s in table.column("source_id").to_pylist() if s in frozenset(wanted))
+    stats, got = _stats_of(lambda: ds.to_table(columns=["source_id"], filter=_in_sql("source_id", wanted)).num_rows)
+    assert got == expected and stats["indexed_fragments"] > 0, (got, expected, stats)
+    assert stats["index_page_cache_misses"] + stats["index_page_cache_hits"] >= 2, stats
+    assert stats["dictionary_blocks_decoded"] <= 2, stats

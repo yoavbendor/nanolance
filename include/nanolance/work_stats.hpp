@@ -34,6 +34,8 @@ struct Counters {
     std::atomic<std::uint64_t> dict_rows_expanded{0};   // rows a dictionary page copied its values out for
     std::atomic<std::uint64_t> index_page_cache_hits{0};    // BTREE windows served from the decoded-window cache
     std::atomic<std::uint64_t> index_page_cache_misses{0};  // BTREE windows read from the index file
+    std::atomic<std::uint64_t> dictionary_blocks_decoded{0};  // dictionary blocks decompressed and parsed
+    std::atomic<std::uint64_t> dictionary_cache_hits{0};      // dictionary blocks served from the decoded-block cache
 };
 
 inline Counters& counters() {
@@ -56,7 +58,8 @@ inline void reset() {
     for (auto* x : {&c.data_bytes_read, &c.data_reads, &c.largest_read, &c.page_windows, &c.read_morsels,
                     &c.fragment_reads, &c.parallel_column_writes, &c.write_buffered_bytes, &c.buffer_pool_hits,
                     &c.buffer_pool_misses, &c.take_cache_hits, &c.indexed_fragments, &c.index_evaluations,
-                    &c.dict_rows_expanded, &c.index_page_cache_hits, &c.index_page_cache_misses}) {
+                    &c.dict_rows_expanded, &c.index_page_cache_hits, &c.index_page_cache_misses,
+                    &c.dictionary_blocks_decoded, &c.dictionary_cache_hits}) {
         x->store(0, std::memory_order_relaxed);
     }
 }

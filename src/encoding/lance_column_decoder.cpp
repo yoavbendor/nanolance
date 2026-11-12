@@ -44,6 +44,7 @@
 #include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
+#include <list>
 #include <mutex>
 #include <type_traits>
 #include <vector>
@@ -799,6 +800,109 @@ using DictionaryBlock = nano_lance::dictionary::Block;
         shape.packed_width = plan.dict_packed_width;
     }
     return dictionary::decode(out, shape, error);
+}
+
+/// Decoded dictionary blocks, kept across reads: process-wide, least recently used out first, bounded in bytes by
+/// NANOLANCE_DICT_CACHE_MB (default 64; 0 turns it off). A block is a pure function of the file's bytes at its buffer
+/// and of the plan fields decode_dictionary_block reads, so a key is the file's name, size and version, the buffer's
+/// offset and size, and those fields. A BTREE's index windows each read their page's dictionary, which is zstd-framed
+/// and about 1 MB decoded: with this cache a page's dictionary is decoded once, not once per window.
+class DictionaryBlockCache {
+public:
+    std::shared_ptr<const DictionaryBlock> find(const std::string& key) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = entries_.find(key);
+        if (it == entries_.end()) {
+            return nullptr;
+        }
+        lru_.splice(lru_.begin(), lru_, it->second.at);
+        return it->second.block;
+    }
+
+    void put(const std::string& key, std::shared_ptr<const DictionaryBlock> block, std::uint64_t bytes) {
+        const auto budget = budget_bytes();
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (bytes > budget || entries_.find(key) != entries_.end()) {
+            return;
+        }
+        while (held_ + bytes > budget && !lru_.empty()) {
+            const auto victim = entries_.find(lru_.back());
+            held_ -= victim->second.bytes;
+            entries_.erase(victim);
+            lru_.pop_back();
+        }
+        lru_.push_front(key);
+        entries_.emplace(key, Entry{std::move(block), bytes, lru_.begin()});
+        held_ += bytes;
+    }
+
+private:
+    struct Entry {
+        std::shared_ptr<const DictionaryBlock> block;
+        std::uint64_t bytes = 0;
+        std::list<std::string>::iterator at;
+    };
+
+    static std::uint64_t budget_bytes() {
+        static const std::uint64_t budget = [] {
+            const char* env = std::getenv("NANOLANCE_DICT_CACHE_MB");
+            if (env == nullptr || *env == '\0') {
+                return std::uint64_t{64} << 20U;
+            }
+            return static_cast<std::uint64_t>(std::strtoull(env, nullptr, 10)) << 20U;
+        }();
+        return budget;
+    }
+
+    std::mutex mutex_;
+    std::list<std::string> lru_;  // most recently used first
+    std::unordered_map<std::string, Entry> entries_;
+    std::uint64_t held_ = 0;
+};
+
+DictionaryBlockCache& dictionary_block_cache() {
+    static DictionaryBlockCache cache;
+    return cache;
+}
+
+/// The decoded dictionary block of `page` (its buffer 2), from the cache when it is there, else read and parsed
+/// (and cached). A file without an identity is never cached.
+[[nodiscard]] bool dictionary_block_of(const EncodingsIo& io, const pb::ColumnPage& page,
+                                       const ColumnEncodingPlan& plan, const std::string& logical_type,
+                                       std::shared_ptr<const DictionaryBlock>& out, std::string& error) {
+    std::uint64_t size = 0;
+    std::int64_t version = 0;
+    const bool keyed = io.identity(size, version);
+    std::string key;
+    if (keyed) {
+        key = io.name() + "|" + std::to_string(size) + "|" + std::to_string(version) + "|" +
+              std::to_string(page.buffer_offsets[2]) + "|" + std::to_string(page.buffer_sizes[2]) + "|" +
+              logical_type + "|" + std::to_string(static_cast<int>(plan.dict_scheme)) + "|" +
+              std::to_string(plan.dict_value_bits) + "|" + std::to_string(plan.dict_items) + "|" +
+              std::to_string(plan.dict_packed_width) + "|" +
+              std::to_string(static_cast<int>(plan.dict_inline_bitpacked)) + "|" +
+              std::to_string(static_cast<int>(plan.dict_out_of_line_bitpacked));
+        out = dictionary_block_cache().find(key);
+        if (out != nullptr) {
+            work_stats::add(work_stats::counters().dictionary_cache_hits, 1U);
+            return true;
+        }
+    }
+    std::vector<std::uint8_t> stored;
+    if (!io.read(page.buffer_offsets[2], page.buffer_sizes[2], stored, error)) {
+        return false;
+    }
+    auto block = std::make_shared<DictionaryBlock>();
+    if (!decode_dictionary_block(plan, logical_type, stored, *block, error)) {
+        return false;
+    }
+    work_stats::add(work_stats::counters().dictionary_blocks_decoded, 1U);
+    if (keyed) {
+        dictionary_block_cache().put(key, block,
+                                     block->bytes.size() + block->ranges.size() * sizeof(block->ranges[0]) + 64U);
+    }
+    out = std::move(block);
+    return true;
 }
 
 /// Appends `count` fixed_size_list ELEMENT validity bits, read LSB-first from the start of `src`, at
@@ -2380,8 +2484,7 @@ bool decode_dict_rle_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
     out.kind = fixed_dict ? ColumnValues::Kind::FixedWidth : ColumnValues::Kind::VariableWidth;
     out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
     std::vector<std::uint8_t> payload;
-    std::vector<std::uint8_t> dict_stored;
-    DictionaryBlock dict;
+    std::shared_ptr<const DictionaryBlock> dict_block;
     Scratch<std::vector<miniblock::ChunkView>> chunks_scratch;
     auto& chunks = chunks_scratch.get();
     std::vector<std::pair<std::uint32_t, std::uint8_t>> runs;  // (dictionary index, run length)
@@ -2391,15 +2494,11 @@ bool decode_dict_rle_column(const EncodingsIo& io, const pb::Field& on_disk_fiel
             error = "dict-rle page missing buffers";
             return false;
         }
-        if (!io.read(page.buffer_offsets[1], page.buffer_sizes[1], payload,
-                                        error) ||
-            !io.read(page.buffer_offsets[2], page.buffer_sizes[2], dict_stored,
-                                        error)) {
+        if (!io.read(page.buffer_offsets[1], page.buffer_sizes[1], payload, error) ||
+            !dictionary_block_of(io, page, encoding_plan, on_disk_field.logical_type, dict_block, error)) {
             return false;
         }
-        if (!decode_dictionary_block(encoding_plan, on_disk_field.logical_type, dict_stored, dict, error)) {
-            return false;
-        }
+        const DictionaryBlock& dict = *dict_block;
         // Same splitter as every other miniblock path, so a nullable column's definition levels
         // are read here rather than being mistaken for run data.
         if (keep != nullptr) {
@@ -2558,8 +2657,7 @@ bool decode_dict_column(const EncodingsIo& io, const pb::Field& on_disk_field,
     out.kind = fixed_dict ? ColumnValues::Kind::FixedWidth : ColumnValues::Kind::VariableWidth;
     out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
     std::vector<std::uint8_t> payload;
-    std::vector<std::uint8_t> dict_stored;
-    DictionaryBlock dict;
+    std::shared_ptr<const DictionaryBlock> dict_block;
     std::vector<std::uint8_t> indices_bytes;
     std::vector<miniblock::ChunkView> index_chunks;
     std::uint64_t validity_rows = 0;
@@ -2568,15 +2666,11 @@ bool decode_dict_column(const EncodingsIo& io, const pb::Field& on_disk_field,
             error = "dict page missing buffers";
             return false;
         }
-        if (!io.read(page.buffer_offsets[1], page.buffer_sizes[1], payload,
-                                        error) ||
-            !io.read(page.buffer_offsets[2], page.buffer_sizes[2], dict_stored,
-                                        error)) {
+        if (!io.read(page.buffer_offsets[1], page.buffer_sizes[1], payload, error) ||
+            !dictionary_block_of(io, page, encoding_plan, on_disk_field.logical_type, dict_block, error)) {
             return false;
         }
-        if (!decode_dictionary_block(encoding_plan, on_disk_field.logical_type, dict_stored, dict, error)) {
-            return false;
-        }
+        const DictionaryBlock& dict = *dict_block;
         const std::size_t num_dict = dict.count;
         // The index chunks go through the same splitter every other miniblock path uses, so a
         // nullable dictionary column (a categorical column with missing values -- the shape this
