@@ -5632,14 +5632,24 @@ bool append_flat_values(ColumnValues& dst, std::uint64_t dst_rows, ColumnValues&
 }
 
 /// decode_column_impl for a flat column, one page at a time when its pages need plans of their own.
+/// `column` with only `page` among its pages, its column-level fields kept. A copy of the whole column per
+/// page is quadratic in the page count: a take over a column of a thousand pages copied a million page records.
+pb::ColumnMetadata single_page_column(const pb::ColumnMetadata& column, const pb::ColumnPage& page) {
+    pb::ColumnMetadata one;
+    one.encoding = column.encoding;
+    one.buffer_offsets = column.buffer_offsets;
+    one.buffer_sizes = column.buffer_sizes;
+    one.pages.push_back(page);
+    return one;
+}
+
 /// Does any page of this flat column decode as a dictionary (plain or run-length coded)?
 bool has_dictionary_page(const pb::Field& on_disk_field, const pb::ColumnMetadata& column_metadata) {
     if (field_metadata_is_true(on_disk_field, "lance-encoding:blob")) {
         return false;  // a blob column decodes through its own path
     }
     for (const auto& page : column_metadata.pages) {
-        pb::ColumnMetadata one_page = column_metadata;
-        one_page.pages.assign(1U, page);
+        const auto one_page = single_page_column(column_metadata, page);
         const auto kind = classify_column_encoding(on_disk_field, one_page).kind;
         if (kind == ColumnEncodingKind::kDict || kind == ColumnEncodingKind::kDictRle) {
             return true;
@@ -5662,8 +5672,7 @@ bool decode_flat_column_selected(const EncodingsIo& io, const pb::Field& on_disk
     // each page's kept rows straight into `out`.
     bool all_dictionary = true;
     for (const auto& page : column_metadata.pages) {
-        pb::ColumnMetadata one_page = column_metadata;
-        one_page.pages.assign(1U, page);
+        const auto one_page = single_page_column(column_metadata, page);
         const auto kind = classify_column_encoding(on_disk_field, one_page).kind;
         all_dictionary = all_dictionary && (kind == ColumnEncodingKind::kDict || kind == ColumnEncodingKind::kDictRle);
     }
@@ -5684,8 +5693,7 @@ bool decode_flat_column_selected(const EncodingsIo& io, const pb::Field& on_disk
         for (const auto k : page_keep) {
             kept += k != 0U ? 1U : 0U;
         }
-        pb::ColumnMetadata one_page = column_metadata;
-        one_page.pages.assign(1U, page);
+        const auto one_page = single_page_column(column_metadata, page);
         ColumnValues part;
         const auto kind = classify_column_encoding(on_disk_field, one_page).kind;
         if (kind == ColumnEncodingKind::kDict || kind == ColumnEncodingKind::kDictRle) {
@@ -5713,8 +5721,7 @@ bool decode_flat_column(const EncodingsIo& io, const pb::Field& on_disk_field,
     out = ColumnValues{};
     std::uint64_t rows = 0;
     for (const auto& page : column_metadata.pages) {
-        pb::ColumnMetadata one_page = column_metadata;
-        one_page.pages.assign(1U, page);
+        const auto one_page = single_page_column(column_metadata, page);
         ColumnValues part;
         if (!decode_column_impl(io, on_disk_field, one_page, part, error, nullptr) ||
             !append_flat_values(out, rows, part, page.length, error)) {
