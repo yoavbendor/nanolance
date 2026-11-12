@@ -19,7 +19,7 @@ bool write_lance_file(const ArrowSchema& schema, const std::vector<const ArrowAr
     }
     LanceSchemaMapping mapping;
     if (!map_arrow_schema(schema, mapping, error, true) || !refuse_unwritten_nested_dictionaries(mapping, error) ||
-        !refuse_unwritten_lists_under_fixed_size_list(mapping, error)) {
+        !refuse_unwritten_under_fixed_size_list(mapping, error)) {
         return false;
     }
     // Integers bit-packed when asked, as Lance's index files have them (row ids and counts take a few bits).

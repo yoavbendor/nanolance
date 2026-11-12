@@ -210,7 +210,7 @@ nanolance or Lance cannot read back.
 | `lance.blob.v2` | external references written; inline, packed, dedicated and external blobs read |
 | Arrow `dictionary` with an integer index over a string, binary or fixed-width type, at the top level | round-trips, stored as Lance stores one (low-cardinality strings are dictionary-encoded on disk anyway) |
 | Arrow `dictionary` inside a `struct` or `list` | read with any integer index; written only with int32 indices (`writing it is not supported unless its indices are int32`). Other dictionary shapes are refused: cast to the value type |
-| `list`, `large_list` or `map` under a `fixed_size_list` of structs | read, from pylance-written 2.2 files, whole, by row range and by take; written refused (`a list or map under a fixed_size_list is read but not written yet`) |
+| `list`, `large_list` or `map` under a `fixed_size_list` of structs | round-trips at format 2.2, with nulls at every level, whole, by row range and by take; pylance 12 reads it back (`test_fsl_struct_list_write.py`) |
 | `fixed_size_list` of `fixed_size_list` of fixed-width items, at the top level | round-trips, with null rows, inner lists and leaves, whole, by take and by row range; written as pylance 12 writes it (mini-block at any width, so rows of 256 bytes or more are not FullZip). Under a struct or list: written refused (`a fixed_size_list of fixed_size_list under a struct or list is read but not written yet`) |
 | `struct` marked `lance-encoding:packed` | read in 2.1 and 2.2 files when its children are fixed-width; written refused (`a packed struct is read but not written yet`) |
 | `timestamp` with a UTC-offset zone (`+05:30`) | refused: Lance supports IANA names only |

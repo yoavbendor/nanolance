@@ -94,8 +94,7 @@ def test_pylance_cannot_read_it_with_another_column(tmp_path):
 @pytest.mark.parametrize("column", [
     pa.array([{"a": [{"x": 1}, {"x": 2}]}], pa.struct([("a", pa.list_(pa.struct([("x", pa.int64())]), 2))])),
     pa.array([[[{"x": 1}, {"x": 2}]]], pa.list_(pa.list_(pa.struct([("x", pa.int64())]), 2))),
-    pa.array([[{"y": [1]}, {"y": []}]], pa.list_(pa.struct([("y", pa.list_(pa.int32()))]), 2)),
-], ids=["in_struct", "in_list", "list_under_it"])
+], ids=["in_struct", "in_list"])
 def test_shapes_not_written_are_refused(tmp_path, column):
     with pytest.raises(Exception, match="fixed_size_list"):
         nl_write_dataset(pa.table({"v": column}), str(tmp_path / "t.lance"))

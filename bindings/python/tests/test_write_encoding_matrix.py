@@ -51,6 +51,28 @@ def _table(values, arrow_type=None):
     return pa.table({"c": pa.array(values, type=arrow_type)})
 
 
+def _fsl_fsl_row(i):
+    """One row of fixed_size_list<fixed_size_list<int32, 2>, 2>: a null row, a null inner list, a null leaf."""
+    if _null(i):
+        return None
+    first = None if i % 5 == 0 else [i, None if i % 3 == 0 else i + 1]
+    return [first, [i + 2, i + 3]]
+
+
+_FSL_STRUCT_LIST = pa.struct([("id", pa.int32()), ("values", pa.list_(pa.int32()))])
+
+
+def _fsl_struct_list_row(i):
+    """One row of fixed_size_list<struct<id int32, values list<int32>>, 2>, with the nulls and empties at every level."""
+    if _null(i):
+        return None
+    first = None if i % 13 == 0 else {
+        "id": None if i % 7 == 0 else i,
+        "values": None if i % 11 == 0 else ([] if i % 5 == 0 else [i, None if i % 3 == 0 else i + 1]),
+    }
+    return [first, {"id": i + 1, "values": [i + 2]}]
+
+
 # (id, table, what the writer should pick for it). The third element is documentation, not an
 # assertion -- the heuristics are free to change; what must not change is that both readers agree.
 SHAPES = [
@@ -104,10 +126,21 @@ SHAPES = [
     # A bfloat16 vector: fixed_size_binary(2) elements tagged lance.bfloat16, which pylance names
     # "lance.bfloat16" as the list's element type.
     ("fsl_bf16_4", _bf16_vectors([float(i % 97) * 0.5 for i in range(4 * N)], 4), "FixedSizeList{4xFlat} bf16"),
+    # fixed_size_list of fixed_size_list: two validity levels over the leaves (W1a), nulls at every level.
+    ("fsl_fsl_i32_2x2", _table([_fsl_fsl_row(i) for i in range(N)], pa.list_(pa.list_(pa.int32(), 2), 2)),
+     "FixedSizeList{2xFixedSizeList{2xFlat, validity}, validity}"),
+    # A list under a fixed_size_list of structs (W1k5): the struct's list has nulls, empties and null items.
+    ("fsl_struct_list_2", _table([_fsl_struct_list_row(i) for i in range(N)], pa.list_(_FSL_STRUCT_LIST, 2)),
+     "FixedSizeList of Struct(id, list<int32>): list under FSL of structs"),
     # Long strings: stock Lance switches to FullZip at 256 bytes; nanolance keeps MiniBlock, which is
     # legal at any value size. This pins that stock Lance reads it.
     ("str_long", _table([("q" * 300) + str(i) for i in range(N)], pa.utf8()), "variable, 300-byte values"),
 ]
+
+# Shapes pylance 12 cannot read beside another column ("cannot read columns of differing lengths together": a
+# fixed_size_list of structs counts rows x N). They are written and read in their own single-column dataset above,
+# and left out of the datasets that hold every shape at once.
+ALONE = {"fsl_struct_list_2"}
 
 MODES = [
     pytest.param({}, id="structural"),
@@ -151,7 +184,7 @@ def test_one_dataset_holding_every_shape_at_once(tmp_path):
     column with a bad page layout takes its neighbours down with it. Writing each shape to its own
     dataset (above) cannot catch that, and neither can reading only the column under test.
     """
-    combined = pa.table({name: table.column("c") for name, table, _ in SHAPES})
+    combined = pa.table({name: table.column("c") for name, table, _ in SHAPES if name not in ALONE})
 
     path = tmp_path / "everything.lance"
     nanolance.write_table(combined, path, compression=True)
@@ -167,7 +200,7 @@ def test_every_shape_survives_sliced_multi_batch_writes(options, tmp_path):
     from row `chunksize` on. Encoding choice and batch slicing are independent axes, and the bug
     lived in their product -- so the matrix has to cover it, not just the single-batch write above.
     """
-    combined = pa.table({name: table.column("c") for name, table, _ in SHAPES})
+    combined = pa.table({name: table.column("c") for name, table, _ in SHAPES if name not in ALONE})
 
     path = tmp_path / "sliced.lance"
     with nanolance.LanceWriter(path, options=nanolance.WriteOptions(**options), max_rows_per_fragment=6_000) as writer:
