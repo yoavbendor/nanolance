@@ -179,10 +179,10 @@ test exists and that every module has a test of its own.
 <!-- spec-summary:start -->
 | layer | done | partial | missing | n/a | modules with a test in their layer |
 |---|---|---|---|---|---|
-| [base](src/base/README.md#spec-coverage) | 14 | 0 | 0 | 1 | 16/16 |
+| [base](src/base/README.md#spec-coverage) | 14 | 0 | 0 | 1 | 17/17 |
 | [io](src/io/README.md#spec-coverage) | 7 | 2 | 2 | 0 | 5/7 |
 | [arrow](src/arrow/README.md#spec-coverage) | 18 | 3 | 0 | 1 | 8/8 |
-| [encoding](src/encoding/README.md#spec-coverage) | 22 | 6 | 6 | 1 | 19/19 |
+| [encoding](src/encoding/README.md#spec-coverage) | 22 | 6 | 6 | 1 | 21/22 |
 | [file](src/file/README.md#spec-coverage) | 14 | 3 | 3 | 1 | 4/4 |
 | [table](src/table/README.md#spec-coverage) | 37 | 16 | 13 | 1 | 18/18 |
 | [expr](src/expr/README.md#spec-coverage) | 17 | 1 | 3 | 0 | 1/1 |
