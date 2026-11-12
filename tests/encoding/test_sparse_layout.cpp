@@ -371,7 +371,9 @@ void test_count_and_item_mismatches_are_refused() {
             "extra structural buffer is refused");
 }
 
-void test_fixed_size_list_is_refused_by_name() {
+void test_fixed_size_list_layer_is_read() {
+    // Two slots of two elements each, all valid: the page holds the four elements as its rows, and the layer's
+    // entries are those elements (fsl_items 2, no validity).
     SparseLayer f;
     f.kind = SparseLayer::Kind::kFixedSizeList;
     f.num_slots = 2;
@@ -382,8 +384,15 @@ void test_fixed_size_list_is_refused_by_name() {
     auto sp = layout(4, 4, std::move(layers));
     std::vector<repdef::UnraveledLayer> out;
     std::string error;
-    require(!sparse::unravel(sp, 2, false, {}, out, error), "fixed-size-list layers are refused");
-    require(error.find("fixed-size-list") != std::string::npos, "the refusal names the layer: " + error);
+    require(sparse::unravel(sp, 4, false, {}, out, error), "a fixed-size-list layer is read: " + error);
+    require(out.size() == 2U, "the leaf and the fixed-size-list layer");
+    require(out.back().length == 4U && out.back().fsl_items == 2U, "the layer's entries are its elements");
+    require(out.back().validity.empty() && out.back().null_count == 0U, "all valid");
+
+    // A page whose rows are not its slots times their dimension is refused, naming the outer layer.
+    std::string bad_error;
+    require(!sparse::unravel(sp, 2, false, {}, out, bad_error), "a page of the wrong row count is refused");
+    require(bad_error.find("sparse outer layer") != std::string::npos, "the refusal names the layer: " + bad_error);
 }
 
 void test_chunk_items() {
@@ -498,7 +507,7 @@ int main() {
     test_list_of_lists();
     test_null_slot_with_children_is_refused();
     test_count_and_item_mismatches_are_refused();
-    test_fixed_size_list_is_refused_by_name();
+    test_fixed_size_list_layer_is_read();
     test_chunk_items();
     test_child_block_flat_inline_bitpacked_and_general();
     test_rle_chunk_widths_and_child_encodings();

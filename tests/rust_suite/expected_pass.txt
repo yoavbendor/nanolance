@@ -899,9 +899,12 @@ lance-encoding::encodings::logical::map::tests::test_nested_map
 lance-encoding::encodings::logical::map::tests::test_simple_map
 lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_auto_sparse_for_single_row_over_budget
 lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_auto_sparse_for_split_required_page
+lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_auto_sparse_keeps_unsupported_values_dense
 lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_auto_sparse_wide_values_keep_dense_fallback
 lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_explicit_sparse_emits_both_validity_polarities
 lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_explicit_sparse_list_and_large_list_null_empty_roundtrip
+lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_explicit_sparse_list_fixed_size_list_struct_roundtrip
+lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_explicit_sparse_map_and_fixed_size_list_roundtrip
 lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_explicit_sparse_nested_page_boundaries_range_and_take
 lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_explicit_sparse_nullable_primitive_roundtrip
 lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_explicit_sparse_nullable_struct_roundtrip
@@ -1260,6 +1263,7 @@ lance-encoding::encodings::physical::binary::tests::test_value_bigger_than_max_p
 lance-encoding::encodings::physical::binary::tests::test_value_bigger_than_max_page_size::encoding_3_TestEncoding__StructuralU32
 lance-encoding::encodings::physical::binary::tests::test_value_bigger_than_max_page_size::encoding_4_TestEncoding__StructuralSparse
 lance-encoding::encodings::physical::bitpacking::test::test_bitpack_encoding_verification
+lance-encoding::encodings::physical::bitpacking::test::test_miniblock_bitpack
 lance-encoding::encodings::physical::bitpacking::test::test_miniblock_bitpack_zero_chunk_selection
 lance-encoding::encodings::physical::block::tests::lz4::test_lz4_compress_round_trip::data_type_1_DataType__Utf8::encoding_1_TestEncoding__StructuralU16::use_slicing_1_false
 lance-encoding::encodings::physical::block::tests::lz4::test_lz4_compress_round_trip::data_type_1_DataType__Utf8::encoding_1_TestEncoding__StructuralU16::use_slicing_2_true
@@ -1292,6 +1296,7 @@ lance-encoding::encodings::physical::fsst::tests::test_fsst::explicit_2_true::en
 lance-encoding::encodings::physical::fsst::tests::test_fsst::explicit_2_true::encoding_2_TestEncoding__StructuralU32
 lance-encoding::encodings::physical::fsst::tests::test_fsst::explicit_2_true::encoding_3_TestEncoding__StructuralSparse
 lance-encoding::encodings::physical::packed::tests::fixed_packed_struct_full_zip_round_trip
+lance-encoding::encodings::physical::packed::tests::variable_packed_struct_utf8_round_trip
 lance-encoding::encodings::physical::rle::tests::test_rle_encoding_verification
 lance-encoding::encodings::physical::value::tests::regress_list_fsl
 lance-encoding::encodings::physical::value::tests::test_decimal128_dictionary_encoding::encoding_1_TestEncoding__StructuralU16

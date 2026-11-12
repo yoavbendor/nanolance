@@ -45,4 +45,12 @@ bool decode_rle_chunk(const page_layout::Compressive& values_encoding, const pag
                       page_layout::BufferScheme values_scheme, std::uint32_t value_bits, std::uint32_t length_bits,
                       std::vector<std::uint8_t>& out, std::string& error);
 
+/// One RLE chunk as its runs, not expanded: `run_values` holds each run's raw value (`value_bits` wide, little-endian,
+/// one per run) and `run_lengths` each run's length. The same checks and framing as decode_rle_chunk. A reader that
+/// keeps runs (a dictionary's RLE indices) takes them from here.
+bool decode_rle_runs(const page_layout::Compressive& values_encoding, const page_layout::Compressive& lengths_encoding,
+                     const std::vector<std::uint8_t>& values, const std::vector<std::uint8_t>& lengths,
+                     page_layout::BufferScheme values_scheme, std::uint32_t value_bits, std::uint32_t length_bits,
+                     std::vector<std::uint8_t>& run_values, std::vector<std::uint64_t>& run_lengths, std::string& error);
+
 }  // namespace nano_lance::child_block

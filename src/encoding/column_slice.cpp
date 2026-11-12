@@ -515,8 +515,10 @@ bool check_layers(const std::vector<ColumnValues::NestedLayer>& layers, std::uin
             return false;
         }
         if (!layer.is_list) {
-            // A struct: one child per entry.
-            if (!layer.offsets.empty() || (k + 1U < layers.size() && layers[k + 1U].length != layer.length)) {
+            // A struct: one child per entry; a converted fixed-size list: one child per element of its rows.
+            const std::uint64_t children_per_entry = layer.fsl_rows ? layer.fsl_items : 1U;
+            if (!layer.offsets.empty() ||
+                (k + 1U < layers.size() && layers[k + 1U].length != layer.length * children_per_entry)) {
                 error = "struct layer " + std::to_string(k) + " is malformed";
                 return false;
             }
@@ -559,6 +561,8 @@ bool cut_layers(const std::vector<ColumnValues::NestedLayer>& layers, const std:
         const auto& layer = layers[k];
         auto& out = cut[k];
         out.is_list = layer.is_list;
+        out.fsl_items = layer.fsl_items;
+        out.fsl_rows = layer.fsl_rows;
         RowRuns children;
         if (layer.is_list) {
             out.offsets.push_back(0);
@@ -576,7 +580,9 @@ bool cut_layers(const std::vector<ColumnValues::NestedLayer>& layers, const std:
                     }
                 }
             } else {
-                children.emplace_back(b, e);  // a struct keeps exactly the entries it is told to
+                // A struct keeps exactly the entries it is told to; a converted fixed-size list keeps its rows' elements.
+                const std::uint64_t scale = layer.fsl_rows ? layer.fsl_items : 1U;
+                children.emplace_back(b * scale, e * scale);
             }
             for (auto i = b; i < e; ++i) {
                 if (layer.is_list) {
@@ -779,6 +785,8 @@ bool slice_column_values(ColumnValues& values, std::uint64_t first, std::uint64_
         const auto& layer = values.layers[k];
         auto& out = cut[k];
         out.is_list = layer.is_list;
+        out.fsl_items = layer.fsl_items;
+        out.fsl_rows = layer.fsl_rows;
         out.length = n;
         if (!layer.is_list) {
             // A struct passes the same range straight to its children.
@@ -787,6 +795,11 @@ bool slice_column_values(ColumnValues& values, std::uint64_t first, std::uint64_
                 if (out.null_count == 0U) {
                     out.validity.clear();
                 }
+            }
+            // A fixed-size list whose entries are its rows passes its elements down: each row is its items.
+            if (layer.fsl_rows) {
+                at *= layer.fsl_items;
+                n *= layer.fsl_items;
             }
             continue;
         }

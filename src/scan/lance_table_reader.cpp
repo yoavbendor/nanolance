@@ -939,39 +939,48 @@ bool fill_nested_nodes(ColumnPlan& plan, std::int64_t rows, std::map<ArrowArray*
                        std::string& error) {
     auto& layers = plan.values->layers;
     const auto& name = plan.field->name;
+    // A sparse page carries an all-valid validity layer for each Arrow level that has a validity, and for a leaf
+    // that is not nullable as well (a map's keys: the entries struct's layer and the key's own), which the plan does
+    // not count. An all-valid struct layer says nothing about any row, so the innermost ones go while the layers
+    // outnumber the plan's levels; the count is checked below as before.
+    while (layers.size() > plan.nodes.size() && !layers.back().is_list && layers.back().null_count == 0U) {
+        layers.pop_back();
+    }
     // A fixed_size_list node's layer counts its elements (every row's `items`): it becomes one entry a row, valid
-    // when the row's first element says so (Lance marks a null row's elements all null at that layer). Each layer
-    // above it counts elements too, so it shrinks by the same factor.
+    // when the row's first element says so (Lance marks a null row's elements all null at that layer). Only that layer
+    // changes: the layers above it count the fixed-size list's rows (a list's offsets index them, a struct's validity
+    // is one entry a row), which the layer's rows are once it is converted.
     if (layers.size() == plan.nodes.size()) {
         for (std::size_t k = layers.size(); k-- > 0;) {
             const auto& node = plan.nodes[k];
             if (node.kind != ColumnPlan::Node::Kind::FixedSizeList) {
                 continue;
             }
-            for (std::size_t up = 0; up <= k; ++up) {
-                auto& layer = layers[up];
-                if (layer.is_list || node.items == 0U || layer.length % node.items != 0U) {
-                    error = "nested column '" + name + "': a fixed_size_list layer of " + std::to_string(layer.length) +
-                            " elements is not whole rows of " + std::to_string(node.items);
-                    return false;
-                }
-                const auto row_count = layer.length / node.items;
-                if (!layer.validity.empty()) {
-                    std::vector<std::uint8_t> bits(static_cast<std::size_t>((row_count + 7U) / 8U), 0U);
-                    std::uint64_t nulls = 0;
-                    for (std::uint64_t r = 0; r < row_count; ++r) {
-                        const auto e = r * node.items;
-                        if (((layer.validity[static_cast<std::size_t>(e >> 3U)] >> (e & 7U)) & 1U) != 0U) {
-                            bits[static_cast<std::size_t>(r >> 3U)] |= static_cast<std::uint8_t>(1U << (r & 7U));
-                        } else {
-                            ++nulls;
-                        }
-                    }
-                    layer.validity = std::move(bits);
-                    layer.null_count = nulls;
-                }
-                layer.length = row_count;
+            auto& layer = layers[k];
+            if (layer.fsl_rows) {
+                continue;  // converted by the decoder already (a column cut by its layers; see convert_fixed_size_list)
             }
+            if (layer.is_list || node.items == 0U || layer.length % node.items != 0U) {
+                error = "nested column '" + name + "': a fixed_size_list layer of " + std::to_string(layer.length) +
+                        " elements is not whole rows of " + std::to_string(node.items);
+                return false;
+            }
+            const auto row_count = layer.length / node.items;
+            if (!layer.validity.empty()) {
+                std::vector<std::uint8_t> bits(static_cast<std::size_t>((row_count + 7U) / 8U), 0U);
+                std::uint64_t nulls = 0;
+                for (std::uint64_t r = 0; r < row_count; ++r) {
+                    const auto e = r * node.items;
+                    if (((layer.validity[static_cast<std::size_t>(e >> 3U)] >> (e & 7U)) & 1U) != 0U) {
+                        bits[static_cast<std::size_t>(r >> 3U)] |= static_cast<std::uint8_t>(1U << (r & 7U));
+                    } else {
+                        ++nulls;
+                    }
+                }
+                layer.validity = std::move(bits);
+                layer.null_count = nulls;
+            }
+            layer.length = row_count;
         }
     }
     if (layers.size() != plan.nodes.size() || layers.empty() ||
@@ -1331,7 +1340,10 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         plan.array = node_array;
         plan.field = field;
         plan.nodes = std::move(path);
-        if (plan.under_list() && !is_blob && field->column_index < 0) {
+        // A fixed_size_list of structs has no column of its own, and is read under a list as the W1k4 branch below
+        // reads it (a list's offsets count its rows, and the layer of its elements is the struct's).
+        const bool fsl_of_struct_under_list = is_fsl && fsl_element == "struct";
+        if (plan.under_list() && !is_blob && field->column_index < 0 && !fsl_of_struct_under_list) {
             collect_error = "column '" + field->name + "': a list of " + field->logical_type + " is not read yet";
             return false;
         }
@@ -1343,8 +1355,9 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
                 collect_error = "column '" + field->name + "': a " + field->logical_type + " is not read yet";
                 return false;
             }
-            path.push_back({ColumnPlan::Node::Kind::FixedSizeList, node_array, fsl_items});
-            return self(self, node_schema->children[0], node_array->children[0], field->id, std::move(path), 0U);
+            // The path so far is in plan.nodes (moved there above): the lists above this node stay on it.
+            plan.nodes.push_back({ColumnPlan::Node::Kind::FixedSizeList, node_array, fsl_items});
+            return self(self, node_schema->children[0], node_array->children[0], field->id, std::move(plan.nodes), 0U);
         }
         if (!is_blob && field->column_index < 0) {
             plan.kind = ColumnPlan::Kind::Skip;
@@ -1786,7 +1799,7 @@ struct ColumnSource {
     /// on-disk field (its column is `metadata`) and this child's index among the struct's children. Null otherwise.
     const pb::Field* packed_parent = nullptr;
     std::size_t packed_child = 0;
-    std::vector<std::uint64_t> packed_widths;  // every child's width in bytes, in struct order
+    std::vector<PackedChild> packed_widths;  // every child's layout in the packed struct, in struct order
     /// A leaf under fixed_size_list<struct>s and structs alone (W1k4): its elements a row, the product of the
     /// lists' sizes. A take picks those elements for each row; 1 otherwise.
     std::uint64_t elements_per_row = 1;
@@ -1937,16 +1950,17 @@ bool v20_packed_struct_sources(const LanceSchemaMapping& mapping, const LanceFie
 /// the column's pages PackedStruct). Each child is read out of the struct's column (decode_lance_packed_struct_child*).
 /// A non-packed parent, or a column that is not packed, adds nothing: its leaves are read on their own.
 bool column_is_packed_struct_v21(const EncodingsIo& io, const pb::ColumnMetadata& column,
-                                 const std::string& logical_type, const std::vector<std::uint64_t>& child_bytes) {
+                                 const std::string& logical_type, const std::vector<PackedChild>& children) {
     // Only a struct can be packed: a list has an item child too, and a constant list page can hold a value the
     // size of that child by chance (test_constant_layout_list_repdef_v2_2).
-    return logical_type == "struct" && packed_struct_column(io, column, child_bytes);
+    return logical_type == "struct" && packed_struct_column(io, column, children);
 }
 
-/// Each direct child of a struct in the file's descriptor, in order: its width in bytes when it is fixed-width, 0
-/// when it is not (or is itself a struct).
-std::vector<std::uint64_t> descriptor_child_widths(const pb::FileDescriptor& descriptor, std::int32_t parent_id) {
-    std::vector<std::uint64_t> widths;
+/// Each direct child of a struct in the file's descriptor, in order: its layout in a packed struct. A fixed-width
+/// child has its width in bytes; a variable-width one (utf8, binary) is variable, with 64-bit offsets when large.
+/// A struct, a list or a fixed-size list is neither, which makes the parent not packed.
+std::vector<PackedChild> descriptor_child_widths(const pb::FileDescriptor& descriptor, std::int32_t parent_id) {
+    std::vector<PackedChild> widths;
     for (const auto& f : descriptor.fields) {
         if (f.parent_id != parent_id) {
             continue;
@@ -1958,7 +1972,14 @@ std::vector<std::uint64_t> descriptor_child_widths(const pb::FileDescriptor& des
         std::uint64_t items = 0;
         const bool plain = !t.empty() && t != "struct" && t != "bool" && !lance_logical_type_is_list(t) &&
                            !lance_field_is_variable_width(t) && !lance_fixed_size_list_parts(t, element, items);
-        widths.push_back(plain ? static_cast<std::uint64_t>(lance_logical_type_value_bytes(t)) : 0U);
+        PackedChild child;
+        if (plain) {
+            child.bytes = static_cast<std::uint64_t>(lance_logical_type_value_bytes(t));
+        } else if (lance_field_is_variable_width(t)) {
+            child.variable = true;
+            child.large = lance_logical_type_has_large_offsets(t);
+        }
+        widths.push_back(child);
     }
     return widths;
 }
@@ -1966,7 +1987,7 @@ std::vector<std::uint64_t> descriptor_child_widths(const pb::FileDescriptor& des
 bool v21_packed_struct_sources(const LanceSchemaMapping& mapping, const LanceField& parent,
                                const std::filesystem::path& path, const pb::FileDescriptor& descriptor,
                                const pb::Field& parent_on_disk, const pb::ColumnMetadata& column,
-                               const std::vector<std::uint64_t>& child_bytes,
+                               const std::vector<PackedChild>& child_bytes,
                                const std::unordered_set<std::int32_t>* allowed_field_ids,
                                std::vector<ColumnSource>& out, std::string& error) {
     int k = 0;
@@ -2025,9 +2046,15 @@ bool v21_packed_parent_sources(const LanceSchemaMapping& mapping, const pb::File
         return true;
     }
     packed = true;
-    if (parent->parent_id >= 0) {
-        error = "packed struct '" + parent->name + "' inside another struct is not read yet";
-        return false;
+    // A packed struct under lists (list<struct>) is read: the lists are its column's layers, as for any leaf below
+    // them. One under a struct, or a map (a list of structs under a name), is not read yet.
+    for (auto ancestor_id = parent->parent_id; ancestor_id >= 0;) {
+        const auto* ancestor = find_mapping_field(mapping, ancestor_id);
+        if (ancestor == nullptr || ancestor->logical_type == "map" || !lance_logical_type_is_list(ancestor->logical_type)) {
+            error = "packed struct '" + parent->name + "' inside another struct is not read yet";
+            return false;
+        }
+        ancestor_id = ancestor->parent_id;
     }
     const auto* on_disk_parent = find_descriptor_field(descriptor, field_id);
     if (on_disk_parent == nullptr) {
