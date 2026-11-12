@@ -1923,8 +1923,10 @@ bool v20_packed_struct_sources(const LanceSchemaMapping& mapping, const LanceFie
 /// the column's pages PackedStruct). Each child is read out of the struct's column (decode_lance_packed_struct_child*).
 /// A non-packed parent, or a column that is not packed, adds nothing: its leaves are read on their own.
 bool column_is_packed_struct_v21(const EncodingsIo& io, const pb::ColumnMetadata& column,
-                                 const std::vector<std::uint64_t>& child_bytes) {
-    return packed_struct_column(io, column, child_bytes);
+                                 const std::string& logical_type, const std::vector<std::uint64_t>& child_bytes) {
+    // Only a struct can be packed: a list has an item child too, and a constant list page can hold a value the
+    // size of that child by chance (test_constant_layout_list_repdef_v2_2).
+    return logical_type == "struct" && packed_struct_column(io, column, child_bytes);
 }
 
 /// Each direct child of a struct in the file's descriptor, in order: its width in bytes when it is fixed-width, 0
@@ -1932,9 +1934,17 @@ bool column_is_packed_struct_v21(const EncodingsIo& io, const pb::ColumnMetadata
 std::vector<std::uint64_t> descriptor_child_widths(const pb::FileDescriptor& descriptor, std::int32_t parent_id) {
     std::vector<std::uint64_t> widths;
     for (const auto& f : descriptor.fields) {
-        if (f.parent_id == parent_id) {
-            widths.push_back(static_cast<std::uint64_t>(lance_logical_type_value_bytes(f.logical_type)));
+        if (f.parent_id != parent_id) {
+            continue;
         }
+        // lance_logical_type_value_bytes falls back to 8 for a type it does not know (a struct, a list), so only the
+        // plain fixed-width primitives count as packable: anything else is 0, which makes the struct not packed.
+        const auto& t = f.logical_type;
+        std::string element;
+        std::uint64_t items = 0;
+        const bool plain = !t.empty() && t != "struct" && t != "bool" && !lance_logical_type_is_list(t) &&
+                           !lance_field_is_variable_width(t) && !lance_fixed_size_list_parts(t, element, items);
+        widths.push_back(plain ? static_cast<std::uint64_t>(lance_logical_type_value_bytes(t)) : 0U);
     }
     return widths;
 }
@@ -1996,7 +2006,8 @@ bool v21_packed_parent_sources(const LanceSchemaMapping& mapping, const pb::File
         return true;
     }
     const auto widths = descriptor_child_widths(descriptor, field_id);
-    if (!column_is_packed_struct_v21(DataFileIo(path), metas[static_cast<std::size_t>(column_index)], widths)) {
+    if (!column_is_packed_struct_v21(DataFileIo(path), metas[static_cast<std::size_t>(column_index)],
+                                   parent->logical_type, widths)) {
         return true;
     }
     packed = true;
@@ -3906,7 +3917,7 @@ bool open_file_plan(const std::filesystem::path& file_path, const LanceScanReque
             const bool is_parent = parents.count(f.id) != 0U;
             if (is_parent && !(static_cast<std::size_t>(column) < metas.size() &&
                                column_is_packed_struct_v21(DataFileIo(file_path), metas[static_cast<std::size_t>(column)],
-                                                           descriptor_child_widths(descriptor, f.id)))) {
+                                                           f.logical_type, descriptor_child_widths(descriptor, f.id)))) {
                 continue;
             }
             if (is_parent) {

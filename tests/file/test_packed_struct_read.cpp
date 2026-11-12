@@ -216,6 +216,38 @@ void check_dataset(const std::filesystem::path& dataset, bool nullable) {
     }
 }
 
+/// A 2.2 list<int32> whose values are all 7, with every third row null (a constant page with levels, and no struct
+/// anywhere). It must read as the list it is, not be taken for a packed struct: the rows are checked one by one.
+void check_const_list(const std::filesystem::path& path) {
+    constexpr std::uint64_t kRows = 1300;
+    std::string error;
+    nano_lance::LanceScanRequest request;
+    ArrowSchema schema{};
+    std::vector<ArrowArray> batches;
+    require(nano_lance::lance_file_read(path, request, schema, batches, error), "const list: " + error);
+    require(schema.n_children == 1, "const list: one column");
+    std::uint64_t row = 0;
+    for (const auto& batch : batches) {
+        const ArrowArray& list = *batch.children[0];
+        const ArrowArray& items = *list.children[0];
+        const auto* offsets = static_cast<const std::int32_t*>(list.buffers[1]);
+        const auto* values = static_cast<const std::int32_t*>(items.buffers[1]);
+        for (std::int64_t r = 0; r < batch.length; ++r, ++row) {
+            const bool valid = bit(list.buffers[0], list.offset + r);
+            require(valid == (row % 3 != 0), "const list: row " + std::to_string(row) + " has the wrong validity");
+            if (!valid) {
+                continue;
+            }
+            const auto begin = offsets[list.offset + r];
+            const auto end = offsets[list.offset + r + 1];
+            require(end - begin == 1, "const list: row " + std::to_string(row) + " is one item long");
+            require(values[items.offset + begin] == 7, "const list: row " + std::to_string(row) + " holds 7");
+        }
+    }
+    require(row == kRows, "const list: " + std::to_string(row) + " rows");
+    release(schema, batches);
+}
+
 }  // namespace
 
 int main() {
@@ -224,6 +256,7 @@ int main() {
     check_file(dir / "v22_packed.lance", false);
     check_file(dir / "v21_packed_nullable.lance", true);
     check_dataset(dir / "v21_dataset", false);
+    check_const_list(dir / "v22_const_list.lance");
     std::cout << "packed struct reads: 2.1, 2.2 and a nullable struct, whole, by range and by take; "
                  "and a 2.1 dataset\n";
     return 0;

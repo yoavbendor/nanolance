@@ -62,6 +62,19 @@ def write_case(lance, pa, directory: Path, version: str, nullable: bool, keep_da
     return data_files[0]
 
 
+def write_const_list(lance, pa, directory: Path) -> Path:
+    """A 2.2 list<int32> column whose every value is 7, with some rows null: a constant page with levels, and no
+    struct anywhere. Its int32 width matches no packed struct, so the reader must not take the list for one."""
+    rows = [None if i % 3 == 0 else [7] for i in range(ROWS)]
+    table = pa.Table.from_arrays([pa.array(rows, pa.list_(pa.int32()))], names=["l"])
+    dataset_dir = directory / "dataset"
+    lance.write_dataset(table, str(dataset_dir), data_storage_version="2.2", max_rows_per_file=ROWS * 2)
+    data_files = sorted((dataset_dir / "data").glob("*.lance"))
+    if len(data_files) != 1:
+        sys.exit(f"expected one data file for const list, found {len(data_files)}")
+    return data_files[0]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--check-only", action="store_true", help="only check that pylance and pyarrow import")
@@ -84,6 +97,10 @@ def main() -> int:
             shutil.copyfile(data, OUT / name)
             print(f"wrote {OUT / name} ({version}, nullable struct: {nullable})")
     print(f"wrote {OUT / 'v21_dataset'} (a dataset of the 2.1 file)")
+    with tempfile.TemporaryDirectory() as tmp:
+        data = write_const_list(lance, pa, Path(tmp))
+        shutil.copyfile(data, OUT / "v22_const_list.lance")
+        print(f"wrote {OUT / 'v22_const_list.lance'} (2.2 constant list<int32> with nulls)")
     return 0
 
 
