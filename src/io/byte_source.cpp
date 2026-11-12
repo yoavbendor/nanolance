@@ -4,6 +4,7 @@
 
 #include "nanolance/object_store.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <filesystem>
@@ -129,6 +130,21 @@ bool is_unbuilt_s3(const std::string& path_or_uri) {
     return path_or_uri.rfind("s3://", 0) == 0 && !is_remote(path_or_uri);
 }
 
+/// A URI built from a native path. On Windows the reader joins components with "\", so "mem://C:/ds" plus
+/// "_versions" arrives as "mem://C:/ds\_versions": object keys are "/"-separated, so the separators after the
+/// scheme are made "/". Local paths (no "://") are returned as they are.
+std::string canonical_uri(const std::string& path_or_uri) {
+#ifdef _WIN32
+    const auto colon = path_or_uri.find("://");
+    if (colon != std::string::npos && colon > 0) {
+        std::string uri = path_or_uri;
+        std::replace(uri.begin() + static_cast<std::ptrdiff_t>(colon + 3), uri.end(), '\\', '/');
+        return uri;
+    }
+#endif
+    return path_or_uri;
+}
+
 }  // namespace
 
 std::unique_ptr<ByteSource> open_local_file(const std::string& path, std::string& error) {
@@ -223,7 +239,8 @@ void register_source_factory(const std::string& scheme, SourceFactory factory) {
     }
 }
 
-std::unique_ptr<ByteSource> open_source(const std::string& path_or_uri, std::string& error) {
+std::unique_ptr<ByteSource> open_source(const std::string& path_or_uri_arg, std::string& error) {
+    const std::string path_or_uri = canonical_uri(path_or_uri_arg);
     const auto colon = path_or_uri.find("://");
     if (colon != std::string::npos && colon > 0) {
         SourceFactory factory;
@@ -374,7 +391,8 @@ bool set_object_store_options(const std::string& uri, const ObjectStoreOptions& 
 }
 #endif
 
-bool list_dir(const std::string& path_or_uri, std::vector<DirEntry>& out, std::string& error, bool with_sizes) {
+bool list_dir(const std::string& path_or_uri_arg, std::vector<DirEntry>& out, std::string& error, bool with_sizes) {
+    const std::string path_or_uri = canonical_uri(path_or_uri_arg);
     out.clear();
     error.clear();
     const auto colon = path_or_uri.find("://");
