@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -286,11 +287,15 @@ void test_duration() {
 
 }  // namespace
 
-int main() {
+int main() try {
+    std::cout << "running nano_lance_dataset_refs\n" << std::flush;
     test_tags();
     test_branches();
     test_drop();
     test_duration();
     std::cout << "dataset_refs: ok\n";
     return 0;
+} catch (const std::exception& e) {
+    std::cerr << "FAIL: uncaught exception: " << e.what() << '\n';
+    return 1;
 }
