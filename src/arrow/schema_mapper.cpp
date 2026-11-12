@@ -539,10 +539,12 @@ bool map_field(const ArrowSchema& field,
         const ArrowSchema& values = *field.dictionary;
         auto value_type = parse_format(values.format == nullptr ? "" : values.format);
         const std::string index_format = format;
-        // Under a struct or list (W1k2) only int32 indices over string or binary values are written: the
-        // shape pylance 12 writes (InlineBitpacking(32) indices, a General{LZ4} dictionary). Other
-        // nested dictionaries keep the refusal.
-        const bool nested_shape = parent_id >= 0 && index_format == "i" && value_type.supported &&
+        // Under a struct or list (W1k2) any integer index over string or binary values is read, as at the top
+        // level. Writing is narrower: only int32 indices (the shape pylance 12 writes: InlineBitpacking(32)
+        // indices, a General{LZ4} dictionary), refused by name in the file writer. Other nested dictionaries
+        // keep the refusal.
+        const bool nested_shape = parent_id >= 0 && !lance_integer_name_of_format(index_format).empty() &&
+                                  value_type.supported &&
                                   (value_type.logical_type == "utf8" || value_type.logical_type == "large_utf8" ||
                                    value_type.logical_type == "binary" || value_type.logical_type == "large_binary") &&
                                   values.dictionary == nullptr;
@@ -743,6 +745,17 @@ bool check_primary_keys(const LanceSchemaMapping& mapping, std::string& error) {
 }
 
 }  // namespace
+
+bool refuse_unwritten_nested_dictionaries(const LanceSchemaMapping& mapping, std::string& error) {
+    for (const auto& field : mapping.fields) {
+        if (field.parent_id >= 0 && !field.dictionary_index_format.empty() && field.dictionary_index_format != "i") {
+            error = "dictionary column '" + field.name + "' inside a struct or list is read, but written only with int32 "
+                    "indices; cast its indices to int32 first";
+            return false;
+        }
+    }
+    return true;
+}
 
 bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, std::string& error,
                       bool /*ignore_nullability*/) {

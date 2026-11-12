@@ -438,7 +438,8 @@ WriteStatus WriteSession::write_batch(struct ArrowArray* batch, struct ArrowSche
     }
 
     LanceSchemaMapping batch_mapping;
-    if (!map_arrow_schema(*schema, batch_mapping, error, state->ignore_nullability)) {
+    if (!map_arrow_schema(*schema, batch_mapping, error, state->ignore_nullability) ||
+        !refuse_unwritten_nested_dictionaries(batch_mapping, error)) {
         return fail(WriteStatus::Unsupported, error);
     }
 

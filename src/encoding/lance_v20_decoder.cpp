@@ -1009,6 +1009,19 @@ bool leaf_type(const pb::Field& field, LeafType& t, std::string& error) {
         t.large = lance_logical_type_has_large_offsets(type);
         return true;
     }
+    // A dictionary of strings or binary, "dict:<value>:<index>:<ordered>" (a list's or struct's item): its
+    // page's items are read as the values, and the reader gives them back as indices into the values.
+    if (type.rfind("dict:", 0) == 0) {
+        const auto end = type.find(':', 5);
+        const auto value = type.substr(5, end == std::string::npos ? std::string::npos : end - 5);
+        if (!lance_field_is_variable_width(value)) {
+            error = "column '" + field.name + "': format 2.0 dictionary of " + value + " is not read";
+            return false;
+        }
+        t.variable = true;
+        t.large = lance_logical_type_has_large_offsets(value);
+        return true;
+    }
     std::string element;
     if (lance_fixed_size_list_parts(type, element, t.items)) {
         if (lance_field_is_variable_width(element)) {
@@ -1021,7 +1034,7 @@ bool leaf_type(const pb::Field& field, LeafType& t, std::string& error) {
     t.null_type = type == "null";
     t.value_bytes = lance_logical_type_value_bytes(type);
     if (t.value_bytes == 0U || type == "struct" || type.rfind("list", 0) == 0 ||
-        type.rfind("large_list", 0) == 0 || type.rfind("dict:", 0) == 0) {
+        type.rfind("large_list", 0) == 0) {
         error = "column '" + field.name + "': format 2.0 values of type " + type + " are not read";
         return false;
     }
