@@ -24,6 +24,8 @@
 #include "nanolance/lz4_block.hpp"
 #include "nanolance/read_safety.hpp"
 #include "nanolance/repdef.hpp"
+#include "nanolance/sparse_layout.hpp"
+#include "nanolance/child_block.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include <nanom/columnar.hpp>
@@ -677,6 +679,12 @@ struct ColumnEncodingPlan {
     /// is a property of the PAGE (its buffer count), not of the descriptor -- so it is decided at
     /// decode time. See `constant_def_buffer_index`.
     bool constant_declares_levels = false;
+    /// kRle: how a chunk's run values and run lengths are stored. Set for a plain RLE column; the
+    /// chunk decode reads each child as its own encoding says (flat, bitpacked or general), with the
+    /// run lengths' width from `rle_length_bits`.
+    std::shared_ptr<const page_layout::Compressive> rle_values;
+    std::shared_ptr<const page_layout::Compressive> rle_lengths;
+    std::uint32_t rle_length_bits = 8;
     /// kVariable written by stock Lance: the page's FSST symbol table, parsed once per column. Empty
     /// `symbol_count` with `passthrough` set is the ordinary case for a small file -- Lance skips FSST
     /// below 32 KiB of input but still wraps the page in the encoding.
@@ -1334,6 +1342,12 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
     switch (inner->kind) {
         case page_layout::CompressiveKind::kRle:
             out.kind = has_dictionary ? ColumnEncodingKind::kDictRle : ColumnEncodingKind::kRle;
+            if (!has_dictionary && inner->values != nullptr && inner->lengths != nullptr) {
+                out.rle_values = page_layout::clone(*inner->values);
+                out.rle_lengths = page_layout::clone(*inner->lengths);
+                const auto bits = child_block::value_bits(*inner->lengths);
+                out.rle_length_bits = bits != 0U ? bits : 8U;
+            }
             if (has_dictionary && inner->values != nullptr && inner->values->kind == page_layout::CompressiveKind::kFlat &&
                 (inner->values->bits_per_value == 8U || inner->values->bits_per_value == 16U ||
                  inner->values->bits_per_value == 32U || inner->values->bits_per_value == 64U)) {
@@ -2224,7 +2238,16 @@ bool decode_rle_column(const EncodingsIo& io, const pb::Field& on_disk_field, co
                 error = "rle chunk is missing its run-lengths buffer";
                 return false;
             }
-            if (!rle::decode(chunk.values, chunk.extra_buffers[0], bpv, out.fixed, error)) {
+            // A General wrapper around the whole RLE encoding frames its first buffer, the run values, one
+            // frame per chunk; the run lengths stay as they are (Lance's general decompressor takes data[0]
+            // only). decode_rle_chunk unframes the values, when the plan says there is a scheme.
+            if (encoding_plan.rle_values != nullptr && encoding_plan.rle_lengths != nullptr) {
+                if (!child_block::decode_rle_chunk(*encoding_plan.rle_values, *encoding_plan.rle_lengths, chunk.values,
+                                                   chunk.extra_buffers[0], encoding_plan.value_scheme, bpv * 8U,
+                                                   encoding_plan.rle_length_bits, out.fixed, error)) {
+                    return false;
+                }
+            } else if (!rle::decode(chunk.values, chunk.extra_buffers[0], bpv, out.fixed, error)) {
                 return false;
             }
         }
@@ -3691,9 +3714,25 @@ bool append_leaf_values(ColumnValues& dst, ColumnValues& src, std::string& error
 /// Decode `count` levels stored as raw u16 (no compression declared) or through `encoding`.
 bool decode_level_buffer(const std::vector<std::uint8_t>& bytes, const page_layout::Compressive* encoding,
                          std::uint64_t count, std::vector<std::uint16_t>& out, std::string& error) {
-    if (count > std::numeric_limits<std::uint32_t>::max() || count > bytes.size() * 8U * 4096U + 65536U) {
+    // Levels are u16, so the decoded size bounds the count. The count is not bounded by the bytes the
+    // levels take: RLE and bitpacked levels compress well, and a zero-width encoding stores none at all
+    // (every level is 0). A raw buffer that is empty holds no levels (a constant page with no repetition
+    // stores an empty buffer for them).
+    if (count > std::numeric_limits<std::uint32_t>::max() || count > default_read_limits().max_uncompressed_bytes / 2U) {
         error = "a page declares an implausible " + std::to_string(count) + " levels";
         return false;
+    }
+    if (encoding != nullptr && zero_width_levels(*encoding)) {
+        if (!bytes.empty()) {
+            error = "0-bit levels carry " + std::to_string(bytes.size()) + " bytes";
+            return false;
+        }
+        out.assign(static_cast<std::size_t>(count), std::uint16_t{0});
+        return true;
+    }
+    if (encoding == nullptr && bytes.empty()) {
+        out.clear();
+        return true;
     }
     if (encoding == nullptr && count == 0U) {
         // Raw u16 levels: pylance leaves the count out (proto3's 0) and the buffer size says it.
@@ -3888,6 +3927,44 @@ bool decode_nested_mini_block_levels(NestedDecodeState& st, const pb::ColumnPage
         }
         window->rows = page_rows;
     }
+    return true;
+}
+
+/// Reads a sparse page's structural buffers and its value chunks' metadata, and unravels the page to the
+/// per-layer offsets and validity a level-encoded page gives. One step of decode_nested_column, for the
+/// Sparse layout (nanolance/sparse_layout.hpp). The values are read later, as mini-block chunks.
+bool decode_nested_sparse_levels(NestedDecodeState& st, const pb::ColumnPage& page,
+                                 const page_layout::PageLayout& layout, const std::string& where,
+                                 NestedPageState& page_state, std::vector<repdef::UnraveledLayer>& unraveled,
+                                 std::string& error) {
+    const EncodingsIo& io = st.io;
+    const auto& sparse_layout = layout.sparse;
+    std::size_t structural = 0;
+    if (page.buffer_offsets.size() != page.buffer_sizes.size() ||
+        !sparse::structural_buffer_count(sparse_layout, structural, error) ||
+        page.buffer_offsets.size() != 2U + structural) {
+        error = where + (error.empty() ? "a sparse page's buffers do not match its layers" : error);
+        return false;
+    }
+    std::vector<std::uint8_t> meta;
+    if (!io.read(page.buffer_offsets[0], page.buffer_sizes[0], meta, error)) {
+        error = where + error;
+        return false;
+    }
+    std::vector<std::vector<std::uint8_t>> buffers(structural);
+    for (std::size_t i = 0; i < structural; ++i) {
+        if (!io.read(page.buffer_offsets[2U + i], page.buffer_sizes[2U + i], buffers[i], error)) {
+            error = where + error;
+            return false;
+        }
+    }
+    std::vector<std::uint64_t> items;
+    if (!sparse::chunk_items(meta, page.buffer_sizes[1], sparse_layout.num_visible_items, items, error) ||
+        !sparse::unravel(sparse_layout, page.length, st.on_disk_field.nullable, buffers, unraveled, error)) {
+        error = where + error;
+        return false;
+    }
+    page_state.items = std::move(items);
     return true;
 }
 
@@ -4115,6 +4192,20 @@ bool decode_nested_page_values(NestedDecodeState& st, const pb::ColumnPage& page
         if (!decode_column_impl(io, on_disk_field, one_page, page_values, error, view)) {
             return false;
         }
+    } else if (layout.kind == page_layout::LayoutKind::kSparse && page_items != 0U) {
+        // The value chunks are mini-block chunks with no levels: the page is read as one, with the
+        // descriptor the sparse layout's own value encoding gives and the item counts its metadata holds.
+        pb::ColumnPage value_page = page;
+        value_page.encoding = sparse::value_descriptor(layout.sparse, layout.sparse.num_visible_items);
+        value_page.length = page_items;
+        pb::ColumnMetadata one_page;
+        one_page.pages.push_back(std::move(value_page));
+        auto view = std::make_shared<ItemView>();
+        view->page_chunk_items.push_back(std::move(items));
+        if (!decode_column_impl(io, on_disk_field, one_page, page_values, error, view)) {
+            error = where + error;
+            return false;
+        }
     } else if (page_items != 0U) {
         if (!decode_nested_constant_items(st, page, layout, unraveled, where, out, page_values, error)) {
             return false;
@@ -4232,12 +4323,17 @@ bool decode_nested_column(const EncodingsIo& io, const pb::Field& on_disk_field,
         }
         rep.clear();
         def.clear();
+        std::vector<repdef::UnraveledLayer> sparse_unraveled;
         if (layout.kind == page_layout::LayoutKind::kMiniBlock) {
             if (!decode_nested_mini_block_levels(st, page, layout, where, window, page_state, error)) {
                 return false;
             }
         } else if (layout.kind == page_layout::LayoutKind::kConstant) {
             if (!decode_nested_constant_levels(st, page, layout, where, page_state, error)) {
+                return false;
+            }
+        } else if (layout.kind == page_layout::LayoutKind::kSparse) {
+            if (!decode_nested_sparse_levels(st, page, layout, where, page_state, sparse_unraveled, error)) {
                 return false;
             }
         } else if (layout.kind == page_layout::LayoutKind::kFullZip) {
@@ -4260,7 +4356,9 @@ bool decode_nested_column(const EncodingsIo& io, const pb::Field& on_disk_field,
         }
 
         std::vector<repdef::UnraveledLayer> unraveled;
-        if (!decode_nested_unravel_page(st, page_state, where, unraveled, error)) {
+        if (layout.kind == page_layout::LayoutKind::kSparse) {
+            unraveled = std::move(sparse_unraveled);
+        } else if (!decode_nested_unravel_page(st, page_state, where, unraveled, error)) {
             return false;
         }
         const auto page_items = unraveled[0].length;
@@ -4338,6 +4436,10 @@ bool column_is_nested(const pb::ColumnMetadata& column_metadata) {
                     return true;
                 }
                 break;
+            case page_layout::LayoutKind::kSparse:
+                // Every sparse page is read by the nested path: its leaf may be nullable with no
+                // struct or list above it, which the flat path would not read as validity.
+                return true;
             default:
                 break;
         }

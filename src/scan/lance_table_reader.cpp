@@ -44,17 +44,36 @@ namespace {
 
 /// Same lookup scoped to one parent, so a struct child named `id` does not resolve to a top-level
 /// `id`. `parent_id` is -1 for top-level fields, matching LanceField::parent_id.
+/// `occurrence` picks among siblings that share a name (a struct may have several children named "",
+/// which Arrow allows and Lance writes): the k-th such sibling in the Arrow array is the k-th such field.
 const LanceField* find_mapping_field_by_name_under(const LanceSchemaMapping& mapping, const char* name,
-                                                   std::int32_t parent_id) {
+                                                   std::int32_t parent_id, std::size_t occurrence = 0) {
     if (name == nullptr) {
         return nullptr;
     }
+    std::size_t seen = 0;
     for (const auto& field : mapping.fields) {
         if (field.parent_id == parent_id && field.name == name) {
-            return &field;
+            if (seen == occurrence) {
+                return &field;
+            }
+            ++seen;
         }
     }
     return nullptr;
+}
+
+/// How many of the siblings before child `index` have the same name as it: its occurrence among them.
+std::size_t same_name_occurrence(const ArrowSchema* parent, std::int64_t index) {
+    std::size_t count = 0;
+    for (std::int64_t j = 0; j < index; ++j) {
+        if (parent->children[j] != nullptr && parent->children[index] != nullptr &&
+            parent->children[j]->name != nullptr && parent->children[index]->name != nullptr &&
+            std::strcmp(parent->children[j]->name, parent->children[index]->name) == 0) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 const LanceField* find_mapping_field(const LanceSchemaMapping& mapping, std::int32_t id) {
@@ -1244,12 +1263,13 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
 
     std::string collect_error;
     const auto collect = [&](auto&& self, const ArrowSchema* node_schema, ArrowArray* node_array,
-                             std::int32_t parent_id, std::vector<ColumnPlan::Node> path) -> bool {
+                             std::int32_t parent_id, std::vector<ColumnPlan::Node> path,
+                             std::size_t occurrence) -> bool {
         if (node_schema == nullptr || node_schema->name == nullptr || node_array == nullptr) {
             collect_error = "batch schema child is missing";
             return false;
         }
-        const auto* field = find_mapping_field_by_name_under(mapping, node_schema->name, parent_id);
+        const auto* field = find_mapping_field_by_name_under(mapping, node_schema->name, parent_id, occurrence);
         if (field == nullptr) {
             collect_error = "mapping field not found for schema child ";
             collect_error += node_schema->name;
@@ -1272,7 +1292,7 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
             path.push_back({lance_logical_type_is_large_list(field->logical_type) ? ColumnPlan::Node::Kind::LargeList
                                                                                   : ColumnPlan::Node::Kind::List,
                             node_array});
-            return self(self, node_schema->children[0], node_array->children[0], field->id, std::move(path));
+            return self(self, node_schema->children[0], node_array->children[0], field->id, std::move(path), 0U);
         }
 
         if (is_struct && node_schema->n_children == 0) {  // an empty struct: valid in every row
@@ -1298,7 +1318,8 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
                     collect_error += field->name;
                     return false;
                 }
-                if (!self(self, node_schema->children[i], node_array->children[i], field->id, path)) {
+                if (!self(self, node_schema->children[i], node_array->children[i], field->id, path,
+                          same_name_occurrence(node_schema, i))) {
                     return false;
                 }
             }
@@ -1322,7 +1343,7 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
                 return false;
             }
             path.push_back({ColumnPlan::Node::Kind::FixedSizeList, node_array, fsl_items});
-            return self(self, node_schema->children[0], node_array->children[0], field->id, std::move(path));
+            return self(self, node_schema->children[0], node_array->children[0], field->id, std::move(path), 0U);
         }
         if (!is_blob && field->column_index < 0) {
             plan.kind = ColumnPlan::Kind::Skip;
@@ -1383,7 +1404,8 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
     };
 
     for (int64_t c = 0; c < batch_schema.n_children; ++c) {
-        if (!collect(collect, batch_schema.children[c], batch.children[c], -1, {})) {
+        if (!collect(collect, batch_schema.children[c], batch.children[c], -1, {},
+                     same_name_occurrence(&batch_schema, c))) {
             error = collect_error;
             ArrowArrayRelease(&batch);
             return false;

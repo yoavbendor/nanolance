@@ -327,17 +327,18 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
         error = "failed to read data file version";
         return false;
     }
-    // 2.1 and 2.2 share the structural page layouts; 2.2 adds encodings a 2.1 file never holds. 2.0
-    // (footer 0.3: ArrayEncoding pages, lance_v20_decoder.cpp) has the same container. 2.3 and the
-    // legacy v1 format are not read.
+    // 2.1 and 2.2 share the structural page layouts; 2.2 adds encodings a 2.1 file never holds. 2.3 adds
+    // the sparse page layout (nanolance/sparse_layout.hpp) and nested variable-width RLE, which the sparse
+    // and RLE decoders read as their own descriptors say. 2.0 (footer 0.3: ArrayEncoding pages,
+    // lance_v20_decoder.cpp) has the same container. The legacy v1 format is not read.
     const bool v2_0 = major == 0U && minor == 3U;
-    if (!v2_0 && (major != 2U || (minor != 1U && minor != 2U))) {
+    if (!v2_0 && (major != 2U || (minor != 1U && minor != 2U && minor != 3U))) {
         // The footer spells format 2.0 as 0.3, and the legacy (v1) format as 0.1 or 0.2.
         const std::string footer = std::to_string(major) + "." + std::to_string(minor);
         const std::string format = major == 0U && minor == 3U                  ? "2.0 (footer 0.3)"
                                    : major == 0U && (minor == 1U || minor == 2U) ? "legacy v1 (footer " + footer + ")"
                                                                                : footer;
-        error = "unsupported Lance file format " + format + " (nanolance reads 2.0, 2.1 and 2.2)";
+        error = "unsupported Lance file format " + format + " (nanolance reads 2.0, 2.1, 2.2 and 2.3)";
         return false;
     }
 

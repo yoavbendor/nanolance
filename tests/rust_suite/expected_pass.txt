@@ -157,6 +157,7 @@ lance-encoding::array_encoding::physical::fixed_size_binary::tests::test_fixed_s
 lance-encoding::array_encoding::physical::fixed_size_binary::tests::test_fixed_size_sliced_utf8
 lance-encoding::array_encoding::physical::fixed_size_binary::tests::test_simple_fixed_size_utf8
 lance-encoding::array_encoding::physical::fixed_size_binary::tests::test_simple_fixed_size_with_nulls_utf8
+lance-encoding::array_encoding::physical::fixed_size_list::tests::test_nested_fsl
 lance-encoding::array_encoding::physical::fixed_size_list::tests::test_simple_fsl
 lance-encoding::array_encoding::physical::fixed_size_list::tests::test_value_fsl_primitive::data_type_1_DataType__Int8::encoding_1_TestEncoding__Array::page_size_1_4096::use_slicing_1_false
 lance-encoding::array_encoding::physical::fixed_size_list::tests::test_value_fsl_primitive::data_type_1_DataType__Int8::encoding_1_TestEncoding__Array::page_size_1_4096::use_slicing_2_true
@@ -597,6 +598,7 @@ lance-encoding::encodings::logical::list::tests::test_list_hnsw_shape_splits_to_
 lance-encoding::encodings::logical::list::tests::test_list_struct_empty::encoding_1_TestEncoding__Array
 lance-encoding::encodings::logical::list::tests::test_list_struct_empty::encoding_2_TestEncoding__StructuralU16
 lance-encoding::encodings::logical::list::tests::test_list_struct_empty::encoding_3_TestEncoding__StructuralU32
+lance-encoding::encodings::logical::list::tests::test_list_struct_empty::encoding_4_TestEncoding__StructuralSparse
 lance-encoding::encodings::logical::list::tests::test_list_struct_list::null_pattern_1_NullPattern__None::encoding_1_TestEncoding__Array
 lance-encoding::encodings::logical::list::tests::test_list_struct_list::null_pattern_1_NullPattern__None::encoding_2_TestEncoding__StructuralU16
 lance-encoding::encodings::logical::list::tests::test_list_struct_list::null_pattern_1_NullPattern__None::encoding_3_TestEncoding__StructuralU32
@@ -676,7 +678,16 @@ lance-encoding::encodings::logical::map::tests::test_map_with_extreme_sizes
 lance-encoding::encodings::logical::map::tests::test_map_with_null_values
 lance-encoding::encodings::logical::map::tests::test_nested_map
 lance-encoding::encodings::logical::map::tests::test_simple_map
+lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_auto_sparse_for_single_row_over_budget
+lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_auto_sparse_for_split_required_page
 lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_auto_sparse_wide_values_keep_dense_fallback
+lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_explicit_sparse_emits_both_validity_polarities
+lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_explicit_sparse_list_and_large_list_null_empty_roundtrip
+lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_explicit_sparse_nested_page_boundaries_range_and_take
+lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_explicit_sparse_nullable_primitive_roundtrip
+lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_explicit_sparse_nullable_struct_roundtrip
+lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_explicit_sparse_serializes_semantic_list_forms
+lance-encoding::encodings::logical::primitive::sparse::writer::tests::test_explicit_sparse_struct_with_constant_and_sparse_children
 lance-encoding::encodings::logical::primitive::tests::test_all_null_constant_layout_still_works_v2_2
 lance-encoding::encodings::logical::primitive::tests::test_binary_large_minichunk_size_over_max_miniblock_values
 lance-encoding::encodings::logical::primitive::tests::test_complex_all_null_constant_def_round_trip
@@ -737,6 +748,7 @@ lance-encoding::encodings::logical::r#struct::tests::test_list_of_struct_with_al
 lance-encoding::encodings::logical::r#struct::tests::test_list_of_struct_with_constant_child_and_empty_lists
 lance-encoding::encodings::logical::r#struct::tests::test_list_of_struct_with_null_struct_element
 lance-encoding::encodings::logical::r#struct::tests::test_nullable_struct
+lance-encoding::encodings::logical::r#struct::tests::test_ragged_scheduling
 lance-encoding::encodings::logical::r#struct::tests::test_simple_masked_nonempty_list
 lance-encoding::encodings::logical::r#struct::tests::test_simple_struct::encoding_1_TestEncoding__Array::page_size_1_4096::use_slicing_1_false
 lance-encoding::encodings::logical::r#struct::tests::test_simple_struct::encoding_1_TestEncoding__Array::page_size_1_4096::use_slicing_2_true
@@ -1060,6 +1072,7 @@ lance-encoding::encodings::physical::fsst::tests::test_fsst::explicit_1_false::e
 lance-encoding::encodings::physical::fsst::tests::test_fsst::explicit_2_true::encoding_1_TestEncoding__StructuralU16
 lance-encoding::encodings::physical::fsst::tests::test_fsst::explicit_2_true::encoding_2_TestEncoding__StructuralU32
 lance-encoding::encodings::physical::fsst::tests::test_fsst::explicit_2_true::encoding_3_TestEncoding__StructuralSparse
+lance-encoding::encodings::physical::rle::tests::test_rle_encoding_verification
 lance-encoding::encodings::physical::value::tests::regress_list_fsl
 lance-encoding::encodings::physical::value::tests::test_decimal128_dictionary_encoding::encoding_1_TestEncoding__StructuralU16
 lance-encoding::encodings::physical::value::tests::test_decimal128_dictionary_encoding::encoding_2_TestEncoding__StructuralU32
@@ -1189,6 +1202,7 @@ lance-encoding::encodings::physical::value::tests::test_value_encoding_verificat
 lance-encoding::encodings::physical::value::tests::test_value_primitive
 lance-file::reader::tests::drop_while_scheduling
 lance-file::reader::tests::full_int8_dictionary_v2_2_roundtrip
+lance-file::reader::tests::sparse_file_writer_reader_scan_range_and_take_roundtrip
 lance-file::reader::tests::test_blocking_take::version_1_ConcreteFileVersion__V2_0
 lance-file::reader::tests::test_blocking_take::version_2_ConcreteFileVersion__V2_1
 lance-file::reader::tests::test_blocking_take::version_3_ConcreteFileVersion__V2_2
@@ -1196,12 +1210,16 @@ lance-file::reader::tests::test_compressing_buffer
 lance-file::reader::tests::test_deep_size_of_includes_column_metadata::version_1_ConcreteFileVersion__V2_0
 lance-file::reader::tests::test_deep_size_of_includes_column_metadata::version_2_ConcreteFileVersion__V2_1
 lance-file::reader::tests::test_deep_size_of_includes_column_metadata::version_3_ConcreteFileVersion__V2_2
+lance-file::reader::tests::test_deep_size_of_includes_column_metadata::version_4_ConcreteFileVersion__V2_3
 lance-file::reader::tests::test_default_reader_rejects_non_monotonic_storage_dictionary_offsets::version_1_LanceFileVersion__V2_1
 lance-file::reader::tests::test_default_reader_rejects_non_monotonic_storage_dictionary_offsets::version_2_LanceFileVersion__V2_2
+lance-file::reader::tests::test_default_reader_rejects_non_monotonic_storage_dictionary_offsets::version_3_LanceFileVersion__V2_3
 lance-file::reader::tests::test_default_reader_rejects_out_of_bounds_miniblock_offsets::version_1_LanceFileVersion__V2_1
 lance-file::reader::tests::test_default_reader_rejects_out_of_bounds_miniblock_offsets::version_2_LanceFileVersion__V2_2
+lance-file::reader::tests::test_default_reader_rejects_out_of_bounds_miniblock_offsets::version_3_LanceFileVersion__V2_3
 lance-file::reader::tests::test_default_reader_rejects_out_of_bounds_variable_width_offsets::version_1_LanceFileVersion__V2_1
 lance-file::reader::tests::test_default_reader_rejects_out_of_bounds_variable_width_offsets::version_2_LanceFileVersion__V2_2
+lance-file::reader::tests::test_default_reader_rejects_out_of_bounds_variable_width_offsets::version_3_LanceFileVersion__V2_3
 lance-file::reader::tests::test_drop_in_progress
 lance-file::reader::tests::test_lazy_reader_direct_projection_matches_eager_reader
 lance-file::reader::tests::test_lazy_reader_fixed_size_list_projection_matches_eager_reader
