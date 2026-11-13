@@ -16,22 +16,22 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | 0.5 Repo slim-down | done for the unambiguous 5.5 MB; the 15.4 MB capture left in place by decision |
 | **Phase 1.3 — read stock-Lance files** | **all three steps done** (parse, oracle, dispatch, FSST) |
 | Fuzz coverage for the descriptor parser | done — found one real bug in 25 executions |
-| 1.1 Real nullability | **done**, read and write, fixed- and variable-width; a null struct is still refused |
+| 1.1 Real nullability | **done**, read and write, fixed- and variable-width; null structs are written and read too (roadmap D) |
 | 1.2 timestamp / date / time / decimal | **done** — plus a pre-existing width-declaration bug it exposed |
 | Phase 2 — wheels, CMake install | **2.1 wheels and 2.3 CI done**; 2.2 install/export deliberately not |
 | Phase 3 — the Python API a parquet user expects | **complete** — streaming, projection, row ranges, `count_rows`/`read_schema`, `nanolance convert` |
 | Phase 4 — read-path optimization | **4.1 done** — 2.01x -> 1.01x peak, ~20% faster reads |
 | [Roadmap](ROADMAP.md) A — pin and instrument | **done** |
-| Roadmap B — FullZip and fixed-size lists | **B1–B4 done**; B5 (FullZip *writer*) not started, not needed for correctness |
+| Roadmap B — FullZip and fixed-size lists | **B1–B5 done**; B5 (the writer's FullZip pages) covers fixed-width values of 256 bytes or more and long variable-width values |
 | Roadmap F — performance | **F2 done** (FSST on write); F1 (page size) open |
 | Roadmap E — small type gaps | **E1–E4 done** (float16, duration, Arrow null type, `large_utf8`/`large_binary` write) |
-| Roadmap C — lists, read side | **C0–C8 done**; only a list of `fixed_size_list` is still refused |
+| Roadmap C — lists, read side | **C0–C8 done**, and a list of `fixed_size_list` too |
 | Lance metadata codec on nanom | **done** — one model in nanom, canonical proto3, deletion files now survive appends |
-| Roadmap D — lists, write side | **D1–D2 done**: lists, maps, lists of structs, null structs round-trip; pages compressed to within ~0.2% of pylance (FSST aside) |
+| Roadmap D — lists, write side | **D1–D2 done**: lists, maps, lists of structs, null structs round-trip; pages compressed to within ~0.2% of pylance (FSST aside). Since: lists of `fixed_size_list`, lists and maps under a `fixed_size_list` of structs (format 2.2), and `fixed_size_list` of `fixed_size_list` at the top level are written |
 | Blobs, every kind (2026-10-09) | **done** — Blob v2 written inline / packed / dedicated / external as Lance writes them, legacy 2.0 / 2.1 blob columns read, blobs inside structs and lists and beside nested columns; `tests/test_blob_kinds.py` against pylance both ways |
 | DuckDB / Polars / LanceDB interop (2026-10-09) | **done** — pyarrow-dataset subclasses, `to_polars()`, DuckDB `lance` extension and LanceDB read nanolance's files and indexes; `tests/test_interop.py`, `tools/interop_suite.py` |
 
-Test suite: **54 ctest** (was 42) and **1395 pytest** (was 22), all passing -- and nothing skipped: the one
+Test suite at the 2026-10 snapshot: **54 ctest** (was 42) and **1395 pytest** (was 22), all passing. At `1b205dd` (2026-11-13): **174 ctest**, all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.
 
 Fuzzers: six targets (`decode`, `page_layout`, `fsst`, `lz4`, `deletion_vector`, `column_decode`),
@@ -1921,9 +1921,7 @@ full decode chain" — true only of the chain up to the footer — now says what
    CI's seeds went from 15 to 1,458 inputs a second. `test_a_large_fsst_page_reads_in_linear_time`
    pins it: 100,000 strings took 21 s before the fix and must now read in under 3.
 
-Still open from these phases: B5 (writing FullZip — nanolance writes long strings as MiniBlock,
-which stock Lance reads, pinned by `str_long` in the write matrix), element nulls on write, and
-page size: nanolance writes ~10 rows per page for a 768-dim float32 vector (roadmap F1).
+Still open from these phases (as of 2026-10; B5 and element nulls on write are done since, see the status table): page size: nanolance writes ~10 rows per page for a 768-dim float32 vector (roadmap F1).
 
 ## Roadmap phase C: reading list columns
 
