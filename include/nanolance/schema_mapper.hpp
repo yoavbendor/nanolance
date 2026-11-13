@@ -322,9 +322,9 @@ bool lance_field_is_empty_struct(const LanceField& field, const LanceSchemaMappi
 
 /// \p ignore_nullability is accepted and ignored; it is kept so existing callers still compile.
 /// Nullable-flagged fields are always accepted now -- pyarrow marks essentially every field nullable,
-/// so gating on the flag rejected almost every real table while protecting nothing. What actually
-/// needed guarding is a null *value*, and that is refused unconditionally during ingest
-/// (see append_batch_column_values), where the data is.
+/// so gating on the flag rejected almost every real table while protecting nothing. Nulls are kept:
+/// ingest captures each column's validity and the writer stores it as Lance's definition levels
+/// (see append_batch_column_values).
 bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, std::string& error,
                       bool ignore_nullability = false);
 /// The write-side refusal of a mapped schema's dictionary inside a struct or list whose indices are not int32:

@@ -38,7 +38,8 @@ for filters and the table layer to commit.
 - Every function reports failure by returning false with a message in `error`; nothing throws, except a
   progress callback the caller supplies (an exception from it stops the build, nothing committed).
   Searches may run concurrently; loaded index files are cached process-wide (`index_cache`), keyed by
-  path, size and modification time, so files rewritten in place are reloaded. A build must not run
+  path, size and modification time, so files rewritten in place are reloaded. A BTREE lookup's decoded index
+  windows are cached too, up to `NANOLANCE_INDEX_PAGE_CACHE_MB` (64 MiB; `index_page_cache_hits` counts them). A build must not run
   concurrently with another commit to the same dataset without the table layer's conflict handling.
 
 ```cpp
