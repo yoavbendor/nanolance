@@ -4810,7 +4810,8 @@ bool take_full_zip_rows(const EncodingsIo& io, const std::string& column, const 
 /// take picks its rows from that copy.
 ///
 /// Bounded: at most NANOLANCE_TAKE_CACHE_MB of decoded columns (default 256; 0 turns the cache off,
-/// for a device that would rather decode again than hold them), dropped all at once when full. Keyed
+/// for a device that would rather decode again than hold them). When a new copy would not fit, the
+/// copies unused for 10 s are dropped; if none is that idle, the new copy is not kept. Keyed
 /// by file path, size and modification time and the field -- Lance never rewrites a data file in place.
 constexpr std::uint64_t kCacheColumnBytes = std::uint64_t{64} << 20U;
 
