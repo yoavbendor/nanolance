@@ -1,7 +1,8 @@
 # nanolance — review & improvement plan
 
 _Reviewed at `b914735`. Every claim below was reproduced on this tree (Ubuntu 24.04, gcc 13.3,
-Release), not read off the docs. Commands to re-run each check are inline._
+Release), not read off the docs. Commands to re-run each check are inline. Findings are kept as reviewed; a
+**Status** line marks what has since been done (2026-11-12)._
 
 ## 1. Verdict
 
@@ -299,11 +300,17 @@ dataframe round-trips byte-exactly through both readers.
 tag. Vendor or statically link zstd so the wheel is self-contained. `pip install nanolance` is the
 entire on-ramp for the parquet audience, and nothing else in this plan reaches them without it.
 
+**Status (2026-11-12):** wheels for manylinux x86_64 and macOS (arm64 and x86_64) are built by `wheels.yml`. No
+Windows wheel: `wheels.yml` has no Windows entry yet.
+
 **2.2 CMake install/export.** `install(TARGETS ... EXPORT)`, a generated `nanolanceConfig.cmake`, a
 `nanolance::nanolance` namespaced target, `find_package(nanolance)` working from an install tree.
 Add a consumer smoke test that builds a tiny program against an installed nanolance.
 
 **2.3 Widen CI.** macOS and Windows at minimum for the library and the wheels.
+
+**Status (2026-11-12):** done for the library. `ci-platforms.yml` builds and runs ctest on macOS (`macos-15`) on
+every push and on Windows (`windows-2022`) when run by hand. The Windows wheel is still open (2.1).
 
 ### Phase 3 — The Python API a parquet user expects (weeks)
 
