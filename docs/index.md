@@ -8,8 +8,8 @@ title: nanolance — a C++ Arrow ↔ Lance writer/reader with a hardened read pa
 feature: rows keep large payloads **external** (referenced by `uri` + `position` + `size`, never
 copied), so a Lance table of large-payload rows costs single-digit bytes per row regardless of
 payload size, while the bytes themselves live once in the source and are fetched on demand (local
-file or `s3://`). Everything nanolance writes is readable by stock `lance` (verified against `lance`
-7.0.0) unless a feature is explicitly marked nanolance-only.
+file or `s3://`). Everything nanolance writes is readable by stock `lance` (verified against `pylance`
+12.0.0 in CI) unless a feature is explicitly marked nanolance-only.
 
 [Get started](getting-started.md){ .md-button .md-button--primary }
 [Memory safety & Rust reviewers](SAFETY.md){ .md-button .md-button--primary }

@@ -101,22 +101,27 @@ The later runs found and fixed these, each pinned by a test that does not need R
   zero-width level encoding stores no bytes at all.
 - **Same-named struct children** (Arrow allows the empty name). Each takes the field of its occurrence.
 - **Format 2.3** files are read.
-- **Packed structs** (`lance-encoding:packed`) in formats 2.1 and 2.2, when their children are fixed-width.
-  A packed struct inside another struct is refused by name.
-- **Fixed-size lists of fixed-size lists** are read. Writing them is refused by name.
-- **Lists, large lists and maps under a fixed-size list of structs** are read (576 round trips), whole,
-  by row range and by take. Writing them is refused by name.
+- **Packed structs** (`lance-encoding:packed`) in formats 2.1 and 2.2, with fixed-width children and, since
+  the variable-width reads above, with `utf8` and `binary` children too. A packed struct inside another struct is
+  refused by name.
+- **Fixed-size lists of fixed-size lists** are read, and written at the top level (mini-block under 256 bytes of
+  leaves, FullZip from 256 bytes). Under a struct or list, writing them is refused by name.
+- **Lists, large lists and maps under a fixed-size list of structs** are read, whole, by row range and by take.
+  They are written too (format 2.2).
 - **Format 2.0 fixed-size lists of booleans** are read.
-- **Dictionaries inside lists and structs** are read with any integer index.
+- **Dictionaries inside lists and structs** are read with any integer index over string or binary values. Writing
+  them is refused unless the indices are int32.
 - **Legacy blob columns** (`lance-encoding:blob`, a LargeBinary) in format 2.1 (48 round trips). Lance 2.1
   stores them as a BlobLayout over a packed (position, size) descriptor, which nanolance already decoded. The
   refusal was in the harness's shim, which refused any such column before reading and stamped 2.2 on it; Lance
   refuses the marker from 2.2 on. The shim writes 2.1 for these files now.
-- **Blob v2 structs in standalone data files** (16 round trips, `test_blob_v2_*`). A file's blob v2 column is one
-  column: a struct marked `lance-encoding:blob` whose five descriptor children have no ids. The file reader counted
-  each child as a column. It now links the children to their parent and counts the struct as one column.
+- **Blob v2 structs in standalone data files** (16 round trips, `tests/file/test_blob_v2_file_read.cpp`). A file's
+  blob v2 column is one column: a struct marked `lance-encoding:blob` whose five descriptor children have no ids. The
+  file reader counted each child as a column. It now links the children to their parent and counts the struct as one
+  column.
 
 What nanolance refuses: none of the round trips. Writing is still refused by name for the shapes that
-were read but not written: a packed struct, a fixed-size list of fixed-size lists under a struct or list, and
-a fixed-size list of structs under a struct or list (`a fixed_size_list of structs inside a struct or list is
-not written yet`).
+were read but not written: a packed struct (`a packed struct is read but not written yet`), a fixed-size list of
+fixed-size lists under a struct or list (`... is read but not written yet`), a fixed-size list of structs under a
+struct or list (`a fixed_size_list of structs inside a struct or list is not written yet`), and a dictionary with a
+non-int32 index inside a struct or list.

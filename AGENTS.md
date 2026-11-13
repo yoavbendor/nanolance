@@ -68,8 +68,10 @@ Lifecycle rules:
   `list`/`large_list`/`map` at any nesting depth, `large_utf8`/`large_binary`, `float16`, `duration` and
   `fixed_size_list` vectors -- README "Types" is the exact table.
 - nanolance reads back everything it writes, and the columns the Rust `lance` crate writes for those
-  types, nested ones included, and reads more than it writes: format 2.0 to 2.3 files, packed structs,
-  the sparse page layout, and fixed-size lists of fixed-size lists (README "Types").
+  types, nested ones included, and reads more than it writes: format 2.0 to 2.3 files, packed structs
+  (fixed- and variable-width children), the sparse page layout, legacy blob columns (2.1), blob v2 structs
+  in standalone files, fixed-size lists of fixed-size lists, and lists of fixed-size lists of structs
+  (README "Types").
 - `commit(is_append=false)` creates; `commit(is_append=true)` (or `nano_lance_writer_init_append`)
   adds a fragment to an existing dataset.
 
@@ -320,7 +322,8 @@ Two repo rules that came out of the same incident:
 ## 8. Delegated sessions and remote reads
 
 - Delegating work to another model session: follow `docs/DELEGATION.md` (brief format, stop rules,
-  run-once test rules, what the reviewer checks). Current state and open items: `docs/NEXT_WEEK.md`.
+  run-once test rules, what the reviewer checks). Current state and open items: the **Status** lines of
+  `docs/ROADMAP.md` (`docs/NEXT_WEEK.md` is a snapshot of 2026-10-17).
 - File I/O on read paths goes through `io::ByteSource` (`include/nanolance/byte_source.hpp`), never
   `std::ifstream` or `std::filesystem` directly, so the reader keeps working from `https://` in the
   WebAssembly build (`wasm/`). Writers and maintenance (cleanup, drop) stay on local files.

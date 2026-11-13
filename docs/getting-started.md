@@ -83,8 +83,7 @@ or `nano_lance_table_read_dataset` / `nano_lance_table_read_dataset_ex` (C ABI,
 - **Schema locks after the first `write_batch`** — every batch in a session shares it.
 - **Call all `set_*` options before the first `write_batch`** (compression, nullability, URI
   dictionary).
-- **`bool` row fields are not supported** (Arrow's 1-bit storage vs. the byte-wide writer path) — use
-  `uint8` for flags.
+- **`bool` columns are written bit-packed**, one bit a value, as Lance writes them; nulls are stored too.
 - **Compression is off by default.** One switch (`set_compression`) picks the right Lance encoding per
   column.
 - **To get small files, model external refs as plain `uri`/`position`/`size` columns**, not the packed

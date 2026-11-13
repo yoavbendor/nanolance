@@ -56,6 +56,10 @@ File *paths* on the read path are attacker-controlled too, so they get the same 
 - **External `file://` blob fetch** — the fetch always rejects a `..` traversal component, and an
   optional base-directory jail (`NANO_LANCE_BLOB_BASE_DIR`) confines every `file://` fetch under a
   configured root when set. `s3://` fetches are unchanged.
+- **Names on every platform, and on Windows** — a backslash in a path component is refused everywhere, so a dataset
+  means the same thing wherever it is read. On Windows a component with a drive letter (`C:x`), an NTFS alternate data
+  stream (`name:stream`) or a reserved device name (`CON`, `nul.txt`) is refused too. Names are UTF-8 on every platform
+  (`src/base/utf8_path.hpp`).
 
 ### Error-path resource safety
 
