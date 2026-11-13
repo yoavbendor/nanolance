@@ -398,7 +398,10 @@ ParsedFormat parse_fixed_size_list(const ArrowSchema& field) {
     // A struct element (fixed_size_list<struct>, W1k4) is written as pylance writes it: the struct's leaves, rows x N
     // elements each; the struct needs fields.
     const bool struct_element = element.supported && element.logical_type == "struct" && field.children[0]->n_children > 0;
+    // A list or map element (fixed_size_list<list<T>>) is refused too: pylance refuses the type ("Unsupported data
+    // type: FixedSizeList(List(...))"), and a file written with it cannot be read back by either reader.
     if (!element.supported || (element.logical_type == "struct" && !struct_element) || element.logical_type == "null" ||
+        element.logical_type == "list" || element.logical_type == "large_list" || element.logical_type == "map" ||
         lance_field_is_variable_width(element.logical_type)) {
         out.rejection = std::string("fixed_size_list of '") +
                         (field.children[0]->format == nullptr ? "?" : field.children[0]->format) +
@@ -599,12 +602,6 @@ bool map_field(const ArrowSchema& field,
 
     mapping.fields.push_back(out);
 
-    if (fsl_struct && parent_id >= 0) {
-        // The leaves count rows x N entries, which the layers above (a struct's rows, a list's offsets) do not
-        // scale to yet; neither reader reads that shape back from pylance's files either.
-        error = "column '" + out.name + "': a fixed_size_list of structs inside a struct or list is not written yet";
-        return false;
-    }
     if (is_struct && !map_struct_children(field, out.id, next_id, next_column, mapping, error)) {
         return false;
     }
@@ -744,24 +741,21 @@ bool refuse_unwritten_nested_dictionaries(const LanceSchemaMapping& mapping, std
     return true;
 }
 
-bool refuse_unwritten_lists_under_fixed_size_list(const LanceSchemaMapping& mapping, std::string& error) {
+bool refuse_unwritten_under_fixed_size_list(const LanceSchemaMapping& mapping, std::string& error) {
     for (const auto& field : mapping.fields) {
-        if (!lance_logical_type_is_list(field.logical_type)) {
-            continue;
+        // fixed_size_list<fixed_size_list> is written at the top level only: its leaves are one nested layout
+        // of the whole column, which a struct or list above it would need its own levels for.
+        if (field.parent_id >= 0 && field.logical_type.rfind("fixed_size_list:fixed_size_list:", 0) == 0) {
+            error = "column '" + field.name +
+                    "': a fixed_size_list of fixed_size_list under a struct or list is read but not written yet";
+            return false;
         }
-        for (auto parent = field.parent_id; parent >= 0;) {
-            const auto up = std::find_if(mapping.fields.begin(), mapping.fields.end(),
-                                         [&](const LanceField& f) { return f.id == parent; });
-            if (up == mapping.fields.end()) {
-                break;
-            }
-            std::string element;
-            std::uint64_t items = 0;
-            if (lance_fixed_size_list_parts(up->logical_type, element, items) && element == "struct") {
-                error = "column '" + field.name + "': a list or map under a fixed_size_list is read but not written yet";
-                return false;
-            }
-            parent = up->parent_id;
+        // The leaves of a fixed_size_list of structs count rows x N entries, which the layers above (a struct's rows,
+        // a list's offsets) do not scale to yet; neither reader reads that shape back from pylance's files either.
+        // Reads take it (the sparse layout's fixed-size-list layer, `list<fixed_size_list<struct>>`); writes do not.
+        if (field.parent_id >= 0 && field.logical_type.rfind("fixed_size_list:struct:", 0) == 0) {
+            error = "column '" + field.name + "': a fixed_size_list of structs inside a struct or list is not written yet";
+            return false;
         }
     }
     return true;

@@ -783,13 +783,13 @@ add_executable(nano_lance_schema_change_error_test tests/api/test_schema_change_
 target_compile_features(nano_lance_schema_change_error_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_schema_change_error_test PRIVATE nanolance)
 
-add_executable(nano_lance_fsl_of_fsl_write_refused_test tests/api/test_fsl_of_fsl_write_refused.cpp)
-target_compile_features(nano_lance_fsl_of_fsl_write_refused_test PRIVATE cxx_std_20)
-target_link_libraries(nano_lance_fsl_of_fsl_write_refused_test PRIVATE nanolance)
+add_executable(nano_lance_fsl_of_fsl_write_test tests/api/test_fsl_of_fsl_write.cpp)
+target_compile_features(nano_lance_fsl_of_fsl_write_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_fsl_of_fsl_write_test PRIVATE nanolance)
 
-add_executable(nano_lance_fsl_struct_list_write_refused_test tests/api/test_fsl_struct_list_write_refused.cpp)
-target_compile_features(nano_lance_fsl_struct_list_write_refused_test PRIVATE cxx_std_20)
-target_link_libraries(nano_lance_fsl_struct_list_write_refused_test PRIVATE nanolance)
+add_executable(nano_lance_fsl_struct_list_write_test tests/api/test_fsl_struct_list_write.cpp)
+target_compile_features(nano_lance_fsl_struct_list_write_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_fsl_struct_list_write_test PRIVATE nanolance)
 
 add_executable(nano_lance_nested_dictionary_write_refused_test tests/api/test_nested_dictionary_write_refused.cpp)
 target_compile_features(nano_lance_nested_dictionary_write_refused_test PRIVATE cxx_std_20)
@@ -1088,6 +1088,61 @@ target_link_libraries(nano_lance_packed_struct_read_test PRIVATE nanolance)
 add_test(NAME nano_lance_packed_struct_read COMMAND $<TARGET_FILE:nano_lance_packed_struct_read_test>)
 set_tests_properties(nano_lance_packed_struct_read PROPERTIES LABELS "smoke")
 
+# Lance 2.2 packed structs with variable-width children (a VariablePackedStruct page), from Lance's own encoder tests:
+# the small files NANOLANCE_RUST_KEEP_PASS keeps (tests/golden/variable_packed), read whole, by range and by take.
+add_executable(nano_lance_variable_packed_struct_read_test tests/file/test_variable_packed_struct_read.cpp)
+target_compile_features(nano_lance_variable_packed_struct_read_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_variable_packed_struct_read_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_compile_definitions(nano_lance_variable_packed_struct_read_test PRIVATE
+    NANO_LANCE_VARIABLE_PACKED_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/variable_packed")
+target_link_libraries(nano_lance_variable_packed_struct_read_test PRIVATE nanolance)
+add_test(NAME nano_lance_variable_packed_struct_read COMMAND $<TARGET_FILE:nano_lance_variable_packed_struct_read_test>)
+set_tests_properties(nano_lance_variable_packed_struct_read PROPERTIES LABELS "smoke")
+
+# A dictionary whose indices are run-length encoded, with u8 and u16 run lengths, from Lance's own encoder test
+# (tests/golden/dict_rle, written with NANOLANCE_RUST_KEEP_PASS): read whole, by range and by take.
+add_executable(nano_lance_dict_rle_read_test tests/file/test_dict_rle_read.cpp)
+target_compile_features(nano_lance_dict_rle_read_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_dict_rle_read_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_compile_definitions(nano_lance_dict_rle_read_test PRIVATE
+    NANO_LANCE_DICT_RLE_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/dict_rle")
+target_link_libraries(nano_lance_dict_rle_read_test PRIVATE nanolance)
+add_test(NAME nano_lance_dict_rle_read COMMAND $<TARGET_FILE:nano_lance_dict_rle_read_test>)
+set_tests_properties(nano_lance_dict_rle_read PROPERTIES LABELS "smoke")
+
+# Lance 2.3 sparse pages of a map (its all-valid key layer) and of a fixed-size list of structs (its fixed-size-list
+# layer), from Lance's own encoder test (tests/golden/sparse, written with NANOLANCE_RUST_KEEP_PASS).
+add_executable(nano_lance_sparse_page_read_test tests/file/test_sparse_page_read.cpp)
+target_compile_features(nano_lance_sparse_page_read_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_sparse_page_read_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_compile_definitions(nano_lance_sparse_page_read_test PRIVATE
+    NANO_LANCE_SPARSE_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/sparse")
+target_link_libraries(nano_lance_sparse_page_read_test PRIVATE nanolance)
+add_test(NAME nano_lance_sparse_page_read COMMAND $<TARGET_FILE:nano_lance_sparse_page_read_test>)
+set_tests_properties(nano_lance_sparse_page_read PROPERTIES LABELS "smoke")
+
+# A legacy blob (`lance-encoding:blob`) in a Lance 2.1 file, read from pylance's file (tests/generate_golden_legacy_blob.py
+# writes it): whole, by a row range and by a take, as the bytes of each row.
+add_executable(nano_lance_legacy_blob_v21_read_test tests/file/test_legacy_blob_v21_read.cpp)
+target_compile_features(nano_lance_legacy_blob_v21_read_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_legacy_blob_v21_read_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_compile_definitions(nano_lance_legacy_blob_v21_read_test PRIVATE
+    NANO_LANCE_LEGACY_BLOB_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/legacy_blob_v21/v21_legacy_blob.lance")
+target_link_libraries(nano_lance_legacy_blob_v21_read_test PRIVATE nanolance)
+add_test(NAME nano_lance_legacy_blob_v21_read COMMAND $<TARGET_FILE:nano_lance_legacy_blob_v21_read_test>)
+set_tests_properties(nano_lance_legacy_blob_v21_read PROPERTIES LABELS "smoke")
+
+# A blob v2 column in a standalone 2.2 data file pylance wrote (tests/generate_golden_blob_v2_file.py): one column for the
+# struct, read as Lance describes it (kind, position, size, blob_id, blob_uri), whole and by a take.
+add_executable(nano_lance_blob_v2_file_read_test tests/file/test_blob_v2_file_read.cpp)
+target_compile_features(nano_lance_blob_v2_file_read_test PRIVATE cxx_std_20)
+target_include_directories(nano_lance_blob_v2_file_read_test PRIVATE ${NANOLANCE_PRIVATE_INCLUDE})
+target_compile_definitions(nano_lance_blob_v2_file_read_test PRIVATE
+    NANO_LANCE_BLOB_V2_FILE_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/blob_v2_file/v22_blob_v2.lance")
+target_link_libraries(nano_lance_blob_v2_file_read_test PRIVATE nanolance)
+add_test(NAME nano_lance_blob_v2_file_read COMMAND $<TARGET_FILE:nano_lance_blob_v2_file_read_test>)
+set_tests_properties(nano_lance_blob_v2_file_read PROPERTIES LABELS "smoke")
+
 # Live S3 integration test (only with the nanos3reader provider): range GETs against a real S3-compatible
 # endpoint; skips unless NANOLANCE_S3_TEST_URI (+ AWS_* env) is set. tests/s3_minio_integration.sh wires
 # this up against a throwaway MinIO. The SigV4 signer vectors now live in the nanos3reader repo's own tests.
@@ -1173,10 +1228,10 @@ set_tests_properties(nano_lance_structural_default PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_schema_change_error COMMAND $<TARGET_FILE:nano_lance_schema_change_error_test>)
 set_tests_properties(nano_lance_schema_change_error PROPERTIES LABELS "smoke")
-add_test(NAME nano_lance_fsl_of_fsl_write_refused COMMAND $<TARGET_FILE:nano_lance_fsl_of_fsl_write_refused_test>)
-set_tests_properties(nano_lance_fsl_of_fsl_write_refused PROPERTIES LABELS "smoke")
-add_test(NAME nano_lance_fsl_struct_list_write_refused COMMAND $<TARGET_FILE:nano_lance_fsl_struct_list_write_refused_test>)
-set_tests_properties(nano_lance_fsl_struct_list_write_refused PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_fsl_of_fsl_write COMMAND $<TARGET_FILE:nano_lance_fsl_of_fsl_write_test>)
+set_tests_properties(nano_lance_fsl_of_fsl_write PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_fsl_struct_list_write COMMAND $<TARGET_FILE:nano_lance_fsl_struct_list_write_test>)
+set_tests_properties(nano_lance_fsl_struct_list_write PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_nested_dictionary_write_refused COMMAND $<TARGET_FILE:nano_lance_nested_dictionary_write_refused_test>)
 set_tests_properties(nano_lance_nested_dictionary_write_refused PROPERTIES LABELS "smoke")
 

@@ -38,7 +38,7 @@ pub(crate) fn check(path: &object_store::path::Path, data: &[RecordBatch], versi
         return;
     }
     let c_path = CString::new(format!("/{}", path.as_ref())).unwrap();
-    match read_columns(&c_path, 0, rows as u64, None) {
+    match read_columns(&c_path, 0, rows as u64, None, false) {
         Err(e) => outcome.note("refused", e, "read"),
         Ok(columns) => {
             if columns.len() != first.num_columns() {

@@ -18,6 +18,14 @@ indexes, io_stats_incremental, scan statistics, the byte-source I/O layer (every
 natively), the WebAssembly build and the public browser demo (github.com/yoavbendor/weblance).
 pylance's suite: 1,200 expected passes.
 
+**Status 2026-11-12:** lists of `fixed_size_list`, `fixed_size_list` of `fixed_size_list` (at the top level, and read
+as pylance's FullZip pages), and lists, large lists and maps under a `fixed_size_list` of structs are written, with
+nulls at every level. Packed structs with variable-width children, dictionary run-length indices of any width, sparse
+map keys and fixed-size-list layers, legacy (2.1) blob columns and blob v2 structs in standalone files are read. Every
+round trip of Lance 12's own encoder tests reads back equal (`docs/RUST_SUITE.md`). Still open: writing packed structs,
+fixed-size lists of fixed-size lists or of structs under a struct or list, the Lance 2.3 planar forms other than the
+sparse layout, and a wheel for Windows (`ci-platforms.yml` builds Windows by hand; `wheels.yml` has no Windows entry).
+
 ---
 
 ## Working order and delegation (2026-10-15)
@@ -265,7 +273,7 @@ Sizes: **XS** < 1 h, **S** half a day, **M** 1–2 days, **L** most of a week �
 | A1 | **Fix `nlance-pagelayout` labelling.** It names physical columns after the first N schema fields, skipping structs but not lists or maps, so a list column is labelled with the list's name and a map's `value` column is labelled `key`. Map physical columns to *leaf* fields. Also print `rep=` (only a flag is stored today), `layers=`, FullZip details, and decode CompressiveEncoding field 11 instead of `Unknown(field 11)`. | S | Sonnet |
 | A2 | **Pin every gap as a failing test by its message.** Add to `test_lance_read_matrix.py`: a *value-size* axis (strings of 64/255/256/1024 B, one-long-value-among-short), FSL at dims 8/64/768, the list shapes above, `halffloat`, `duration`. Use `KNOWN_GAPS` with the specific message, exactly as the four previous gaps were pinned, so each fails loudly when fixed. | S | Sonnet |
 | A3 | **proto3 defaulting hardening.** `Field.type` (ours 2, proto3's 0) and `Field.encoding` (ours 1, proto3's 0) are the same shape as the `parent_id` bug. Neither is load-bearing on the read path today; make the decoder honour proto3 and add hand-built wire-byte tests like the `parent_id` ones in `tests/table/test_lance_minimal_pb.cpp`. | XS | Sonnet |
-| A4 | **`macos-14` → `macos-15`** in `wheels.yml` and `ci-platforms.yml` (deprecated; a retired label queues forever — see PROGRESS item 12). | XS | Sonnet |
+| A4 | ~~**`macos-14` → `macos-15`** in `wheels.yml` and `ci-platforms.yml`~~ **done** (both use `macos-15` now; deprecated; a retired label queues forever — see PROGRESS item 12). | XS | Sonnet |
 
 ### Phase B — FullZip and fixed-size lists (highest user impact)
 
@@ -296,7 +304,7 @@ Sizes: **XS** < 1 h, **S** half a day, **M** 1–2 days, **L** most of a week �
   `bits_per_value` counts both — 768 × float32 is 25,344 bits. On MiniBlock the chunk carries two
   buffers: element bits for all the chunk's rows back to back, then the values.
 
-**Status:** B1–B4 done — see PROGRESS, "Roadmap phases A, B and E". B5 not started.
+**Status:** B1–B4 done — see PROGRESS, "Roadmap phases A, B and E". B5 is done for the writer's FullZip pages: fixed-width values of 256 bytes or more (a fixed-size list's leaves, `9871099`, `b9f9b5e`) and variable-width values that average 128 bytes or more in a default column (4096 bytes when the column sets its own encoding). Pylance's FullZip `fixed_size_list<fixed_size_list>` pages are read (`966365b`).
 
 Done when: A2's value-size and FSL cells pass with their `KNOWN_GAPS` entries deleted, the
 write-matrix gains FSL and long-string shapes read by both readers, and a 768-dim embedding column
@@ -324,8 +332,8 @@ the `list<list<…>>` part of C5: every flat leaf type, null/empty lists and nul
 constant pages inside lists, row ranges and deletions (`tests/test_lance_lists.py`, 66 cases against
 pylance). **C5 done** too: lists of structs and structs of lists, with nulls at every level — which
 also fixed null structs outside any list, read until then as structs of nulls. **C8 done**: FullZip
-list pages -- lists of long strings or binaries, at any depth, under structs and as map values. Open:
-a list of `fixed_size_list`. **C6 done** since: `map` reads as Arrow's
+list pages -- lists of long strings or binaries, at any depth, under structs and as map values. **A list of
+`fixed_size_list`** is read and written with nulls at every level (`89c6deb`, `b35dbc8`). **C6 done** since: `map` reads as Arrow's
 map type — it is stored as a list of (key, value) structs, so it needed only the schema mapping.
 
 Done when the list shapes in A2 pass, `test_type_support_matrix.py` moves `list`, `large_list`,
@@ -387,6 +395,10 @@ rust lance reading its own file (6.1–6.7 ms on the same runs). F1 is still ope
 | G2 | **Nightly fuzz** with a persisted corpus (`actions/cache`), all six targets, longer runs. CI's 120 s is a regression guard; the OOB read took ~9 min locally. | S | Sonnet |
 | G3 | `nanolance import --rows-per-fragment`. | S | Sonnet |
 | G4 | **Windows** bring-up in `ci-platforms.yml`, then add `windows-2022` to the wheels matrix. Mostly waiting on CI and fixing what it reports. | M | Sonnet |
+
+**Status (2026-11-12):** the `windows` job in `ci-platforms.yml` builds and passes its tests (157 tests, run by hand;
+the bash smoke tests are off on WIN32; `194adf9` fixed UTF-8 tag names). Still open: the job runs on
+`workflow_dispatch` only, and `windows-2022` is not in the wheels matrix.
 
 ---
 

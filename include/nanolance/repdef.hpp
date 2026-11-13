@@ -37,6 +37,9 @@ struct UnraveledLayer {
     std::vector<std::int64_t> offsets;      // lists only: length + 1 entries, starting at 0
     std::vector<std::uint8_t> validity;     // LSB-first bits; empty when every entry is valid
     std::uint64_t null_count = 0;
+    // A sparse fixed-size-list layer (sparse_layout.hpp): the elements each slot holds. Its entries are then the
+    // elements, `length` counting them, and its validity is each slot's repeated over its elements. Zero otherwise.
+    std::uint64_t fsl_items = 0;
 };
 
 /// Pass as `num_items` when the page does not declare its item count (a constant page): the count

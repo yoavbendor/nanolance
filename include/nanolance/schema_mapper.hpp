@@ -164,6 +164,18 @@ inline bool lance_fixed_size_list_parts(const std::string& logical_type, std::st
     return true;
 }
 
+/// Split `fixed_size_list:fixed_size_list:<leaf>:<a>:<b>` (fixed_size_list<fixed_size_list<leaf, a>, b>) into
+/// its leaf type, the inner size a and the outer size b. Returns false for anything else. Whether the leaf
+/// is one the writer lays out is the caller's check.
+inline bool lance_fixed_size_list_of_fixed_size_list_parts(const std::string& logical_type, std::string& leaf,
+                                                           std::uint64_t& inner, std::uint64_t& outer) {
+    std::string element;
+    if (!lance_fixed_size_list_parts(logical_type, element, outer)) {
+        return false;
+    }
+    return lance_fixed_size_list_parts(element, leaf, inner);
+}
+
 inline std::size_t lance_logical_type_value_bytes(const std::string& logical_type);
 
 /// Fixed-width byte size for Lance on-disk logical types (writer/reader parity).
@@ -310,17 +322,17 @@ bool lance_field_is_empty_struct(const LanceField& field, const LanceSchemaMappi
 
 /// \p ignore_nullability is accepted and ignored; it is kept so existing callers still compile.
 /// Nullable-flagged fields are always accepted now -- pyarrow marks essentially every field nullable,
-/// so gating on the flag rejected almost every real table while protecting nothing. What actually
-/// needed guarding is a null *value*, and that is refused unconditionally during ingest
-/// (see append_batch_column_values), where the data is.
+/// so gating on the flag rejected almost every real table while protecting nothing. Nulls are kept:
+/// ingest captures each column's validity and the writer stores it as Lance's definition levels
+/// (see append_batch_column_values).
 bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, std::string& error,
                       bool ignore_nullability = false);
 /// The write-side refusal of a mapped schema's dictionary inside a struct or list whose indices are not int32:
 /// such a dictionary is read for any integer index, but written only as pylance 12 writes it (int32 indices).
 bool refuse_unwritten_nested_dictionaries(const LanceSchemaMapping& mapping, std::string& error);
-/// The write-side refusal of a list or map under a fixed_size_list of structs: read (the leaves are decoded from
-/// the layers Lance writes for it), but not written yet. Refused by name before any file is started.
-bool refuse_unwritten_lists_under_fixed_size_list(const LanceSchemaMapping& mapping, std::string& error);
+/// The write-side refusal, by name, before any file is started, of a fixed_size_list of fixed_size_list under a
+/// struct or list: written only at the top level.
+bool refuse_unwritten_under_fixed_size_list(const LanceSchemaMapping& mapping, std::string& error);
 /// The same schema, field for field -- names, types, nullability, nesting -- whatever the field ids
 /// and column positions. What an append checks a batch against: a dataset's field ids need not run
 /// 0..n (a dropped or re-typed column leaves a gap), a new batch's always do.

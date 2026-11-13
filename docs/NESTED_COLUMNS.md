@@ -93,7 +93,10 @@ read is refused by name. They are written together, so disagreement means a corr
 
 ## What this does not cover yet
 
-`fixed_size_list` inside or around a list.
+Fixed-size lists inside or around a list are read: `list<fixed_size_list<T>>` (both writers, both readers), and
+`list<fixed_size_list<struct>>` and lists or maps under a fixed-size list of structs (read whole, by range and by
+take; written at top level, and the list-of-FSL-of-struct write is refused by name). Writing a fixed-size list of
+fixed-size lists or of structs under a struct or list is refused by name (see README "Types").
 
 ## FullZip list pages (C8)
 

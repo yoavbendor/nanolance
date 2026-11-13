@@ -2681,6 +2681,203 @@ bool write_fixed_size_list_column(const ColumnEncodeContext& ctx, std::ostream& 
     return true;
 }
 
+/// Copies the bits [first, first + count) of an LSB-first bitmap into `out`, which it sizes to the bytes they take.
+void copy_bit_range(const std::vector<std::uint8_t>& bits, std::uint64_t first, std::uint64_t count,
+                    std::vector<std::uint8_t>& out) {
+    out.assign(static_cast<std::size_t>((count + 7U) / 8U), 0U);
+    for (std::uint64_t k = 0; k < count; ++k) {
+        const auto at = first + k;
+        if ((bits[at >> 3U] >> (at & 7U)) & 1U) {
+            out[k >> 3U] |= static_cast<std::uint8_t>(1U << (k & 7U));
+        }
+    }
+}
+
+/// Whether a fixed_size_list<fixed_size_list> column is written as FullZip pages: pylance 12 writes it so for rows of
+/// 256 bytes or more of leaves (measured with nlance-pagelayout: 4 x 16 float32 is FullZip, 4 x 15 is mini-block, with
+/// or without nulls). `lance-encoding:structural-encoding=miniblock` keeps mini-block; `fullzip` forces FullZip.
+bool fsl_of_fsl_wants_full_zip(const LanceField& field, std::size_t leaf_row_bytes) {
+    const auto option = field.metadata.find("lance-encoding:structural-encoding");
+    const std::string text = option == field.metadata.end() ? std::string() : option->second;
+    if (text == "miniblock") {
+        return false;
+    }
+    return text == "fullzip" || leaf_row_bytes >= kFullZipMinFixedRowBytes;
+}
+
+/// Writes a fixed_size_list<fixed_size_list<leaf, a>, b> column as FullZip pages, the layout pylance writes for rows of
+/// 256 bytes or more: each row is one slot, [control word when the column has nulls][the outer validity, ceil(b/8) bytes,
+/// when the outer level has validity][the leaf validity, ceil(a*b/8) bytes, when the leaves have it][the a*b leaves].
+/// A null row keeps its slot (zeros), as write_full_zip_fixed_column does. The descriptor is
+/// FixedSizeList{b, FixedSizeList{a, Flat, leaf validity}, outer validity} over the slot, the one the reader decodes
+/// (test_fsl_of_fsl_fullzip_read.py reads pylance's pages; test_fsl_of_fsl_write.py reads these).
+bool write_full_zip_fixed_size_list_of_fixed_size_list_column(const ColumnEncodeContext& ctx, std::ostream& out,
+                                                              std::vector<pb::ColumnMetadata>& columns,
+                                                              std::string& error) {
+    constexpr std::uint64_t kFullZipFixedPageBytes = std::uint64_t{1} << 20U;
+    const auto& field = ctx.field;
+    const auto& values = ctx.values;
+    std::string leaf;
+    std::uint64_t inner = 0;
+    std::uint64_t outer = 0;
+    if (!lance_fixed_size_list_of_fixed_size_list_parts(field.logical_type, leaf, inner, outer)) {
+        error = "column '" + field.name + "' is not a fixed_size_list of fixed_size_list";
+        return false;
+    }
+    const auto leaf_value_bytes = lance_logical_type_value_bytes(leaf);
+    const std::uint64_t leaves = inner * outer;
+    const std::size_t value_bytes = leaf_value_bytes * static_cast<std::size_t>(leaves);
+    if (value_bytes == 0U || values.fixed_size() != ctx.rows * value_bytes) {
+        error = "column value buffer size is not aligned to field width for " + field.name;
+        return false;
+    }
+    const bool outer_validity = !values.outer_item_validity.empty();
+    const bool leaf_validity = !values.item_validity.empty();
+    const bool nulls = ctx.column_has_nulls;
+    const std::size_t outer_bytes = outer_validity ? static_cast<std::size_t>((outer + 7U) / 8U) : 0U;
+    const std::size_t leaf_validity_bytes = leaf_validity ? static_cast<std::size_t>((leaves + 7U) / 8U) : 0U;
+    const std::size_t row_bytes = outer_bytes + leaf_validity_bytes + value_bytes;
+    std::vector<std::uint8_t> encoding = descriptor::fixed_size_list(
+        outer,
+        descriptor::fixed_size_list(inner, descriptor::flat(static_cast<std::uint64_t>(leaf_value_bytes) * 8U),
+                                    leaf_validity),
+        outer_validity);
+    const std::size_t control = full_zip::control_bytes(0U, nulls ? 1U : 0U);
+    const std::uint64_t rows = ctx.rows;
+    const std::uint64_t per_page = std::max<std::uint64_t>(1U, kFullZipFixedPageBytes / (control + row_bytes));
+    const std::vector<std::uint8_t> zeros(row_bytes, 0U);
+    std::vector<std::uint8_t> outer_row;
+    std::vector<std::uint8_t> leaf_row;
+    pb::ColumnMetadata column;
+    column.encoding = column_encoding_bytes();
+    std::vector<std::uint8_t> data;
+    for (std::uint64_t first = 0; first < rows;) {
+        const auto end = std::min(rows, first + per_page);
+        data.clear();
+        data.reserve(static_cast<std::size_t>(end - first) * (control + row_bytes));
+        for (auto r = first; r < end; ++r) {
+            const bool valid = !nulls || validity_bit(values.validity, r);
+            full_zip::append_level(data, control, valid ? 0U : 1U, nullptr, 0U, 0U);
+            if (!valid) {
+                data.insert(data.end(), zeros.begin(), zeros.end());
+                continue;
+            }
+            if (outer_validity) {
+                copy_bit_range(values.outer_item_validity, r * outer, outer, outer_row);
+                data.insert(data.end(), outer_row.begin(), outer_row.end());
+            }
+            if (leaf_validity) {
+                copy_bit_range(values.item_validity, r * leaves, leaves, leaf_row);
+                data.insert(data.end(), leaf_row.begin(), leaf_row.end());
+            }
+            const auto* bytes = values.fixed_data() + static_cast<std::size_t>(r) * value_bytes;
+            data.insert(data.end(), bytes, bytes + value_bytes);
+        }
+        descriptor::FullZip layout;
+        layout.bits_def = nulls ? 1U : 0U;
+        layout.bits_per_value = static_cast<std::uint64_t>(row_bytes) * 8U;
+        layout.num_items = end - first;
+        layout.num_visible_items = end - first;
+        layout.value_compression = encoding;
+        layout.layers = {nulls ? static_cast<std::uint8_t>(repdef::kNullableItem)
+                               : static_cast<std::uint8_t>(repdef::kAllValidItem)};
+        pb::ColumnPage page;
+        page.buffer_offsets.push_back(write_buffer(out, data));
+        page.buffer_sizes.push_back(data.size());
+        page.length = end - first;
+        page.priority = first;
+        page.encoding = descriptor::page_encoding(layout);
+        column.pages.push_back(std::move(page));
+        first = end;
+    }
+    columns.push_back(std::move(column));
+    return true;
+}
+
+/// Writes a fixed_size_list<fixed_size_list<leaf, a>, b> column (one of the two shapes pylance 12 writes at format
+/// 2.1 and 2.2 alike): mini-block chunks of up to three buffers, the outer validity (one bit an inner list, when an
+/// inner list is null), the leaf validity (one bit a leaf, when a leaf is null) and the leaves, under
+/// FixedSizeList{b, FixedSizeList{a, Flat, leaf validity}, outer validity} -- the layout pylance writes, measured by
+/// nlance-pagelayout. Row nulls take the definition levels, as for a single fixed_size_list. Rows of 256 bytes or more
+/// of leaves go to write_full_zip_fixed_size_list_of_fixed_size_list_column instead (see fsl_of_fsl_wants_full_zip).
+bool write_fixed_size_list_of_fixed_size_list_column(const ColumnEncodeContext& ctx, std::ostream& out,
+                                                     std::vector<pb::ColumnMetadata>& columns, std::string& error) {
+    const auto& field = ctx.field;
+    const auto& values = ctx.values;
+    std::string leaf;
+    std::uint64_t inner = 0;
+    std::uint64_t outer = 0;
+    if (!lance_fixed_size_list_of_fixed_size_list_parts(field.logical_type, leaf, inner, outer)) {
+        error = "column '" + field.name + "' is not a fixed_size_list of fixed_size_list";
+        return false;
+    }
+    const auto leaf_bytes = lance_logical_type_value_bytes(leaf);
+    const std::uint64_t leaves = inner * outer;
+    const auto row_bytes = leaf_bytes * static_cast<std::size_t>(leaves);
+    if (row_bytes == 0U || values.fixed_size() % row_bytes != 0U) {
+        error = "column value buffer size is not aligned to field width for " + field.name;
+        return false;
+    }
+    const auto total = static_cast<std::uint64_t>(values.fixed_size() / row_bytes);
+    if (total != ctx.rows) {
+        error = "column value count does not match row count for " + field.name;
+        return false;
+    }
+    if (fsl_of_fsl_wants_full_zip(field, row_bytes)) {
+        return write_full_zip_fixed_size_list_of_fixed_size_list_column(ctx, out, columns, error);
+    }
+    const bool outer_validity = !values.outer_item_validity.empty();
+    const bool leaf_validity = !values.item_validity.empty();
+    const bool nulls = ctx.column_has_nulls;
+    const std::size_t outer_bytes = outer_validity ? static_cast<std::size_t>((outer + 7U) / 8U) : 0U;
+    const std::size_t leaf_bytes_row = leaf_validity ? static_cast<std::size_t>((leaves + 7U) / 8U) : 0U;
+    const std::size_t per_row = row_bytes + outer_bytes + leaf_bytes_row;
+    const auto by_bytes = max_values_per_uncompressed_chunk(per_row + 1U);
+    const auto multi = multichunk_values(nulls ? std::min<std::size_t>(1024U, by_bytes) : by_bytes);
+    const auto max_chunk_rows = multi != 0U ? multi : std::size_t{1};
+    pb::ColumnMetadata column;
+    column.encoding = column_encoding_bytes();
+    MiniblockPageWriter page_writer(out);
+    std::vector<std::uint8_t> outer_bits;
+    std::vector<std::uint8_t> leaf_bits;
+    for (std::size_t off = 0; off < total;) {
+        const auto count = std::min<std::size_t>(max_chunk_rows, static_cast<std::size_t>(total - off));
+        std::vector<std::pair<const std::uint8_t*, std::size_t>> buffers;
+        if (outer_validity) {
+            copy_bit_range(values.outer_item_validity, off * outer, count * outer, outer_bits);
+            buffers.emplace_back(outer_bits.data(), outer_bits.size());
+        }
+        if (leaf_validity) {
+            copy_bit_range(values.item_validity, off * leaves, count * leaves, leaf_bits);
+            buffers.emplace_back(leaf_bits.data(), leaf_bits.size());
+        }
+        buffers.emplace_back(values.fixed_data() + off * row_bytes, count * row_bytes);
+        const auto def = nulls ? pack_definition_levels(values.validity, off, count) : std::vector<std::uint8_t>{};
+        page_writer.begin_chunk();
+        const auto footprint = stream_miniblock_chunk(out, count, def, buffers);
+        page_writer.end_chunk(footprint, count);
+        off += count;
+        if (off < total && multi != 0U && page_writer.payload_bytes() < kTargetMiniblockPageBytes) {
+            continue;
+        }
+        pb::ColumnPage page;
+        const auto page_rows = page_writer.rows();
+        page_writer.finish(page);
+        descriptor::MiniBlock m;
+        const auto leaf_layer = descriptor::flat(static_cast<std::uint32_t>(leaf_bytes * 8U));
+        const auto inner_layer = descriptor::fixed_size_list(inner, leaf_layer, leaf_validity);
+        m.value_compression = descriptor::fixed_size_list(outer, inner_layer, outer_validity);
+        if (nulls) {
+            m.def_compression = repdef_encoding_bytes();
+        }
+        mini_block_tail(m, page_rows, static_cast<std::uint8_t>(buffers.size()), nulls);
+        page.encoding = descriptor::page_encoding(m);
+        column.pages.push_back(std::move(page));
+    }
+    columns.push_back(std::move(column));
+    return true;
+}
+
 /// Writes a constant column: the single value stored once, inline or in one data buffer.
 /// One branch of encode_column, which writes one column (step 2 of write_lance_data_file).
 bool write_constant_column(const ColumnEncodeContext& ctx, std::ostream& out, std::vector<pb::ColumnMetadata>& columns,
@@ -3805,6 +4002,16 @@ bool encode_column(const FileWriteState& state, std::size_t field_index, std::os
         return write_dictionary_column(ctx, out, columns);
     }
 
+    // A fixed_size_list of fixed_size_list (top level only; the mapper refuses it under a struct or list): two levels
+    // of validity over the leaves, in mini-block chunks (see write_fixed_size_list_of_fixed_size_list_column).
+    {
+        std::string leaf;
+        std::uint64_t inner = 0;
+        std::uint64_t outer = 0;
+        if (lance_fixed_size_list_of_fixed_size_list_parts(field.logical_type, leaf, inner, outer)) {
+            return write_fixed_size_list_of_fixed_size_list_column(ctx, out, columns, error);
+        }
+    }
     // A fixed_size_list with null elements inside valid rows: Lance's mini-block chunks of two
     // buffers, the elements' validity bits then the values, under FixedSizeList{has_validity}. From 256
     // bytes of values on (or when asked with structural-encoding=fullzip) it is FullZip instead, with the

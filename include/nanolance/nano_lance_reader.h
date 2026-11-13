@@ -129,6 +129,8 @@ typedef struct NanoLanceWorkStats {
     uint64_t dict_rows_expanded; /* rows a dictionary page copied its values out for */
     uint64_t index_page_cache_hits; /* BTREE index windows served from the decoded-window cache */
     uint64_t index_page_cache_misses; /* BTREE index windows read from the index file */
+    uint64_t dictionary_blocks_decoded; /* dictionary blocks decompressed and parsed */
+    uint64_t dictionary_cache_hits; /* dictionary blocks served from the decoded-block cache */
 } NanoLanceWorkStats;
 
 void nano_lance_work_stats(NanoLanceWorkStats* out);

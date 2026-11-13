@@ -417,9 +417,9 @@ The main reasons tests fail today:
   (about 60), table branches, object stores or the `mem_wal`.
 - Many need table branches.
 - About 25 need filter functions nanolance lacks, or a data storage version other than 2.2.
-- A tail of writer gaps in nanolance itself: dictionary columns inside structs or lists, null
-  elements of a fixed-size list under a list or struct, bfloat16. Each is a real gap, listed by
-  the run.
+- A tail of writer gaps in nanolance itself, as this run found them: dictionary columns inside structs or lists, null
+  elements of a fixed-size list under a list or struct, bfloat16. Since then both the first two are written (int32
+  indices for dictionaries; null elements in valid rows), so the rest of that list is what this run still counted.
 
 ## Bugs the suite found in nanolance itself
 

@@ -415,6 +415,10 @@ def test_constant_pages_with_different_values(lance, tmp_path, monkeypatch):
     assert reader.take_rows([5, 1030, 3000, 4095]).to_table() == want.take([5, 1030, 3000, 4095])
 
 
+# Shapes pylance 12 refuses to write in format 2.1: a fixed_size_list of structs (2.2 only).
+PYLANCE_21_REFUSES = {"matrix-fsl_struct_list_2"}
+
+
 def _pylance_written_shapes():
     from tests.test_lance_lists import SHAPES as LIST_SHAPES
     from tests.test_write_encoding_matrix import SHAPES as MATRIX
@@ -432,6 +436,8 @@ def test_pylance_written_shapes_read_back(lance, tmp_path, version):
     fixed_size_binary constant wider than 32 bytes refused (its value is a one-buffer scalar)."""
     failures = []
     for name, table in _pylance_written_shapes():
+        if version == "2.1" and name in PYLANCE_21_REFUSES:
+            continue  # pylance 12 itself refuses to write it at 2.1
         uri = str(tmp_path / f"{name}-{version}")
         lance.write_dataset(table, uri, data_storage_version=version)
         want = lance.dataset(uri).to_table()

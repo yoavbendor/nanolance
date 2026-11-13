@@ -43,7 +43,7 @@ bool chunk_items(const std::vector<std::uint8_t>& meta, std::uint64_t value_byte
 ///
 /// On success `out` holds one entry per structural level in the order repdef::unravel uses: out[0] is
 /// the leaf items (length num_visible_items, with the leaf's validity) and the last entry's length is
-/// `rows`. Fixed-size-list layers are refused for now.
+/// `rows`. A fixed-size-list layer is read: its validity is decoded as a validity layer's, and it reports its elements (`fsl_items`).
 bool unravel(const page_layout::SparseLayout& layout, std::uint64_t rows, bool leaf_nullable,
              const std::vector<std::vector<std::uint8_t>>& buffers, std::vector<repdef::UnraveledLayer>& out,
              std::string& error);

@@ -178,9 +178,9 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
     // Local paths and registered object stores (s3://); any other URI would otherwise become a local
     // directory named after its scheme.
     const bool object_store = io::is_object_store_output(utf8::string_of(dataset_path));
-    if (!object_store && dataset_path.string().find("://") != std::string::npos) {
-        error = "writes to " + dataset_path.string().substr(0, dataset_path.string().find("://")) +
-                ":// are not supported (nanolance writes local paths and s3:// URIs): " + dataset_path.string();
+    if (!object_store && utf8::string_of(dataset_path).find("://") != std::string::npos) {
+        error = "writes to " + utf8::string_of(dataset_path).substr(0, utf8::string_of(dataset_path).find("://")) +
+                ":// are not supported (nanolance writes local paths and s3:// URIs): " + utf8::string_of(dataset_path);
         return false;
     }
     // Before anything is written: a refused commit leaves the version and its files as they were.
@@ -412,7 +412,7 @@ bool commit_dataset_version_once(const std::filesystem::path& dataset_path, cons
         mode = exists ? CommitMode::Append : CommitMode::Create;
     }
     if (mode == CommitMode::Create && exists) {
-        error = "dataset already exists: " + dataset_path.string();
+        error = "dataset already exists: " + utf8::string_of(dataset_path);
         return false;
     }
     if (mode == CommitMode::Append && !exists) {

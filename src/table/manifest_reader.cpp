@@ -386,7 +386,7 @@ bool migrate_manifest_names_v2(const std::filesystem::path& dataset_path, std::s
             continue;
         }
         std::error_code ec;
-        std::filesystem::rename(dataset_path / "_versions" / entry.name,
+        std::filesystem::rename(dataset_path / "_versions" / utf8::from_utf8(entry.name),
                                 dataset_path / "_versions" / manifest_name_v2(version), ec);
         if (ec) {
             error = "failed to rename manifest " + entry.name + ": " + ec.message();

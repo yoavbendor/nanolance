@@ -109,8 +109,9 @@ A baseline is the record of a known-good commit on one runner CPU. Re-record aft
 performance on purpose, and for each new runner CPU:
 
 1. Push the branch.
-2. Dispatch `linux-bench` with `record_perf_baseline` set to true. The job measures the index benchmarks
-   and commits `bench/results/perf/<cpu>-<cores>c.json` to the branch with `[skip ci]`.
+2. Dispatch `linux-bench` with `record_perf_baseline` set to true. The job measures the index benchmarks and
+   writes `bench/results/perf/<cpu>-<cores>c.json`. On `main` it commits that file with `[skip ci]`; on any other
+   branch it uploads the file as the `perf-baseline` artifact, to copy into the branch by hand.
 3. Later pushes compare against that file.
 
 GitHub's `ubuntu-latest` pool mixes CPU models, so one recording covers only the CPU it ran on. The gate

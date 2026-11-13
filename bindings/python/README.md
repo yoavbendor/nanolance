@@ -80,8 +80,8 @@ Differences worth knowing before you switch:
   (zstd on strings, byte-stream-split + zstd on floats). Structural encodings -- bitpacking,
   constant, RLE, dictionary -- are on by default and independent of it.
 - Types nanolance will not round-trip are **refused at write time**, by name, rather than written in
-  a shape it cannot read back: `list`, `large_utf8`/`large_binary`, Arrow `dictionary` columns and
-  Arrow's `null` type.
+  a shape it cannot read back: a union, a `timestamp` with a UTC-offset zone, a `fixed_size_list` of a list,
+  large list or map, and a few nested shapes (the root [README "Types"](../../README.md#types) has the table).
 
 Already have parquet files? Convert one and compare:
 
@@ -154,17 +154,17 @@ already decoded them all by the time it returns.
 | Category | Supported | Notes |
 |----------|-----------|-------|
 | Integers | int8–int64, uint8–uint64 | FastLanes bitpacking, RLE, constant layout — **on by default** (`structural_encoding=True`) |
-| Floats | float32, float64 | Written **uncompressed** (no byte-stream-split yet) |
-| Strings / binary | utf8, binary, fixed_size_binary | dict-RLE, structural dictionary, constant layout **on by default**; zstd for high-cardinality columns only with `compression=True`. `large_utf8`/`large_binary` are refused — cast to the 32-bit offset type first. |
+| Floats | float32, float64 | Written as plain pages by default; byte-stream-split + zstd with `compression=True` |
+| Strings / binary | utf8, large_utf8, binary, large_binary, fixed_size_binary | dict-RLE, structural dictionary, constant layout **on by default**; zstd for high-cardinality columns only with `compression=True` |
 | Structs | nested struct columns | Same type coverage as [nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet) |
-| Nullability | values and schemas | Nulls are **stored**, via Lance's definition-level layer, and stock Lance reads them back — in fixed-width and in `utf8`/`binary` columns. A null **struct** is refused (that is not the same as a struct whose fields are null), as is a null in a `lance.blob.v2` column. `ignore_nullability` is a no-op kept for compatibility. |
+| Nullability | values and schemas | Nulls are **stored**, via Lance's definition-level layer, and stock Lance reads them back — in fixed-width and in `utf8`/`binary` columns. A null **struct** is stored as its own definition level (not the same as a struct whose fields are null), as Lance stores it. A null row in a `lance.blob.v2` column is stored too, external references included. `ignore_nullability` is a no-op kept for compatibility. |
 | Append | `WriteOptions(append=True)` or `append=True` kwarg | Adds a fragment to an existing dataset |
 | Multi-batch tables | yes | Streams all record batches from the input |
 
 | Not supported on write | Workaround |
 |------------------------|------------|
-| **`bool` columns** | Use `uint8` (0/1) — Arrow's 1-bit layout vs nanolance's byte-wide path |
-| **list, map, union** Arrow types | Flatten or serialize to string/binary |
+| **union** Arrow type | Flatten or serialize to string/binary (refused by name) |
+| **`fixed_size_list` of a list, large list or map** | Use a `list` column (refused by name) |
 | **`lance.blob.v2` + URI dictionary** (`blob_uri_dictionary=True`) | nanolance-only; stock `lance` cannot read those blob columns |
 
 Two independent knobs control encoding: **structural** (lossless bitpacking / constant / RLE /
@@ -248,26 +248,27 @@ end is an **error**, not an empty table -- it nearly always means the caller's a
 Negative values are refused rather than given `[-10:]` semantics, which would need the row count and
 would otherwise read the wrong rows silently.
 
-**Scope.** nanolance reads back everything it writes, and now every non-nested column type stock
-Lance writes:
+**Scope.** nanolance reads back everything it writes, and the column types stock Lance writes, nested ones
+included, except the packed-struct shapes listed under *Not supported* below:
 
 | Readable | Notes |
 |----------|-------|
 | Datasets written by `nanolance.write_table` | Round-trip tested |
 | Fixed-width, temporal and decimal columns from stock Lance | int/uint 8–64, float, bool, timestamp/date/time, decimal128/256, `fixed_size_binary` |
 | `utf8` / `large_utf8` / `binary` from stock Lance | Including FSST-compressed |
+| Lists, large lists, maps and fixed-size lists from stock Lance | Whole, by row range and by take, nulls at every level (`test_lance_lists.py`, `test_fsl_read_shapes.py`) |
 | Nullable columns from stock Lance | Bit-packed *and* run-length-encoded definition levels |
 | Categorical columns from stock Lance | Including their LZ4-compressed dictionary |
 | Struct columns written by nanolance, append fragments | Yes (reads latest manifest) |
 
 | Not supported | Use instead |
 |----------------|-------------|
-| `list` and `struct` columns written by **stock Lance** | `pylance` — these are unmapped at the manifest layer, and refused by name |
+| Packed structs written by **stock Lance** inside another struct or under a map, and a packed child that is null under a list | refused by name (`packed struct ... inside another struct is not read yet`); read `pylance` |
 | `blob_uri_dictionary` blob columns | nanolance reader only (not stock `lance`) |
 
 **Interop rule of thumb:** everything nanolance writes with default Lance-compatible options is
 readable by **both** `nanolance.read_table` and `lance.dataset()` (verified against `pylance` 12.0.0).
-The reverse now holds for every non-nested column shape; anything still missing is **refused by
+The reverse holds for every shape in the table above; anything still missing is **refused by
 name**, never misread.
 
 ---
@@ -279,34 +280,37 @@ name**, never misread.
 
 ## Benchmarks vs pylance
 
-Numbers below are from **Ubuntu CI** (clang Release, 200k rows, best-of-5 writes / best-of-7 reads). Source: [`bench/linux-ci-results.md`](../../bench/linux-ci-results.md) (auto-updated on every push). Reproduce C++ baselines with `python tools/bench.py` from the repo root.
+Numbers below are from **Ubuntu CI** (clang 19 Release, 200k rows, best-of-5 writes / best-of-7 reads), commit
+`07ec05b`, 2026-11-10. Source: [`bench/linux-ci-results.md`](../../bench/linux-ci-results.md) (auto-updated on every
+push). Reproduce them with `python tools/bench.py` from the repo root.
 
 The Python bindings call the same C++ writer/reader; expect only minor overhead vs the C++ numbers (PyCapsule import/export, no extra copies).
 
+Parquet, pylance (`lance.write_dataset`) and nanolance's Python binding run in one process, from the Arrow table in memory.
+
 ### Write time (ms, lower is better)
 
-| Dataset profile | nanolance | pylance (`lance`) | Ratio (nl / pylance) |
-|-----------------|-----------|-------------------|----------------------|
-| **pcap_ref** — run-length URI + monotonic `position` + constant `size` (3 cols) | 24.2 core / 31.8 proc | 10.6 | **~2.3×** slower write |
-| **wide_int** — uint64 ts + uint32 caplen + low-card uint8 (4 cols) | 10.6 core / 14.1 proc | 2.6 | **~4.1×** slower write |
-| **high_card** — random uint64 id + unique hex strings (2 cols) | 166.5 core / 172.1 proc | 17.6 | **~9.5×** slower write |
-| **scattered low-card strings** — `row-{i%500}` cycling (3 cols, `compression=True`) | ~2.9× pylance (post structural-dict) | 1.0× | **~2.9×** slower write, **~1.0×** on-disk size |
+| Dataset profile | nanolance (`write_table`) | pylance (`lance.write_dataset`) | Ratio (nl / pylance) |
+|-----------------|---------------------------|---------------------------------|----------------------|
+| **pcap_ref** — run-length URI + monotonic `position` + constant `size` (3 cols) | 3.33 | 10.07 | **0.33×** (nanolance faster) |
+| **wide_int** — uint64 ts + uint32 caplen + low-card uint8 (4 cols) | 2.95 | 4.52 | **0.65×** (nanolance faster) |
+| **high_card** — random uint64 id + unique hex strings (2 cols) | 24.92 | 18.92 | **1.32×** (nanolance slower) |
 
-`write(core)` = encode + commit only. `write(proc)` for nanolance includes subprocess/IPC overhead in the C++ CLI bench; Python `write_table` is in-process (closer to core).
-
-**Where nanolance wins on size:** pcap-style external-ref columns beat Parquet (~3.6 B/row vs ~4.2 B/row) and match pylance (~3.5 B/row). **Where pylance wins on write:** high-cardinality unique strings (no dictionary benefit); store app-level deltas for monotonic high-range integers if size matters.
+**Size (bytes a row).** pcap_ref: nanolance 3.47, pylance 3.47, Parquet (zstd) 4.19. wide_int: 8.49, 8.49 and 5.21
+(Parquet is smaller on sorted or low-range numbers, where its delta and dictionary encodings apply). high_card: 17.99,
+18.88 and 15.51.
 
 ### Read time (ms, lower is better)
 
-| Dataset profile | nanolance native read | pylance reading a nanolance file | pylance reading its own file |
-|-----------------|----------------------|----------------------------------|------------------------------|
-| **pcap_ref** | 10.9 | 8.7 | 5.3 |
-| **wide_int** | 12.5 | 11.2 | 3.5 |
-| **high_card** | 15.5 | 11.5 | 5.9 |
+| Dataset profile | nanolance (`read_table`) | pylance reading a nanolance file | pylance reading its own file |
+|-----------------|--------------------------|----------------------------------|------------------------------|
+| **pcap_ref** | 0.71 | 5.27 | 5.83 |
+| **wide_int** | 0.65 | 2.44 | 2.63 |
+| **high_card** | 5.37 | 8.02 | 4.99 |
 
-Native nanolance read is **~2× slower than pylance** on these profiles (memory-bandwidth bound column materialization). Files nanolance writes are still read quickly by pylance (~1.2–1.5× native read in the table above).
-
-Read throughput is the known remaining gap; write + on-disk size are the headline strengths for pcap-style and repetitive-column workloads.
+On pcap_ref and wide_int nanolance's native read is several times faster than pylance reading either file. On high_card
+it is level with pylance reading its own file (5.37 against 4.99 ms), and pylance reads nanolance's file more slowly
+(8.02 ms).
 
 ### Python micro-benchmarks
 

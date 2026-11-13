@@ -7,43 +7,12 @@
   "rust_failed": [],
   "nanolance": {
     "no round trip": 523,
-    "pass": 1446,
-    "refused": 17
+    "pass": 1463
   },
   "round_trips": {
-    "pass": 10913,
-    "refused": 74
+    "pass": 10987
   },
-  "top_refusals": [
-    {
-      "count": 48,
-      "reason": "file: schema: a legacy blob column (\"lance-encoding:blob\") is read from format N.N only"
-    },
-    {
-      "count": 20,
-      "reason": "read: the file has N columns for N leaf fields; nanolance reads files whose every leaf field is one column"
-    },
-    {
-      "count": 2,
-      "reason": "read: column 'value': unsupported page layout: FullZip{values=VariablePackedStruct{Variable{offsets=Flat(N)}/lenN},offset_bits=N,rep_bits=N,def_bits=N,layers=[v"
-    },
-    {
-      "count": 1,
-      "reason": "file: schema: column 'item': a fixed_size_list of structs inside a struct or list is not written yet"
-    },
-    {
-      "count": 1,
-      "reason": "read: nested column 'keys' decoded to a different shape than its schema (N layers for N levels)"
-    },
-    {
-      "count": 1,
-      "reason": "read: column 'value' page N: sparse layout has a fixed-size-list layer, which nanolance does not read yet"
-    },
-    {
-      "count": 1,
-      "reason": "read: dict-rle run count mismatch between indices and lengths"
-    }
-  ],
+  "top_refusals": [],
   "top_type_differences": [],
   "mismatched_tests": []
 }

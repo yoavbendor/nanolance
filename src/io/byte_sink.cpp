@@ -67,7 +67,7 @@ public:
         flush();
         const bool ok = static_cast<bool>(*this) && buf_.close() != nullptr;
         if (!ok) {
-            error = "failed to write " + path_.string();
+            error = "failed to write " + utf8::string_of(path_);
         }
         return ok;
     }
@@ -97,13 +97,13 @@ std::unique_ptr<OutputFile> open_output(const std::string& path_or_uri, std::str
     if (path.has_parent_path()) {
         std::filesystem::create_directories(path.parent_path(), ec);
         if (ec) {
-            error = "failed to create " + path.parent_path().string() + ": " + ec.message();
+            error = "failed to create " + utf8::string_of(path.parent_path()) + ": " + ec.message();
             return nullptr;
         }
     }
     auto out = std::make_unique<LocalOutput>();
     if (!out->open(path)) {
-        error = "failed to open " + path.string() + " for writing";
+        error = "failed to open " + utf8::string_of(path) + " for writing";
         return nullptr;
     }
     return out;
@@ -121,25 +121,26 @@ bool put_if_absent(const std::string& path_or_uri, const std::vector<std::uint8_
     std::error_code ec;
     std::filesystem::create_directories(final_path.parent_path(), ec);
     if (ec) {
-        error = "failed to create " + final_path.parent_path().string() + ": " + ec.message();
+        error = "failed to create " + utf8::string_of(final_path.parent_path()) + ": " + ec.message();
         return false;
     }
     // The temp name is the writer's own: two writers racing for one name must not share it, or one's
     // link could publish the other's bytes (and report success for a change it lost).
     static std::atomic<std::uint64_t> counter{0};
     const auto unique = std::to_string(std::random_device{}()) + "-" + std::to_string(counter.fetch_add(1U));
-    const auto temp_path = final_path.parent_path() / (utf8::string_of(final_path.filename()) + "." + unique + ".tmp");
+    const auto temp_path =
+        final_path.parent_path() / utf8::from_utf8(utf8::string_of(final_path.filename()) + "." + unique + ".tmp");
     {
         std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
         if (!out) {
-            error = "failed to open " + temp_path.string();
+            error = "failed to open " + utf8::string_of(temp_path);
             return false;
         }
         out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
         out.close();
         if (!out) {
             std::filesystem::remove(temp_path, ec);
-            error = "failed to write " + temp_path.string();
+            error = "failed to write " + utf8::string_of(temp_path);
             return false;
         }
     }
@@ -160,7 +161,7 @@ bool put_if_absent(const std::string& path_or_uri, const std::vector<std::uint8_
     std::filesystem::rename(temp_path, final_path, ec);
     if (ec) {
         std::filesystem::remove(temp_path, ec);
-        error = "failed to publish " + final_path.string() + ": " + ec.message();
+        error = "failed to publish " + utf8::string_of(final_path) + ": " + ec.message();
         return false;
     }
     return true;
@@ -181,7 +182,7 @@ bool remove_output(const std::string& path_or_uri, std::string& error) {
         return backend.remove(path_or_uri, error);
     }
     std::error_code ec;
-    std::filesystem::remove(path_or_uri, ec);
+    std::filesystem::remove(utf8::from_utf8(path_or_uri), ec);
     if (const auto hook = g_output_removed_hook.load(std::memory_order_acquire)) {
         hook(path_or_uri);
     }

@@ -19,7 +19,7 @@ prints a `MISMATCH` line and the script exits non-zero.
 # quick check, about 1 second to generate and load
 python3 bench/graph/graph_bench.py --small
 
-# default size: 250k nodes, 1M edges (about 4 minutes on the machine below)
+# default size: 250k nodes, 1M edges (7 to 11 minutes on the machine below, with other jobs running)
 python3 bench/graph/graph_bench.py --json results.json
 
 # options: --nodes N --edges M --seed S --sample 20 --reps 5 --warmup 3
@@ -72,73 +72,110 @@ name is historical: they do not touch rows. The 0.01 ms figures reflect that.
 
 ## Results
 
-Measured on this machine, not a general claim. Run on 2026-11-10, default size
+Measured on this machine, not a general claim. One run on 2026-11-13 at 11:48 UTC, default size
 (250,000 nodes, 1,000,000 edges, seed 20260101), `--sample 20 --reps 5 --warmup 3`
-(100 timed calls per row, 20 for the hub rows).
+(100 timed calls per row). The 1-minute load was 1.2 when the run started and about 2.5 while it ran: the
+machine is shared with other builds, so treat differences of up to about 1.5 times as noise. Raw JSON:
+`benchmark_script`, `machine`, `versions` and `results` in the `--json` output.
 
-**Machine:** Intel(R) Xeon(R) Processor @ 2.30GHz, 4 logical cores, 15.7 GB RAM,
-Linux 6.18, Python 3.13.18. Single process, one query at a time, warm
-OS page cache, no tuning.
+**Machine:** Intel(R) Xeon(R) Processor @ 2.10GHz, 4 logical cores, 15.7 GB RAM,
+Linux 6.18, Python 3.13.18. Single process, one query at a time, warm OS page cache,
+no tuning.
 
-**Versions:** pylance 12.0.0, nanolance 0.2.0 (editable install from the main nanolance
-tree, commit 2c7d090), ladybug 0.19.0, pyarrow 26.0.1, numpy 2.5.3.
+**Versions:** pylance 12.0.0, nanolance 0.2.0 built from commit `1b205dd` into a target directory (the JSON
+records no commit; comment-only edits to headers were made while the build ran), ladybug 0.19.0, pyarrow 26.0.1,
+numpy 2.5.3.
 
-**Data sizes:** nodes.lance 86 MB, edges.lance 242 MB (both zstd, pylance-written),
-ladybug.db 569 MB. The parquet files used for the Ladybug COPY (207 MB) were deleted
-after loading.
+**Data sizes:** nodes.lance 86 MB, edges.lance 242 MB (both zstd, pylance-written), ladybug.db
+569 MB. The parquet files used for the Ladybug COPY (207 MB) were deleted after loading.
 
-**Graph shape:** max degree 30,336. The top-20 hubs have degree at least 4,496. Median
-degree 3. 23,104 nodes (9%) have no edges.
+**Graph shape:** max degree 30,336. The top-20 hubs have degree at least 4,496. Median degree 3.
+23,104 nodes (9%) have no edges.
 
-**Build times:** generate 5.0 s, pylance write 2.7 s, indexes 2.5 s (edge_key BTREE the
-slowest at 1.3 s), Ladybug DDL and COPY 29.8 s.
+**Build times:** generate 6.8 s, pylance write 2.6 s, indexes 2.8 s (edge_key BTREE the slowest at
+1.1 s), Ladybug DDL and COPY 25.5 s.
+
+**Warm-up:** before timing a query, the bench runs its sample list once untimed (3 calls, then one
+full pass), after a correctness pass that runs every sample on every engine, and the timed passes repeat the same IN lists. So the BTREE index-window cache
+(`NANOLANCE_INDEX_PAGE_CACHE_MB`), the dictionary-block cache and the take cache are warm for every timed call. A cold first
+call costs more. The bench does not record first-call timings, so that cost is not measured here.
 
 | Query | nanolance p50 / p95 / mean (ms) | pylance p50 / p95 / mean (ms) | Ladybug p50 / p95 / mean (ms) | avg rows |
 |---|---|---|---|---|
-| one_hop_single | 4.40 / 10.97 / 5.43 | 2.70 / 5.48 / 3.06 | 3.48 / 12.06 / 4.48 | 5.9 |
-| one_hop_hub | 314.49 / 716.89 / 366.11 | 463.07 / 1437.10 / 589.28 | 65.70 / 103.43 / 73.61 | 7717.8 |
-| edges_in_batch_50 | 29.33 / 46.38 / 32.08 | 8.58 / 17.31 / 9.89 | 63.05 / 107.39 / 67.51 | 127.5 |
-| edges_in_batch_500 | 79.31 / 162.91 / 86.41 | 58.41 / 99.09 / 63.77 | 291.92 / 415.96 / 299.33 | 1683.5 |
-| nodes_in_batch_50 | 8.41 / 14.47 / 9.35 | 6.35 / 7.68 / 6.25 | 92.44 / 132.10 / 98.01 | 50.0 |
-| nodes_in_batch_500 | 26.17 / 34.88 / 27.29 | 32.16 / 46.70 / 34.43 | 363.84 / 442.83 / 374.00 | 500.0 |
-| in_unindexed_50 | 108.18 / 129.93 / 110.53 | 14.43 / 18.37 / 15.19 | 57.24 / 98.04 / 63.06 | 50.0 |
-| in_unindexed_500 | 1012.34 / 1171.80 / 1020.97 | 19.80 / 28.62 / 20.77 | 277.33 / 376.57 / 287.75 | 500.0 |
-| type_filter_count | 0.01 / 0.01 / 0.01 | 0.45 / 0.66 / 0.47 | 9.33 / 17.84 / 10.31 | 21936.2 |
-| full_scan_count_edges_rel3 | 0.01 / 0.01 / 0.01 | 1.44 / 1.87 / 1.41 | 78.89 / 107.76 / 80.36 | 81728.9 |
-| one_hop_single_cached_keys | 37.18 / 44.79 / 37.81 | n/a | n/a | 5.9 |
-| one_hop_hub_cached_keys | 134.30 / 202.64 / 140.77 | n/a | n/a | 7717.8 |
+| one_hop_single | 2.10 / 3.80 / 2.18 | 4.17 / 7.17 / 4.62 | 4.28 / 10.88 / 5.11 | 5.9 |
+| one_hop_hub | 152.75 / 490.66 / 196.19 | 440.17 / 1336.77 / 541.77 | 57.10 / 81.10 / 58.74 | 7717.8 |
+| edges_in_batch_50 | 2.08 / 2.98 / 2.20 | 9.14 / 14.95 / 9.66 | 52.11 / 68.09 / 54.79 | 127.5 |
+| edges_in_batch_500 | 12.26 / 18.12 / 13.69 | 55.25 / 72.45 / 55.05 | 327.96 / 410.59 / 341.21 | 1683.5 |
+| nodes_in_batch_50 | 2.47 / 3.22 / 2.60 | 7.89 / 9.33 / 7.99 | 65.67 / 83.21 / 68.83 | 50.0 |
+| nodes_in_batch_500 | 15.91 / 19.21 / 15.82 | 34.13 / 40.88 / 34.47 | 332.04 / 420.18 / 343.46 | 500.0 |
+| in_unindexed_50 | 23.29 / 32.15 / 25.14 | 16.44 / 19.84 / 16.70 | 49.61 / 68.94 / 53.80 | 50.0 |
+| in_unindexed_500 | 31.17 / 39.95 / 32.79 | 21.78 / 26.98 / 22.10 | 311.42 / 396.24 / 320.61 | 500.0 |
+| type_filter_count | 0.012 / 0.020 / 0.015 | 0.518 / 0.759 / 0.558 | 9.79 / 12.33 / 10.09 | 21936.3 |
+| full_scan_count_edges_rel3 | 0.014 / 0.049 / 0.021 | 2.06 / 3.23 / 2.09 | 56.53 / 78.80 / 60.24 | 81729.0 |
+| one_hop_single_cached_keys | 27.76 / 40.98 / 29.88 | n/a | n/a | 5.9 |
+| one_hop_hub_cached_keys | 66.71 / 145.77 / 76.84 | n/a | n/a | 7717.8 |
 
-Correctness: 0 mismatches. Every sample of every query was checked: nanolance equals
-pylance on full rows, the cached-keys path equals the plain nanolance path, and Ladybug
-equals pylance on ids.
+Correctness: 0 mismatches. Every sample of every query was checked: nanolance equals pylance on full
+rows, the cached-keys path equals the plain nanolance path, and Ladybug equals pylance on ids.
+
+### History
+
+Headline rows, nanolance p50 in ms. Each column is a separate run; the first is measured before the
+changes listed below it.
+
+| Query | 2026-11-10 | 2026-11-12 | 2026-11-13 |
+|---|---:|---:|---:|
+| one_hop_single | 4.40 | 3.15 | 2.10 |
+| one_hop_hub | 314.49 | 269.89 | 152.75 |
+| edges_in_batch_50 | 29.33 | 4.01 | 2.08 |
+| nodes_in_batch_500 | 26.17 | 17.78 | 15.91 |
+| in_unindexed_50 | 108.18 | 21.30 | 23.29 |
+| in_unindexed_500 | 1012.34 | 29.88 | 31.17 |
+| one_hop_single_cached_keys | 37.18 | 41.41 | 27.76 |
+| one_hop_hub_cached_keys | 134.30 | 125.23 | 66.71 |
+
+The changes between the 2026-11-12 and 2026-11-13 runs: decoded dictionary blocks are kept in a process-wide cache
+(`7545882`, so a BTREE lookup decodes each dictionary block once, not once per window), and a dense take keeps its
+column's decoded copy up to 64 MB (`8346692`, which made a hub's one-hop edge fetch 5 to 8 ms warm). The
+`one_hop_hub` row moved most. The unindexed IN rows did not move: both still scan `name` with no index.
 
 ## Observations
 
-- `in_unindexed_500` is about 50 times slower on nanolance (1.0 s) than on pylance
-  (20 ms). `in_unindexed_50` is about 7 times slower. Ladybug takes 277 ms here. The
-  plans differ: pylance filters on `name` alone and then takes the other columns, while
-  nanolance's plan is one scan that projects `id, name, type` with the filter applied
-  inside it. That is a likely cause, but it is not confirmed by profiling.
-- `edges_in_batch_50` is about 3.4 times slower on nanolance than on pylance, and the
-  gap narrows at 500 ids. Both use the same BTREE index on `source_id`. Not investigated
-  further.
-- For ordinary nodes, the adapter's cached-key path is about 8 times slower than the
-  filter path (37 ms vs 4.4 ms p50). The cache only saves reading the key columns once;
-  each call still runs `is_in` over all 1M rows. For hub nodes the cached path is faster
-  than the filter path (134 ms vs 314 ms p50).
-- Hub one-hop is faster on nanolance than on pylance (314 ms vs 463 ms p50), but both
-  are slower than Ladybug (66 ms), which reads the adjacency lists directly.
-- Ladybug is the fastest of the three on `one_hop_hub`, and it is slower than pylance on
-  the batch-by-id and unindexed-name queries. It is the slowest on the batch-by-id
-  queries. It has no secondary index on `source_id`, `type` or `name` in this benchmark.
-- Caveats: 4 cores, one process, one query at a time, and warm cache. Results are for
-  this graph shape and these query sizes, and may not match other machines or workloads.
+- Hub one-hop is faster on nanolance than on pylance (153 ms against 440 ms p50), but Ladybug is still
+  fastest (57 ms), since it reads the adjacency lists directly.
+- Batch-by-id queries are faster on nanolance than on pylance and Ladybug: `edges_in_batch_50` 2.1 ms
+  against 9.1 ms (pylance) and 52 ms (Ladybug); `nodes_in_batch_500` 15.9 ms against 34.1 ms and 332 ms.
+- Unindexed IN lists are slower than pylance by about 1.4 times: `in_unindexed_50` 23.3 ms against 16.4 ms,
+  `in_unindexed_500` 31.2 ms against 21.8 ms. Both scan `name` with no index; the gap is not profiled.
+- For ordinary nodes, the adapter's cached-key path is about 13 times slower than the filter path
+  (27.8 ms against 2.1 ms p50): the cache saves only reading the key columns once, and each call still runs
+  `is_in` over all 1M rows. For hub nodes the cached path is faster than the filter path (66.7 ms against 152.8 ms).
+- Counts answered from the BITMAP index (`type_filter_count`, `full_scan_count_edges_rel3`) take about
+  0.01 to 0.02 ms on nanolance, from the index alone, against 0.5 and 2.1 ms on pylance.
+- Ladybug is the slowest of the three on every batch-by-id and unindexed-name query here. Its rows are higher
+  than in the 2026-11-12 run on most rows (up to about 1.5 times), which is consistent with the shared machine.
+- Caveats: 4 cores, one process, one query at a time, warm cache, and a shared machine (see the load
+  note above). Results are for this graph shape and these query sizes, and may not match other machines or
+  workloads. There is one run this time, not two as before; treat differences smaller than about 1.5 times as noise.
 
-## Changes since
+## Known gaps
 
-The tables above were measured before these nanolance changes, so they do not include them:
+**Hub 1-hop (deferred, 2026-11-13).** On the default graph, `one_hop_hub` takes 153 ms p50 against
+Ladybug's 57 ms (pylance: 440 ms). Fetching a hub's edges is no longer the cost: it takes 5 to 8 ms
+warm, since the take cache keeps a dense take's column copy (up to 64 MB) and BTREE dictionary blocks
+are decoded once. What remains is fetching the hub's ~20.8k neighbour nodes. A
+`to_table(filter="id IN (...)")` over those ids costs about 170 ms, while a `take` of the same row ids
+costs 5 ms. Measured phases: filter parse 8 to 13 ms, index candidates 45 to 55 ms, candidate decode
+and filter about 6 ms. About 100 ms is not located yet. The 5 to 8 ms, 170 ms, 5 ms and phase figures are
+the 2026-11-12 measurements; they were not re-measured in the 2026-11-13 run.
 
-- Unindexed IN lists use a hash set (`1636abe`, from `dd3dc04`).
-- Dictionary pages expand only the rows a read asks for (`a0f0ca3`, from `73e1b9c`). That change
-  copied a column's page records once per page in flat decodes, which was quadratic in the page
-  count; `31c9097` fixed the copy.
+Next steps, in order:
+
+1. In nanolance, take an index-resolved IN's candidate rows directly instead of decoding them
+   through the scan path, then find the unlocated ~100 ms.
+2. Re-measure cppognee's `cognee_nanograph` adapter through the index. The adapter reads edges by
+   node id with `pc.is_in` over cached `source_id` / `target_id` columns. An indexed filter is 3x
+   faster for single nodes (7 ms against 22 ms), but `get_neighborhood` was 1.6 to 3.4x slower that
+   way, because its induced-edge step issues IN lists of thousands of ids. Step 1 should change that.
+   The adapter test `test_node_edge_lookups_read_both_directions_with_quoted_ids` pins the behaviour
+   the switch must keep.

@@ -20,7 +20,7 @@ Lance's protobuf metadata. A program links only the parts it calls: a writer of 
 
 ## What it does
 
-- **Files:** writes Lance file format 2.2 and reads 2.0, 2.1 and 2.2, with Lance's encodings:
+- **Files:** writes Lance file format 2.2 and reads 2.0 to 2.3, with Lance's encodings:
   bitpacking, run-length, dictionary, FSST, byte-stream split, zstd and LZ4, constant and all-null pages,
   mini-block and full-zip layouts, nested and repeated columns ([src/encoding](src/encoding/README.md),
   [src/file](src/file/README.md)).
@@ -118,9 +118,15 @@ cmake --build build
 ctest --test-dir build -L smoke               # or -L layer:table for one layer's tests
 ```
 
-CMake 3.22+ and a C++20 compiler (GCC 12 or later, Clang, AppleClang); the first configure fetches nanoarrow, zstd,
-nanom and CLI11. Behind a firewall, `NANOLANCE_GIT_BASE` points every fetch at a mirror
-([docs/BUILDING_BEHIND_A_FIREWALL.md](docs/BUILDING_BEHIND_A_FIREWALL.md)).
+CMake 3.22+ and a C++23 compiler to build (GCC 12 or later, Clang, AppleClang; the public headers are C++20, so a
+consumer needs C++20); the first configure fetches nanoarrow, zstd, nanom and CLI11. Behind a firewall,
+`NANOLANCE_GIT_BASE` points every fetch at a mirror ([docs/BUILDING_BEHIND_A_FIREWALL.md](docs/BUILDING_BEHIND_A_FIREWALL.md)).
+
+**Platforms.** Linux (`linux-bench.yml`; ASan and UBSan in `memory-safety.yml`) and macOS (`macos-15`, `ci-platforms.yml`) build the library and run `ctest` on pushes that change it.
+Windows (MSVC, `windows-2022`) runs the same job by hand; its test suite passes there, and the bash smoke tests are
+disabled on Windows. File names are UTF-8 on every platform ([src/base/utf8_path.hpp](src/base/utf8_path.hpp)), and
+the path jail refuses a backslash everywhere and, on Windows, drive-relative names, `:` streams and reserved device
+names ([docs/SAFETY.md](docs/SAFETY.md)).
 
 | Option | Default | |
 |---|---|---|
@@ -182,15 +188,15 @@ test exists and that every module has a test of its own.
 | [base](src/base/README.md#spec-coverage) | 14 | 0 | 0 | 1 | 17/17 |
 | [io](src/io/README.md#spec-coverage) | 7 | 2 | 2 | 0 | 5/7 |
 | [arrow](src/arrow/README.md#spec-coverage) | 18 | 3 | 0 | 1 | 8/8 |
-| [encoding](src/encoding/README.md#spec-coverage) | 22 | 6 | 6 | 1 | 21/22 |
-| [file](src/file/README.md#spec-coverage) | 14 | 3 | 3 | 1 | 4/4 |
+| [encoding](src/encoding/README.md#spec-coverage) | 22 | 8 | 4 | 1 | 21/22 |
+| [file](src/file/README.md#spec-coverage) | 14 | 4 | 2 | 1 | 4/4 |
 | [table](src/table/README.md#spec-coverage) | 37 | 16 | 13 | 1 | 18/18 |
 | [expr](src/expr/README.md#spec-coverage) | 17 | 1 | 3 | 0 | 1/1 |
 | [scan](src/scan/README.md#spec-coverage) | 19 | 2 | 1 | 1 | 1/1 |
 | [index](src/index/README.md#spec-coverage) | 31 | 14 | 9 | 0 | 18/20 |
 | [dataset](src/dataset/README.md#spec-coverage) | 22 | 4 | 0 | 0 | 6/7 |
 | [api](src/api/README.md#spec-coverage) | 13 | 2 | 1 | 0 | 5/9 |
-| **all** | **214** | **53** | **38** | **6** | |
+| **all** | **214** | **56** | **35** | **6** | |
 <!-- spec-summary:end -->
 
 What the tables mark missing is the roadmap's raw material ([docs/ROADMAP.md](docs/ROADMAP.md)).
@@ -207,14 +213,15 @@ nanolance or Lance cannot read back.
 | `timestamp` (with or without an IANA time zone), `date32/64`, `time32/64`, `duration`, `decimal128/256` | round-trips |
 | `struct` (any depth, null structs included), `list`, `large_list`, `map`, `fixed_size_list` | round-trips, with null and empty lists and null items at any level |
 | `null` | round-trips (Lance's all-null page) |
-| `lance.blob.v2` | external references written; inline, packed, dedicated and external blobs read |
+| `lance.blob.v2` | external references written, with null rows (page layout as pylance's, `test_blob_kinds.py`); inline, packed, dedicated and external blobs read, in dataset and standalone files; legacy `lance-encoding:blob` columns read from 2.1 files |
 | Arrow `dictionary` with an integer index over a string, binary or fixed-width type, at the top level | round-trips, stored as Lance stores one (low-cardinality strings are dictionary-encoded on disk anyway) |
-| Arrow `dictionary` inside a `struct` or `list` | read with any integer index; written only with int32 indices (`writing it is not supported unless its indices are int32`). Other dictionary shapes are refused: cast to the value type |
-| `list`, `large_list` or `map` under a `fixed_size_list` of structs | read, from pylance-written 2.2 files, whole, by row range and by take; written refused (`a list or map under a fixed_size_list is read but not written yet`) |
-| `fixed_size_list` of `fixed_size_list` | read, from pylance-written files; written refused (`a fixed_size_list of fixed_size_list is read but not written yet`) |
-| `struct` marked `lance-encoding:packed` | read in 2.1 and 2.2 files when its children are fixed-width; written refused (`a packed struct is read but not written yet`) |
+| Arrow `dictionary` inside a `struct` or `list` | read with any integer index over string or binary values; written only with int32 indices (`writing it is not supported unless its indices are int32`). Other dictionary shapes are refused: cast to the value type |
+| `list`, `large_list` or `map` under a `fixed_size_list` of structs | round-trips at format 2.2, with nulls at every level, whole, by row range and by take; pylance 12 reads it back (`test_fsl_struct_list_write.py`) |
+| `fixed_size_list` of `fixed_size_list` of fixed-width items, at the top level | round-trips, with null rows, inner lists and leaves, whole, by take and by row range; written as pylance 12 writes it: mini-block under 256 bytes of leaves, FullZip from 256 bytes (`test_fsl_of_fsl_wide_layout_matches_pylance`). Pylance's FullZip pages are read too (`test_fsl_of_fsl_fullzip_read.py`); a pylance page with no nulls at all is refused by name, since pylance cannot read that page either. Under a struct or list: written refused (`a fixed_size_list of fixed_size_list under a struct or list is read but not written yet`) |
+| `struct` marked `lance-encoding:packed` | read in 2.1 and 2.2 files when its children are fixed-width or variable-width (`utf8`, `large_utf8`, `binary`, `large_binary`), at the top level or under a list; a packed struct inside another struct or under a map, and a packed child that is null under a list, are refused by name; written refused (`a packed struct is read but not written yet`) |
 | `timestamp` with a UTC-offset zone (`+05:30`) | refused: Lance supports IANA names only |
-| a null element inside a valid `fixed_size_list` row | refused |
+| `fixed_size_list` of a `list`, `large_list` or `map` | refused by name (`fixed_size_list of '+l' is not supported`): pylance 12 refuses the type too, and nanolance used to write a file neither reader could open |
+| `fixed_size_list` with null elements inside valid rows, at the top level or under a list or struct | round-trips, with nulls at every level, whole, by take and by row range. At the top level the page layout is pylance's (mini-block with element validity under 256 bytes, FullZip from 256 bytes; `test_writer_tail.py` compares it with pylance's file); under a list the page layout can differ from pylance's (the rep/def encoding, and where pages are cut), and both readers still read it back equal |
 
 Nulls are stored in every column kind. Files in formats 2.0 to 2.3 are read; nanolance writes 2.2.
 
@@ -236,6 +243,51 @@ Nulls are stored in every column kind. Files in formats 2.0 to 2.3 are read; nan
 - **S3 credentials** are resolved as the AWS tools do (environment, profiles, `credential_process`, ECS/EKS,
   IMDSv2); SSO and assume-role profiles are not: export their credentials first
   ([docs/s3_reader_notes.md](docs/s3_reader_notes.md)).
+
+## Configuration
+
+nanolance reads these environment variables; none is needed. An unset or empty variable takes the default. "Once"
+means the value is read the first time the code needs it and kept for the process, so setting it later has no
+effect. "Per call" means it is read each time the code path runs. Defaults are quoted from the code
+(`src/`, `include/`).
+
+| Variable | Default | Effect | Change it when | Read |
+|---|---|---|---|---|
+| `NANOLANCE_THREADS` | the CPUs in the process's affinity mask | Threads for reads and writes, the calling thread included; `1` starts no worker. Files do not depend on it. | Sharing a machine, or profiling one thread. | Once, when the thread count is first decided (again on `set_threads(0)`). |
+| `NANOLANCE_INDEX_PAGE_CACHE_MB` | `64` | Budget for decoded BTREE index windows, least recently used first out. `0` keeps none. | A lookup over a large index keeps missing (`index_page_cache_misses`). | Once. |
+| `NANOLANCE_DICT_CACHE_MB` | `64` | Budget for decoded dictionary blocks, least recently used first out. `0` decodes every block again. | A lookup over dictionary pages keeps decoding blocks (`dictionary_blocks_decoded`). | Once. |
+| `NANOLANCE_TAKE_CACHE_MB` | `256` | Budget for decoded columns that `take` keeps. A column is cached only if its encoded pages are at most 64 MB, and its first copy is filled by a take of at least one row in 64 (a sparse take reads the chunks holding its rows); entries unused for 10 s are dropped when a new one would not fit. `0` turns the cache off. | Repeated takes (say, training epochs) decode again each time, or memory is tight. | Once. |
+| `NANOLANCE_BUFFER_POOL_MB` | `128` | Budget for idle decoded output buffers reused across calls; buffers idle for 2 s are dropped. `0` turns the pool off. | Allocation dominates a workload, or memory is tight. | Once. |
+| `NANOLANCE_LIST_WINDOW_KB` | `4096` | Size of the chunk windows a MiniBlock list page is decoded in; a window is what a decode holds at once, not the whole page. | Peak memory on very large list pages. | Once. |
+| `NANOLANCE_MORSEL_KB` | `4096` | Smallest row range (in encoded bytes) that a parallel read is cut into. | Parallel reads of small amounts of data are slower than a single thread. | Once. |
+| `NANOLANCE_FTS_EXHAUSTIVE` | unset | Exactly `1` turns off top-k pruning in full-text search, so every document is scored. | Checking a ranking against the exhaustive answer. | Once. |
+| `NANOLANCE_NO_AVX2` | unset | Any value other than `0` uses the baseline (non-AVX2) dot-product kernel for vector search. | Ruling out the AVX2 kernel when debugging a vector result. | Once. |
+| `NANOLANCE_COMMIT_ATTEMPTS` | `20` on a local path, `200` on an object store | Attempts at one commit before it gives up on conflicts, from `1` to `100000`. | Many writers commit to one dataset at once. | Per call. |
+| `NANO_LANCE_BLOB_BASE_DIR` | unset (no limit) | `file://` blob reads must lie under this directory. A `..` component is refused either way. | Blob descriptors come from data you do not trust. | Per call. |
+| `NANOLANCE_TMPDIR` | the system temporary directory, else `/tmp` | Where an S3 write spills to a temporary file once it passes its in-memory limit. | The system temporary directory is small. | Per temporary file. |
+| `LANCE_CPU_THREADS` | unset | Compute threads for an HNSW vector query. Set, it replaces the default below. | Limiting vector search CPU use. | Per query. |
+| `LANCE_IO_CORE_RESERVATION` | `2` | Cores kept back from HNSW query compute when `LANCE_CPU_THREADS` is unset. | Leaving more or fewer cores for I/O. | Per query. |
+| `LANCE_LANGUAGE_MODEL_HOME` | `$XDG_DATA_HOME/lance/language_models` (when `XDG_DATA_HOME` is an absolute path), else `~/.local/share/lance/language_models`; macOS `~/Library/Application Support/lance/language_models`; Windows `%LOCALAPPDATA%\lance\language_models` | Where the jieba and lindera dictionaries are read from. nanolance never downloads them. | The models are installed elsewhere. | Per tokenizer setup. |
+| `LINDERA_CONFIG_PATH` | unset (an empty config, with no dictionary) | Lindera config file, used for a model directory that has no `config.yml` of its own. | A lindera model directory without its own config. | Per model load. |
+
+### Work counters
+
+Tests and diagnostics read process-wide counters of the work nanolance did. Python returns them from
+`nanolance._work_stats()` (a dict) and `nanolance._reset_work_stats()` zeroes them; C has `nano_lance_work_stats()`
+(a `NanoLanceWorkStats`) and `nano_lance_reset_work_stats()`. The fields have the same names in both. They are not a
+stable API. The seven below are the cache, dictionary and index counters; the rest (`data_bytes_read`, `data_reads`,
+`largest_read`, `page_windows`, `read_morsels`, `fragment_reads`, and the write and buffer-pool counters) are listed
+in [include/nanolance/work_stats.hpp](include/nanolance/work_stats.hpp).
+
+| Counter | Counts |
+|---|---|
+| `index_page_cache_hits` | BTREE index windows served from the decoded-window cache (`NANOLANCE_INDEX_PAGE_CACHE_MB`). |
+| `dictionary_blocks_decoded` | Dictionary blocks decompressed and parsed (not served from `NANOLANCE_DICT_CACHE_MB`). |
+| `dictionary_cache_hits` | Dictionary blocks served from the decoded-block cache. |
+| `index_page_cache_misses` | BTREE index windows read from the index file. |
+| `take_cache_hits` | `take` columns served from a decoded copy (`NANOLANCE_TAKE_CACHE_MB`). |
+| `dict_rows_expanded` | Rows a dictionary page copied its values out for. |
+| `index_evaluations` | Predicate evaluations over index values, one bind each. |
 
 ## Testing
 

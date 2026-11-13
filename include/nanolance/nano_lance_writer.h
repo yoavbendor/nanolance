@@ -105,10 +105,8 @@ int nano_lance_writer_init_append(NanoLanceWriter* writer, const char* path, int
 /// the flag rejected essentially every real table (pyarrow marks all fields nullable) while
 /// protecting nothing: what needed guarding is a null *value*, not a nullable *flag*.
 ///
-/// A batch that actually contains a null is refused at write_batch, with a message naming the column
-/// and row. nanolance writes no Lance validity information, so a null slot has nowhere to go; it used
-/// to be written as the slot's raw bytes, silently turning [10, null, 30] into [10, 0, 30] -- and
-/// stock Lance read those wrong values back without complaint. Fill or drop nulls before writing.
+/// Nulls are written as Lance writes them (definition levels, at every depth), so a null reads back as a null,
+/// never as its slot's raw bytes.
 int nano_lance_writer_set_ignore_nullability(NanoLanceWriter* writer, bool ignore_nullability);
 /// Opt in to URI-dictionary encoding for `lance.blob.v2` external columns: store each distinct URI
 /// once and reference it per row by index. Much smaller when many rows point at one object, but the

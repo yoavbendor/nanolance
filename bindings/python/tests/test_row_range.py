@@ -19,7 +19,7 @@ import pytest
 
 import nanolance
 from tests.support import require_pylance
-from tests.test_write_encoding_matrix import SHAPES
+from tests.test_write_encoding_matrix import ALONE, SHAPES
 
 N = 20_000
 ROWS_PER_FRAGMENT = 6_000  # -> fragments of 6000, 6000, 6000, 2000
@@ -38,8 +38,9 @@ def _expected(full, offset, length):
 
 @pytest.fixture(scope="module")
 def every_shape(tmp_path_factory):
-    """One dataset holding every encoding, written across four fragments."""
-    combined = pa.table({name: table.column("c") for name, table, _ in SHAPES})
+    """One dataset holding every encoding, written across four fragments. The ALONE shapes are left out:
+    pylance 12 cannot read them beside other columns (test_write_encoding_matrix covers them alone)."""
+    combined = pa.table({name: table.column("c") for name, table, _ in SHAPES if name not in ALONE})
     path = tmp_path_factory.mktemp("range") / "every_shape.lance"
     with nanolance.LanceWriter(path, max_rows_per_fragment=ROWS_PER_FRAGMENT) as writer:
         for batch in combined.to_batches(max_chunksize=2_000):

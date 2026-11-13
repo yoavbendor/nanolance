@@ -317,6 +317,24 @@ bool chunk_items(const std::vector<std::uint8_t>& meta, std::uint64_t value_byte
     return true;
 }
 
+/// The size of a layer's child domain: a list's child slots, or a fixed-size list's slots times their dimension (the
+/// elements it holds). False when that overflows.
+bool child_domain(const SparseLayer& layer, std::uint64_t& out) {
+    if (layer.kind == SparseLayer::Kind::kList) {
+        out = layer.num_child_slots;
+        return true;
+    }
+    if (layer.kind == SparseLayer::Kind::kFixedSizeList) {
+        if (layer.dimension != 0U && layer.num_slots > ~std::uint64_t{0} / layer.dimension) {
+            return false;
+        }
+        out = layer.num_slots * layer.dimension;
+        return true;
+    }
+    out = layer.num_slots;
+    return true;
+}
+
 bool unravel(const SparseLayout& layout, std::uint64_t rows, bool leaf_nullable,
              const std::vector<std::vector<std::uint8_t>>& buffers, std::vector<UnraveledLayer>& out,
              std::string& error) {
@@ -367,9 +385,21 @@ bool unravel(const SparseLayout& layout, std::uint64_t rows, bool leaf_nullable,
                 }
                 break;
             }
-            case SparseLayer::Kind::kFixedSizeList:
-                error = "sparse layout has a fixed-size-list layer, which nanolance does not read yet";
-                return false;
+            case SparseLayer::Kind::kFixedSizeList: {
+                // Its slots hold `dimension` elements each; the only set is the slots' validity.
+                if (layer.dimension == 0U) {
+                    error = "sparse layer " + std::to_string(i) + " is a fixed-size list of dimension 0";
+                    return false;
+                }
+                if (needs_buffer(layer.validity.positions) && !take_buffer(buffers, next, buffer, error)) {
+                    return false;
+                }
+                if (!materialize_validity(layer.validity, layer.num_slots, buffer, d.valid, error)) {
+                    error = "sparse layer " + std::to_string(i) + ": " + error;
+                    return false;
+                }
+                break;
+            }
         }
     }
     if (next != buffers.size()) {
@@ -378,8 +408,20 @@ bool unravel(const SparseLayout& layout, std::uint64_t rows, bool leaf_nullable,
         return false;
     }
 
-    // Pass 2: the domains must chain from the page's rows down to its leaf items.
-    if (n != 0U && layout.layers[0].num_slots != rows) {
+    // Pass 2: the domains must chain from the page's rows down to its leaf items. A page's rows are its outer layer's
+    // slots times the dimension of every fixed-size-list layer in it (Lance counts a fixed-size list's elements as the
+    // page's rows, as the nested levels of a fixed-size list do).
+    std::uint64_t fsl_scale = 1;
+    for (const auto& layer : layout.layers) {
+        if (layer.kind == SparseLayer::Kind::kFixedSizeList) {
+            if (layer.dimension != 0U && fsl_scale > ~std::uint64_t{0} / layer.dimension) {
+                error = "sparse fixed-size-list layers are too large";
+                return false;
+            }
+            fsl_scale *= layer.dimension;
+        }
+    }
+    if (n != 0U && layout.layers[0].num_slots * fsl_scale != rows) {
         error = "sparse outer layer has " + std::to_string(layout.layers[0].num_slots) + " slots for a page of " +
                 std::to_string(rows) + " rows";
         return false;
@@ -392,9 +434,11 @@ bool unravel(const SparseLayout& layout, std::uint64_t rows, bool leaf_nullable,
     for (std::size_t i = 0; i < n; ++i) {
         const auto& layer = layout.layers[i];
         const std::uint64_t child = i + 1U < n ? layout.layers[i + 1U].num_slots : leaf_items;
-        const std::uint64_t child_slots = layer.kind == SparseLayer::Kind::kList
-                                              ? layer.num_child_slots
-                                              : layer.num_slots;
+        std::uint64_t child_slots = 0;
+        if (!child_domain(layer, child_slots)) {
+            error = "sparse fixed-size-list layer " + std::to_string(i) + " is too large";
+            return false;
+        }
         if (child_slots != child) {
             error = "sparse layer " + std::to_string(i) + " has a child domain of " + std::to_string(child_slots) +
                     " slots, the next layer has " + std::to_string(child);
@@ -431,6 +475,32 @@ bool unravel(const SparseLayout& layout, std::uint64_t rows, bool leaf_nullable,
         u.length = layer.num_slots;
         if (layer.kind == SparseLayer::Kind::kValidity) {
             finish_validity(d.valid, u.length, u);
+            u.kind = u.null_count != 0U ? repdef::kNullableItem : repdef::kAllValidItem;
+        } else if (layer.kind == SparseLayer::Kind::kFixedSizeList) {
+            // Its entries are the elements its slots hold: `dimension` a slot, each taking its slot's validity (Arrow
+            // counts a fixed-size list's elements in its layer, as the dense fixed-size-list layers do).
+            std::uint64_t elements = 0;
+            if (!child_domain(layer, elements)) {
+                error = "sparse fixed-size-list layer " + std::to_string(step) + " is too large";
+                return false;
+            }
+            u.length = elements;
+            u.fsl_items = layer.dimension;
+            u.validity.assign(static_cast<std::size_t>((elements + 7U) / 8U), 0U);
+            for (std::uint64_t slot = 0; slot < layer.num_slots; ++slot) {
+                const bool valid = is_valid(d.valid, slot);
+                for (std::uint64_t k = 0; k < layer.dimension; ++k) {
+                    const std::uint64_t e = slot * layer.dimension + k;
+                    if (valid) {
+                        u.validity[static_cast<std::size_t>(e >> 3U)] |= static_cast<std::uint8_t>(1U << (e & 7U));
+                    } else {
+                        ++u.null_count;
+                    }
+                }
+            }
+            if (u.null_count == 0U) {
+                u.validity.clear();
+            }
             u.kind = u.null_count != 0U ? repdef::kNullableItem : repdef::kAllValidItem;
         } else {
             // Offsets over the parent slots: a non-empty slot takes its count of child slots; a valid
@@ -471,9 +541,16 @@ bool unravel(const SparseLayout& layout, std::uint64_t rows, bool leaf_nullable,
         }
         out.push_back(std::move(u));
     }
-    if (out.back().length != rows) {
-        error = "sparse layers describe " + std::to_string(out.back().length) + " rows, the page " +
-                std::to_string(rows);
+    // The outermost layer's entries: its slots, or a fixed-size list's elements (its slots times the dimension).
+    std::uint64_t outer_entries = rows;  // a flat page: its one entry per row (checked above)
+    if (n != 0U) {
+        const auto& outer = layout.layers[0];
+        outer_entries = outer.kind == SparseLayer::Kind::kFixedSizeList ? outer.num_slots * outer.dimension
+                                                                        : outer.num_slots;
+    }
+    if (out.back().length != outer_entries) {
+        error = "sparse layers describe " + std::to_string(out.back().length) + " entries, the page's outer layer " +
+                std::to_string(outer_entries);
         return false;
     }
     return true;

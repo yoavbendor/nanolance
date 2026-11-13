@@ -49,22 +49,29 @@ Lifecycle rules:
   `write_batch` and only says so at runtime (`INVALID_STATE`).
 - **Nulls are stored** via Lance's definition-level layer, and stock Lance reads them back: in
   fixed-width columns (int, float, bool, timestamp/date/time, decimal, `fixed_size_binary`) and in
-  variable-width ones (`utf8`, `binary`). Still refused, by name: a null **struct** (as opposed to a
-  null field inside one), and a null in a `lance.blob.v2` external-reference column.
+  variable-width ones (`utf8`, `binary`). A null **struct** (as opposed to a null field inside one) is stored
+  as its own definition level, at any depth and under lists, as Lance stores it (`test_lance_parity.py`,
+  `test_lance_list_writes.py`). A null row in a `lance.blob.v2` column is stored too, external references
+  included, with pylance's page layout (`test_blob_kinds.py::test_null_external_references_written_as_pylance_writes_them`).
   `nano_lance_writer_set_ignore_nullability` is a no-op kept for compatibility; the manifest's
   nullable flag now mirrors the Arrow schema, as pylance's does.
 - Types nanolance cannot round-trip are refused at `write_batch` rather than written, each by name: a
-  `timestamp` whose timezone is a UTC offset rather than an IANA name (Lance panics on those), a list of
-  `fixed_size_list`, a list or map under a `fixed_size_list` of structs (`a list or map under a fixed_size_list is read but not written yet`), a null element inside a valid `fixed_size_list` row, a `fixed_size_list` of
-  `fixed_size_list` (`a fixed_size_list of fixed_size_list is read but not written yet`), a struct marked
+  `timestamp` whose timezone is a UTC offset rather than an IANA name (Lance panics on those), a
+  `fixed_size_list` of a list, large list or map (`fixed_size_list of '+l' is not supported`; pylance refuses
+  the type too), a `fixed_size_list` of `fixed_size_list` under a struct or list (`a fixed_size_list of fixed_size_list under a
+  struct or list is read but not written yet`; at the top level it is written, with nulls at both levels), a
+  `fixed_size_list` of structs under a struct or list (`a fixed_size_list of structs inside a struct or list is
+  not written yet`), a struct marked
   `lance-encoding:packed` (`a packed struct is read but not written yet`), and a dictionary inside a struct
   or list with non-int32 indices (`writing it is not supported unless its indices are int32`). Top-level
   Arrow dictionaries with an integer index are written. Everything else round-trips, including
   `list`/`large_list`/`map` at any nesting depth, `large_utf8`/`large_binary`, `float16`, `duration` and
   `fixed_size_list` vectors -- README "Types" is the exact table.
 - nanolance reads back everything it writes, and the columns the Rust `lance` crate writes for those
-  types, nested ones included, and reads more than it writes: format 2.0 to 2.3 files, packed structs,
-  the sparse page layout, and fixed-size lists of fixed-size lists (README "Types").
+  types, nested ones included, and reads more than it writes: format 2.0 to 2.3 files, packed structs
+  (fixed- and variable-width children), the sparse page layout, legacy blob columns (2.1), blob v2 structs
+  in standalone files, fixed-size lists of fixed-size lists, and lists of fixed-size lists of structs
+  (README "Types").
 - `commit(is_append=false)` creates; `commit(is_append=true)` (or `nano_lance_writer_init_append`)
   adds a fragment to an existing dataset.
 
@@ -315,7 +322,8 @@ Two repo rules that came out of the same incident:
 ## 8. Delegated sessions and remote reads
 
 - Delegating work to another model session: follow `docs/DELEGATION.md` (brief format, stop rules,
-  run-once test rules, what the reviewer checks). Current state and open items: `docs/NEXT_WEEK.md`.
+  run-once test rules, what the reviewer checks). Current state and open items: the **Status** lines of
+  `docs/ROADMAP.md` (`docs/NEXT_WEEK.md` is a snapshot of 2026-10-17).
 - File I/O on read paths goes through `io::ByteSource` (`include/nanolance/byte_source.hpp`), never
   `std::ifstream` or `std::filesystem` directly, so the reader keeps working from `https://` in the
   WebAssembly build (`wasm/`). Writers and maintenance (cleanup, drop) stay on local files.
