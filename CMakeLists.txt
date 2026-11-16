@@ -650,6 +650,13 @@ if(NANOLANCE_BUILD_FUSE_EXAMPLE)
     add_subdirectory(examples/fuselance)
 endif()
 
+# ndjson2lance -- mixed JSON-lines logs in, one Lance table per record shape out. Off by default: it
+# fetches simdjson_arrow (and with it simdjson) at configure time. Independent of NANOLANCE_BUILD_EXAMPLES.
+option(NANOLANCE_BUILD_NDJSON2LANCE "Build the ndjson2lance example (fetches simdjson_arrow)" OFF)
+if(NANOLANCE_BUILD_NDJSON2LANCE)
+    add_subdirectory(examples/ndjson2lance)
+endif()
+
 if(NOT NANOLANCE_BUILD_TESTS)
     return()
 endif()
