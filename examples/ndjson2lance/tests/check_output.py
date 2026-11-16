@@ -107,17 +107,11 @@ def project(value, typ):
     return value
 
 
-def read_table(path, interop):
-    """The table as a pyarrow Table, read by pylance. If pylance cannot read it, the content is read
-    by nanolance instead, and the pylance failure is recorded in interop (a failure of the run)."""
-    try:
-        return lance.dataset(str(path)).to_table()
-    except Exception as error:  # noqa: BLE001 - pylance's error types vary by version
-        first = str(error).splitlines()[0][:200]
-        interop.append(f"{path.name}: pylance cannot read it: {first}")
-        import nanolance  # the repo's own reader; only needed for this fallback
-
-        return pa.table(nanolance.read_table(str(path)))
+def column_sources(schema_json):
+    """{column name as written: key name in the input}. A renamed column (a dot in the key) carries
+    its key in "source_name" in the catalog's schema."""
+    schema = json.loads(schema_json)
+    return {child["name"]: child.get("source_name", child["name"]) for child in schema["children"]}
 
 
 def main(argv):
@@ -128,7 +122,6 @@ def main(argv):
     truth = json.loads(pathlib.Path(argv[3]).read_text(encoding="utf-8"))
     mode = argv[4]
     failures = []
-    interop = []
 
     def check(ok, message):
         if not ok:
@@ -204,11 +197,21 @@ def main(argv):
                   f"{objects[0]}/{objects[-1]}")
         expected_rejects.update(reject_lines)
 
-        table = read_table(out / f"{row['table']}.lance", interop)
+        try:
+            table = lance.dataset(str(out / f"{row['table']}.lance")).to_table()
+        except Exception as error:  # noqa: BLE001 - pylance's error types vary by version
+            failures.append(f"{row['table']}: pylance cannot read the table: "
+                            f"{str(error).splitlines()[0][:200]}")
+            continue
         got = table.to_pylist()
+        sources = column_sources(row["schema"])
+        check(list(sources) == table.schema.names,
+              f"{row['table']}: columns {table.schema.names} differ from the catalog's {list(sources)}")
         root = pa.struct(list(table.schema))
         try:
-            want = [project(lines[n][2], root) for n in table_lines]
+            # The value as the writer sees it: each top-level column reads its source key.
+            want = [project({col: lines[n][2].get(src) for col, src in sources.items()}, root)
+                    for n in table_lines]
         except ValueError as error:
             failures.append(f"{row['table']}: {error}")
             continue
@@ -269,8 +272,6 @@ def main(argv):
         print(f"  failed {table}: {status}" + ("  [known list<null> gap]" if known_gap else ""))
         if not known_gap:
             failures.append(f"{table} failed for a reason other than the null gap: {status}")
-    for message in interop:
-        failures.append("interop: " + message)
     if failures:
         print(f"FAIL ({len(failures)})")
         for message in failures[:50]:

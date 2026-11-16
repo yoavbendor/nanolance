@@ -166,6 +166,14 @@ class Sink {
                NANO_LANCE_OK;
     }
 
+    // Unstaged: while held, the writer buffers every row until publish() (no automatic commits).
+    // Staged: rows only become visible at finish(), so there is nothing to hold.
+    bool hold(bool on) {
+        if (staged_) return true;
+        return nano_lance_writer_set_max_pending_bytes(writer_.handle(),
+                                                       on ? 0 : options_.table_bytes) == NANO_LANCE_OK;
+    }
+
     bool finish() {
         if (!staged_) return true;
         uint64_t version = 0;
@@ -348,8 +356,12 @@ class Heap {
     // The table's schema as compact JSON, or "" when it was never locked.
     std::string schema_json() const {
         if (!has_schema_) return "";
-        std::string out;
-        append_field_json(&out, schema_);
+        std::string out = "{\"name\":\"\",\"type\":\"struct\",\"nullable\":false,\"children\":[";
+        for (size_t i = 0; i < schema_.children.size(); ++i) {
+            if (i != 0) out += ',';
+            append_field_json(&out, schema_.children[i], column_names_[i]);
+        }
+        out += "]}";
         return out;
     }
 
@@ -473,14 +485,20 @@ class Heap {
     // Exports the schema, creates the table, and writes the first dump: the batches learning inferred
     // from every staged line.
     void lock(const simdjson_arrow::field& schema, Batches& batches) {
-        const simdjson_arrow::status exported = simdjson_arrow::export_schema(schema, &arrow_schema_);
+        schema_ = schema;
+        has_schema_ = true;
+        for (const simdjson_arrow::field& c : schema_.children) known_.insert(c.name);
+        // The writer gets the renamed schema; the reads keep the keys as they are.
+        column_names_ = writer_column_names(schema_);
+        simdjson_arrow::field writer_schema = schema_;
+        for (size_t i = 0; i < writer_schema.children.size(); ++i) {
+            writer_schema.children[i].name = column_names_[i];
+        }
+        const simdjson_arrow::status exported = simdjson_arrow::export_schema(writer_schema, &arrow_schema_);
         if (!exported.ok()) {
             drop_staged_as_unwritable("cannot export the schema: " + exported.message);
             return;
         }
-        schema_ = schema;
-        has_schema_ = true;
-        for (const simdjson_arrow::field& c : schema_.children) known_.insert(c.name);
         if (!sink_.open()) {
             drop_staged_as_unwritable("cannot create the table: " + sink_.error());
             return;
@@ -499,6 +517,30 @@ class Heap {
         state_ = State::locked;
     }
 
+    // pylance refuses a top-level column name with a dot, so the writer's schema names each such
+    // column with '.' replaced by '_'. A renamed name equal to another top-level name gets _2, _3,
+    // ... (names without a dot keep theirs). Reads still match keys by their original names.
+    static std::vector<std::string> writer_column_names(const simdjson_arrow::field& schema) {
+        std::unordered_set<std::string> taken;
+        for (const simdjson_arrow::field& c : schema.children) {
+            if (c.name.find('.') == std::string::npos) taken.insert(c.name);
+        }
+        std::vector<std::string> names;
+        for (const simdjson_arrow::field& c : schema.children) {
+            std::string name = c.name;
+            if (name.find('.') != std::string::npos) {
+                std::replace(name.begin(), name.end(), '.', '_');
+                const std::string base = name;
+                for (int k = 2; taken.count(name) != 0; ++k) {
+                    name = base + "_" + std::to_string(k);
+                }
+                taken.insert(name);
+            }
+            names.push_back(name);
+        }
+        return names;
+    }
+
     void drop_staged_as_unwritable(std::string message) {
         unwritable += lines_.size();
         clear_staged();
@@ -506,15 +548,21 @@ class Heap {
     }
 
     // Writes the staged lines through the locked schema, then publishes them as one version.
+    // The rows are held in the writer until publish(): the writer would otherwise commit part of the
+    // flush by itself when its budget fills, and a flush that fails midway would leave those rows
+    // visible while they are counted unwritable. Held, a failed flush leaves nothing visible, so
+    // its unwritable count is exact.
     void flush() {
         Flush f;
         const uint64_t total = lines_.size();
+        if (!sink_.hold(true)) mark_failed("cannot hold a flush: " + sink_.error());
         write_range(0, lines_.size(), &f);
         if (state_ == State::locked && !sink_.publish()) {
             mark_failed("cannot publish the table: " + sink_.error());
         }
         if (state_ == State::locked) {
             rows += f.written;
+            if (!sink_.hold(false)) mark_failed("cannot release a flush: " + sink_.error());
         } else {
             unwritable += total - f.rejected;
         }
@@ -568,10 +616,16 @@ class Heap {
         return simdjson_arrow::read_ndjson(schema_, text, &batches->items, options);
     }
 
-    // The schema as JSON: {"name","type","nullable"} and "children" for struct and list fields.
-    static void append_field_json(std::string* out, const simdjson_arrow::field& f) {
+    // A field as compact JSON: {"name","type","nullable"} and "children" for struct and list fields.
+    // A top-level column the writer sees under another name also gets "source_name".
+    static void append_field_json(std::string* out, const simdjson_arrow::field& f,
+                                  const std::string& name) {
         *out += "{\"name\":";
-        append_json_string(out, f.name);
+        append_json_string(out, name);
+        if (name != f.name) {
+            *out += ",\"source_name\":";
+            append_json_string(out, f.name);
+        }
         *out += ",\"type\":\"";
         *out += type_name(f.type);
         *out += f.nullable ? "\",\"nullable\":true" : "\",\"nullable\":false";
@@ -579,7 +633,7 @@ class Heap {
             *out += ",\"children\":[";
             for (size_t i = 0; i < f.children.size(); ++i) {
                 if (i != 0) *out += ',';
-                append_field_json(out, f.children[i]);
+                append_field_json(out, f.children[i], f.children[i].name);
             }
             *out += ']';
         }
@@ -628,6 +682,7 @@ class Heap {
     std::string bytes_;       // staged lines, each followed by '\n'
     std::vector<Line> lines_;  // staged lines, in input order
     simdjson_arrow::field schema_;
+    std::vector<std::string> column_names_;  // the names the writer sees, parallel to schema_.children
     bool has_schema_ = false;
     ArrowSchema arrow_schema_{};
     std::unordered_set<std::string> known_;  // top-level keys of the locked schema

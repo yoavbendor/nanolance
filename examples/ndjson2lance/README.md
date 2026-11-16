@@ -76,7 +76,8 @@ line accounting does not balance (a bug).
   in halves until each bad line stands alone, so good lines keep their order.
 - A key the locked schema lacks is counted in `new_key_lines` (skipped on read) or rejected with
   `--strict`.
-- Each flush is a visible version (`--one-version` defers all of them to one).
+- Each flush is a visible version (`--one-version` defers all of them to one). A flush's rows are
+  held in the writer until it publishes, so a flush that fails midway leaves nothing visible.
 - Every non-blank line ends up in a table, in `_rejects.lance`, or counted as unwritable (its table
   failed); the summary asserts that.
 - Memory: about tables x (`--table-mb` + `--flush-mb`), plus the learned rows of tables still
@@ -84,6 +85,6 @@ line accounting does not balance (a bug).
 
 ## Known limits
 
-- pylance 12 cannot read a table whose top-level field name contains a dot (a key like `user.id`):
-  the table opens and counts, but every read fails with "No field named ...". nanolance reads it.
-  Keys with spaces are fine. See the checker's interop failures.
+- A top-level key with a dot is stored with `.` replaced by `_` (`user.id` becomes `user_id`),
+  because pylance 12 cannot read a top-level column name with a dot. A collision gets `_2`, `_3`, ...
+  The catalog's schema keeps the key as `source_name`. Nested dots are unchanged.
