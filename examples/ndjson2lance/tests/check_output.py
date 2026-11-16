@@ -107,6 +107,19 @@ def project(value, typ):
     return value
 
 
+def read_table(path, interop):
+    """The table as a pyarrow Table, read by pylance. If pylance cannot read it, the content is read
+    by nanolance instead, and the pylance failure is recorded in interop (a failure of the run)."""
+    try:
+        return lance.dataset(str(path)).to_table()
+    except Exception as error:  # noqa: BLE001 - pylance's error types vary by version
+        first = str(error).splitlines()[0][:200]
+        interop.append(f"{path.name}: pylance cannot read it: {first}")
+        import nanolance  # the repo's own reader; only needed for this fallback
+
+        return pa.table(nanolance.read_table(str(path)))
+
+
 def main(argv):
     if len(argv) != 5 or argv[4] not in ("keys", "event"):
         sys.exit(__doc__)
@@ -115,6 +128,7 @@ def main(argv):
     truth = json.loads(pathlib.Path(argv[3]).read_text(encoding="utf-8"))
     mode = argv[4]
     failures = []
+    interop = []
 
     def check(ok, message):
         if not ok:
@@ -190,9 +204,9 @@ def main(argv):
                   f"{objects[0]}/{objects[-1]}")
         expected_rejects.update(reject_lines)
 
-        dataset = lance.dataset(str(out / f"{row['table']}.lance"))
-        got = dataset.to_table().to_pylist()
-        root = pa.struct(list(dataset.schema))
+        table = read_table(out / f"{row['table']}.lance", interop)
+        got = table.to_pylist()
+        root = pa.struct(list(table.schema))
         try:
             want = [project(lines[n][2], root) for n in table_lines]
         except ValueError as error:
@@ -255,6 +269,8 @@ def main(argv):
         print(f"  failed {table}: {status}" + ("  [known list<null> gap]" if known_gap else ""))
         if not known_gap:
             failures.append(f"{table} failed for a reason other than the null gap: {status}")
+    for message in interop:
+        failures.append("interop: " + message)
     if failures:
         print(f"FAIL ({len(failures)})")
         for message in failures[:50]:

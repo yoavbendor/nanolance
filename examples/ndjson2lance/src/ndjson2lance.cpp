@@ -31,6 +31,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -401,7 +402,7 @@ class Heap {
         const Line& last = lines_[count - 1];
         const simdjson::padded_string text(bytes_.data(), last.offset + last.length + 1);
         *schema = simdjson_arrow::field();
-        simdjson_arrow::ndjson_options options;
+        simdjson_arrow::ndjson_options options = read_options(0, count);
         const simdjson_arrow::status s = simdjson_arrow::read_ndjson(text, schema, &batches->items, options);
         if (!s.ok()) {
             *reason = s.message;
@@ -546,13 +547,23 @@ class Heap {
         write_range(mid, end, f);
     }
 
+    // simdjson_arrow parses a record within one window of block_size bytes, and a batch is cut at
+    // block_size, so the window must hold the longest line of the read (1 MB is only the default).
+    simdjson_arrow::ndjson_options read_options(size_t begin, size_t end) const {
+        size_t longest = 0;
+        for (size_t i = begin; i < end; ++i) longest = std::max(longest, lines_[i].length + 1);
+        simdjson_arrow::ndjson_options options;
+        options.block_size = std::max(options.block_size, longest);
+        return options;
+    }
+
     simdjson_arrow::status read_range(size_t begin, size_t end, Batches* batches) {
         const Line& first = lines_[begin];
         const Line& last = lines_[end - 1];
         const size_t from = first.offset;
         const size_t to = last.offset + last.length + 1;
         const simdjson::padded_string text(bytes_.data() + from, to - from);
-        simdjson_arrow::ndjson_options options;
+        simdjson_arrow::ndjson_options options = read_options(begin, end);
         options.threads = (to - from) >= kThreadedReadBytes ? options_.threads : 1;
         return simdjson_arrow::read_ndjson(schema_, text, &batches->items, options);
     }
@@ -763,7 +774,9 @@ class Router {
         const bool by_route = !options_.route_key.empty();
         for (auto entry : object) {
             simdjson::ondemand::field field;
-            if (auto e = entry.get(field)) return reject_route(number, p, n, simdjson::error_message(e));
+            if (auto e = std::move(entry).get(field)) {
+                return reject_route(number, p, n, simdjson::error_message(e));
+            }
             std::string_view key;
             if (auto e = field.unescaped_key().get(key)) {
                 return reject_route(number, p, n, simdjson::error_message(e));
@@ -777,9 +790,8 @@ class Router {
                 }
             }
         }
-        bool at_end = false;
-        if (auto e = doc.at_end().get(at_end)) return reject_route(number, p, n, simdjson::error_message(e));
-        if (!at_end) return reject_route(number, p, n, "trailing content after the record");
+        // at_end() is false while the document has trailing content after the object.
+        if (!doc.at_end()) return reject_route(number, p, n, "trailing content after the record");
         std::sort(keys_.begin(), keys_.begin() + static_cast<std::ptrdiff_t>(n_keys_));
         for (size_t i = 1; i < n_keys_; ++i) {
             if (keys_[i] == keys_[i - 1]) {
@@ -910,7 +922,8 @@ bool prepare_out_dir(const fs::path& dir, std::string* error) {
 }
 
 // One row per table: its name, route, counts, first and last input line, schema, and status.
-bool write_catalog(const Options& options, const std::vector<std::unique_ptr<Heap>>& heaps) {
+// Returns "" on success, else why the catalog was not written.
+std::string write_catalog(const Options& options, const std::vector<std::unique_ptr<Heap>>& heaps) {
     BatchBuilder batch({{"table", NANOARROW_TYPE_STRING},
                         {"route", NANOARROW_TYPE_STRING},
                         {"rows", NANOARROW_TYPE_UINT64},
@@ -934,9 +947,15 @@ bool write_catalog(const Options& options, const std::vector<std::unique_ptr<Hea
         batch.str(9, h->status());
         batch.end_row();
     }
-    if (!batch.finish()) return false;
-    Sink sink(options.out_dir / (std::string(kCatalogName) + ".lance"), options, false);
-    return sink.open() && sink.write(batch.array(), batch.schema()) && sink.publish();
+    const std::string name = std::string(kCatalogName) + ".lance";
+    if (!batch.finish()) return "cannot build the catalog batch";
+    // Staged, so that finish() publishes it: an unstaged create commit refuses to run with no rows,
+    // and a catalog of an empty input has none.
+    Sink sink(options.out_dir / name, options, true);
+    if (!sink.open()) return "cannot open " + name + ": " + sink.error();
+    if (!sink.write(batch.array(), batch.schema())) return "cannot write " + name + ": " + sink.error();
+    if (!sink.finish()) return "cannot publish " + name + ": " + sink.error();
+    return "";
 }
 
 int run(const Options& options) {
@@ -974,7 +993,8 @@ int run(const Options& options) {
 
     router.finish();
     const bool rejects_ok = rejects.finish();
-    const bool catalog_ok = write_catalog(options, router.heaps());
+    const std::string catalog_error = write_catalog(options, router.heaps());
+    const bool catalog_ok = catalog_error.empty();
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
@@ -1010,7 +1030,7 @@ int run(const Options& options) {
                  seconds > 0 ? static_cast<double>(rows) / seconds : 0.0);
     if (!fatal.empty()) std::fprintf(stderr, "ndjson2lance: stopped: %s\n", fatal.c_str());
     if (!rejects_ok) std::fprintf(stderr, "ndjson2lance: %s\n", rejects.error().c_str());
-    if (!catalog_ok) std::fprintf(stderr, "ndjson2lance: cannot write %s.lance\n", std::string(kCatalogName).c_str());
+    if (!catalog_ok) std::fprintf(stderr, "ndjson2lance: %s\n", catalog_error.c_str());
 
     if (!balanced) {
         std::fprintf(stderr,
