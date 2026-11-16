@@ -1773,13 +1773,20 @@ bool write_nested_column(std::ostream& out, const LanceField& field, const Colum
         pb::ColumnPage page;
         page.length = n;
         page.priority = row / unit;  // a top-level row number: Lance does not scale it by the lists' sizes
-        if (ser.items.empty()) {
-            // No values at all -- every list empty or null. Lance writes a ConstantLayout with no
-            // value and the levels as raw u16 buffers [rep, def]; so does this.
+        // A null-typed leaf has slots (its null items) but no values to store, so its page is the constant one too.
+        const bool constant_page = ser.items.empty() || field.logical_type == "null";
+        if (constant_page) {
+            // No values at all -- every list empty or null, or every item a null of a null-typed leaf. Lance writes a
+            // ConstantLayout with no value and the levels as raw u16 buffers [rep, def]; so does this.
             descriptor::Constant constant;
             constant.layers.assign(ser.layers.begin(), ser.layers.end());
             constant.num_rep_values = ser.rep.size();
             constant.num_def_values = ser.def.size();
+            // A null-typed leaf's all-null page names its definition levels' encoding, Flat(16) over the raw u16
+            // words, as pylance writes it (the bytes are the same as the unnamed raw form).
+            if (field.logical_type == "null" && !ser.def.empty()) {
+                constant.def_compression = descriptor::flat(16U);
+            }
             std::vector<std::uint8_t> raw_rep;
             std::vector<std::uint8_t> raw_def;
             append_u16_levels(raw_rep, ser.rep);
@@ -1828,7 +1835,7 @@ bool write_nested_column(std::ostream& out, const LanceField& field, const Colum
         row += n;
         // The next page: as many rows as the one just built says fit, a little under the limit. (A
         // page of only empty or null lists has no payload to measure: keep the row count.)
-        if (!ser.items.empty()) {
+        if (!constant_page) {
             const auto per_row = std::max<std::size_t>(1U, built.payload.size() / static_cast<std::size_t>(n));
             try_rows = std::clamp<std::uint64_t>(page_bytes * 7U / 8U / per_row, 1U, kMaxRowsPerPage);
         }

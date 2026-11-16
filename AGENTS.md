@@ -51,7 +51,10 @@ Lifecycle rules:
   fixed-width columns (int, float, bool, timestamp/date/time, decimal, `fixed_size_binary`) and in
   variable-width ones (`utf8`, `binary`). A null **struct** (as opposed to a null field inside one) is stored
   as its own definition level, at any depth and under lists, as Lance stores it (`test_lance_parity.py`,
-  `test_lance_list_writes.py`). A null row in a `lance.blob.v2` column is stored too, external references
+  `test_lance_list_writes.py`). A null-typed child (`list<null>`, `large_list<null>`, `struct<a: null>`,
+  `list<struct<a: null>>`, `map<utf8, null>`) is written as Lance's all-null page: a constant with no value and
+  the levels of the layers above it, as pylance 12 writes it (`test_null_children_write.py`). A null row in a
+  `lance.blob.v2` column is stored too, external references
   included, with pylance's page layout (`test_blob_kinds.py::test_null_external_references_written_as_pylance_writes_them`).
   `nano_lance_writer_set_ignore_nullability` is a no-op kept for compatibility; the manifest's
   nullable flag now mirrors the Arrow schema, as pylance's does.

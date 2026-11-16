@@ -860,9 +860,20 @@ bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, c
     }
     std::string element;
     std::uint64_t items = 0;
-    if (field.logical_type == "null" || lance_extension_is_lance_owned(field.extension_name)) {
-        error = "column '" + field.name + "': a list of " + field.logical_type + " cannot be written yet";
+    if (lance_extension_is_lance_owned(field.extension_name)) {
+        error = "column '" + field.name + "': a " + field.logical_type + " with the extension '" +
+                field.extension_name + "' cannot be written under a list or struct yet";
         return false;
+    }
+    if (field.logical_type == "null") {
+        // Arrow's null type has no buffers: each item is null and only the count is stored. Every item so
+        // far is null too, so the null count is the number of items already held.
+        const auto items_before = out.null_count;
+        out.kind = ColumnValues::Kind::FixedWidth;
+        out.validity.resize(static_cast<std::size_t>((items_before + static_cast<std::uint64_t>(count) + 7U) / 8U),
+                            0U);
+        out.null_count += static_cast<std::uint64_t>(count);
+        return true;
     }
     ArrowArray leaf = *node;
     leaf.offset = at;
