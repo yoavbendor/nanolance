@@ -63,7 +63,7 @@ struct Options {
     size_t threads = 1;
     bool strict = false;
     bool one_version = false;
-    bool compress = false;
+    bool compress = true;  // zstd on string columns; --no-compress turns it off
 };
 
 // Record batches read by simdjson_arrow. Each one is a struct ArrowArray that the caller releases
@@ -1130,7 +1130,9 @@ int main(int argc, char** argv) {
     app.add_flag("--strict", options.strict, "Reject a line with a key the locked schema lacks");
     app.add_flag("--one-version", options.one_version,
                  "Publish each table as one version at the end, not one version per flush");
-    app.add_flag("--compress", options.compress, "zstd-compress string columns");
+    bool no_compress = false;
+    app.add_flag("--no-compress", no_compress,
+                 "Keep string columns uncompressed (zstd is the default)");
 
     try {
         app.parse(argc, argv);
@@ -1142,6 +1144,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     options.out_dir = out_dir;
+    options.compress = !no_compress;
     options.flush_bytes = flush_mb * kMiB;
     options.table_bytes = table_mb * kMiB;
     options.max_line_bytes = max_line_mb * kMiB;
