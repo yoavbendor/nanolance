@@ -149,6 +149,13 @@ calls `lance_dataset_scan_core` instead of `lance_dataset_scan` ([src/scan](src/
 Embedding in another CMake project: `add_subdirectory` with `NANOLANCE_BUILD_TESTS` off, then link `nanolance`
 (`nanolance::nanolance`); `nanolance_reader` alone is enough to fetch external payloads.
 
+## Examples
+
+- [`examples/ndjson2lance`](examples/ndjson2lance/README.md) reads mixed JSON-lines logs and writes one Lance table per
+  record shape, with a catalog and a rejects table. It is off by default (`-DNANOLANCE_BUILD_NDJSON2LANCE=ON`).
+- On a 1 GB stream it takes 6.823 s and 147.9 MB peak RSS, against 38.388 s and 2,191.3 MB for `pyarrow.json` with
+  pylance; output 170.1 MB against 122.7 MB ([bench/ndjson/README.md](bench/ndjson/README.md)).
+
 ## How the code is organized
 
 `src/` is eleven layers, each using only the ones below it (`tools/check_layers.py` checks every include in CI).

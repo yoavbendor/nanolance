@@ -18,13 +18,16 @@ The option is off by default. `NANOLANCE_BUILD_EXAMPLES` is not needed.
 
 ## Quick start
 
+Run from the repository root; the paths are relative to it.
+
 ```
 python3 examples/ndjson2lance/tests/gen_logs.py --seed 1 | ./build/examples/ndjson2lance/ndjson2lance out/
 ```
 
 `out/` must not exist or must be empty. It then holds one `<table>.lance` per record shape,
 `_rejects.lance` (lines that could not be stored, with the reason) and `_catalog.lance` (one row
-per table). Read a table back with pylance or with nanolance's Python package:
+per table). Read a table back with pylance or with nanolance's Python package (`pip install -e
+bindings/python` first):
 
 ```python
 import lance, nanolance, pyarrow as pa
@@ -56,6 +59,12 @@ Route by one field instead of by the set of keys with `--route-key event`.
 Exit status: 0 on success; 1 when a table, the rejects file or the catalog could not be written,
 or the input stopped early (a line longer than `--max-line-mb`, a read error); 2 when the summary's
 line accounting does not balance (a bug).
+
+## Performance
+
+On the 1 GB mixed stream: 6.823 s and 147.9 MB peak RSS, against 38.388 s and 2,191.3 MB for
+`pyarrow.json` with pylance. Output is 170.1 MB against 122.7 MB. Details and the other runs are in
+[bench/ndjson/README.md](../../bench/ndjson/README.md).
 
 ## Design notes
 
