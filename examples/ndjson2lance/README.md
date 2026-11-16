@@ -51,7 +51,7 @@ Route by one field instead of by the set of keys with `--route-key event`.
 | `--max-line-mb N` | 16 | longest accepted line |
 | `--strict` | off | reject a line with a key the locked schema does not have |
 | `--one-version` | off | publish each table as one version at the end, not one per flush |
-| `--compress` | off | zstd-compress string columns |
+| `--no-compress` | off | keep string columns uncompressed; by default they are zstd-compressed |
 
 Exit status: 0 on success; 1 when a table, the rejects file or the catalog could not be written,
 or the input stopped early (a line longer than `--max-line-mb`, a read error); 2 when the summary's
