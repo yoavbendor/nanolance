@@ -26,6 +26,7 @@ import collections
 import io
 import json
 import os
+import shutil
 import sys
 
 import lance
@@ -106,6 +107,7 @@ def main(argv=None):
             lance.write_dataset(table, os.path.join(args.out_dir, f"t{idx:02d}.lance"))
         except OSError:
             # pylance refuses a top-level column name with a dot ("user.id"); the tool renames such keys.
+            shutil.rmtree(os.path.join(args.out_dir, f"t{idx:02d}.lance"), ignore_errors=True)
             unwritable += table.num_rows
             continue
         tables += 1
