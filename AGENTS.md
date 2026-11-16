@@ -80,6 +80,12 @@ Lifecycle rules:
 
 `arrowipc2lance` reads its Arrow IPC stream from `-i/--input FILE` or, with neither given, stdin.
 
+`examples/ndjson2lance` routes mixed JSON-lines records into one Lance table per record shape. It is built with
+`-DNANOLANCE_BUILD_NDJSON2LANCE=ON` (OFF by default) and fetches simdjson through FetchContent; offline, pass
+`-DFETCHCONTENT_SOURCE_DIR_SIMDJSON=...` with a local copy. pylance refuses top-level field names that contain `.`,
+and nanolance's writer still accepts them, so a tool that wants pylance-readable output must rename them:
+ndjson2lance renames `.` to `_`.
+
 Read back with `nano_lance::lance_table_read_dataset(path, schema, batches, error)` (C++,
 `nanolance/lance_table_reader.hpp`) or fetch external bytes with
 `nano_lance_fetch_external_blob(uri, position, size, ...)`.
