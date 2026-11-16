@@ -947,40 +947,53 @@ bool fill_nested_nodes(ColumnPlan& plan, std::int64_t rows, std::map<ArrowArray*
         layers.pop_back();
     }
     // A fixed_size_list node's layer counts its elements (every row's `items`): it becomes one entry a row, valid
-    // when the row's first element says so (Lance marks a null row's elements all null at that layer). Only that layer
-    // changes: the layers above it count the fixed-size list's rows (a list's offsets index them, a struct's validity
-    // is one entry a row), which the layer's rows are once it is converted.
+    // when the row's first element says so (Lance marks a null row's elements all null at that layer). The struct
+    // layers directly above it count the same elements (a struct's validity is one entry per element here, as in
+    // struct<fixed_size_list<struct>>), so each shrinks by the same factor, up to the nearest list: a list's offsets
+    // already index the fixed-size list's rows.
     if (layers.size() == plan.nodes.size()) {
         for (std::size_t k = layers.size(); k-- > 0;) {
             const auto& node = plan.nodes[k];
             if (node.kind != ColumnPlan::Node::Kind::FixedSizeList) {
                 continue;
             }
-            auto& layer = layers[k];
-            if (layer.fsl_rows) {
-                continue;  // converted by the decoder already (a column cut by its layers; see convert_fixed_size_list)
-            }
-            if (layer.is_list || node.items == 0U || layer.length % node.items != 0U) {
-                error = "nested column '" + name + "': a fixed_size_list layer of " + std::to_string(layer.length) +
-                        " elements is not whole rows of " + std::to_string(node.items);
-                return false;
-            }
-            const auto row_count = layer.length / node.items;
-            if (!layer.validity.empty()) {
-                std::vector<std::uint8_t> bits(static_cast<std::size_t>((row_count + 7U) / 8U), 0U);
-                std::uint64_t nulls = 0;
-                for (std::uint64_t r = 0; r < row_count; ++r) {
-                    const auto e = r * node.items;
-                    if (((layer.validity[static_cast<std::size_t>(e >> 3U)] >> (e & 7U)) & 1U) != 0U) {
-                        bits[static_cast<std::size_t>(r >> 3U)] |= static_cast<std::uint8_t>(1U << (r & 7U));
-                    } else {
-                        ++nulls;
-                    }
+            for (std::size_t up = k + 1; up-- > 0;) {
+                auto& layer = layers[up];
+                if (up == k && layer.fsl_rows) {
+                    // Converted by the decoder already (a column cut by its layers; see convert_fixed_size_list).
+                    continue;
                 }
-                layer.validity = std::move(bits);
-                layer.null_count = nulls;
+                if (layer.is_list) {
+                    if (up == k) {
+                        error = "nested column '" + name + "': a fixed_size_list layer of " +
+                                std::to_string(layer.length) + " elements is not whole rows of " +
+                                std::to_string(node.items);
+                        return false;
+                    }
+                    break;
+                }
+                if (node.items == 0U || layer.length % node.items != 0U) {
+                    error = "nested column '" + name + "': a fixed_size_list layer of " + std::to_string(layer.length) +
+                            " elements is not whole rows of " + std::to_string(node.items);
+                    return false;
+                }
+                const auto row_count = layer.length / node.items;
+                if (!layer.validity.empty()) {
+                    std::vector<std::uint8_t> bits(static_cast<std::size_t>((row_count + 7U) / 8U), 0U);
+                    std::uint64_t nulls = 0;
+                    for (std::uint64_t r = 0; r < row_count; ++r) {
+                        const auto e = r * node.items;
+                        if (((layer.validity[static_cast<std::size_t>(e >> 3U)] >> (e & 7U)) & 1U) != 0U) {
+                            bits[static_cast<std::size_t>(r >> 3U)] |= static_cast<std::uint8_t>(1U << (r & 7U));
+                        } else {
+                            ++nulls;
+                        }
+                    }
+                    layer.validity = std::move(bits);
+                    layer.null_count = nulls;
+                }
+                layer.length = row_count;
             }
-            layer.length = row_count;
         }
     }
     if (layers.size() != plan.nodes.size() || layers.empty() ||
