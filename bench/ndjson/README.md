@@ -61,30 +61,25 @@ one group gave three different top-level orders); single-threaded reads give the
 
 ## Results
 
-Medians of 3 runs. Machine: 4 vCPU Intel Xeon @ 2.10 GHz, 15 GB RAM, Linux VM, shared. Input:
-989,133,346 bytes, 900,000 non-blank lines (`gen_logs.py --profile realistic --seed 2 --lines
-900000`). MB = 10^6 bytes. Output bytes are the size of all files under the output directory.
-
-**The timings in this table are noisy.** This run was slower than an earlier run of the same
-configurations on the same machine (the baseline took 96 s here against 48 s before, and single runs
-ranged from 43 to 163 s). Within this run every configuration ran in the same period, so the ratios
-between rows are the more reliable part. A later paired rerun (below) is also shown.
+Medians of 3 runs, `RUNS=3 bench/ndjson/run.sh`. Machine: 4 vCPU Intel Xeon @ 2.10 GHz, 15 GB RAM,
+Linux VM, shared; 1-minute load average 1.0 to 1.9 during the runs. Input: 989,133,346 bytes, 900,000
+non-blank lines (`gen_logs.py --profile realistic --seed 2 --lines 900000`). MB = 10^6 bytes. Output
+bytes are the size of all files under the output directory.
 
 1 GB stream, key mode unless stated:
 
-| config | wall s | input MB/s | rows/s | peak RSS MB | output MB | out/in | tables | rows | rejects | unwritable | load1 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| ndjson2lance (zstd on strings, default) | 9.127 | 108.4 | 96,530 | 147.9 | 170.1 | 0.172 | 7 | 880,999 | 19,001 | 0 | 0.86 |
-| ndjson2lance `--no-compress` | 5.716 | 173.1 | 154,135 | 140.0 | 816.8 | 0.826 | 7 | 880,999 | 19,001 | 0 | 1.22 |
-| ndjson2lance default, `--threads 4` | 6.772 | 146.1 | 130,093 | 168.7 | 170.1 | 0.172 | 7 | 880,999 | 19,001 | 0 | 1.36 |
-| ndjson2lance default, `--route-key event` | 13.476 | 73.4 | 65,378 | 127.9 | 170.2 | 0.172 | 6 | 880,999 | 19,001 | 0 | 1.55 |
-| baseline | 96.452 | 10.3 | 6,984 | 2,133.5 | 122.7 | 0.124 | 6 | 673,623 | 1,837 | 224,540 | 1.22 |
-| baseline `--route-key event` | 47.714 | 20.7 | 14,118 | 2,175.5 | 122.8 | 0.124 | 5 | 673,623 | 1,837 | 224,540 | 1.75 |
+| config | wall s | input MB/s | rows/s | peak RSS MB | output MB | out/in | tables | rows | rejects | unwritable |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| ndjson2lance (zstd on strings, default) | 6.823 | 145.0 | 129,120 | 147.9 | 170.1 | 0.172 | 7 | 880,999 | 19,001 | 0 |
+| ndjson2lance `--no-compress` | 5.297 | 186.7 | 166,321 | 140.1 | 816.8 | 0.826 | 7 | 880,999 | 19,001 | 0 |
+| ndjson2lance default, `--threads 4` | 6.804 | 145.4 | 129,476 | 173.7 | 170.1 | 0.172 | 7 | 880,999 | 19,001 | 0 |
+| ndjson2lance default, `--route-key event` | 6.921 | 142.9 | 127,297 | 127.9 | 170.2 | 0.172 | 6 | 880,999 | 19,001 | 0 |
+| baseline | 38.388 | 25.8 | 17,548 | 2,191.3 | 122.7 | 0.124 | 6 | 673,623 | 1,837 | 224,540 |
+| baseline `--route-key event` | 40.364 | 24.5 | 16,689 | 2,237.6 | 122.8 | 0.124 | 5 | 673,623 | 1,837 | 224,540 |
 
-Paired rerun, run after the table was measured, alternating the two modes, one run each (wall s):
-default 7.08, 7.23, 6.85 (median 7.08); `--no-compress` 6.32, 5.72, 7.36 (median 6.32). Event route:
-default 6.83, 6.76; `--no-compress` 5.45, 5.56. So zstd costs about 0.5 to 1.3 s per run here, which is
-7 to 25% of the wall time. The 13.5 s event median above is the slow period, not the route.
+zstd costs about 1.5 s of 6.8 s here (22%) and cuts the output 4.8 times. An earlier, more loaded run
+of the same script gave slower and noisier timings on both sides (single baseline runs from 43 to
+163 s); the ratios between rows were similar.
 
 GH Archive hour `2026-11-15-12.json.gz` (7.6 MB gzipped, 19,151 lines), `--route-key type`:
 
@@ -125,8 +120,8 @@ from `baseline.py`; both were read back with pylance.
   cannot differ, but the value check cannot see an int-versus-float difference on its own; the schema
   check covers that.
 
-The comparison scripts are in `/tmp/claude-0/-home-user/a0827d52-7706-57a6-8b39-5dcfa0bb3d61/scratchpad/types/`
-(`schema_cmp.py`, `value_cmp.py`), not in the repository.
+The comparison scripts are `schema_cmp.py` and `value_cmp.py` in this directory; run them on a tool
+output directory and a baseline output directory (run.sh deletes its outputs, so write them by hand).
 
 ## Why the baseline loses rows
 
@@ -181,22 +176,16 @@ what was made.
 
 ## Interpretation
 
-- Speed and memory: the tool is faster and uses less memory than the baseline in every configuration
-  here. In the table, key mode is 10.6 times faster with zstd and 16.9 times faster without, and the
-  event route is 3.5 times faster with zstd. The baseline's peak RSS is 2.1 GB against 128 to 169 MB for
-  the tool (13 to 17 times less). The baseline holds every group in memory, while the tool writes one
-  flush at a time. The ratios come from one noisy period; the paired rerun puts the tool at about 7 s
-  against the baseline's 48 s in the earlier, calmer run.
-- Size: the default output is 170 MB, 1.4 times the baseline's 122.7 MB. Without zstd the tool's output is
-  816.8 MB. Per row, the tables both sides wrote come within about 6% of the baseline with zstd and were
-  4.7 to 5.2 times larger without it.
-- Compression cost: zstd added 0.5 to 1.3 s per run in the paired reruns, with peak RSS about 8 to 13
-  MB higher. That is a real but modest cost for a file 4.8 times smaller.
-- `--threads 4` gave 6.8 s against 9.1 s median for threads 1 in this run, but the paired runs show the
-  threads 1 default at about 7 s, so no speedup is claimed. The outputs are identical with one or four
-  threads (C).
-- Event routing (`--route-key event`) writes 6 tables and the same rows; its speed differs from key
-  routing only within the noise of this run.
+- Speed and memory: the tool is 5.6 times faster than the baseline with zstd (6.8 s against 38.4 s) and
+  7.2 times faster without it, with 13 to 17 times less peak memory (128 to 174 MB against 2.2 GB). The
+  baseline holds every group in memory; the tool writes one flush at a time.
+- Size: the default output is 170 MB, 1.4 times the baseline's 122.7 MB, and the tables both sides wrote
+  are within about 6% per row. The remaining gap is the long `detail` column: pylance uses FSST, the tool
+  zstd (see "Output size and compression"). Without zstd the output is 816.8 MB.
+- Compression cost: about 1.5 s of 6.8 s, and about 8 MB more peak RSS, for a file 4.8 times smaller.
+- `--threads 4` gave no speedup (6.80 s against 6.82 s); the router is one thread. The outputs are
+  identical with one or four threads (C).
+- Event routing writes 6 tables and the same rows at the same speed as key routing.
 
 ## Not done
 
