@@ -162,6 +162,7 @@ encoding per column type:
 | Constant column (all rows equal), fixed **or** string/binary | **ConstantLayout** (value stored once; ~0 data bytes) | structural (default) | constant int → 0.007, constant URI string → 0.009 B/row |
 | Low-cardinality run-length column, fixed **or** string | **RLE** (ints) / **Dictionary+RLE** (strings) | structural (default) | run-length URI: 2.90 → 0.033 B/row (87×); run-length int: → 0.027 B/row |
 | String / binary (non-constant, high-cardinality) | **zstd** (`General(ZSTD)`, `[u64 len][zstd]` per chunk) | `--compress` (opt-in) | repetitive string: 7.6 → ~3 B/row |
+| utf8 / large_utf8 FullZip column (default column, values averaging 128 bytes or more, `--compress` off) | **FSST per value**, `FullZip{values=Fsst{table, Variable}}`: one table per column in every page's descriptor; a page the table does not pay on, or with a value over 32 KiB, stays plain | structural (default) | `db_query` detail column (29,939 rows, ~864 B): 872.3 → 150.4 B/row (pylance 154.6) |
 | `float` / `double` fixed-width | **byte-stream-split + zstd** (`General(ZSTD){ ByteStreamSplit{ Flat } }`) | `--compress` (opt-in) | smooth double column: ~23% smaller |
 | `bool` fixed-width | **bit-packed** (`Flat{bits_per_value:1}`, LSB-first, same as stock Lance) | always on | 200k rows: ~200 KB → ~25 KB (8×) |
 

@@ -381,12 +381,26 @@ for a large one. See PROGRESS, "Roadmap E4".
 | F1 | *(status)* **Reopened and done.** The first measurement (200,000 rows) said no change was needed and claimed bitpacked columns were already multi-chunk pages. That was wrong: the flat writer put one chunk per page, so a 2M-row int64 column became 1,954 pages of 2.5 KB, and the benchmark matrix (`tools/bench_matrix.py`) showed Rust reading it 5.7x slower than its own file (104 vs 18 ms). Every fixed-width column is now written as ~512 KiB pages of many chunks (measured from 64 KiB to 8 MiB: within noise of the best for Rust, within ~10% of the best for nanolance); Rust reads nanolance's numeric files at its own speed. See PROGRESS.md, "Performance from the benchmark matrix". | | |
 | F3 | **Memory budget for writing** — `max_pending_bytes`: write_batch flushes a fragment when the buffered data reaches it (edge devices). | S | **Done** — see PROGRESS |
 | F2 | **FSST on write** — the answer to the one bench shape nanolance still loses (`high_card`, 7.67 ms vs 5.12 ms). Encoder only; the reader exists. Correctness oracle: pylance reads it; speed oracle: the bench. | M–L | **Opus** |
-| F4 | **FSST for long strings in the writer** — pylance's default for long string columns. F2 covers the mini-block string pages; the FullZip string writer has no FSST, so long strings stay plain or zstd. Measured on the ndjson benchmark's `detail` column (`bench/ndjson/README.md`): nanolance zstd 160.2 B/row, pylance FSST 154.0 B/row, nanolance uncompressed 876.3 B/row. Correctness oracle: pylance reads it; size oracle: that column. | M | **Opus** |
+| F4 | **FSST for long strings in the writer** (done 2026-11-17, see Status below) — pylance's default for long string columns. F2 covers the mini-block string pages; the FullZip string writer has no FSST, so long strings stay plain or zstd. Measured on the ndjson benchmark's `detail` column (`bench/ndjson/README.md`): nanolance zstd 160.2 B/row, pylance FSST 154.0 B/row, nanolance uncompressed 876.3 B/row. Correctness oracle: pylance reads it; size oracle: that column. | M | **Opus** |
 
 **Status:** F2 done — see PROGRESS, "Roadmap F2". String files are now as small as pylance's or
 smaller. On `high_card`, rust lance reads nanolance's file in ~7 ms (10.8–18.7 ms before, when it was
 zstd); nanolance's own read is about where it was (7.6–8.0 ms against 7.7–10.6 ms) and still trails
 rust lance reading its own file (6.1–6.7 ms on the same runs). F1 is still open.
+
+**Status (2026-11-17):** F4 done. A utf8 or large_utf8 FullZip column (values averaging 128 bytes or more, no codec,
+`compression` off) is FSST-compressed per value, `FullZip{values=Fsst{table, Variable}}`, with one table per column in
+each page's descriptor (`write_full_zip_variable_column`, `plan_full_zip_page_fsst`); a page the table does not pay on,
+or with a value over 32 KiB, stays plain. Layout text equal to pylance's (`test_fullzip_fsst.py`), reads equal both
+ways, and the page file is byte-identical across thread counts. Measured: the `db_query` `detail` column of
+`gen_logs.py --profile realistic --seed 2 --lines 200000` (29,939 rows, 864 bytes a value): 872.3 B/row before,
+150.4 B/row now, pylance 154.6 (nanolance 2.7% smaller). Write of that column, median of 3: nanolance 54.7 ms on one
+thread and 36.7 ms on default threads, pylance 54.2 ms on its default threads (one-thread pylance not measured).
+`bench_matrix.py --only string_long` (50,000 docs, ~900 B, 45.0 MB raw; 4 cores, load 0.7): file 45.2 MB → 8.8 MB
+(pylance 9.0 MB); C++ write one core 43.6 → 105.1 ms (pylance 95.0 ms: slower on one core), all cores 43.1 → 76.5 ms
+(pylance 98.0 ms); C++ read 13.6 → 10.5 ms. Writes cost more on one core because every value is compressed; the
+one-core write goal is not met for string_long. Not done: the per-page table (pylance trains one per page) and a
+write-side speedup of the one-core compression.
 
 ### Phase G — packaging and infrastructure (independent; run in parallel)
 

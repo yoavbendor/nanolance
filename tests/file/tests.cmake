@@ -22,3 +22,11 @@ target_compile_features(nano_lance_null_children_write_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_null_children_write_test PRIVATE nanolance)
 add_test(NAME nano_lance_null_children_write COMMAND $<TARGET_FILE:nano_lance_null_children_write_test>)
 set_tests_properties(nano_lance_null_children_write PROPERTIES LABELS "smoke")
+
+# FSST on a FullZip utf8 page (roadmap F4): one page of compressible text with nulls, written by nano_lance::Writer. The
+# descriptor must be FullZip over Fsst, and the C reader must give back every string and null.
+add_executable(nano_lance_fullzip_fsst_test tests/file/test_fullzip_fsst.cpp)
+target_compile_features(nano_lance_fullzip_fsst_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_fullzip_fsst_test PRIVATE nanolance)
+add_test(NAME nano_lance_fullzip_fsst COMMAND $<TARGET_FILE:nano_lance_fullzip_fsst_test>)
+set_tests_properties(nano_lance_fullzip_fsst PROPERTIES LABELS "smoke")

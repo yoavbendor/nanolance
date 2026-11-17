@@ -237,7 +237,9 @@ Nulls are stored in every column kind. Files in formats 2.0 to 2.3 are read; nan
 - **The schema is fixed by the first batch** of a write session.
 - **Compression:** structural encodings (bitpacking, constant pages, run-length, dictionary) are on by default
   and cost nothing to read; `compression = true` adds zstd for high-cardinality strings and byte-stream split
-  + zstd for floats. Per-column measurements: [AGENTS.md §3](AGENTS.md#3-enabling-the-compression-that-was-measured).
+  + zstd for floats. Structural FSST also covers long strings: a utf8 column of values averaging 128 bytes or
+  more is written as FullZip pages, each value compressed on its own with the column's FSST table (the layout
+  pylance writes for them), unless `compression = true` asks for zstd. Per-column measurements: [AGENTS.md §3](AGENTS.md#3-enabling-the-compression-that-was-measured).
 - **Small files of references:** model them as plain `uri` / `position` / `size` columns rather than the packed
   `lance.blob.v2` descriptor (about 3 against 41 bytes a row): [AGENTS.md §4](AGENTS.md#4-data-model-how-to-actually-get-small-files-important).
 - **Memory while writing:** the writer holds rows until a commit; `max_pending_bytes` makes `write_batch` commit a
