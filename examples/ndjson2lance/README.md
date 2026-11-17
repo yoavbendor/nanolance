@@ -14,7 +14,9 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNANOLANCE_BUILD_NDJSON
 ninja -C build ndjson2lance
 ```
 
-The option is off by default. `NANOLANCE_BUILD_EXAMPLES` is not needed.
+The option is off by default. `NANOLANCE_BUILD_EXAMPLES` is not needed. Writing to `s3://` needs
+`-DNANOLANCE_ENABLE_S3=ON` as well (it needs the libcurl development headers); a build without it
+refuses an `s3://` output at start.
 
 ## Quick start
 
@@ -38,12 +40,34 @@ rows = pa.table(nanolance.read_table("out/t01_buckets_detail_event.lance"))  # n
 
 Route by one field instead of by the set of keys with `--route-key event`.
 
+## Writing to S3
+
+Give an `s3://` prefix instead of a directory. The tables, `_rejects.lance` and `_catalog.lance` are
+written under it, as they are into a directory. The prefix must hold no objects yet (a run into a
+prefix that has any is refused with exit 1, and nothing is written).
+
+```
+cat logs.ndjson | ndjson2lance s3://BUCKET/results/ -i - --route-key T
+```
+
+Credentials come from the AWS environment chain (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`AWS_SESSION_TOKEN`, `AWS_REGION`, profiles). For an S3-compatible store such as MinIO, or for moto in
+the tests, give its endpoint:
+
+```
+ndjson2lance s3://BUCKET/results/ -i logs.ndjson --s3-endpoint http://127.0.0.1:9000 --s3-allow-http
+```
+
+Each flush of a table is one commit, so a large input makes many S3 requests. `--one-version` publishes
+each table once, at the end, which is far fewer requests. A run that fails part way leaves its objects
+under the prefix; the next run needs a new prefix.
+
 ## Flags
 
 | flag | default | meaning |
 |---|---|---|
-| `out_dir` | required | output directory; must not exist or be empty |
-| `-i, --input FILE` | stdin | read FILE instead of stdin |
+| `out_dir` | required | output directory, or an `s3://bucket/prefix`; must not exist or be empty (an `s3://` prefix must hold no objects) |
+| `-i, --input FILE` | stdin | read FILE instead of stdin; `-i -` reads stdin explicitly |
 | `--route-key FIELD` | (none) | route by this top-level field's value, not by the set of keys |
 | `--learn-rows N` | 100 | rows a schema is learned from before it can lock |
 | `--learn-max-rows N` | 10000 | most rows learned before a schema locks as it is |
@@ -56,6 +80,9 @@ Route by one field instead of by the set of keys with `--route-key event`.
 | `--one-version` | off | publish each table as one version at the end, not one per flush |
 | `--no-compress` | off | keep string columns uncompressed; by default they are zstd-compressed |
 | `--no-merge` | off | reject a line of several JSON objects instead of merging them into one record |
+| `--s3-endpoint URL` | (AWS) | `s3://` output: endpoint of an S3-compatible store (MinIO, moto) |
+| `--s3-region REGION` | (AWS env) | `s3://` output: region |
+| `--s3-allow-http` | off | `s3://` output: allow an `http://` endpoint |
 
 Exit status: 0 on success; 1 when a table, the rejects file or the catalog could not be written,
 or the input stopped early (a line longer than `--max-line-mb`, a read error); 2 when the summary's
