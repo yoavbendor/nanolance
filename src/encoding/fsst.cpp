@@ -84,6 +84,20 @@ bool decompress_value(const SymbolTable& table, const std::uint8_t* data, std::s
 #if defined(NANOLANCE_FSST_AVX512)
 namespace {
 
+/// The kernel runs on this CPU and when NANOLANCE_FSST_SIMD is not "0" (read once per process).
+bool kernel_usable() {
+    static const bool usable = [] {
+        const char* off = std::getenv("NANOLANCE_FSST_SIMD");
+        if (off != nullptr && std::strcmp(off, "0") == 0) {
+            return false;
+        }
+        __builtin_cpu_init();
+        return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq") &&
+               __builtin_cpu_supports("popcnt");
+    }();
+    return usable;
+}
+
 /// The first byte no multi-byte symbol contains, or -1. The kernel appends such a byte after each value: a symbol
 /// holding it could match past the value's end. cwida's encoder picks its terminator the same way.
 int pick_terminator(const Encoder& encoder) {
@@ -115,9 +129,22 @@ bool kernel_built() {
 #endif
 }
 
+bool kernel_available() {
+#if defined(NANOLANCE_FSST_AVX512)
+    return kernel_usable();
+#else
+    return false;
+#endif
+}
+
 void attach_batch_table(Encoder& encoder) {
     encoder.batch.reset();
 #if defined(NANOLANCE_FSST_AVX512)
+    // Everything in the kernel's translation unit is compiled for AVX-512, building its table included: on a CPU
+    // without it (or with NANOLANCE_FSST_SIMD=0) nothing of it may run.
+    if (!kernel_usable()) {
+        return;
+    }
     const int terminator = pick_terminator(encoder);
     if (terminator < 0 || encoder.symbol_count == 0) {
         return;  // no kernel for this table: the portable compressors serve it
@@ -178,24 +205,6 @@ void compress_many_portable(const Encoder& encoder, Item* items, std::size_t cou
 }
 
 #if defined(NANOLANCE_FSST_AVX512)
-namespace {
-
-/// The kernel runs on this CPU and when NANOLANCE_FSST_SIMD is not "0" (read once per process).
-bool kernel_usable() {
-    static const bool usable = [] {
-        const char* off = std::getenv("NANOLANCE_FSST_SIMD");
-        if (off != nullptr && std::strcmp(off, "0") == 0) {
-            return false;
-        }
-        __builtin_cpu_init();
-        return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq") &&
-               __builtin_cpu_supports("popcnt");
-    }();
-    return usable;
-}
-
-}  // namespace
-
 bool compress_many_avx512(const Encoder& encoder, Item* items, std::size_t count) {
     if (encoder.batch == nullptr || !kernel_usable()) {
         return false;
