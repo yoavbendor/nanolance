@@ -301,6 +301,39 @@ def case_merge_rules(tool):
               f"no-merge: catalog {catalog}, rejects {rejects}")
 
 
+def case_nested_keys(tool):
+    """A nested key that appears after the schema locked: counted, and with --strict rejected."""
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        path = work / "drift.ndjson"
+        path.write_text("\n".join([DEVICE_IRQ] * 150 + [DEVICE_LOD] * 150) + "\n", encoding="utf-8")
+
+        code, stderr = run(tool, work / "keep", "-i", str(path))
+        check(code == 0, f"keep: exit {code}:\n{stderr}")
+        counts = summary(stderr)
+        check(counts["rows"] == 300 and counts["rejects"] == 0,
+              f"keep: counts {counts}")
+        catalog, tables, rejects = read_outputs(work / "keep")
+        check([(r["table"], r["new_nested_key_lines"]) for r in catalog] == [("t01_T_V_d", 150)],
+              f"keep: catalog {catalog}")
+        check(len(tables["t01_T_V_d"]) == 300 and rejects == [],
+              f"keep: rows {len(tables['t01_T_V_d'])}, rejects {rejects}")
+        match = re.search(r"(\d+) new-nested-key lines", stderr)
+        check(match is not None and int(match.group(1)) == 150,
+              f"keep: summary does not count 150 nested-key lines:\n{stderr}")
+
+        code, stderr = run(tool, work / "strict", "-i", str(path), "--strict")
+        check(code == 0, f"strict: exit {code}:\n{stderr}")
+        counts = summary(stderr)
+        check(counts["rows"] == 150 and counts["rejects"] == 150 and counts["unwritable"] == 0,
+              f"strict: counts {counts}")
+        catalog, tables, rejects = read_outputs(work / "strict")
+        check(catalog[0]["new_nested_key_lines"] == 150, f"strict: catalog {catalog}")
+        check(len(tables["t01_T_V_d"]) == 150, "strict: table rows")
+        check(rejects_of(rejects) == [(line, "new nested key after lock: v.R")
+                                      for line in range(151, 301)],
+              f"strict: rejects {rejects_of(rejects)[:3]}...")
+
 
 CASES = {
     "route-keys": lambda tool: case_route(tool, "keys"),
@@ -312,6 +345,7 @@ CASES = {
     "dotted": case_dotted,
     "merge": case_merge,
     "merge-rules": case_merge_rules,
+    "nested-keys": case_nested_keys,
 }
 
 

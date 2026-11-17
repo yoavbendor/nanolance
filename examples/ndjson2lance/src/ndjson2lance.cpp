@@ -370,6 +370,7 @@ class Heap {
     uint64_t rows = 0;
     uint64_t rejects = 0;
     uint64_t new_key_lines = 0;
+    uint64_t new_nested_key_lines = 0;
     uint64_t unwritable = 0;
     uint64_t first_line = 0;
     uint64_t last_line = 0;
@@ -573,7 +574,7 @@ class Heap {
         Flush f;
         const uint64_t total = lines_.size();
         if (!sink_.hold(true)) mark_failed("cannot hold a flush: " + sink_.error());
-        write_range(0, lines_.size(), &f);
+        write_flush(&f);
         if (state_ == State::locked && !sink_.publish()) {
             mark_failed("cannot publish the table: " + sink_.error());
         }
@@ -584,6 +585,32 @@ class Heap {
             unwritable += total - f.rejected;
         }
         clear_staged();
+    }
+
+    // Writes every staged line. A flush that reads whole through the locked schema, with no key the
+    // schema lacks, is written from that read. Otherwise the records with a nested key the schema
+    // lacks are counted (and rejected with --strict), and the rest is written by write_range. A
+    // top-level key the schema lacks is already counted by accept() and makes the read fail too, so
+    // such a flush takes the same path and finds no nested key.
+    void write_flush(Flush* f) {
+        if (state_ != State::locked) return;
+        Batches batches;
+        if (read_range(0, lines_.size(), &batches, true).ok()) {
+            write_batches(batches, lines_.size(), f);
+            return;
+        }
+        const std::vector<std::string> nested = nested_paths();
+        size_t run = 0;
+        for (size_t i = 0; i < lines_.size(); ++i) {
+            if (nested[i].empty()) continue;
+            ++new_nested_key_lines;
+            if (!options_.strict) continue;
+            write_range(run, i, f);
+            reject_line(lines_[i].number, staged_raw(i), "new nested key after lock: " + nested[i]);
+            ++f->rejected;
+            run = i + 1;
+        }
+        write_range(run, lines_.size(), f);
     }
 
     // Writes the batches of one read of count lines.
@@ -602,7 +629,7 @@ class Heap {
     void write_range(size_t begin, size_t end, Flush* f) {
         if (begin == end || state_ != State::locked) return;
         Batches batches;
-        const simdjson_arrow::status read = read_range(begin, end, &batches);
+        const simdjson_arrow::status read = read_range(begin, end, &batches, false);
         if (read.ok()) {
             write_batches(batches, end - begin, f);
             return;
@@ -617,6 +644,88 @@ class Heap {
         write_range(mid, end, f);
     }
 
+    // For each staged record, the path of its first nested key that the locked schema lacks, or "".
+    std::vector<std::string> nested_paths() const {
+        std::vector<std::string> paths(lines_.size());
+        const simdjson::padded_string text(bytes_.data(), bytes_.size());
+        const char* buffer_end = text.data() + text.size() + simdjson::SIMDJSON_PADDING;
+        simdjson::ondemand::parser parser;
+        for (size_t i = 0; i < lines_.size(); ++i) {
+            const char* p = text.data() + lines_[i].offset;
+            paths[i] = nested_path(parser, p, lines_[i].length, static_cast<size_t>(buffer_end - p));
+        }
+        return paths;
+    }
+
+    // The path of the first nested key of one record that the locked schema lacks, or "". Only
+    // keys inside struct fields of the schema are checked (a list of scalars has no keys).
+    std::string nested_path(simdjson::ondemand::parser& parser, const char* p, size_t n,
+                            size_t capacity) const {
+        simdjson::ondemand::document doc;
+        simdjson::ondemand::object object;
+        if (parser.iterate(simdjson::padded_string_view(p, n, capacity)).get(doc) ||
+            doc.get_object().get(object)) {
+            return "";  // not a record: the read reports it
+        }
+        for (auto entry : object) {
+            simdjson::ondemand::field field;
+            std::string_view key;
+            if (std::move(entry).get(field) || field.unescaped_key().get(key)) return "";
+            const simdjson_arrow::field* column = find_child(schema_, key);
+            if (column == nullptr || !has_struct(*column)) continue;
+            std::string path = nested_in(field.value(), *column, std::string(key));
+            if (!path.empty()) return path;
+        }
+        return "";
+    }
+
+    // The path of the first key under v that the schema field f lacks, or "". path names v so far;
+    // a list adds no name, so the key of a list's struct is named by the list's field.
+    static std::string nested_in(simdjson::ondemand::value v, const simdjson_arrow::field& f,
+                                 std::string path) {
+        if (f.type == simdjson_arrow::type::struct_) {
+            simdjson::ondemand::object object;
+            if (v.get_object().get(object)) return "";
+            for (auto entry : object) {
+                simdjson::ondemand::field field;
+                std::string_view key;
+                if (std::move(entry).get(field) || field.unescaped_key().get(key)) return "";
+                std::string child_path = path + "." + std::string(key);
+                const simdjson_arrow::field* child = find_child(f, key);
+                if (child == nullptr) return child_path;
+                if (has_struct(*child)) {
+                    std::string found = nested_in(field.value(), *child, std::move(child_path));
+                    if (!found.empty()) return found;
+                }
+            }
+            return "";
+        }
+        simdjson::ondemand::array array;
+        if (v.get_array().get(array)) return "";
+        for (auto element : array) {
+            simdjson::ondemand::value item;
+            if (element.get(item)) return "";
+            std::string found = nested_in(item, f.children[0], path);
+            if (!found.empty()) return found;
+        }
+        return "";
+    }
+
+    static const simdjson_arrow::field* find_child(const simdjson_arrow::field& f,
+                                                   std::string_view key) {
+        for (const simdjson_arrow::field& c : f.children) {
+            if (c.name == key) return &c;
+        }
+        return nullptr;
+    }
+
+    // Whether the values of f can hold a struct: f is one, or a list of them.
+    static bool has_struct(const simdjson_arrow::field& f) {
+        if (f.type == simdjson_arrow::type::struct_) return true;
+        return f.type == simdjson_arrow::type::list && !f.children.empty() &&
+               has_struct(f.children[0]);
+    }
+
     // simdjson_arrow parses a record within one window of block_size bytes, and a batch is cut at
     // block_size, so the window must hold the longest line of the read (1 MB is only the default).
     simdjson_arrow::ndjson_options read_options(size_t begin, size_t end) const {
@@ -627,8 +736,8 @@ class Heap {
         return options;
     }
 
-    // Reads lines [begin, end).
-    simdjson_arrow::status read_range(size_t begin, size_t end, Batches* batches) {
+    // Reads lines [begin, end). strict: a key the schema lacks, at any depth, fails the read.
+    simdjson_arrow::status read_range(size_t begin, size_t end, Batches* batches, bool strict) {
         const Line& first = lines_[begin];
         const Line& last = lines_[end - 1];
         const size_t from = first.offset;
@@ -636,6 +745,7 @@ class Heap {
         const simdjson::padded_string text(bytes_.data() + from, to - from);
         simdjson_arrow::ndjson_options options = read_options(begin, end);
         options.threads = (to - from) >= kThreadedReadBytes ? options_.threads : 1;
+        options.error_on_unknown_fields = strict;
         return simdjson_arrow::read_ndjson(schema_, text, &batches->items, options);
     }
 
@@ -1094,6 +1204,7 @@ std::string write_catalog(const Options& options, const std::vector<std::unique_
                         {"rows", NANOARROW_TYPE_UINT64},
                         {"rejects", NANOARROW_TYPE_UINT64},
                         {"new_key_lines", NANOARROW_TYPE_UINT64},
+                        {"new_nested_key_lines", NANOARROW_TYPE_UINT64},
                         {"first_line", NANOARROW_TYPE_UINT64},
                         {"last_line", NANOARROW_TYPE_UINT64},
                         {"unwritable", NANOARROW_TYPE_UINT64},
@@ -1105,11 +1216,12 @@ std::string write_catalog(const Options& options, const std::vector<std::unique_
         batch.u64(2, h->rows);
         batch.u64(3, h->rejects);
         batch.u64(4, h->new_key_lines);
-        batch.u64(5, h->first_line);
-        batch.u64(6, h->last_line);
-        batch.u64(7, h->unwritable);
-        batch.str(8, h->schema_json());
-        batch.str(9, h->status());
+        batch.u64(5, h->new_nested_key_lines);
+        batch.u64(6, h->first_line);
+        batch.u64(7, h->last_line);
+        batch.u64(8, h->unwritable);
+        batch.str(9, h->schema_json());
+        batch.str(10, h->status());
         batch.end_row();
     }
     const std::string name = std::string(kCatalogName) + ".lance";
@@ -1166,18 +1278,21 @@ int run(const Options& options) {
     uint64_t rows = 0;
     uint64_t unwritable = 0;
     uint64_t new_keys = 0;
+    uint64_t new_nested = 0;
     bool tables_ok = true;
-    std::fprintf(stderr, "%-28s %12s %10s %10s %12s  %s\n", "table", "rows", "rejects", "new_keys",
-                 "unwritable", "status");
+    std::fprintf(stderr, "%-28s %12s %10s %10s %12s %12s  %s\n", "table", "rows", "rejects",
+                 "new_keys", "new_nested", "unwritable", "status");
     for (const auto& h : router.heaps()) {
         rows += h->rows;
         unwritable += h->unwritable;
         new_keys += h->new_key_lines;
+        new_nested += h->new_nested_key_lines;
         if (h->status() != "ok") tables_ok = false;
-        std::fprintf(stderr, "%-28s %12llu %10llu %10llu %12llu  %s\n", h->name().c_str(),
+        std::fprintf(stderr, "%-28s %12llu %10llu %10llu %12llu %12llu  %s\n", h->name().c_str(),
                      static_cast<unsigned long long>(h->rows),
                      static_cast<unsigned long long>(h->rejects),
                      static_cast<unsigned long long>(h->new_key_lines),
+                     static_cast<unsigned long long>(h->new_nested_key_lines),
                      static_cast<unsigned long long>(h->unwritable), h->status().c_str());
     }
     const uint64_t non_blank = router.records();
@@ -1185,11 +1300,12 @@ int run(const Options& options) {
     const double mb = static_cast<double>(reader.bytes()) / static_cast<double>(kMiB);
     std::fprintf(stderr,
                  "ndjson2lance: %llu input lines (%llu blank), %zu tables, %llu rows, %llu rejects, "
-                 "%llu new-key lines, %llu unwritable\n",
+                 "%llu new-key lines, %llu unwritable, %llu new-nested-key lines\n",
                  static_cast<unsigned long long>(router.line_count()),
                  static_cast<unsigned long long>(router.blank_lines()), router.heaps().size(),
                  static_cast<unsigned long long>(rows), static_cast<unsigned long long>(rejects.count()),
-                 static_cast<unsigned long long>(new_keys), static_cast<unsigned long long>(unwritable));
+                 static_cast<unsigned long long>(new_keys), static_cast<unsigned long long>(unwritable),
+                 static_cast<unsigned long long>(new_nested));
     std::fprintf(stderr, "ndjson2lance: %.2f s, %.1f MB/s, %.0f rows/s\n", seconds,
                  seconds > 0 ? mb / seconds : 0.0,
                  seconds > 0 ? static_cast<double>(rows) / seconds : 0.0);
