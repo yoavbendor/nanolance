@@ -23,7 +23,8 @@ Lance's protobuf metadata. A program links only the parts it calls: a writer of 
 - **Files:** writes Lance file format 2.2 and reads 2.0 to 2.3, with Lance's encodings:
   bitpacking, run-length, dictionary, FSST, byte-stream split, zstd and LZ4, constant and all-null pages,
   mini-block and full-zip layouts, nested and repeated columns ([src/encoding](src/encoding/README.md),
-  [src/file](src/file/README.md)).
+  [src/file](src/file/README.md)). FSST compresses values averaging 128 bytes or more with AVX-512 when the CPU has it, to the same bytes as the
+  portable path (`NANOLANCE_FSST_SIMD=0` turns the kernel off).
 - **Tables:** manifests, fragments, deletion files, stable row ids, data overlays, transactions with Lance's
   conflict rules, versions, tags and branches ([src/table](src/table/README.md)).
 - **Indexes,** built and searched in Lance's format: scalar (BTree, Bitmap, LabelList, ZoneMap, BloomFilter,
@@ -195,7 +196,7 @@ test exists and that every module has a test of its own.
 | [base](src/base/README.md#spec-coverage) | 14 | 0 | 0 | 1 | 17/17 |
 | [io](src/io/README.md#spec-coverage) | 7 | 2 | 2 | 0 | 5/7 |
 | [arrow](src/arrow/README.md#spec-coverage) | 18 | 3 | 0 | 1 | 8/8 |
-| [encoding](src/encoding/README.md#spec-coverage) | 22 | 8 | 4 | 1 | 21/22 |
+| [encoding](src/encoding/README.md#spec-coverage) | 22 | 8 | 4 | 1 | 21/24 |
 | [file](src/file/README.md#spec-coverage) | 14 | 4 | 2 | 1 | 4/4 |
 | [table](src/table/README.md#spec-coverage) | 37 | 16 | 13 | 1 | 18/18 |
 | [expr](src/expr/README.md#spec-coverage) | 17 | 1 | 3 | 0 | 1/1 |
