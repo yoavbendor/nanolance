@@ -52,13 +52,41 @@ Route by one field instead of by the set of keys with `--route-key event`.
 | `--table-mb N` | 32 | per table: the writer's `max_pending_bytes` |
 | `--threads N` | 1 | threads for reading large flushes |
 | `--max-line-mb N` | 16 | longest accepted line |
-| `--strict` | off | reject a line with a key the locked schema does not have |
+| `--strict` | off | reject a line with a key the locked schema does not have, at the top level or nested (a nested one gets the reason `new nested key after lock: a.b`) |
 | `--one-version` | off | publish each table as one version at the end, not one per flush |
 | `--no-compress` | off | keep string columns uncompressed; by default they are zstd-compressed |
+| `--no-merge` | off | reject a line of several JSON objects instead of merging them into one record |
 
 Exit status: 0 on success; 1 when a table, the rejects file or the catalog could not be written,
 or the input stopped early (a line longer than `--max-line-mb`, a read error); 2 when the summary's
 line accounting does not balance (a bug).
+
+## Device logs
+
+Device logs often write a prefix object and then a payload object on one line, with no separator:
+
+```
+{"time":"T00:03:55.164260+0000Z","logger":"buildroot","app":"MEST 1182","ts":{"name":"monotonic@11818","t":235.164264},"line":""}{"T":"lod","V":1,"d":5985,"t":236524162,"v":[{"M":[10,5],"R":"FotaAgent"},{"M":[0,0],"R":"coredump_fs_watcher"}]}
+{"time":"T00:03:55.164260+0000Z","logger":"buildroot","app":"MEST 1182","ts":{"name":"monotonic@11818","t":235.164264},"line":""}{"T":"irq","V":1,"d":902,"t":236624875,"v":[{"M":[0,0,0,1525864,1550,24329]}]}
+```
+
+Each such line is one record. Its keys are the prefix's and the payload's together. Two kinds of
+payload can share top-level keys (here `T`, `V`, `d`, `t`, `v`), and then key routing puts them in one
+table, where a nested key of one kind is not in the schema of the other. Route by the kind instead:
+
+```
+ndjson2lance device.ndjson out/ --route-key T
+```
+
+```
+table                                rows    rejects   new_keys   new_nested   unwritable  status
+lod                                     1          0          0            0            0  ok
+irq                                     1          0          0            0            0  ok
+```
+
+Each table has the prefix columns `time`, `logger`, `app`, `ts`, `line` and the payload columns.
+`--no-merge` restores the old behaviour, where such a line is rejected with `trailing content after
+the record`.
 
 ## Performance
 
@@ -71,8 +99,11 @@ On the 1 GB mixed stream: 6.823 s and 147.9 MB peak RSS, against 38.388 s and 2,
 - Reading: blocks of whole lines (16 MB, or the longest line if larger); the tail after the last
   newline is carried into the next block. A UTF-8 BOM on line 1 is removed, CRLF is accepted, and
   blank lines are counted and skipped.
-- Routing: each line is parsed alone with simdjson On-Demand. Non-objects, malformed lines,
-  trailing content and repeated top-level keys go to `_rejects.lance` with no table.
+- Routing: each line is parsed with simdjson On-Demand. A line of several JSON objects back to
+  back (a prefix object, then the payload) is one record: the keys of every object are merged
+  in input order, and a key in two of them is rejected. Non-objects, malformed lines, other
+  trailing content and repeated top-level keys go to `_rejects.lance` with no table. The
+  rejects keep the line as it came, and the table keeps the merged record.
 - A table is named by its route value, or `t<NN>_<first three keys>` by key set; names are made
   safe for file names and kept unique (`_rejects` and `_catalog` are reserved).
 - Learning: the first `--learn-rows` lines are staged and inferred with `simdjson_arrow`. While the
@@ -83,8 +114,11 @@ On the 1 GB mixed stream: 6.823 s and 147.9 MB peak RSS, against 38.388 s and 2,
 - Locked: the schema is exported, the table is created with the first dump (the inferred batches),
   and later lines are read through the same schema in flushes. A flush that fails to read is split
   in halves until each bad line stands alone, so good lines keep their order.
-- A key the locked schema lacks is counted in `new_key_lines` (skipped on read) or rejected with
-  `--strict`.
+- A top-level key the locked schema lacks is counted in `new_key_lines` (skipped on read) or rejected
+  with `--strict`. A nested key the locked schema lacks (inside a struct, or a list of structs) is
+  counted in `new_nested_key_lines` (skipped on read), and rejected with `--strict`. The flush is first
+  read with simdjson_arrow's `error_on_unknown_fields`; only a flush that fails that read is checked
+  line by line, so ordinary flushes cost one read.
 - Each flush is a visible version (`--one-version` defers all of them to one). A flush's rows are
   held in the writer until it publishes, so a flush that fails midway leaves nothing visible.
 - Every non-blank line ends up in a table, in `_rejects.lance`, or counted as unwritable (its table
@@ -94,6 +128,12 @@ On the 1 GB mixed stream: 6.823 s and 147.9 MB peak RSS, against 38.388 s and 2,
 
 ## Known limits
 
+- A line with other trailing content after an object (`{"a":1}[1]`) is rejected with simdjson's
+  `INCOMPLETE_ARRAY_OR_OBJECT` reason: simdjson reports it before the object is read, so the
+  `trailing content after the record` reason is given only for a following `{` (with
+  `--no-merge`) or other bytes simdjson reads past the object (such as `}`).
+- A nested key that appears after the schema locked is skipped on read (a `R` under `v`, say): the
+  record keeps its other values, and `new_nested_key_lines` counts the record.
 - A top-level key with a dot is stored with `.` replaced by `_` (`user.id` becomes `user_id`),
   because pylance 12 cannot read a top-level column name with a dot. A collision gets `_2`, `_3`, ...
   The catalog's schema keeps the key as `source_name`. Nested dots are unchanged.
