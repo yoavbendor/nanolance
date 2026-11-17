@@ -59,6 +59,11 @@ def main(argv=None):
     ap.add_argument("--route-key", metavar="FIELD")
     args = ap.parse_args(argv)
 
+    # CORES (set by run.sh) bounds pyarrow's compute and I/O threads, as the tool's --threads does.
+    if os.environ.get("CORES"):
+        pa.set_cpu_count(int(os.environ["CORES"]))
+        pa.set_io_thread_count(int(os.environ["CORES"]))
+
     if os.path.isdir(args.out_dir) and os.listdir(args.out_dir):
         sys.exit("baseline: out_dir must not exist or be empty")
     os.makedirs(args.out_dir, exist_ok=True)
