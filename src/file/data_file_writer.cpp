@@ -1228,6 +1228,9 @@ void append_offset(std::vector<std::uint8_t>& offsets, std::int64_t value, bool 
 /// not binary, at least 32 KiB of them, the longest at least 5 bytes.
 constexpr std::uint64_t kFsstMinBytes = 32U * 1024U;
 constexpr std::uint64_t kFsstMinMaxLength = 5U;
+/// Lance compresses a page with a longer value per value with zstd or lz4 instead of FSST; nanolance keeps such a
+/// FullZip page plain.
+constexpr std::uint64_t kFsstMaxValueBytes = 32U * 1024U;
 
 bool fsst_applies_to(const LanceField& field) {
     return field.logical_type == "utf8" || field.logical_type == "large_utf8";
@@ -1387,6 +1390,23 @@ bool fsst_pays_on_first_page(const fsst::Encoder& encoder, const ColumnValues& v
     }
     ColumnValues packed;
     return plan_item_fsst(encoder, values, items, packed);
+}
+
+/// A FullZip page's values under the column's FSST table, as Lance does for a page of values (Lance's
+/// `try_variable_width_per_value`): the page's values at least 32 KiB, the longest between 5 bytes and 32 KiB, and
+/// FSST pays. `items` are the page's valid rows; `packed` gets their compressed values, in row order. False (the page
+/// stays plain) otherwise.
+bool plan_full_zip_page_fsst(const fsst::Encoder& encoder, const ColumnValues& values,
+                             const std::vector<std::uint64_t>& items, ColumnValues& packed) {
+    std::uint64_t raw = 0;
+    std::uint64_t longest = 0;
+    for (const auto i : items) {
+        const auto size = static_cast<std::uint64_t>(variable_offset(values, i + 1U) - variable_offset(values, i));
+        raw += size;
+        longest = std::max(longest, size);
+    }
+    return raw >= kFsstMinBytes && longest >= kFsstMinMaxLength && longest <= kFsstMaxValueBytes &&
+           plan_item_fsst(encoder, values, items, packed);
 }
 
 /// The dictionary of an Arrow dictionary leaf under a struct or list (W1k2): every entry of the Arrow
@@ -1860,14 +1880,22 @@ constexpr std::uint64_t kDefaultFullZipMinAverageValueBytes = 128U;
 /// offsets where each row starts (Lance requires one for variable-width FullZip pages) -- which is what
 /// lets a reader fetch one row without reading the page: a shuffled mini-batch of 64 images out of
 /// thousands reads 64 images, not the column. Pages are cut at ~8 MiB of values, at least one row.
+///
+/// With `fsst_encoder` (the column's table, trained by write_plain_variable_column), a page that
+/// plan_full_zip_page_fsst accepts stores each value compressed, behind the length of its compressed bytes, with
+/// the table in its descriptor: Lance's per-value Fsst{Variable} layout. The other pages stay plain.
 bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& values, std::uint64_t rows,
-                                    pb::ColumnMetadata& column, std::string& error) {
+                                    pb::ColumnMetadata& column, std::string& error,
+                                    const fsst::Encoder* fsst_encoder) {
     constexpr std::size_t kPageBytes = std::size_t{8} << 20U;
     const bool large = values.variable.large;
     const std::size_t length_bytes = large ? 8U : 4U;
     column.encoding = column_encoding_bytes();
+    const auto table = fsst_encoder != nullptr ? fsst::serialize(*fsst_encoder) : std::vector<std::uint8_t>{};
     std::vector<std::uint8_t> data;
     std::vector<std::uint64_t> starts;
+    std::vector<std::uint64_t> valid_rows;
+    ColumnValues packed;
     std::uint64_t row = 0;
     while (row < rows) {
         const auto first = row;
@@ -1883,6 +1911,20 @@ bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& value
             }
             ++end;
         }
+        // The page's values, compressed when the table pays on it: `stored` then holds the valid rows' compressed
+        // values in row order, so the k-th valid row reads item k of it.
+        bool fsst = false;
+        if (fsst_encoder != nullptr) {
+            valid_rows.clear();
+            for (auto r = first; r < end; ++r) {
+                if (validity_bit(values.validity, r)) {
+                    valid_rows.push_back(r);
+                }
+            }
+            fsst = plan_full_zip_page_fsst(*fsst_encoder, values, valid_rows, packed);
+        }
+        const ColumnValues& stored = fsst ? packed : values;
+        std::uint64_t stored_item = 0;
         data.clear();
         data.reserve(bytes + static_cast<std::size_t>(end - first));
         starts.clear();
@@ -1894,14 +1936,15 @@ bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& value
                 full_zip::append_level(data, control, 1U, nullptr, 0U, length_bytes);  // definition 1: a null item
                 continue;
             }
-            const auto begin = variable_offset(values, r);
-            const auto len = static_cast<std::uint64_t>(variable_offset(values, r + 1U) - begin);
+            const auto item = fsst ? stored_item++ : r;
+            const auto begin = variable_offset(stored, item);
+            const auto len = static_cast<std::uint64_t>(variable_offset(stored, item + 1U) - begin);
             if (!large && len > std::numeric_limits<std::uint32_t>::max()) {
                 error = "a utf8/binary value over 4 GiB";
                 return false;
             }
             static constexpr std::uint8_t kEmpty = 0U;
-            full_zip::append_level(data, control, 0U, len != 0U ? values.variable.data.data() + begin : &kEmpty,
+            full_zip::append_level(data, control, 0U, len != 0U ? stored.variable.data.data() + begin : &kEmpty,
                                    static_cast<std::size_t>(len), length_bytes);
         }
         starts.push_back(data.size());
@@ -1912,7 +1955,8 @@ bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& value
         layout.bits_per_offset = length_bytes * 8U;
         layout.num_items = end - first;
         layout.num_visible_items = end - first;
-        layout.value_compression = descriptor::variable(descriptor::flat(length_bytes * 8U));
+        const auto value_encoding = descriptor::variable(descriptor::flat(length_bytes * 8U));
+        layout.value_compression = fsst ? descriptor::fsst(table, value_encoding) : value_encoding;
         layout.layers = {nulls ? static_cast<std::uint8_t>(repdef::kNullableItem)
                                : static_cast<std::uint8_t>(repdef::kAllValidItem)};
 
@@ -3614,9 +3658,20 @@ bool write_plain_variable_column(const ColumnEncodeContext& ctx, std::ostream& o
     // MiniBlock chunks.
     const bool full_zip = plain_variable_is_full_zip(
         values, rows, uses_default_layout(ctx) ? kDefaultFullZipMinAverageValueBytes : kFullZipMinAverageValueBytes);
-    if (full_zip ? !write_full_zip_variable_column(out, values, rows, column, error)
-                 : !write_nested_column(out, field, values, rows, column, error, nullptr, /*plain=*/true)) {
-        return false;
+    if (!full_zip) {
+        if (!write_nested_column(out, field, values, rows, column, error, nullptr, /*plain=*/true)) {
+            return false;
+        }
+    } else {
+        // A string column the writer's structural encodings tagged for FSST, uncompressed and with no codec of its
+        // own, trains one table for its FullZip pages, as the mini-block strings do (train_column_fsst).
+        fsst::Encoder trained;
+        const bool use_fsst = fsst_applies_to(field) && ctx.codec == ColumnCodec::kAbsent && !ctx.compress &&
+                              ctx.packing_it != field.metadata.end() && ctx.packing_it->second == "fsst" &&
+                              train_column_fsst(field, values, trained);
+        if (!write_full_zip_variable_column(out, values, rows, column, error, use_fsst ? &trained : nullptr)) {
+            return false;
+        }
     }
     columns.push_back(std::move(column));
     return true;

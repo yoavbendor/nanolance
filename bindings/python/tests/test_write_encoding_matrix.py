@@ -135,6 +135,10 @@ SHAPES = [
     # Long strings: stock Lance switches to FullZip at 256 bytes; nanolance keeps MiniBlock, which is
     # legal at any value size. This pins that stock Lance reads it.
     ("str_long", _table([("q" * 300) + str(i) for i in range(N)], pa.utf8()), "variable, 300-byte values"),
+    # FSST on a FullZip page with nulls: ~180-byte values, high-cardinality so no dictionary takes them, one in
+    # eleven null. Pylance writes the same page FullZip over Fsst (test_fullzip_fsst.py).
+    ("null_str_fullzip_fsst", _table([None if _null(i) else f"row {i} " + "request user session timeout " * 6
+                                      for i in range(N)], pa.utf8()), "FullZip over Fsst, def levels"),
 ]
 
 # Shapes pylance 12 cannot read beside another column ("cannot read columns of differing lengths together": a
