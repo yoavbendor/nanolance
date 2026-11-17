@@ -214,14 +214,15 @@ def case_dotted(tool):
         check(sources == {"a_b_2": "a.b", "a_b": None}, f"collision: sources {sources}")
 
 
-# Device-log lines: a prefix object (PRE) before a payload object (LOD, IRQ), and the payloads alone.
-DEVICE_PRE = ('{"time":"T00:03:55.164260+0000Z","logger":"buildroot","app":"MEST 1182",'
-              '"ts":{"name":"monotonic@11818","t":235.164264},"line":""}')
-DEVICE_LOD = ('{"T":"lod","V":1,"d":5985,"t":236524162,"v":[{"M":[10,5],"R":"FotaAgent"},'
-              '{"M":[0,0],"R":"coredump_fs_watcher"},{"M":[215941,71130],"R":"cv_main_thread"}]}')
-DEVICE_IRQ = ('{"T":"irq","V":1,"d":902,"t":236624875,"v":[{"M":[0,0,0,1525864,1550,24329]}]}')
-PAYLOAD_COLUMNS = ["T", "V", "d", "t", "v"]
-PREFIX_COLUMNS = ["time", "logger", "app", "ts", "line"]
+# Log lines with a prefix object (PRE) before a payload object (CPU, DISK), and the payloads alone.
+# Both payload kinds share their top-level keys; only CPU's list items carry "name".
+PREFIX = ('{"time":"2026-01-01T00:00:00.000001Z","host":"node-1","app":"svc 42",'
+              '"clock":{"name":"mono","t":12.5},"line":""}')
+PAYLOAD_CPU = ('{"kind":"cpu","ver":1,"dur":120,"seq":1001,"items":[{"vals":[3,4],"name":"a"},'
+              '{"vals":[0,0],"name":"b"},{"vals":[7000,2100],"name":"c"}]}')
+PAYLOAD_DISK = ('{"kind":"disk","ver":1,"dur":80,"seq":1002,"items":[{"vals":[0,0,0,51200,40,900]}]}')
+PAYLOAD_COLUMNS = ["kind", "ver", "dur", "seq", "items"]
+PREFIX_COLUMNS = ["time", "host", "app", "clock", "line"]
 
 
 def rejects_of(rejects):
@@ -233,32 +234,32 @@ def case_merge(tool):
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         merged = work / "merged.ndjson"
-        merged.write_text(DEVICE_PRE + DEVICE_LOD + "\n" + DEVICE_PRE + DEVICE_IRQ + "\n",
+        merged.write_text(PREFIX + PAYLOAD_CPU + "\n" + PREFIX + PAYLOAD_DISK + "\n",
                           encoding="utf-8")
-        code, stderr = run(tool, work / "merged", "-i", str(merged), "--route-key", "T")
+        code, stderr = run(tool, work / "merged", "-i", str(merged), "--route-key", "kind")
         check(code == 0, f"merged: exit {code}:\n{stderr}")
         counts = summary(stderr)
         check(counts["rows"] == 2 and counts["rejects"] == 0 and counts["unwritable"] == 0,
               f"merged: counts {counts}")
         catalog, tables, rejects = read_outputs(work / "merged")
-        check(sorted(tables) == ["irq", "lod"] and rejects == [],
+        check(sorted(tables) == ["cpu", "disk"] and rejects == [],
               f"merged: tables {sorted(tables)}, rejects {rejects}")
-        for name, payload in (("lod", DEVICE_LOD), ("irq", DEVICE_IRQ)):
+        for name, payload in (("cpu", PAYLOAD_CPU), ("disk", PAYLOAD_DISK)):
             schema = lance.dataset(str(work / "merged" / f"{name}.lance")).schema.names
             check(schema == PREFIX_COLUMNS + PAYLOAD_COLUMNS, f"merged {name}: columns {schema}")
-            want = {**json.loads(DEVICE_PRE), **json.loads(payload)}
+            want = {**json.loads(PREFIX), **json.loads(payload)}
             check(tables[name] == [want], f"merged {name}: rows {tables[name]}, want {[want]}")
-            check(tables[name][0]["v"] == want["v"], f"merged {name}: v lost its R values")
+            check(tables[name][0]["items"] == want["items"], f"merged {name}: items lost their names")
 
         # The same payloads without the prefix: the same payload columns.
         bare = work / "bare.ndjson"
-        bare.write_text(DEVICE_LOD + "\n" + DEVICE_IRQ + "\n", encoding="utf-8")
-        code, stderr = run(tool, work / "bare", "-i", str(bare), "--route-key", "T")
+        bare.write_text(PAYLOAD_CPU + "\n" + PAYLOAD_DISK + "\n", encoding="utf-8")
+        code, stderr = run(tool, work / "bare", "-i", str(bare), "--route-key", "kind")
         check(code == 0, f"bare: exit {code}:\n{stderr}")
         _, tables, _ = read_outputs(work / "bare")
-        check(tables["lod"] == [json.loads(DEVICE_LOD)] and tables["irq"] == [json.loads(DEVICE_IRQ)],
+        check(tables["cpu"] == [json.loads(PAYLOAD_CPU)] and tables["disk"] == [json.loads(PAYLOAD_DISK)],
               f"bare: rows {tables}")
-        check(lance.dataset(str(work / "bare" / "lod.lance")).schema.names == PAYLOAD_COLUMNS,
+        check(lance.dataset(str(work / "bare" / "cpu.lance")).schema.names == PAYLOAD_COLUMNS,
               "bare: columns differ from the payload's")
 
 
@@ -306,7 +307,7 @@ def case_nested_keys(tool):
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         path = work / "drift.ndjson"
-        path.write_text("\n".join([DEVICE_IRQ] * 150 + [DEVICE_LOD] * 150) + "\n", encoding="utf-8")
+        path.write_text("\n".join([PAYLOAD_DISK] * 150 + [PAYLOAD_CPU] * 150) + "\n", encoding="utf-8")
 
         code, stderr = run(tool, work / "keep", "-i", str(path))
         check(code == 0, f"keep: exit {code}:\n{stderr}")
@@ -314,10 +315,10 @@ def case_nested_keys(tool):
         check(counts["rows"] == 300 and counts["rejects"] == 0,
               f"keep: counts {counts}")
         catalog, tables, rejects = read_outputs(work / "keep")
-        check([(r["table"], r["new_nested_key_lines"]) for r in catalog] == [("t01_T_V_d", 150)],
+        check([(r["table"], r["new_nested_key_lines"]) for r in catalog] == [("t01_dur_items_kind", 150)],
               f"keep: catalog {catalog}")
-        check(len(tables["t01_T_V_d"]) == 300 and rejects == [],
-              f"keep: rows {len(tables['t01_T_V_d'])}, rejects {rejects}")
+        check(len(tables["t01_dur_items_kind"]) == 300 and rejects == [],
+              f"keep: rows {len(tables['t01_dur_items_kind'])}, rejects {rejects}")
         match = re.search(r"(\d+) new-nested-key lines", stderr)
         check(match is not None and int(match.group(1)) == 150,
               f"keep: summary does not count 150 nested-key lines:\n{stderr}")
@@ -329,8 +330,8 @@ def case_nested_keys(tool):
               f"strict: counts {counts}")
         catalog, tables, rejects = read_outputs(work / "strict")
         check(catalog[0]["new_nested_key_lines"] == 150, f"strict: catalog {catalog}")
-        check(len(tables["t01_T_V_d"]) == 150, "strict: table rows")
-        check(rejects_of(rejects) == [(line, "new nested key after lock: v.R")
+        check(len(tables["t01_dur_items_kind"]) == 150, "strict: table rows")
+        check(rejects_of(rejects) == [(line, "new nested key after lock: items.name")
                                       for line in range(151, 301)],
               f"strict: rejects {rejects_of(rejects)[:3]}...")
 

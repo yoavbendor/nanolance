@@ -61,30 +61,31 @@ Exit status: 0 on success; 1 when a table, the rejects file or the catalog could
 or the input stopped early (a line longer than `--max-line-mb`, a read error); 2 when the summary's
 line accounting does not balance (a bug).
 
-## Device logs
+## Logs with a prefix object
 
-Device logs often write a prefix object and then a payload object on one line, with no separator:
+Some loggers write a prefix object and then a payload object on one line, with no separator:
 
 ```
-{"time":"T00:03:55.164260+0000Z","logger":"buildroot","app":"MEST 1182","ts":{"name":"monotonic@11818","t":235.164264},"line":""}{"T":"lod","V":1,"d":5985,"t":236524162,"v":[{"M":[10,5],"R":"FotaAgent"},{"M":[0,0],"R":"coredump_fs_watcher"}]}
-{"time":"T00:03:55.164260+0000Z","logger":"buildroot","app":"MEST 1182","ts":{"name":"monotonic@11818","t":235.164264},"line":""}{"T":"irq","V":1,"d":902,"t":236624875,"v":[{"M":[0,0,0,1525864,1550,24329]}]}
+{"time":"2026-01-01T00:00:00.000001Z","host":"node-1","app":"svc 42","clock":{"name":"mono","t":12.5},"line":""}{"kind":"cpu","ver":1,"dur":120,"seq":1001,"items":[{"vals":[3,4],"name":"a"},{"vals":[0,0],"name":"b"}]}
+{"time":"2026-01-01T00:00:00.000002Z","host":"node-1","app":"svc 42","clock":{"name":"mono","t":12.6},"line":""}{"kind":"disk","ver":1,"dur":80,"seq":1002,"items":[{"vals":[0,0,0,51200,40,900]}]}
 ```
 
 Each such line is one record. Its keys are the prefix's and the payload's together. Two kinds of
-payload can share top-level keys (here `T`, `V`, `d`, `t`, `v`), and then key routing puts them in one
-table, where a nested key of one kind is not in the schema of the other. Route by the kind instead:
+payload can share top-level keys (here `kind`, `ver`, `dur`, `seq`, `items`), and then key routing
+puts them in one table, where a nested key of one kind (`items.name`) is not in the schema of the
+other. Route by the kind instead:
 
 ```
-ndjson2lance device.ndjson out/ --route-key T
+ndjson2lance out/ -i logs.ndjson --route-key kind
 ```
 
 ```
 table                                rows    rejects   new_keys   new_nested   unwritable  status
-lod                                     1          0          0            0            0  ok
-irq                                     1          0          0            0            0  ok
+cpu                                     1          0          0            0            0  ok
+disk                                    1          0          0            0            0  ok
 ```
 
-Each table has the prefix columns `time`, `logger`, `app`, `ts`, `line` and the payload columns.
+Each table has the prefix columns `time`, `host`, `app`, `clock`, `line` and the payload columns.
 `--no-merge` restores the old behaviour, where such a line is rejected with `trailing content after
 the record`.
 
