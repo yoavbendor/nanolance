@@ -287,6 +287,60 @@ void the_fast_compressor_matches_the_plain_one() {
     }
 }
 
+/// compress_into_padded (one value, 7 readable bytes after it) and compress_into_padded4 (four values at
+/// once) must emit exactly what compress_into emits, for every value in a column buffer with trailing padding.
+void the_padded_compressors_match_compress_into() {
+    std::vector<std::string> strings;
+    std::uint64_t x = 0x2545F4914F6CDD1DULL;
+    for (int i = 0; i < 6000; ++i) {
+        x ^= x << 13U;
+        x ^= x >> 7U;
+        x ^= x << 17U;
+        std::string v = "item/" + std::to_string(x % 99991) + "/lane-" + std::to_string(i % 13);
+        v.resize(static_cast<std::size_t>(i % 61));
+        if (i % 7 == 0) {
+            v.push_back(static_cast<char>(x >> 32U));  // bytes no symbol covers
+        }
+        strings.push_back(v);
+    }
+    fsst::Encoder encoder;
+    require(fsst::train(views(strings), encoder), "training succeeds");
+    std::vector<std::uint8_t> column;
+    std::vector<std::size_t> begin;
+    for (const auto& s : strings) {
+        begin.push_back(column.size());
+        column.insert(column.end(), s.begin(), s.end());
+    }
+    column.resize(column.size() + 8U, 0U);  // every value has 7 readable bytes after it
+    std::vector<std::uint8_t> want(2 * 64 + 8);
+    std::vector<std::uint8_t> got(2 * 64 + 8);
+    const auto size_of = [&](std::size_t i) { return strings[i].size(); };
+    for (std::size_t i = 0; i < strings.size(); ++i) {
+        const auto n = fsst::compress_into(encoder, column.data() + begin[i], size_of(i), want.data());
+        const auto m = fsst::compress_into_padded(encoder, column.data() + begin[i], size_of(i), got.data());
+        require(n == m && std::equal(want.begin(), want.begin() + static_cast<std::ptrdiff_t>(n), got.begin()),
+                "padded compression agrees on '" + strings[i] + "'");
+    }
+    for (std::size_t i = 0; i + 4U <= strings.size(); i += 4U) {
+        const std::uint8_t* data[4];
+        std::size_t sizes[4];
+        std::uint8_t* dst[4];
+        std::size_t written[4];
+        std::vector<std::uint8_t> out(4 * (2 * 64 + 8));
+        for (std::size_t k = 0; k < 4; ++k) {
+            data[k] = column.data() + begin[i + k];
+            sizes[k] = size_of(i + k);
+            dst[k] = out.data() + k * (2 * 64 + 8);
+        }
+        fsst::compress_into_padded4(encoder, data, sizes, dst, written);
+        for (std::size_t k = 0; k < 4; ++k) {
+            const auto n = fsst::compress_into(encoder, data[k], sizes[k], want.data());
+            require(written[k] == n && std::equal(want.begin(), want.begin() + static_cast<std::ptrdiff_t>(n), dst[k]),
+                    "four-lane compression agrees on '" + strings[i + k] + "'");
+        }
+    }
+}
+
 void nothing_to_train_on_is_declined() {
     fsst::Encoder encoder;
     require(!fsst::train({}, encoder), "no values: no table");
@@ -300,6 +354,7 @@ int main() {
     encoder_is_deterministic();
     the_fast_compressor_matches_the_plain_one();
     nothing_to_train_on_is_declined();
+    the_padded_compressors_match_compress_into();
     table_shape_is_validated();
     a_parsed_table_reports_what_it_holds();
     codes_expand_to_their_symbols();

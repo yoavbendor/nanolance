@@ -46,6 +46,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstring>
 
 // The codec itself is nanom's (nanom/fsst.hpp, nanom/fsst_encode.hpp, namespace nanom::codec::fsst):
@@ -104,6 +105,53 @@ inline std::size_t compress_into(const Encoder& encoder, const std::uint8_t* dat
         reinterpret_cast<std::byte*>(dst));
 }
 
+namespace detail {
+
+/// One value's greedy parse in progress (see compress_into_padded).
+struct PaddedLane {
+    const std::uint8_t* data;
+    std::size_t size;
+    std::size_t pos;
+    std::uint8_t* out;
+};
+
+/// Advance one position of a padded parse: the longest long symbol that matches, else the two-byte or
+/// one-byte entry, else an escape. Branch-free on the match: whether a long symbol matches is close to a
+/// coin flip on text, so the choice is a select, not a mispredicted branch. Every position writes its code and
+/// literal byte (the literal is kept only for an escape), so the bytes are the same as a branching loop's.
+inline void padded_step(const Encoder& encoder, PaddedLane& lane) {
+    namespace f = ::nanom::codec::fsst;
+    // The low `8 * n` bits of a word, by symbol length n (0 is never a match: an empty slot).
+    static constexpr auto kLowBytes = [] {
+        std::array<std::uint64_t, 9> masks{};
+        for (std::size_t n = 1; n <= 8; ++n) {
+            masks[n] = n == 8 ? ~std::uint64_t{0} : (std::uint64_t{1} << (8 * n)) - 1U;
+        }
+        return masks;
+    }();
+    std::uint64_t word = 0;
+    std::memcpy(&word, lane.data + lane.pos, 8);
+    const std::size_t remaining = lane.size - lane.pos;
+    const auto& s = encoder.long_codes[f::enc_detail::hash3(word)];
+    const bool long_hit = std::size_t{s.length} - 1U < 8U && s.length <= remaining &&
+                          ((word ^ s.value) & kLowBytes[s.length]) == 0;
+    std::uint16_t entry = 0;
+    if (remaining >= 2) {
+        entry = encoder.short_or_byte[word & 0xFFFF];
+    } else {
+        const auto one = encoder.byte_codes[word & 0xFF];
+        entry = static_cast<std::uint16_t>((1U << 8) | (one != Encoder::kNone ? one : f::kEscape));
+    }
+    const std::uint8_t code = long_hit ? s.code : static_cast<std::uint8_t>(entry & 0xFF);
+    const std::size_t step = long_hit ? s.length : static_cast<std::size_t>(entry >> 8);
+    lane.out[0] = code;
+    lane.out[1] = static_cast<std::uint8_t>(word & 0xFF);
+    lane.out += code == f::kEscape ? 2 : 1;
+    lane.pos += step;
+}
+
+}  // namespace detail
+
 /// `compress_into` for a value with at least 7 readable bytes after it (any bytes): the 8-byte loads run
 /// to the value's end instead of finishing the last bytes from a zero-padded copy, which for short values
 /// (ids, codes) is most of them. The same output: a long symbol (3+ bytes) matches only within the value,
@@ -111,36 +159,44 @@ inline std::size_t compress_into(const Encoder& encoder, const std::uint8_t* dat
 /// whenever a long symbol could fit.
 inline std::size_t compress_into_padded(const Encoder& encoder, const std::uint8_t* data, std::size_t size,
                                         std::uint8_t* dst) {
-    namespace f = ::nanom::codec::fsst;
     if (encoder.short_or_byte.empty()) {  // an encoder built without train(): the general path
         return compress_into(encoder, data, size, dst);
     }
-    std::uint8_t* out = dst;
-    std::size_t pos = 0;
-    while (pos < size) {
-        std::uint64_t word = 0;
-        std::memcpy(&word, data + pos, 8);
-        const std::size_t remaining = size - pos;
-        const auto& s = encoder.long_codes[f::enc_detail::hash3(word)];
-        if (s.length != 0 && s.length <= remaining && ((word ^ s.value) << (64 - 8 * s.length)) == 0) {
-            *out++ = s.code;
-            pos += s.length;
-            continue;
-        }
-        std::uint16_t entry = 0;
-        if (remaining >= 2) {
-            entry = encoder.short_or_byte[word & 0xFFFF];
-        } else {
-            const auto one = encoder.byte_codes[word & 0xFF];
-            entry = static_cast<std::uint16_t>((1U << 8) | (one != Encoder::kNone ? one : f::kEscape));
-        }
-        const auto code = static_cast<std::uint8_t>(entry & 0xFF);
-        out[0] = code;
-        out[1] = static_cast<std::uint8_t>(word & 0xFF);
-        out += code == f::kEscape ? 2 : 1;
-        pos += entry >> 8;
+    detail::PaddedLane lane{data, size, 0, dst};
+    while (lane.pos < size) {
+        detail::padded_step(encoder, lane);
     }
-    return static_cast<std::size_t>(out - dst);
+    return static_cast<std::size_t>(lane.out - dst);
+}
+
+/// `compress_into_padded` for four values at once, each with the padding `compress_into_padded` needs. Their
+/// parses are independent, so their dependency chains (load, table lookup, next position) overlap: text
+/// compression is latency-bound, one value at a time leaves the core waiting. `written[i]` gets the bytes
+/// written at `dst[i]`, the same as four calls to compress_into_padded.
+inline void compress_into_padded4(const Encoder& encoder, const std::uint8_t* const data[4],
+                                  const std::size_t size[4], std::uint8_t* const dst[4], std::size_t written[4]) {
+    if (encoder.short_or_byte.empty()) {
+        for (std::size_t i = 0; i < 4; ++i) {
+            written[i] = compress_into(encoder, data[i], size[i], dst[i]);
+        }
+        return;
+    }
+    detail::PaddedLane lanes[4];
+    for (std::size_t i = 0; i < 4; ++i) {
+        lanes[i] = detail::PaddedLane{data[i], size[i], 0, dst[i]};
+    }
+    for (bool active = true; active;) {
+        active = false;
+        for (auto& lane : lanes) {
+            if (lane.pos < lane.size) {
+                detail::padded_step(encoder, lane);
+                active = true;
+            }
+        }
+    }
+    for (std::size_t i = 0; i < 4; ++i) {
+        written[i] = static_cast<std::size_t>(lanes[i].out - dst[i]);
+    }
 }
 
 /// The `kSymbolTableBytes` serialization `parse_symbol_table` (and Lance) reads, encoder switch on.
