@@ -603,3 +603,27 @@ def test_long_text_in_a_default_column_is_fsst_coded_on_disk(tmp_path):
     on_disk = _data_bytes(path)
     assert on_disk < raw * 0.4, (on_disk, raw)
     assert nl.dataset(path).to_table().column("properties").to_pylist() == values
+
+
+def test_a_repeated_sparse_take_of_a_mid_size_column_is_served_from_its_copy(tmp_path):
+    """An indexed query's few rows (1k of 500k, scattered) taken again and again, as the scalar-index benchmark's
+    `all|id < 1000` does: a column under 16 MB encoded keeps its decoded copy after the first take, whatever the take's
+    density, so the repeat reads none of it. The density rule for the 16-64 MB columns once dropped this, and every
+    repeat read and decoded the column again (CI perf gate: 1.2 ms became 7.5 ms)."""
+    if _knob_overridden("NANOLANCE_TAKE_CACHE_MB"):
+        pytest.skip("NANOLANCE_TAKE_CACHE_MB is set in the environment")
+    rng = np.random.default_rng(5)
+    n = 500_000
+    values = rng.standard_normal(n)
+    path = str(tmp_path / "mid.lance")
+    nl.write_dataset(pa.table({"f": pa.array(values)}), path, max_rows_per_file=1_000_000)
+    ours = nl.dataset(path)
+    encoded = _data_bytes(path)
+    assert (1 << 20) < encoded <= 16 << 20, encoded
+    rows = sorted(rng.choice(n, 1_000, replace=False).tolist())
+    ours.take(rows, columns=["f"])
+    first_stats, first = _stats_of(lambda: ours.take(rows, columns=["f"]))
+    second_stats, second = _stats_of(lambda: ours.take(rows, columns=["f"]))
+    assert first.column("f").to_pylist() == [values[r] for r in rows]
+    assert second.equals(first)
+    assert second_stats["take_cache_hits"] >= 1 and second_stats["data_bytes_read"] == 0, second_stats

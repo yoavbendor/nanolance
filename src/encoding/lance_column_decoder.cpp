@@ -4820,6 +4820,10 @@ constexpr std::uint64_t kCacheColumnBytes = std::uint64_t{64} << 20U;
 /// more and the repeated take is served from it. A sparser take reads only the chunks holding its rows, as before
 /// (an indexed IN of 500 values reads 2.6k rows of a million: decoding the column whole would cost more than that).
 constexpr std::uint64_t kDenseTakeDivisor = 64;
+/// Up to this size a column's copy is kept on its first take whatever the take's density, as before the cache grew to
+/// kCacheColumnBytes: a repeated sparse take (an indexed `id < 1000` of 500k rows, all columns) is then served from the
+/// copy. The density rule above applies only to the larger columns the bigger cache added.
+constexpr std::uint64_t kAnyTakeCacheColumnBytes = std::uint64_t{16} << 20U;
 
 std::uint64_t take_cache_budget() {
     static const std::uint64_t budget = [] {
@@ -5623,7 +5627,8 @@ static bool decode_lance_physical_column_rows_impl(const EncodingsIo& io, const 
                                                : encoded <= kSmallColumnBytes ? CacheFill::FirstTake
                                                : chunked                    ? CacheFill::Never
                                                : nested                     ? CacheFill::SecondTake
-                                               : rows.size() * kDenseTakeDivisor >= page_first.back()
+                                               : encoded <= kAnyTakeCacheColumnBytes ||
+                                                         rows.size() * kDenseTakeDivisor >= page_first.back()
                                                                             ? CacheFill::FirstTake
                                                                             : CacheFill::Never);
         if (whole == nullptr && !error.empty()) {
