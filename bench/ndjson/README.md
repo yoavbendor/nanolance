@@ -122,38 +122,32 @@ and divided by their rows; the page layouts were checked with `build/nlance-page
 
 | CORES | writer | write s | output MB | detail B/row | peak threads |
 |---:|---|---:|---:|---:|---:|
-| 1 | nanolance `write_table(compression=False)` | 1.503 | 601.3 | 863.8 | 5 |
-| 1 | nanolance `write_table(compression=True)` | 3.247 | 125.9 | 157.9 | 5 |
-| 1 | pylance `write_dataset(data_storage_version="2.2")` | 1.748 | 122.6 | 152.9 | 13 |
-| 4 | nanolance `write_table(compression=False)` | 1.773 | 601.3 | 863.8 | 11 |
-| 4 | nanolance `write_table(compression=True)` | 3.186 | 125.9 | 157.9 | 11 |
-| 4 | pylance `write_dataset(data_storage_version="2.2")` | 1.640 | 122.6 | 152.9 | 20 |
+| 1 | nanolance `write_table(compression=False)` (FSST on long strings) | 1.804 | 119.9 | 148.8 | 5 |
+| 1 | nanolance `write_table(compression=True)` (zstd on strings) | 3.117 | 125.9 | 157.9 | 5 |
+| 1 | pylance `write_dataset(data_storage_version="2.2")` | 1.770 | 122.7 | 153.0 | 15 |
+| 4 | nanolance `write_table(compression=False)` (FSST on long strings) | 1.549 | 119.9 | 148.8 | 11 |
+| 4 | nanolance `write_table(compression=True)` (zstd on strings) | 3.135 | 125.9 | 157.9 | 11 |
+| 4 | pylance `write_dataset(data_storage_version="2.2")` | 1.713 | 122.7 | 153.0 | 20 |
 
-Commands: `bench/ndjson/run.sh` with `MODES=keys RUNS=3 CORES=1|4 INPUT=... WORKDIR=...`; then
-`writer_only.py prep TOOL INPUT WORKDIR/results.jsonl TABLES_DIR` and
-`writer_only.py run WORK PY_DIR TABLES_DIR 3 1 4`. Peak threads are sampled from `/proc/self/status`
-inside the timed process.
+Load average about 1.0. Commands: `bench/ndjson/run.sh` with `MODES=keys RUNS=3 CORES=1|4 INPUT=...
+WORKDIR=...`; then `writer_only.py prep TOOL INPUT WORKDIR/results.jsonl TABLES_DIR` and
+`writer_only.py run WORK PY_DIR TABLES_DIR 3 1 4`, where `PY_DIR` is a `pip install --target` of the
+same commit's Python package (the script refuses to run if `nanolance` is imported from anywhere else).
+Peak threads are sampled from `/proc/self/status` inside the timed process.
 
-Interpretation. With the same cores, ndjson2lance is faster than the baseline at both settings: 4.2
-times (zstd) and 4.9 times (`--no-compress`) at CORES=1, 6.1 and 7.4 times at CORES=4. The tool does not
-speed up with more cores (7.24 s at CORES=1 and 4 with zstd), and the baseline is slower at CORES=4
-(44.1 s against 30.2 s), so the two core counts are not a scaling comparison. For the writes alone on
-the same tables, nanolance without compression is the fastest writer (1.50 s at CORES=1, 1.77 s at
-CORES=4) but writes 601.3 MB, against pylance's 1.75 s and 1.64 s for 122.6 MB; nanolance with zstd takes
-3.25 s and 3.19 s for 125.9 MB. None of the writers gets faster with four cores, because each table is
-written in turn. The thread pools follow the
-limit: peak thread count rises from 5 to 11 for nanolance and from 13 to 20 for pylance.
+Interpretation. With the same cores, ndjson2lance is faster than the baseline end to end at both
+settings: 4.2 times (zstd) and 4.9 times (`--no-compress`) at CORES=1, 6.1 and 7.4 times at CORES=4. The
+tool does not speed up with more cores (one router thread), and the baseline was slower at CORES=4 in
+this run, so the two core counts are not a scaling comparison. For the writes alone on the same tables,
+nanolance with its default encodings (FSST on long strings) writes the smallest files (119.9 MB against
+pylance's 122.7 MB) in about the same time on one core (1.80 s against 1.77 s) and faster on four (1.55 s
+against 1.71 s). zstd on strings is both larger (125.9 MB) and slower (3.1 s) than FSST here. On the
+tool's own output the same holds: `--no-compress` gives 162.5 MB in 6.0 s against zstd's 170.1 MB in
+7.2 s. The 816.8 MB `--no-compress` figure in the Results section predates FSST on long strings.
 
-Caveats:
-
-- The `--no-compress` writer row is not the encoding the tool's `--no-compress` produces. On the same
-  table (`t01`), the tool's output stores `detail` as FSST (`FullZip{values=Fsst{...}}`), while
-  `nanolance.write_table(compression=False)` and the `LanceWriter` class store it as plain `Variable`
-  pages (`nlance-pagelayout -v`). The writer-only no-compress row therefore measures plain pages, not
-  the tool's. Not investigated further.
-- Output of the tool's `--no-compress` is 162.5 MB here. The 816.8 MB figure in the Results section
-  predates FSST on long strings and is not comparable to this run.
-- The tool's zstd output (170.1 MB) is larger than its `--no-compress` output (162.5 MB) on this stream.
+A first run of the writer-only script loaded a stale editable build of nanolance (from before FSST on
+long strings) and measured plain pages (601 MB) for `compression=False`; the script now checks which
+`nanolance` it imported, and the table above is from a rerun with the current build.
 
 ## Assertion output (1 GB stream)
 

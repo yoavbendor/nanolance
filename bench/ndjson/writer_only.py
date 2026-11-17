@@ -79,11 +79,19 @@ def prep(args):
 
 
 def measure(args):
-    # Import nanolance from the private install, not from the source tree the editable install points at.
-    sys.path[:] = [p for p in sys.path if "/home/user/nanolance" not in p]
+    # Import nanolance from the given install. An editable install's import hook would otherwise win over
+    # sys.path and load whatever extension it last built, so drop it first, then check what was loaded.
+    sys.meta_path[:] = [
+        f
+        for f in sys.meta_path
+        if "editable" not in type(f).__name__.lower() and "nanolance" not in type(f).__module__.lower()
+    ]
     sys.path.insert(0, args.nanolance_py)
     import lance
     import nanolance
+
+    if not os.path.abspath(nanolance.__file__).startswith(os.path.abspath(args.nanolance_py)):
+        sys.exit(f"writer_only: nanolance was loaded from {nanolance.__file__}, not {args.nanolance_py}")
     import pyarrow as pa
 
     tables = load_tables(args.tables_dir)
