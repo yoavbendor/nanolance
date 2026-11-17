@@ -15,6 +15,8 @@ baseline, and Python 3 for the generator. Environment:
 - `INPUT=FILE` uses an existing realistic NDJSON file; without it the script generates
   `gen_logs.py --profile realistic --seed ${SEED:-2} --lines ${LINES:-900000}` (about 1 GB).
 - `RUNS=3` runs per configuration (medians are shown).
+- `CORES=N` (default `nproc`) bounds every timed command to cores `0..N-1` with `taskset`, and sets the
+  thread count of each side (see "Equal cores" below). `MODES=keys` runs key mode only.
 - `GH_GZ=FILE` adds the GH Archive section: one `.json.gz` hour, decompressed to WORKDIR, read with
   `--route-key type`. It is skipped when unset.
 
@@ -87,6 +89,71 @@ GH Archive hour `2026-11-15-12.json.gz` (7.6 MB gzipped, 19,151 lines), `--route
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | ndjson2lance (zstd default) | 0.433 | 78.3 | 44,187 | 123.5 | 15.1 | 0.445 | 16 | 19,151 | 0 | 0 | 1.17 |
 | baseline | 2.290 | 14.8 | 7,010 | 373.3 | 6.5 | 0.191 | 13 | 16,055 | 0 | 3,096 | 1.38 |
+
+## Equal cores (CORES=1 and CORES=4)
+
+Run 2026-11-17 on the same 4 vCPU VM as the Results section, 1 GB stream (`gen_logs.py --profile
+realistic --seed 2 --lines 900000`, 989,133,346 bytes), key mode, `RUNS=3`, medians. Load is the
+1-minute average read before each run (`/proc/loadavg`, in `results.jsonl`); the load1 column is the
+median. Each timed command runs under `taskset -c 0-(CORES-1)`. The tool gets `--threads CORES` and
+`NANOLANCE_THREADS=CORES`; the baseline gets `RAYON_NUM_THREADS`, `LANCE_CPU_THREADS`,
+`LANCE_IO_THREADS` and `OMP_NUM_THREADS` set to CORES, and `pyarrow.set_cpu_count` /
+`set_io_thread_count` set to CORES.
+
+End to end (`CORES=1 MODES=keys RUNS=3 bench/ndjson/run.sh`, and `CORES=4`):
+
+| CORES | config | wall s | input MB/s | rows/s | peak RSS MB | output MB | out/in | tables | rows | rejects | unwritable | load1 |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | ndjson2lance (zstd on strings, default) | 7.237 | 136.7 | 121,730 | 142.8 | 170.1 | 0.172 | 7 | 880,999 | 19,001 | 0 | 1.06 |
+| 1 | ndjson2lance `--no-compress` | 6.160 | 160.6 | 143,020 | 156.2 | 162.5 | 0.164 | 7 | 880,999 | 19,001 | 0 | 1.24 |
+| 1 | baseline | 30.212 | 32.7 | 22,297 | 2,028.1 | 122.7 | 0.124 | 6 | 673,623 | 1,837 | 224,540 | 1.15 |
+| 4 | ndjson2lance (zstd on strings, default) | 7.230 | 136.8 | 121,860 | 173.0 | 170.1 | 0.172 | 7 | 880,999 | 19,001 | 0 | 1.14 |
+| 4 | ndjson2lance `--no-compress` | 5.969 | 165.7 | 147,602 | 183.3 | 162.5 | 0.164 | 7 | 880,999 | 19,001 | 0 | 1.33 |
+| 4 | baseline | 44.083 | 22.4 | 15,281 | 2,328.6 | 122.7 | 0.124 | 6 | 673,623 | 1,837 | 224,540 | 1.21 |
+
+All A and B checks pass at both settings (B2 too); C is not run in key-only mode. The INFO lines are the
+same as in the Results section: the baseline writes no table for the metric records (207,376 rows).
+
+Writer only (`bench/ndjson/writer_only.py`): the six tables both sides wrote, read once into Arrow with
+pylance from a `--no-compress` tool run, then written by each writer in a fresh process under the same
+`taskset` and thread settings. Timed region: the writes only; median of 3. The `detail` column is
+pylance's `DataStatistics` `bytes_on_disk` for the field (Lance field id), summed over the six tables
+and divided by their rows; the page layouts were checked with `build/nlance-pagelayout -v`.
+
+| CORES | writer | write s | output MB | detail B/row | peak threads |
+|---:|---|---:|---:|---:|---:|
+| 1 | nanolance `write_table(compression=False)` | 1.503 | 601.3 | 863.8 | 5 |
+| 1 | nanolance `write_table(compression=True)` | 3.247 | 125.9 | 157.9 | 5 |
+| 1 | pylance `write_dataset(data_storage_version="2.2")` | 1.748 | 122.6 | 152.9 | 13 |
+| 4 | nanolance `write_table(compression=False)` | 1.773 | 601.3 | 863.8 | 11 |
+| 4 | nanolance `write_table(compression=True)` | 3.186 | 125.9 | 157.9 | 11 |
+| 4 | pylance `write_dataset(data_storage_version="2.2")` | 1.640 | 122.6 | 152.9 | 20 |
+
+Commands: `bench/ndjson/run.sh` with `MODES=keys RUNS=3 CORES=1|4 INPUT=... WORKDIR=...`; then
+`writer_only.py prep TOOL INPUT WORKDIR/results.jsonl TABLES_DIR` and
+`writer_only.py run WORK PY_DIR TABLES_DIR 3 1 4`. Peak threads are sampled from `/proc/self/status`
+inside the timed process.
+
+Interpretation. With the same cores, ndjson2lance is faster than the baseline at both settings: 4.2
+times (zstd) and 4.9 times (`--no-compress`) at CORES=1, 6.1 and 7.4 times at CORES=4. The tool does not
+speed up with more cores (7.24 s at CORES=1 and 4 with zstd), and the baseline is slower at CORES=4
+(44.1 s against 30.2 s), so the two core counts are not a scaling comparison. For the writes alone on
+the same tables, nanolance without compression is the fastest writer (1.50 s at CORES=1, 1.77 s at
+CORES=4) but writes 601.3 MB, against pylance's 1.75 s and 1.64 s for 122.6 MB; nanolance with zstd takes
+3.25 s and 3.19 s for 125.9 MB. None of the writers gets faster with four cores, because each table is
+written in turn. The thread pools follow the
+limit: peak thread count rises from 5 to 11 for nanolance and from 13 to 20 for pylance.
+
+Caveats:
+
+- The `--no-compress` writer row is not the encoding the tool's `--no-compress` produces. On the same
+  table (`t01`), the tool's output stores `detail` as FSST (`FullZip{values=Fsst{...}}`), while
+  `nanolance.write_table(compression=False)` and the `LanceWriter` class store it as plain `Variable`
+  pages (`nlance-pagelayout -v`). The writer-only no-compress row therefore measures plain pages, not
+  the tool's. Not investigated further.
+- Output of the tool's `--no-compress` is 162.5 MB here. The 816.8 MB figure in the Results section
+  predates FSST on long strings and is not comparable to this run.
+- The tool's zstd output (170.1 MB) is larger than its `--no-compress` output (162.5 MB) on this stream.
 
 ## Assertion output (1 GB stream)
 

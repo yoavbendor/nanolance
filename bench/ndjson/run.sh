@@ -10,6 +10,12 @@
 #   INPUT=FILE   existing realistic NDJSON to use; without it the input is generated
 #   SEED=2       generator seed            LINES=900000  generator --lines (about 1 GB)
 #   RUNS=3       runs per configuration (the table shows medians)
+#   CORES=N      cores for every timed command (default: nproc). Each timed command runs under
+#                taskset -c 0-(N-1); the tool gets --threads N and NANOLANCE_THREADS=N; the baseline
+#                gets RAYON_NUM_THREADS, LANCE_CPU_THREADS, LANCE_IO_THREADS, OMP_NUM_THREADS = N and
+#                pyarrow.set_cpu_count / set_io_thread_count = N (baseline.py reads CORES)
+#   MODES=keys   "keys" runs key mode only (no event-mode configs and no --threads 4 config);
+#                default "keys event"
 #   GH_GZ=FILE   a GH Archive hour (.json.gz); the GH section runs only when set
 #
 # Configurations: ndjson2lance in key mode (string columns zstd-compressed by default), --route-key
@@ -34,6 +40,9 @@ if [[ -z "$TOOL" || ! -x "$TOOL" ]]; then
 fi
 WORK="${2:-$(mktemp -d "${TMPDIR:-/tmp}/ndjson-bench.XXXXXX")}"
 RUNS="${RUNS:-3}"
+CORES="${CORES:-$(nproc)}"
+MODES="${MODES:-keys event}"
+CPUSET="0-$((CORES - 1))"
 GEN="$ROOT/examples/ndjson2lance/tests/gen_logs.py"
 BASE="$HERE/baseline.py"
 LOGS="$WORK/logs"
@@ -44,6 +53,7 @@ mkdir -p "$WORK/out" "$LOGS"
 echo "machine: nproc=$(nproc) cpu='$(lscpu | sed -n 's/^Model name: *//p')' load_before_start=$(cut -d' ' -f1-3 /proc/loadavg)"
 echo "tool: $TOOL"
 echo "workdir: $WORK"
+echo "cores: $CORES (taskset -c $CPUSET; modes: $MODES)"
 
 if [[ -n "${INPUT:-}" ]]; then
     IN="$INPUT"
@@ -102,20 +112,24 @@ PY
 
 # name kind route threads input extra-flags ("-" for none)
 configs=(
-    "tool-keys tool keys 1 $IN -"
-    "base-keys base keys 1 $IN -"
-    "tool-event tool event 1 $IN -"
-    "base-event base event 1 $IN -"
-    "tool-keys-t4 tool keys 4 $IN -"
-    "tool-keys-nocompress tool keys 1 $IN --no-compress"
+    "tool-keys tool keys $CORES $IN -"
+    "base-keys base keys $CORES $IN -"
+    "tool-keys-nocompress tool keys $CORES $IN --no-compress"
 )
+if [[ " $MODES " == *" event "* ]]; then
+    configs+=(
+        "tool-event tool event $CORES $IN -"
+        "base-event base event $CORES $IN -"
+        "tool-keys-t4 tool keys 4 $IN -"
+    )
+fi
 GHIN=""
 if [[ -n "${GH_GZ:-}" ]]; then
     GHIN="$WORK/gh.ndjson"
     gunzip -c "$GH_GZ" > "$GHIN"
     configs+=(
-        "gh-tool-type tool type 1 $GHIN -"
-        "gh-base-type base type 1 $GHIN -"
+        "gh-tool-type tool type $CORES $GHIN -"
+        "gh-base-type base type $CORES $GHIN -"
     )
 fi
 
@@ -125,12 +139,15 @@ for spec in "${configs[@]}"; do
         out="$WORK/out/$config-$run"
         case "$kind" in
             tool)
-                args=("$TOOL" "$out" -i "$inpath" --threads "$threads")
+                args=(env NANOLANCE_THREADS="$threads" taskset -c "$CPUSET"
+                      "$TOOL" "$out" -i "$inpath" --threads "$threads")
                 [[ "$route" == keys ]] || args+=(--route-key "$route")
                 [[ "$extra" == "-" ]] || args+=($extra)
                 ;;
             base)
-                args=(python3 "$BASE" "$inpath" "$out")
+                args=(env RAYON_NUM_THREADS="$threads" LANCE_CPU_THREADS="$threads"
+                      LANCE_IO_THREADS="$threads" OMP_NUM_THREADS="$threads" CORES="$threads"
+                      taskset -c "$CPUSET" python3 "$BASE" "$inpath" "$out")
                 [[ "$route" == keys ]] || args+=(--route-key "$route")
                 ;;
         esac
@@ -140,6 +157,7 @@ done
 rm -f -- "$GHIN"
 
 echo
+echo "results: CORES=$CORES"
 python3 - "$RES" "$RUNS" <<'PY'
 import json, re, statistics, sys
 from collections import defaultdict
