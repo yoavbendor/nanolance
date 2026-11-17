@@ -2403,6 +2403,7 @@ bool decode_rle_column(const EncodingsIo& io, const pb::Field& on_disk_field, co
 bool append_dict_fixed(const DictionaryBlock& dict, const std::vector<std::uint32_t>& picked, ColumnValues& out,
                        std::string& error) {
     const std::size_t base = out.fixed.size();
+    reserve_more(out.fixed, picked.size() * dict.value_bytes);  // through the pool, as append_dict_variable
     out.fixed.resize(base + picked.size() * dict.value_bytes);
     std::uint8_t* dest = out.fixed.data() + base;
     for (const auto index : picked) {
@@ -2440,10 +2441,10 @@ bool append_dict_variable(const DictionaryBlock& dict, const std::vector<std::ui
     }
     const auto width = static_cast<std::size_t>(out.variable.large ? 8U : 4U);
     const std::size_t offsets_base = out.variable.offsets.size();
-    if (data_end > out.variable.data.capacity()) {
-        out.variable.data.reserve(static_cast<std::size_t>(data_end));
-        advise_huge_pages(out.variable.data);
-    }
+    // Grow through the buffer pool, as the whole-page expansion does (reserve_more): a plain reserve took fresh
+    // memory on every read and left the pool's buffers unused, so a repeated read faulted its output in again.
+    reserve_more(out.variable.data, static_cast<std::size_t>(data_end) - data_base);
+    reserve_more(out.variable.offsets, picked.size() * width);
     out.variable.data.resize(static_cast<std::size_t>(data_end));
     out.variable.offsets.resize(offsets_base + picked.size() * width);
     std::uint8_t* dest = out.variable.data.data() + data_base;
