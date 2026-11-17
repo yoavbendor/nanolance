@@ -7,15 +7,19 @@ the reason on stderr. Exit 77 (ctest SKIP): pylance or pyarrow is not installed,
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
+import urllib.parse
+import uuid
 from pathlib import Path
 
 try:
     import lance
     import pyarrow  # noqa: F401 - pylance returns pyarrow tables
+    from pyarrow import fs as pafs
 except ImportError as error:
     print(f"skip: {error}")
     sys.exit(77)
@@ -34,10 +38,10 @@ def check(condition, message):
         raise AssertionError(message)
 
 
-def run(tool, out, *args, stdin=None):
+def run(tool, out, *args, stdin=None, env=None):
     """Runs the tool with out as its output directory. Returns (exit code, stderr)."""
     process = subprocess.run([str(tool), str(out), *args], capture_output=True, text=True,
-                             stdin=stdin, timeout=120)
+                             stdin=stdin, env=env, timeout=300)
     return process.returncode, process.stderr
 
 
@@ -336,6 +340,121 @@ def case_nested_keys(tool):
               f"strict: rejects {rejects_of(rejects)[:3]}...")
 
 
+S3_BUCKET = "nl-test"  # created by the moto step of CI (and by hand, see the README)
+S3_ENV = {**os.environ, "AWS_ACCESS_KEY_ID": "testing", "AWS_SECRET_ACCESS_KEY": "testing",
+          "AWS_REGION": "us-east-1"}
+
+
+def s3_endpoint():
+    """The S3 endpoint of the s3 cases. Without NANOLANCE_S3_TEST_ENDPOINT (no moto server) they skip."""
+    endpoint = os.environ.get("NANOLANCE_S3_TEST_ENDPOINT")
+    if not endpoint:
+        print("skip: NANOLANCE_S3_TEST_ENDPOINT is not set (no S3 server)")
+        sys.exit(77)
+    return endpoint
+
+
+def new_prefix():
+    return f"s3://{S3_BUCKET}/{uuid.uuid4().hex}/out"
+
+
+class Store:
+    """An output location, a local directory or an s3:// prefix (with an endpoint), read by pylance."""
+
+    def __init__(self, location, endpoint=None):
+        self.location = location
+        self.endpoint = endpoint
+
+    def uri(self, name):
+        return f"{self.location}/{name}.lance"
+
+    def dataset(self, name):
+        if self.endpoint is None:
+            return lance.dataset(self.uri(name))
+        options = {"access_key_id": "testing", "secret_access_key": "testing", "region": "us-east-1",
+                   "endpoint": self.endpoint, "allow_http": "true"}
+        return lance.dataset(self.uri(name), storage_options=options)
+
+    def names(self):
+        """The entries of the location, sorted: "<name>.lance" for each dataset."""
+        if self.endpoint is None:
+            return sorted(path.name for path in Path(self.location).iterdir())
+        bucket, _, key = self.location[len("s3://"):].partition("/")
+        url = urllib.parse.urlparse(self.endpoint)
+        s3 = pafs.S3FileSystem(access_key="testing", secret_key="testing", region="us-east-1",
+                               endpoint_override=url.netloc, scheme=url.scheme)
+        infos = s3.get_file_info(pafs.FileSelector(f"{bucket}/{key}", recursive=False,
+                                                   allow_not_found=True))
+        return sorted(info.base_name for info in infos)
+
+
+def read_store(store):
+    """(catalog rows, {table: rows}, rejects rows) of an output location, read by pylance."""
+    names = store.names()
+    catalog = store.dataset("_catalog").to_table().to_pylist()
+    tables = {row["table"]: store.dataset(row["table"]).to_table().to_pylist()
+              for row in catalog if row["status"] == "ok"}
+    rejects = store.dataset("_rejects").to_table().to_pylist() if "_rejects.lance" in names else []
+    return catalog, tables, rejects
+
+
+def case_stdin(tool):
+    """'-i -' and no -i read stdin: the same tables and rows as reading the file with -i FILE."""
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        input_path, _ = generate(work)
+        code, stderr = run(tool, work / "file", "-i", str(input_path))
+        check(code == 0, f"-i FILE: exit {code}:\n{stderr}")
+        want = read_store(Store(str(work / "file")))
+        for name, args in (("-i -", ["-i", "-"]), ("no -i", [])):
+            with open(input_path, "rb") as stdin_file:
+                code, stderr = run(tool, work / name.replace(" ", "_"), *args, stdin=stdin_file)
+            check(code == 0, f"{name}: exit {code}:\n{stderr}")
+            got = read_store(Store(str(work / name.replace(" ", "_"))))
+            check(got == want, f"{name}: output differs from -i FILE")
+
+
+def case_s3(tool, one_version):
+    """An s3:// output reads back as the same local run: same objects, catalog, tables, rows and order."""
+    endpoint = s3_endpoint()
+    extra = ["--one-version"] if one_version else []
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        input_path, _ = generate(work)
+        code, stderr = run(tool, work / "local", "-i", str(input_path), *extra)
+        check(code == 0, f"local run: exit {code}:\n{stderr}")
+        local = Store(str(work / "local"))
+
+        prefix = new_prefix()
+        code, stderr = run(tool, prefix, "-i", str(input_path), "--s3-endpoint", endpoint,
+                           "--s3-allow-http", *extra, env=S3_ENV)
+        check(code == 0, f"s3 run: exit {code}:\n{stderr}")
+        remote = Store(prefix, endpoint)
+        check(local.names() and remote.names() == local.names(),
+              f"objects differ: s3 {remote.names()}, local {local.names()}")
+        check(read_store(remote) == read_store(local), "s3 output differs from the local run")
+
+
+def case_s3_rerun(tool):
+    """A second run into the same prefix is refused before anything is written."""
+    endpoint = s3_endpoint()
+    with tempfile.TemporaryDirectory() as tmp:
+        input_path, _ = generate(Path(tmp))
+        prefix = new_prefix()
+        args = ["-i", str(input_path), "--s3-endpoint", endpoint, "--s3-allow-http"]
+        code, stderr = run(tool, prefix, *args, env=S3_ENV)
+        check(code == 0, f"first run: exit {code}:\n{stderr}")
+        store = Store(prefix, endpoint)
+        before = (store.names(), store.dataset("_catalog").version)
+
+        code, stderr = run(tool, prefix, *args, env=S3_ENV)
+        check(code == 1, f"second run: exit {code}, expected 1:\n{stderr}")
+        check(f"'{prefix}' already holds" in stderr and "refusing to write into it" in stderr,
+              f"second run: no refusal message:\n{stderr}")
+        after = (store.names(), store.dataset("_catalog").version)
+        check(before == after, f"the refused run changed the output: {before} -> {after}")
+
+
 CASES = {
     "route-keys": lambda tool: case_route(tool, "keys"),
     "route-event": lambda tool: case_route(tool, "event"),
@@ -347,6 +466,10 @@ CASES = {
     "merge": case_merge,
     "merge-rules": case_merge_rules,
     "nested-keys": case_nested_keys,
+    "stdin": case_stdin,
+    "s3": lambda tool: case_s3(tool, one_version=False),
+    "s3-one-version": lambda tool: case_s3(tool, one_version=True),
+    "s3-rerun": case_s3_rerun,
 }
 
 

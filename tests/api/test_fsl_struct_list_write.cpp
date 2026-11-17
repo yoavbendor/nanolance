@@ -165,6 +165,14 @@ void check_read_back(const std::string& path, bool map) {
         rows += fsl.length;
     }
     require(rows == 1, "one row read back");
+    for (auto& b : batches) {
+        if (b.release != nullptr) {
+            b.release(&b);
+        }
+    }
+    if (schema.release != nullptr) {
+        schema.release(&schema);
+    }
 }
 
 }  // namespace

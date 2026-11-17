@@ -174,6 +174,10 @@ now carries the structural encodings instead of plain pages.
 `compression_level` is the zstd level (also used as a hint; 0 = zstd default) and applies only to the
 zstd path; structural encodings ignore it.
 
+FSST compression (the string columns above) runs on an AVX-512 kernel when the CPU has AVX-512F, DQ and
+POPCNT and a batch's values average 128 bytes or more. It writes the same bytes as the portable compressor, which the unit tests and the byte-identity runs
+check; `NANOLANCE_FSST_SIMD=0` turns the kernel off for A/B runs.
+
 ### nanolance-only option: external-URI dictionary
 
 `nano_lance_writer_set_blob_uri_dictionary(&w, true)` deduplicates identical external URIs in a

@@ -402,6 +402,8 @@ thread and 36.7 ms on default threads, pylance 54.2 ms on its default threads (o
 one-core write goal is not met for string_long. Not done: the per-page table (pylance trains one per page) and a
 write-side speedup of the one-core compression.
 
+**AVX-512 FSST (2026-11-17):** the FSST compressor runs an AVX-512 kernel when the CPU has it and the batch's values average 128 bytes or more; the bytes are unchanged (`NANOLANCE_FSST_SIMD=0` turns it off). `bench_matrix.py --only string_long string_text --runs 7`, 4 cores, load about 1.0, SIMD off then on: `string_long` one core 89.9 → 68.6 ms, all cores 62.5 → 55.1 ms; `string_text` one core 74.4 → 68.5 ms, all cores 60.7 → 59.4 ms (within run-to-run noise). Sizes equal in both settings. The compress-only speedup measured earlier on `string_long` was 1.27x; the matrix times include the rest of the write.
+
 ### Phase G — packaging and infrastructure (independent; run in parallel)
 
 | # | Task | Size | Model |

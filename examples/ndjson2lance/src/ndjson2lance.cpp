@@ -11,7 +11,10 @@
 // Every non-blank input line ends up in exactly one table, in _rejects.lance, or as unwritable
 // (its table could not be written). The summary checks that count.
 
+#include "nanolance/byte_sink.hpp"
+#include "nanolance/byte_source.hpp"
 #include "nanolance/nano_lance_writer.h"
+#include "nanolance/object_store.hpp"
 #include "nanolance/writer.hpp"
 #include "simdjson_arrow.h"
 
@@ -51,7 +54,12 @@ constexpr char kKeySeparator = '\x1f';
 constexpr size_t kThreadedReadBytes = kMiB;
 
 struct Options {
-    fs::path out_dir;
+    // A local directory, or with object_store the s3:// prefix the tables go under (no trailing '/').
+    std::string out_dir;
+    bool object_store = false;
+    // Connection settings for an s3:// output; used only when s3_given (else the AWS env chain applies).
+    nano_lance::io::ObjectStoreOptions s3;
+    bool s3_given = false;
     std::string input;      // empty: stdin
     std::string route_key;  // empty: route by the set of top-level keys
     size_t learn_rows = 100;
@@ -66,6 +74,14 @@ struct Options {
     bool compress = true;  // zstd on string columns; --no-compress turns it off
     bool merge = true;     // concatenated objects on one line are one record; --no-merge turns it off
 };
+
+// The path of one dataset of the output: <out_dir>/<name>.lance, or <prefix>/<name>.lance on an
+// object store (joined as text: a URI is not a file-system path).
+std::string dataset_path(const Options& options, std::string_view name) {
+    const std::string file = std::string(name) + ".lance";
+    if (options.object_store) return options.out_dir + "/" + file;
+    return (fs::path(options.out_dir) / file).string();
+}
 
 // Record batches read by simdjson_arrow. Each one is a struct ArrowArray that the caller releases
 // (simdjson_arrow.h); this holder does it on scope exit.
@@ -140,7 +156,7 @@ class BatchBuilder {
 // as one version.
 class Sink {
   public:
-    Sink(fs::path path, const Options& options, bool staged)
+    Sink(std::string path, const Options& options, bool staged)
         : path_(std::move(path)), options_(options), staged_(staged) {}
 
     bool open() {
@@ -152,8 +168,7 @@ class Sink {
         // budget is set once the dataset exists (see publish()).
         c.max_pending_bytes = staged_ ? options_.table_bytes : 0;
         // nano_lance::Writer's handle() is the documented way to reach options it does not wrap.
-        const std::string path = path_.string();
-        return nano_lance_writer_open(writer_.handle(), path.c_str(), &c) == NANO_LANCE_OK;
+        return nano_lance_writer_open(writer_.handle(), path_.c_str(), &c) == NANO_LANCE_OK;
     }
 
     bool write(ArrowArray* batch, ArrowSchema* schema) { return writer_.write_batch(batch, schema); }
@@ -185,7 +200,7 @@ class Sink {
     std::string error() const { return writer_.error(); }
 
   private:
-    fs::path path_;
+    std::string path_;
     const Options& options_;
     bool staged_;
     bool created_ = false;
@@ -196,7 +211,9 @@ class Sink {
 // rejects file is in the order the problems were found, and each row names its line.
 class Rejects {
   public:
-    explicit Rejects(const Options& options) : sink_(options.out_dir / (std::string(kRejectsName) + ".lance"), options, options.one_version), flush_bytes_(options.flush_bytes) {}
+    explicit Rejects(const Options& options)
+        : sink_(dataset_path(options, kRejectsName), options, options.one_version),
+          flush_bytes_(options.flush_bytes) {}
 
     void add(uint64_t line, std::string_view table, std::string_view reason, std::string_view raw) {
         lines_.push_back(line);
@@ -288,7 +305,7 @@ class Heap {
           route_(std::move(route)),
           options_(options),
           rejects_(rejects),
-          sink_(options.out_dir / (name_ + ".lance"), options, options.one_version) {}
+          sink_(dataset_path(options, name_), options, options.one_version) {}
 
     ~Heap() {
         if (arrow_schema_.release != nullptr) arrow_schema_.release(&arrow_schema_);
@@ -1175,6 +1192,30 @@ class Router {
     std::string fatal_;
 };
 
+// An object-store output prefix must hold nothing yet, as a local output directory must be empty. The
+// listing tells an absent prefix (no entries, no error) from a failed one (an error).
+bool prepare_object_store_out(const Options& options, std::string* error) {
+    if (options.s3_given) {
+        std::string set_error;
+        if (!nano_lance::io::set_object_store_options(options.out_dir, options.s3, set_error)) {
+            *error = set_error;
+            return false;
+        }
+    }
+    std::vector<nano_lance::io::DirEntry> entries;
+    std::string list_error;
+    if (!nano_lance::io::list_dir(options.out_dir, entries, list_error)) {
+        *error = "cannot list '" + options.out_dir + "': " + list_error;
+        return false;
+    }
+    if (!entries.empty()) {
+        *error = "'" + options.out_dir + "' already holds " + std::to_string(entries.size()) +
+                 " entries; refusing to write into it";
+        return false;
+    }
+    return true;
+}
+
 bool prepare_out_dir(const fs::path& dir, std::string* error) {
     std::error_code ec;
     if (fs::exists(dir, ec)) {
@@ -1194,6 +1235,11 @@ bool prepare_out_dir(const fs::path& dir, std::string* error) {
         return false;
     }
     return true;
+}
+
+bool prepare_output(const Options& options, std::string* error) {
+    if (options.object_store) return prepare_object_store_out(options, error);
+    return prepare_out_dir(fs::path(options.out_dir), error);
 }
 
 // One row per table: its name, route, counts, first and last input line, schema, and status.
@@ -1228,7 +1274,7 @@ std::string write_catalog(const Options& options, const std::vector<std::unique_
     if (!batch.finish()) return "cannot build the catalog batch";
     // Staged, so that finish() publishes it: an unstaged create commit refuses to run with no rows,
     // and a catalog of an empty input has none.
-    Sink sink(options.out_dir / name, options, true);
+    Sink sink(dataset_path(options, kCatalogName), options, true);
     if (!sink.open()) return "cannot open " + name + ": " + sink.error();
     if (!sink.write(batch.array(), batch.schema())) return "cannot write " + name + ": " + sink.error();
     if (!sink.finish()) return "cannot publish " + name + ": " + sink.error();
@@ -1237,7 +1283,7 @@ std::string write_catalog(const Options& options, const std::vector<std::unique_
 
 int run(const Options& options) {
     std::string error;
-    if (!prepare_out_dir(options.out_dir, &error)) {
+    if (!prepare_output(options, &error)) {
         std::fprintf(stderr, "ndjson2lance: %s\n", error.c_str());
         return 1;
     }
@@ -1334,8 +1380,10 @@ int main(int argc, char** argv) {
 
     CLI::App app{"Mixed JSON-lines logs in, one clean Lance table per record shape out."};
     std::string out_dir;
-    app.add_option("out_dir", out_dir, "Output directory; must not exist or must be empty")->required();
-    app.add_option("-i,--input", options.input, "Input file (default: stdin)");
+    app.add_option("out_dir", out_dir,
+                   "Output directory, or s3://bucket/prefix; must not exist or be empty (a prefix: hold nothing)")
+        ->required();
+    app.add_option("-i,--input", options.input, "Input file; '-' or none reads stdin");
     app.add_option("--route-key", options.route_key,
                    "Route by this top-level field's value instead of by the set of keys");
     app.add_option("--learn-rows", options.learn_rows, "Rows a schema is learned from")
@@ -1362,6 +1410,14 @@ int main(int argc, char** argv) {
     bool no_merge = false;
     app.add_flag("--no-merge", no_merge,
                  "Reject a line of several JSON objects instead of merging them into one record");
+    std::string s3_endpoint;
+    std::string s3_region;
+    bool s3_allow_http = false;
+    app.add_option("--s3-endpoint", s3_endpoint,
+                   "s3:// output: endpoint URL of an S3-compatible store (MinIO, moto)");
+    app.add_option("--s3-region", s3_region, "s3:// output: region (default: the AWS environment)");
+    app.add_flag("--s3-allow-http", s3_allow_http,
+                 "s3:// output: allow an http:// endpoint (needed for MinIO and moto)");
 
     try {
         app.parse(argc, argv);
@@ -1372,7 +1428,36 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "ndjson2lance: --learn-max-rows must be at least --learn-rows\n");
         return 1;
     }
-    options.out_dir = out_dir;
+    if (options.input == "-") options.input.clear();
+    const bool s3_flags = !s3_endpoint.empty() || !s3_region.empty() || s3_allow_http;
+    if (out_dir.find("://") != std::string::npos) {
+        if (out_dir.rfind("s3://", 0) != 0) {
+            std::fprintf(stderr, "ndjson2lance: '%s': only s3:// outputs are supported\n", out_dir.c_str());
+            return 1;
+        }
+        if (!nano_lance::io::is_object_store_output(out_dir)) {
+            std::fprintf(stderr,
+                         "ndjson2lance: '%s' is an s3:// output, and this build cannot write to S3: "
+                         "rebuild with -DNANOLANCE_ENABLE_S3=ON\n",
+                         out_dir.c_str());
+            return 1;
+        }
+        options.object_store = true;
+        options.out_dir = out_dir;
+        while (options.out_dir.size() > std::string("s3://").size() && options.out_dir.back() == '/') {
+            options.out_dir.pop_back();
+        }
+        options.s3.endpoint = s3_endpoint;
+        options.s3.region = s3_region;
+        options.s3.allow_http = s3_allow_http;
+        options.s3_given = s3_flags;
+    } else {
+        if (s3_flags) {
+            std::fprintf(stderr, "ndjson2lance: --s3-endpoint, --s3-region and --s3-allow-http need an s3:// output\n");
+            return 1;
+        }
+        options.out_dir = out_dir;
+    }
     options.compress = !no_compress;
     options.merge = !no_merge;
     options.flush_bytes = flush_mb * kMiB;

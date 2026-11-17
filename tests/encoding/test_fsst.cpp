@@ -8,11 +8,15 @@
 
 #include "nanolance/fsst.hpp"
 
+#include <nanom/fsst_encode.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -349,6 +353,168 @@ void nothing_to_train_on_is_declined() {
 
 }  // namespace
 
+
+/// Words that give long symbols, so the kernel's jobs end inside matches.
+std::string word_text(std::mt19937_64& rng, std::size_t size) {
+    static const char* const words[] = {"alpha ", "beta ", "gamma ", "delta ", "epsilon ", "river ", "stone ", "x"};
+    std::string out;
+    while (out.size() < size) {
+        out += words[rng() % 8U];
+    }
+    out.resize(size);
+    return out;
+}
+
+/// A table by hand (no training): symbols as byte strings, codes in order. Mirrors what train() leaves behind.
+fsst::Encoder table_of(const std::vector<std::string>& symbols) {
+    namespace ed = ::nanom::codec::fsst::enc_detail;
+    fsst::Encoder e;
+    ed::reset(e);
+    for (const auto& s : symbols) {
+        std::uint64_t value = 0;
+        for (std::size_t k = 0; k < s.size(); ++k) {
+            value |= std::uint64_t{static_cast<std::uint8_t>(s[k])} << (8U * k);
+        }
+        require(ed::add(e, value, static_cast<unsigned>(s.size())), "hand-built table refused a symbol");
+    }
+    e.short_or_byte.resize(65536);
+    for (std::uint32_t w = 0; w < 65536; ++w) {
+        const auto two = e.short_codes[w];
+        const auto one = e.byte_codes[w & 0xFF];
+        e.short_or_byte[w] = two != fsst::Encoder::kNone   ? static_cast<std::uint16_t>((2U << 8U) | two)
+                             : one != fsst::Encoder::kNone ? static_cast<std::uint16_t>((1U << 8U) | one)
+                                                           : static_cast<std::uint16_t>((1U << 8U) | fsst::kEscape);
+    }
+    fsst::attach_batch_table(e);
+    return e;
+}
+
+/// Every value compressed by the batch entry point must equal compress_into's bytes, the same for the dispatching
+/// compress_many. Where this build or CPU has no kernel, only the portable path runs, and the test says so.
+void batch_output_matches_compress_into(const fsst::Encoder& e, const std::vector<std::string>& values,
+                                        const std::string& label) {
+    std::vector<std::vector<std::uint8_t>> expected(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        const auto* p = reinterpret_cast<const std::uint8_t*>(values[i].data());
+        expected[i].resize(2U * values[i].size() + 8U);
+        expected[i].resize(fsst::compress_into(e, p, values[i].size(), expected[i].data()));
+    }
+    for (int dispatch = 0; dispatch < 2; ++dispatch) {
+        std::vector<std::vector<std::uint8_t>> out(values.size());
+        std::vector<fsst::Item> items(values.size());
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            out[i].assign(2U * values[i].size() + 8U, 0xEEU);
+            items[i] = fsst::Item{reinterpret_cast<const std::uint8_t*>(values[i].data()), values[i].size(),
+                                  out[i].data(), false, 0U};
+        }
+        if (dispatch == 0) {
+            if (!fsst::compress_many_avx512(e, items.data(), items.size())) {
+                std::cout << "note: " << label << ": AVX-512 kernel unavailable here; portable path only\n";
+                fsst::compress_many_portable(e, items.data(), items.size());
+            }
+        } else {
+            fsst::compress_many(e, items.data(), items.size());
+        }
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            require(items[i].written == expected[i].size(),
+                    label + ": value " + std::to_string(i) + " (" + std::to_string(values[i].size()) +
+                        " bytes) wrote " + std::to_string(items[i].written) + ", compress_into " +
+                        std::to_string(expected[i].size()));
+            require(std::memcmp(out[i].data(), expected[i].data(), expected[i].size()) == 0,
+                    label + ": value " + std::to_string(i) + " (" + std::to_string(values[i].size()) +
+                        " bytes) differs from compress_into");
+        }
+    }
+}
+
+/// The batch output is compress_into's, byte for byte, on random values and on the lengths where a job ends
+/// (511 and 512 bytes, the cut at 503), with values that have symbols straddling the cut, escapes at it, and empties.
+void batch_output_is_compress_into_bytes() {
+    std::mt19937_64 rng(20260417);
+    std::vector<std::string> corpus;
+    for (int i = 0; i < 400; ++i) {
+        corpus.push_back(word_text(rng, 40 + rng() % 1500));
+    }
+    const auto e = [&] {
+        std::vector<std::pair<const std::uint8_t*, std::size_t>> views;
+        for (const auto& v : corpus) {
+            views.push_back({reinterpret_cast<const std::uint8_t*>(v.data()), v.size()});
+        }
+        fsst::Encoder enc;
+        require(fsst::train(views, enc), "training on the corpus");
+        return enc;
+    }();
+
+    std::vector<std::string> values;
+    for (const std::size_t n : {0U, 1U, 2U, 3U, 6U, 7U, 8U, 9U, 502U, 503U, 504U, 505U, 506U, 507U, 508U, 509U, 510U,
+                                511U, 512U, 513U, 1022U, 1023U, 1024U, 1025U, 1533U, 1534U, 1535U, 2100U}) {
+        values.push_back(word_text(rng, n));
+    }
+    // Binary values: escapes everywhere, including at the cut.
+    for (int i = 0; i < 120; ++i) {
+        std::string v(rng() % 1200, '\0');
+        for (auto& c : v) {
+            c = static_cast<char>(rng());
+        }
+        values.push_back(v);
+    }
+    // Text with a symbol straddling bytes 503..511 in every alignment.
+    for (std::size_t shift = 0; shift < 16; ++shift) {
+        std::string v = word_text(rng, 600 + shift);
+        values.push_back(v.substr(shift));
+    }
+    for (int i = 0; i < 1500; ++i) {
+        values.push_back(word_text(rng, rng() % 9));
+    }
+    for (int i = 0; i < 300; ++i) {
+        values.push_back(word_text(rng, rng() % 3000));
+    }
+    batch_output_matches_compress_into(e, values, "random and boundary values");
+}
+
+/// A table whose symbols hold every byte value has no terminator byte: the kernel is not built for it, and the
+/// batch entry point runs the portable compressors. The output is still compress_into's.
+void table_without_a_terminator_falls_back() {
+    std::vector<std::string> symbols;
+    for (int b = 0; b < 256; b += 2) {
+        symbols.push_back(std::string{static_cast<char>(b), static_cast<char>(b + 1)});
+    }
+    const auto e = table_of(symbols);
+    require(e.batch == nullptr, "a table with no terminator byte must not get a kernel table");
+    std::mt19937_64 rng(3);
+    std::vector<std::string> values;
+    for (int i = 0; i < 200; ++i) {
+        std::string v(rng() % 900, '\0');
+        for (auto& c : v) {
+            c = static_cast<char>(rng());
+        }
+        values.push_back(v);
+    }
+    std::vector<std::uint8_t> out(2U * 900U + 8U);
+    fsst::Item item{nullptr, 0, out.data(), false, 0U};
+    require(!fsst::compress_many_avx512(e, &item, 1U), "no kernel table: the kernel must decline");
+    batch_output_matches_compress_into(e, values, "terminator fallback");
+}
+
+/// The batch path also serves a table that has a terminator (the one-byte symbols leave a byte free).
+void table_with_a_terminator_uses_the_kernel_when_there_is_one() {
+    const auto e = table_of({"ab", "abc", "bcdefg", "e", "f", "gh", "hello"});
+    // Without the kernel here (not built: ARM, MSVC, WebAssembly; or a CPU without AVX-512) no kernel table is
+    // attached; the identity check below still runs, on the portable path.
+    require((e.batch != nullptr) == fsst::kernel_available(),
+            "a table with a free terminator byte gets a kernel table exactly when the kernel is available");
+    std::mt19937_64 rng(11);
+    std::vector<std::string> values;
+    for (int i = 0; i < 300; ++i) {
+        std::string v(rng() % 1500, 'a');
+        for (auto& c : v) {
+            c = "abcdefgh"[rng() % 8U];
+        }
+        values.push_back(v);
+    }
+    batch_output_matches_compress_into(e, values, "hand-built table with a terminator");
+}
+
 int main() {
     encoder_round_trips_and_compresses();
     encoder_is_deterministic();
@@ -361,6 +527,9 @@ int main() {
     corrupt_streams_are_refused_rather_than_truncated();
     an_encoder_that_declined_passes_bytes_through();
     values_accumulate_onto_one_buffer();
+    batch_output_is_compress_into_bytes();
+    table_without_a_terminator_falls_back();
+    table_with_a_terminator_uses_the_kernel_when_there_is_one();
     std::cout << "fsst tests passed\n";
     return 0;
 }

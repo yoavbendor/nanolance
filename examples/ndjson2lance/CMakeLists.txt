@@ -33,12 +33,13 @@ find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
     set(_ndjson2lance_test "${CMAKE_CURRENT_SOURCE_DIR}/tests/ndjson2lance_test.py")
     foreach(_case IN ITEMS route-keys route-event determinism tiny longline hostile dotted
-                       merge merge-rules nested-keys)
+                       merge merge-rules nested-keys stdin s3 s3-one-version s3-rerun)
         string(REPLACE "-" "_" _name "ndjson2lance_${_case}")
         add_test(NAME ${_name}
             COMMAND Python3::Interpreter "${_ndjson2lance_test}" ${_case}
                     --tool $<TARGET_FILE:ndjson2lance>)
+        # The s3 cases skip (77) only when NANOLANCE_S3_TEST_ENDPOINT is unset; with it set they must pass.
         set_tests_properties(${_name} PROPERTIES
-            LABELS ndjson2lance SKIP_RETURN_CODE 77 TIMEOUT 120)
+            LABELS ndjson2lance SKIP_RETURN_CODE 77 TIMEOUT 300)
     endforeach()
 endif()

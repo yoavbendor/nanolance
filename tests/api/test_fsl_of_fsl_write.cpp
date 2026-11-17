@@ -150,6 +150,14 @@ int main() {
         }
     }
     require(row == 4, "four rows read back, got " + std::to_string(row));
+    for (auto& b : batches) {
+        if (b.release != nullptr) {
+            b.release(&b);
+        }
+    }
+    if (schema.release != nullptr) {
+        schema.release(&schema);
+    }
     std::filesystem::remove_all(ds, ec);
     std::cerr << "fixed_size_list of fixed_size_list writes and reads back with its nulls\n";
     return 0;

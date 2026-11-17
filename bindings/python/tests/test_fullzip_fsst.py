@@ -80,6 +80,8 @@ def _layout(path: Path) -> list[str]:
 
 def _page_data_bytes(path: Path) -> list[tuple[int, int]]:
     """(rows, data-buffer bytes) of each page of the dataset's one column, from the verbose report."""
+    if not PAGELAYOUT.exists():
+        pytest.skip(f"{PAGELAYOUT} not built")
     out = subprocess.run([str(PAGELAYOUT), "-v", str(path)], capture_output=True, text=True, check=True).stdout
     pages = re.findall(r"^\s+page \d+: rows=(\d+) buffers=\[(\d+),", out, flags=re.MULTILINE)
     return [(int(rows), int(data)) for rows, data in pages]
