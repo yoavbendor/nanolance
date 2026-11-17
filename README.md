@@ -149,6 +149,13 @@ calls `lance_dataset_scan_core` instead of `lance_dataset_scan` ([src/scan](src/
 Embedding in another CMake project: `add_subdirectory` with `NANOLANCE_BUILD_TESTS` off, then link `nanolance`
 (`nanolance::nanolance`); `nanolance_reader` alone is enough to fetch external payloads.
 
+## Examples
+
+- [`examples/ndjson2lance`](examples/ndjson2lance/README.md) reads mixed JSON-lines logs and writes one Lance table per
+  record shape, with a catalog and a rejects table. It is off by default (`-DNANOLANCE_BUILD_NDJSON2LANCE=ON`).
+- On a 1 GB stream it takes 6.823 s and 147.9 MB peak RSS, against 38.388 s and 2,191.3 MB for `pyarrow.json` with
+  pylance; output 170.1 MB against 122.7 MB ([bench/ndjson/README.md](bench/ndjson/README.md)).
+
 ## How the code is organized
 
 `src/` is eleven layers, each using only the ones below it (`tools/check_layers.py` checks every include in CI).
@@ -212,7 +219,7 @@ nanolance or Lance cannot read back.
 | `utf8`, `large_utf8`, `binary`, `large_binary`, `fixed_size_binary(N)` | round-trips |
 | `timestamp` (with or without an IANA time zone), `date32/64`, `time32/64`, `duration`, `decimal128/256` | round-trips |
 | `struct` (any depth, null structs included), `list`, `large_list`, `map`, `fixed_size_list` | round-trips, with null and empty lists and null items at any level |
-| `null` | round-trips (Lance's all-null page) |
+| `null` | round-trips (Lance's all-null page), at the top level and as a child of a list or struct: `list<null>`, `large_list<null>`, `list<list<null>>`, `struct<a: null, ...>` (at any depth, with null structs and null rows), `list<struct<a: null, b: utf8>>`, `struct<l: list<null>>` and `map<utf8, null>`, with null rows, empty lists and lists of nulls, whole, by row range and by take. The null-typed pages are Lance's constant pages with the repetition and definition levels of the layers above, as pylance 12 writes them (`bindings/python/tests/test_null_children_write.py`, `tests/file/test_null_children_write.cpp`). Pylance 12 refuses to write a struct with a null row and a null child, so those shapes are checked by the round trip alone |
 | `lance.blob.v2` | external references written, with null rows (page layout as pylance's, `test_blob_kinds.py`); inline, packed, dedicated and external blobs read, in dataset and standalone files; legacy `lance-encoding:blob` columns read from 2.1 files |
 | Arrow `dictionary` with an integer index over a string, binary or fixed-width type, at the top level | round-trips, stored as Lance stores one (low-cardinality strings are dictionary-encoded on disk anyway) |
 | Arrow `dictionary` inside a `struct` or `list` | read with any integer index over string or binary values; written only with int32 indices (`writing it is not supported unless its indices are int32`). Other dictionary shapes are refused: cast to the value type |
@@ -230,7 +237,9 @@ Nulls are stored in every column kind. Files in formats 2.0 to 2.3 are read; nan
 - **The schema is fixed by the first batch** of a write session.
 - **Compression:** structural encodings (bitpacking, constant pages, run-length, dictionary) are on by default
   and cost nothing to read; `compression = true` adds zstd for high-cardinality strings and byte-stream split
-  + zstd for floats. Per-column measurements: [AGENTS.md §3](AGENTS.md#3-enabling-the-compression-that-was-measured).
+  + zstd for floats. Structural FSST also covers long strings: a utf8 column of values averaging 128 bytes or
+  more is written as FullZip pages, each value compressed on its own with the column's FSST table (the layout
+  pylance writes for them), unless `compression = true` asks for zstd. Per-column measurements: [AGENTS.md §3](AGENTS.md#3-enabling-the-compression-that-was-measured).
 - **Small files of references:** model them as plain `uri` / `position` / `size` columns rather than the packed
   `lance.blob.v2` descriptor (about 3 against 41 bytes a row): [AGENTS.md §4](AGENTS.md#4-data-model-how-to-actually-get-small-files-important).
 - **Memory while writing:** the writer holds rows until a commit; `max_pending_bytes` makes `write_batch` commit a

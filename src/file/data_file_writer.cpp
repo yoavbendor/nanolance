@@ -1228,6 +1228,9 @@ void append_offset(std::vector<std::uint8_t>& offsets, std::int64_t value, bool 
 /// not binary, at least 32 KiB of them, the longest at least 5 bytes.
 constexpr std::uint64_t kFsstMinBytes = 32U * 1024U;
 constexpr std::uint64_t kFsstMinMaxLength = 5U;
+/// Lance compresses a page with a longer value per value with zstd or lz4 instead of FSST; nanolance keeps such a
+/// FullZip page plain.
+constexpr std::uint64_t kFsstMaxValueBytes = 32U * 1024U;
 
 bool fsst_applies_to(const LanceField& field) {
     return field.logical_type == "utf8" || field.logical_type == "large_utf8";
@@ -1306,73 +1309,82 @@ bool plan_item_fsst(const fsst::Encoder& encoder, const ColumnValues& values, co
         }
     };
     put(0U, 0U);
-    // A value with 7 readable bytes after it in the column's buffer is compressed without the zero-padded
-    // copy of its last bytes (the same output; most of the work for short values).
+    // Item j compresses into its own slot of the scratch, twice the raw bytes before it, and its length goes to
+    // `lens`; a pass after closes the gaps in item order. The same bytes however the items are split: with
+    // threads to spare, the items in parts compress side by side (a string column's write was 70% here).
     const auto* base = values.variable.data.data();
     const std::size_t readable = values.variable.data.size();
-    const auto compress = [&](std::uint64_t begin, std::size_t size, std::uint8_t* to) {
-        return static_cast<std::size_t>(begin) + size + 7U <= readable
-                   ? fsst::compress_into_padded(encoder, base + begin, size, to)
-                   : fsst::compress_into(encoder, base + begin, size, to);
+    // A value with 7 readable bytes after it in the column's buffer is compressed without the zero-padded
+    // copy of its last bytes (the same output; most of the work for short values).
+    const auto padded = [&](std::uint64_t begin, std::size_t size) {
+        return static_cast<std::size_t>(begin) + size + 7U <= readable;
     };
-    // With threads to spare, the items in parts compressed side by side (a string column's write
-    // was 70% here): part k compresses into its own worst-case region of the scratch -- twice the
-    // raw bytes before it -- with offsets relative to that region, and a pass after closes the gaps
-    // and rebases the offsets. The same bytes as one thread.
+    const auto begin_of = [&](std::size_t j) { return variable_offset(values, items[j]); };
+    const auto size_of = [&](std::size_t j) {
+        return static_cast<std::size_t>(variable_offset(values, items[j] + 1U) - variable_offset(values, items[j]));
+    };
     constexpr std::size_t kItemsPerPart = 4096U;
-    const auto parts = std::min<std::size_t>(parallel::threads(), items.size() / kItemsPerPart);
-    std::size_t at = 0;
-    if (parts <= 1U) {
-        std::size_t slot = 0;
-        for (const auto i : items) {
-            const auto begin = variable_offset(values, i);
-            const auto size = static_cast<std::size_t>(variable_offset(values, i + 1U) - begin);
-            at += compress(begin, size, scratch.data() + at);
-            put(++slot, at);
+    const auto parts =
+        std::max<std::size_t>(1U, std::min<std::size_t>(parallel::threads(), items.size() / kItemsPerPart));
+    std::vector<std::size_t> first(parts + 1U);   // items of part k: [first[k], first[k+1])
+    std::vector<std::size_t> region(parts);       // where part k's first slot starts
+    for (std::size_t k = 0; k <= parts; ++k) {
+        first[k] = items.size() * k / parts;
+    }
+    std::size_t raw_before = 0;
+    for (std::size_t k = 0; k < parts; ++k) {
+        region[k] = 2U * raw_before;
+        for (auto j = first[k]; j < first[k + 1U]; ++j) {
+            raw_before += size_of(j);
         }
-    } else {
-        std::vector<std::size_t> first(parts + 1U);   // items of part k: [first[k], first[k+1])
-        std::vector<std::size_t> region(parts + 1U);  // where part k compresses to
-        std::vector<std::size_t> written(parts);
-        for (std::size_t k = 0; k <= parts; ++k) {
-            first[k] = items.size() * k / parts;
-        }
-        std::size_t raw_before = 0;
-        for (std::size_t k = 0; k < parts; ++k) {
-            region[k] = 2U * raw_before;
-            for (auto j = first[k]; j < first[k + 1U]; ++j) {
-                raw_before += static_cast<std::size_t>(variable_offset(values, items[j] + 1U) -
-                                                       variable_offset(values, items[j]));
+    }
+    std::vector<std::size_t> lens(items.size());
+    auto* dst = scratch.data();
+    parallel::for_each(parts, [&](std::size_t k) {
+        std::size_t slot = region[k];
+        std::size_t j = first[k];
+        const auto end = first[k + 1U];
+        // Four values at a time when all four are padded: their greedy parses overlap (compress_into_padded4).
+        while (j < end) {
+            bool four = end - j >= 4U;
+            for (std::size_t i = 0; four && i < 4U; ++i) {
+                four = padded(begin_of(j + i), size_of(j + i));
             }
-        }
-        auto* dst = scratch.data();
-        parallel::for_each(parts, [&](std::size_t k) {
-            std::size_t local = 0;
-            for (auto j = first[k]; j < first[k + 1U]; ++j) {
-                const auto begin = variable_offset(values, items[j]);
-                const auto size = static_cast<std::size_t>(variable_offset(values, items[j] + 1U) - begin);
-                local += compress(begin, size, dst + region[k] + local);
-                put(j + 1U, local);
-            }
-            written[k] = local;
-        });
-        for (std::size_t k = 0; k < parts; ++k) {
-            if (region[k] != at) {
-                std::memmove(dst + at, dst + region[k], written[k]);
-            }
-            for (auto j = first[k]; j < first[k + 1U]; ++j) {
-                std::uint64_t local = 0;
-                if (large) {
-                    std::memcpy(&local, offsets + (j + 1U) * 8U, 8U);
-                } else {
-                    std::int32_t narrow = 0;
-                    std::memcpy(&narrow, offsets + (j + 1U) * 4U, 4U);
-                    local = static_cast<std::uint64_t>(narrow);
+            if (four) {
+                const std::uint8_t* data[4];
+                std::size_t sizes[4];
+                std::uint8_t* to[4];
+                std::size_t written[4];
+                for (std::size_t i = 0; i < 4U; ++i) {
+                    data[i] = base + begin_of(j + i);
+                    sizes[i] = size_of(j + i);
+                    to[i] = dst + slot;
+                    slot += 2U * sizes[i];
                 }
-                put(j + 1U, at + local);
+                fsst::compress_into_padded4(encoder, data, sizes, to, written);
+                for (std::size_t i = 0; i < 4U; ++i) {
+                    lens[j + i] = written[i];
+                }
+                j += 4U;
+                continue;
             }
-            at += written[k];
+            const auto begin = begin_of(j);
+            const auto size = size_of(j);
+            lens[j] = padded(begin, size) ? fsst::compress_into_padded(encoder, base + begin, size, dst + slot)
+                                          : fsst::compress_into(encoder, base + begin, size, dst + slot);
+            slot += 2U * size;
+            ++j;
         }
+    });
+    std::size_t at = 0;
+    std::size_t slot = 0;
+    for (std::size_t j = 0; j < items.size(); ++j) {
+        if (slot != at) {
+            std::memmove(dst + at, dst + slot, lens[j]);
+        }
+        at += lens[j];
+        slot += 2U * size_of(j);
+        put(j + 1U, at);
     }
     packed.variable.data.assign(scratch.data(), scratch.data() + at);
     return (at + fsst::kSymbolTableBytes) * 10U < raw * 9U;
@@ -1387,6 +1399,23 @@ bool fsst_pays_on_first_page(const fsst::Encoder& encoder, const ColumnValues& v
     }
     ColumnValues packed;
     return plan_item_fsst(encoder, values, items, packed);
+}
+
+/// A FullZip page's values under the column's FSST table, as Lance does for a page of values (Lance's
+/// `try_variable_width_per_value`): the page's values at least 32 KiB, the longest between 5 bytes and 32 KiB, and
+/// FSST pays. `items` are the page's valid rows; `packed` gets their compressed values, in row order. False (the page
+/// stays plain) otherwise.
+bool plan_full_zip_page_fsst(const fsst::Encoder& encoder, const ColumnValues& values,
+                             const std::vector<std::uint64_t>& items, ColumnValues& packed) {
+    std::uint64_t raw = 0;
+    std::uint64_t longest = 0;
+    for (const auto i : items) {
+        const auto size = static_cast<std::uint64_t>(variable_offset(values, i + 1U) - variable_offset(values, i));
+        raw += size;
+        longest = std::max(longest, size);
+    }
+    return raw >= kFsstMinBytes && longest >= kFsstMinMaxLength && longest <= kFsstMaxValueBytes &&
+           plan_item_fsst(encoder, values, items, packed);
 }
 
 /// The dictionary of an Arrow dictionary leaf under a struct or list (W1k2): every entry of the Arrow
@@ -1773,13 +1802,20 @@ bool write_nested_column(std::ostream& out, const LanceField& field, const Colum
         pb::ColumnPage page;
         page.length = n;
         page.priority = row / unit;  // a top-level row number: Lance does not scale it by the lists' sizes
-        if (ser.items.empty()) {
-            // No values at all -- every list empty or null. Lance writes a ConstantLayout with no
-            // value and the levels as raw u16 buffers [rep, def]; so does this.
+        // A null-typed leaf has slots (its null items) but no values to store, so its page is the constant one too.
+        const bool constant_page = ser.items.empty() || field.logical_type == "null";
+        if (constant_page) {
+            // No values at all -- every list empty or null, or every item a null of a null-typed leaf. Lance writes a
+            // ConstantLayout with no value and the levels as raw u16 buffers [rep, def]; so does this.
             descriptor::Constant constant;
             constant.layers.assign(ser.layers.begin(), ser.layers.end());
             constant.num_rep_values = ser.rep.size();
             constant.num_def_values = ser.def.size();
+            // A null-typed leaf's all-null page names its definition levels' encoding, Flat(16) over the raw u16
+            // words, as pylance writes it (the bytes are the same as the unnamed raw form).
+            if (field.logical_type == "null" && !ser.def.empty()) {
+                constant.def_compression = descriptor::flat(16U);
+            }
             std::vector<std::uint8_t> raw_rep;
             std::vector<std::uint8_t> raw_def;
             append_u16_levels(raw_rep, ser.rep);
@@ -1828,7 +1864,7 @@ bool write_nested_column(std::ostream& out, const LanceField& field, const Colum
         row += n;
         // The next page: as many rows as the one just built says fit, a little under the limit. (A
         // page of only empty or null lists has no payload to measure: keep the row count.)
-        if (!ser.items.empty()) {
+        if (!constant_page) {
             const auto per_row = std::max<std::size_t>(1U, built.payload.size() / static_cast<std::size_t>(n));
             try_rows = std::clamp<std::uint64_t>(page_bytes * 7U / 8U / per_row, 1U, kMaxRowsPerPage);
         }
@@ -1853,14 +1889,22 @@ constexpr std::uint64_t kDefaultFullZipMinAverageValueBytes = 128U;
 /// offsets where each row starts (Lance requires one for variable-width FullZip pages) -- which is what
 /// lets a reader fetch one row without reading the page: a shuffled mini-batch of 64 images out of
 /// thousands reads 64 images, not the column. Pages are cut at ~8 MiB of values, at least one row.
+///
+/// With `fsst_encoder` (the column's table, trained by write_plain_variable_column), a page that
+/// plan_full_zip_page_fsst accepts stores each value compressed, behind the length of its compressed bytes, with
+/// the table in its descriptor: Lance's per-value Fsst{Variable} layout. The other pages stay plain.
 bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& values, std::uint64_t rows,
-                                    pb::ColumnMetadata& column, std::string& error) {
+                                    pb::ColumnMetadata& column, std::string& error,
+                                    const fsst::Encoder* fsst_encoder) {
     constexpr std::size_t kPageBytes = std::size_t{8} << 20U;
     const bool large = values.variable.large;
     const std::size_t length_bytes = large ? 8U : 4U;
     column.encoding = column_encoding_bytes();
+    const auto table = fsst_encoder != nullptr ? fsst::serialize(*fsst_encoder) : std::vector<std::uint8_t>{};
     std::vector<std::uint8_t> data;
     std::vector<std::uint64_t> starts;
+    std::vector<std::uint64_t> valid_rows;
+    ColumnValues packed;
     std::uint64_t row = 0;
     while (row < rows) {
         const auto first = row;
@@ -1876,6 +1920,20 @@ bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& value
             }
             ++end;
         }
+        // The page's values, compressed when the table pays on it: `stored` then holds the valid rows' compressed
+        // values in row order, so the k-th valid row reads item k of it.
+        bool fsst = false;
+        if (fsst_encoder != nullptr) {
+            valid_rows.clear();
+            for (auto r = first; r < end; ++r) {
+                if (validity_bit(values.validity, r)) {
+                    valid_rows.push_back(r);
+                }
+            }
+            fsst = plan_full_zip_page_fsst(*fsst_encoder, values, valid_rows, packed);
+        }
+        const ColumnValues& stored = fsst ? packed : values;
+        std::uint64_t stored_item = 0;
         data.clear();
         data.reserve(bytes + static_cast<std::size_t>(end - first));
         starts.clear();
@@ -1887,14 +1945,15 @@ bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& value
                 full_zip::append_level(data, control, 1U, nullptr, 0U, length_bytes);  // definition 1: a null item
                 continue;
             }
-            const auto begin = variable_offset(values, r);
-            const auto len = static_cast<std::uint64_t>(variable_offset(values, r + 1U) - begin);
+            const auto item = fsst ? stored_item++ : r;
+            const auto begin = variable_offset(stored, item);
+            const auto len = static_cast<std::uint64_t>(variable_offset(stored, item + 1U) - begin);
             if (!large && len > std::numeric_limits<std::uint32_t>::max()) {
                 error = "a utf8/binary value over 4 GiB";
                 return false;
             }
             static constexpr std::uint8_t kEmpty = 0U;
-            full_zip::append_level(data, control, 0U, len != 0U ? values.variable.data.data() + begin : &kEmpty,
+            full_zip::append_level(data, control, 0U, len != 0U ? stored.variable.data.data() + begin : &kEmpty,
                                    static_cast<std::size_t>(len), length_bytes);
         }
         starts.push_back(data.size());
@@ -1905,7 +1964,8 @@ bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& value
         layout.bits_per_offset = length_bytes * 8U;
         layout.num_items = end - first;
         layout.num_visible_items = end - first;
-        layout.value_compression = descriptor::variable(descriptor::flat(length_bytes * 8U));
+        const auto value_encoding = descriptor::variable(descriptor::flat(length_bytes * 8U));
+        layout.value_compression = fsst ? descriptor::fsst(table, value_encoding) : value_encoding;
         layout.layers = {nulls ? static_cast<std::uint8_t>(repdef::kNullableItem)
                                : static_cast<std::uint8_t>(repdef::kAllValidItem)};
 
@@ -3607,9 +3667,20 @@ bool write_plain_variable_column(const ColumnEncodeContext& ctx, std::ostream& o
     // MiniBlock chunks.
     const bool full_zip = plain_variable_is_full_zip(
         values, rows, uses_default_layout(ctx) ? kDefaultFullZipMinAverageValueBytes : kFullZipMinAverageValueBytes);
-    if (full_zip ? !write_full_zip_variable_column(out, values, rows, column, error)
-                 : !write_nested_column(out, field, values, rows, column, error, nullptr, /*plain=*/true)) {
-        return false;
+    if (!full_zip) {
+        if (!write_nested_column(out, field, values, rows, column, error, nullptr, /*plain=*/true)) {
+            return false;
+        }
+    } else {
+        // A string column the writer's structural encodings tagged for FSST, uncompressed and with no codec of its
+        // own, trains one table for its FullZip pages, as the mini-block strings do (train_column_fsst).
+        fsst::Encoder trained;
+        const bool use_fsst = fsst_applies_to(field) && ctx.codec == ColumnCodec::kAbsent && !ctx.compress &&
+                              ctx.packing_it != field.metadata.end() && ctx.packing_it->second == "fsst" &&
+                              train_column_fsst(field, values, trained);
+        if (!write_full_zip_variable_column(out, values, rows, column, error, use_fsst ? &trained : nullptr)) {
+            return false;
+        }
     }
     columns.push_back(std::move(column));
     return true;

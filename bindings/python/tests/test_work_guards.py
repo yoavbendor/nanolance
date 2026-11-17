@@ -585,3 +585,21 @@ def test_a_dense_take_of_a_large_column_is_served_from_its_copy_the_second_time(
     assert second.equals(first)
     assert second_stats["take_cache_hits"] >= 1, second_stats
     assert second_stats["data_bytes_read"] * 10 < first_stats["data_bytes_read"], (first_stats, second_stats)
+
+
+def test_long_text_in_a_default_column_is_fsst_coded_on_disk(tmp_path):
+    """A utf8 column of ~560-byte log-like sentences with no field metadata is FullZip over FSST (roadmap F4), as
+    pylance writes it. Written as plain FullZip it is the raw text (2.1 MB for 4,000 rows of ~530 bytes); FSST writes
+    about a fifth of that, so the data files are guarded at 40% of the raw bytes."""
+    rng = np.random.default_rng(5)
+    words = np.array(
+        "request user session timeout retry connected host port error warning latency cache miss hit queue worker "
+        "batch flush".split()
+    )
+    values = [" ".join(rng.choice(words, 80)) for _ in range(4_000)]
+    raw = sum(len(v) for v in values)
+    path = str(tmp_path / "logs.lance")
+    nl.write_dataset(pa.table({"properties": pa.array(values)}), path)
+    on_disk = _data_bytes(path)
+    assert on_disk < raw * 0.4, (on_disk, raw)
+    assert nl.dataset(path).to_table().column("properties").to_pylist() == values
