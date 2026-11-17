@@ -427,6 +427,17 @@ if(NANOLANCE_WITH_JIEBA)
     target_compile_definitions(nanolance PRIVATE NANOLANCE_WITH_JIEBA=1)
 endif()
 
+# The AVX-512 FSST batch compressor (src/encoding/fsst_avx512.cpp, adapted from cwida/fsst; see
+# THIRD-PARTY-LICENSES.md). Only GCC and Clang on x86-64 build it, and only its own translation unit gets the
+# AVX-512 flags: the rest of nanolance stays baseline x86-64, and the CPU is checked at run time.
+if(NOT EMSCRIPTEN AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND
+   (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang"))
+    target_sources(nanolance PRIVATE src/encoding/fsst_avx512.cpp)
+    set_source_files_properties(src/encoding/fsst_avx512.cpp PROPERTIES
+        COMPILE_OPTIONS "-mavx512f;-mavx512dq;-mpopcnt;-O1")
+    target_compile_definitions(nanolance PRIVATE NANOLANCE_FSST_AVX512=1)
+endif()
+
 add_library(nanolance::nanolance ALIAS nanolance)
 
 # liblance_c: the C API of the lance-c project (compat/lance-c/include/lance/lance.h) over nanolance,
