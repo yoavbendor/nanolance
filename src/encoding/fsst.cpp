@@ -81,6 +81,7 @@ bool decompress_value(const SymbolTable& table, const std::uint8_t* data, std::s
     return true;
 }
 
+#if defined(NANOLANCE_FSST_AVX512)
 namespace {
 
 /// The first byte no multi-byte symbol contains, or -1. The kernel appends such a byte after each value: a symbol
@@ -104,6 +105,7 @@ int pick_terminator(const Encoder& encoder) {
 }
 
 }  // namespace
+#endif
 
 void attach_batch_table(Encoder& encoder) {
     encoder.batch.reset();
