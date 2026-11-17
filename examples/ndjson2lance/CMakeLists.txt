@@ -32,7 +32,8 @@ target_link_libraries(ndjson2lance PRIVATE nanolance simdjson_arrow CLI11::CLI11
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
     set(_ndjson2lance_test "${CMAKE_CURRENT_SOURCE_DIR}/tests/ndjson2lance_test.py")
-    foreach(_case IN ITEMS route-keys route-event determinism tiny longline hostile dotted)
+    foreach(_case IN ITEMS route-keys route-event determinism tiny longline hostile dotted
+                       merge merge-rules)
         string(REPLACE "-" "_" _name "ndjson2lance_${_case}")
         add_test(NAME ${_name}
             COMMAND Python3::Interpreter "${_ndjson2lance_test}" ${_case}

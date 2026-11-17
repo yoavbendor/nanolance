@@ -64,6 +64,7 @@ struct Options {
     bool strict = false;
     bool one_version = false;
     bool compress = true;  // zstd on string columns; --no-compress turns it off
+    bool merge = true;     // concatenated objects on one line are one record; --no-merge turns it off
 };
 
 // Record batches read by simdjson_arrow. Each one is a struct ArrowArray that the caller releases
@@ -295,10 +296,11 @@ class Heap {
     Heap(const Heap&) = delete;
     Heap& operator=(const Heap&) = delete;
 
-    // A parsed line of this table (p, n: its text without the newline). keys are its top-level
-    // keys, n_keys of them.
-    void accept(const char* p, size_t n, uint64_t number, const std::vector<std::string>& keys,
-                size_t n_keys) {
+    // A parsed record of this table: p, n is the text to stage (a line, or several objects merged
+    // into one record), raw the input line it came from (the same bytes as p, n for a plain line).
+    // keys are its top-level keys, n_keys of them.
+    void accept(const char* p, size_t n, std::string_view raw, uint64_t number,
+                const std::vector<std::string>& keys, size_t n_keys) {
         if (first_line == 0) first_line = number;
         last_line = number;
         if (state_ == State::locked) {
@@ -307,7 +309,7 @@ class Heap {
                 if (known_.count(keys[i]) != 0) continue;
                 ++new_key_lines;
                 if (options_.strict) {
-                    reject_line(number, std::string_view(p, n), "new key after lock: " + keys[i]);
+                    reject_line(number, raw, "new key after lock: " + keys[i]);
                     return;
                 }
                 break;
@@ -317,7 +319,7 @@ class Heap {
             ++unwritable;
             return;
         }
-        stage(p, n, number);
+        stage(p, n, raw, number);
         if (state_ == State::learning) {
             const size_t count = lines_.size();
             if (count >= options_.learn_rows &&
@@ -373,18 +375,26 @@ class Heap {
     uint64_t last_line = 0;
 
   private:
+    static constexpr size_t kNoRaw = static_cast<size_t>(-1);
+
     struct Line {
         size_t offset;  // in bytes_
         size_t length;  // without the newline that follows it in bytes_
         uint64_t number;
+        size_t raw;     // index in raws_ when the staged text is not the input line, else kNoRaw
     };
     struct Flush {
         uint64_t written = 0;
         uint64_t rejected = 0;
     };
 
-    void stage(const char* p, size_t n, uint64_t number) {
-        lines_.push_back(Line{bytes_.size(), n, number});
+    void stage(const char* p, size_t n, std::string_view raw, uint64_t number) {
+        Line line{bytes_.size(), n, number, kNoRaw};
+        if (raw.data() != p) {
+            line.raw = raws_.size();
+            raws_.emplace_back(raw);
+        }
+        lines_.push_back(line);
         bytes_.append(p, n);
         bytes_.push_back('\n');
     }
@@ -392,6 +402,7 @@ class Heap {
     void clear_staged() {
         lines_.clear();
         bytes_.clear();
+        raws_.clear();
     }
 
     void reject_line(uint64_t number, std::string_view raw, const std::string& reason) {
@@ -401,6 +412,12 @@ class Heap {
 
     std::string_view staged_text(size_t index) const {
         return std::string_view(bytes_).substr(lines_[index].offset, lines_[index].length);
+    }
+
+    // The input line a staged record came from (the record itself for a plain line).
+    std::string_view staged_raw(size_t index) const {
+        const Line& line = lines_[index];
+        return line.raw == kNoRaw ? staged_text(index) : std::string_view(raws_[line.raw]);
     }
 
     void mark_failed(std::string message) {
@@ -447,7 +464,7 @@ class Heap {
             simdjson_arrow::field probe_schema;
             infer(hi, &probe_schema, &probe, &reason);
             const Line culprit = lines_[hi - 1];
-            reject_line(culprit.number, staged_text(hi - 1), reason);
+            reject_line(culprit.number, staged_raw(hi - 1), reason);
             remove_staged(hi - 1);
         }
         return false;
@@ -461,7 +478,7 @@ class Heap {
         for (size_t i = 0; i < lines_.size(); ++i) {
             if (i == index) continue;
             const Line& l = lines_[i];
-            kept_lines.push_back(Line{kept.size(), l.length, l.number});
+            kept_lines.push_back(Line{kept.size(), l.length, l.number, l.raw});
             kept.append(bytes_, l.offset, l.length);
             kept.push_back('\n');
         }
@@ -569,6 +586,17 @@ class Heap {
         clear_staged();
     }
 
+    // Writes the batches of one read of count lines.
+    void write_batches(Batches& batches, size_t count, Flush* f) {
+        for (ArrowArray& b : batches.items) {
+            if (!sink_.write(&b, &arrow_schema_)) {
+                mark_failed("cannot write the table: " + sink_.error());
+                return;
+            }
+        }
+        f->written += count;
+    }
+
     // Writes lines [begin, end). A block that does not read is split in halves until its bad
     // lines stand alone and are rejected; the other lines are written in input order.
     void write_range(size_t begin, size_t end, Flush* f) {
@@ -576,17 +604,11 @@ class Heap {
         Batches batches;
         const simdjson_arrow::status read = read_range(begin, end, &batches);
         if (read.ok()) {
-            for (ArrowArray& b : batches.items) {
-                if (!sink_.write(&b, &arrow_schema_)) {
-                    mark_failed("cannot write the table: " + sink_.error());
-                    return;
-                }
-            }
-            f->written += end - begin;
+            write_batches(batches, end - begin, f);
             return;
         }
         if (end - begin == 1) {
-            reject_line(lines_[begin].number, staged_text(begin), read.message);
+            reject_line(lines_[begin].number, staged_raw(begin), read.message);
             ++f->rejected;
             return;
         }
@@ -605,6 +627,7 @@ class Heap {
         return options;
     }
 
+    // Reads lines [begin, end).
     simdjson_arrow::status read_range(size_t begin, size_t end, Batches* batches) {
         const Line& first = lines_[begin];
         const Line& last = lines_[end - 1];
@@ -679,8 +702,9 @@ class Heap {
     Sink sink_;
     State state_ = State::learning;
     std::string error_;
-    std::string bytes_;       // staged lines, each followed by '\n'
-    std::vector<Line> lines_;  // staged lines, in input order
+    std::string bytes_;       // staged records, each followed by '\n'
+    std::vector<std::string> raws_;  // input lines of merged records (Line::raw indexes this)
+    std::vector<Line> lines_;  // staged records, in input order
     simdjson_arrow::field schema_;
     std::vector<std::string> column_names_;  // the names the writer sees, parallel to schema_.children
     bool has_schema_ = false;
@@ -813,49 +837,54 @@ class Router {
         route(p, n, static_cast<size_t>(buffer_end - p), number);
     }
 
+    // A line is one record: one JSON object, or several back to back (a prefix object, then the
+    // payload), which make one record. Their keys are checked together and the record is staged as
+    // one object (merged_), while the rejects keep the line as it came.
     void route(const char* p, size_t n, size_t capacity, uint64_t number) {
-        simdjson::ondemand::document doc;
-        if (auto e = parser_.iterate(simdjson::padded_string_view(p, n, capacity)).get(doc)) {
-            return reject_route(number, p, n, simdjson::error_message(e));
-        }
-        simdjson::ondemand::object object;
-        if (auto e = doc.get_object().get(object)) {
-            return reject_route(number, p, n,
-                                e == simdjson::INCORRECT_TYPE ? "a record must be a JSON object"
-                                                              : simdjson::error_message(e));
-        }
         n_keys_ = 0;
+        parts_.clear();
         bool route_found = false;
-        const bool by_route = !options_.route_key.empty();
-        for (auto entry : object) {
-            simdjson::ondemand::field field;
-            if (auto e = std::move(entry).get(field)) {
-                return reject_route(number, p, n, simdjson::error_message(e));
+        size_t begin = skip_ws(p, n, 0);
+        for (;;) {
+            size_t close = 0;
+            size_t next = 0;
+            if (std::string error = parse_part(p, n, capacity, begin, &route_found, &close, &next);
+                !error.empty()) {
+                return reject_route(number, p, n, error);
             }
-            std::string_view key;
-            if (auto e = field.unescaped_key().get(key)) {
-                return reject_route(number, p, n, simdjson::error_message(e));
+            parts_.push_back(Part{begin, close, n_keys_});
+            const size_t after = skip_ws(p, n, next);
+            if (after == n) break;
+            if (!options_.merge || p[after] != '{') {
+                return reject_route(number, p, n, "trailing content after the record");
             }
-            if (n_keys_ == keys_.size()) keys_.emplace_back();
-            keys_[n_keys_++].assign(key.data(), key.size());
-            if (by_route && key == options_.route_key) {
-                route_found = true;
-                if (auto e = route_text(field.value(), &route_text_)) {
-                    return reject_route(number, p, n, simdjson::error_message(e));
+            begin = after;
+        }
+        size_t keys_begin = 0;
+        for (const Part& part : parts_) {
+            std::sort(keys_.begin() + static_cast<std::ptrdiff_t>(keys_begin),
+                      keys_.begin() + static_cast<std::ptrdiff_t>(part.keys_end));
+            for (size_t i = keys_begin + 1; i < part.keys_end; ++i) {
+                if (keys_[i] == keys_[i - 1]) {
+                    return reject_route(number, p, n, "duplicate top-level key: " + keys_[i]);
                 }
             }
+            keys_begin = part.keys_end;
         }
-        // at_end() is false while the document has trailing content after the object.
-        if (!doc.at_end()) return reject_route(number, p, n, "trailing content after the record");
-        std::sort(keys_.begin(), keys_.begin() + static_cast<std::ptrdiff_t>(n_keys_));
-        for (size_t i = 1; i < n_keys_; ++i) {
-            if (keys_[i] == keys_[i - 1]) {
-                return reject_route(number, p, n, "duplicate top-level key: " + keys_[i]);
+        const bool merged = parts_.size() > 1;
+        if (merged) {
+            std::sort(keys_.begin(), keys_.begin() + static_cast<std::ptrdiff_t>(n_keys_));
+            for (size_t i = 1; i < n_keys_; ++i) {
+                if (keys_[i] == keys_[i - 1]) {
+                    return reject_route(number, p, n, "duplicate key across concatenated objects: " +
+                                                           keys_[i]);
+                }
             }
+            build_merged(p);
         }
 
         Heap* heap = nullptr;
-        if (!by_route) {
+        if (!by_route_key()) {
             fingerprint_.clear();
             for (size_t i = 0; i < n_keys_; ++i) {
                 if (i != 0) fingerprint_.push_back(kKeySeparator);
@@ -881,7 +910,81 @@ class Router {
                 heap = it->second;
             }
         }
-        heap->accept(p, n, number, keys_, n_keys_);
+        const std::string_view raw(p, n);
+        if (merged) {
+            heap->accept(merged_.data(), merged_.size(), raw, number, keys_, n_keys_);
+        } else {
+            heap->accept(p, n, raw, number, keys_, n_keys_);
+        }
+    }
+
+    bool by_route_key() const { return !options_.route_key.empty(); }
+
+    static bool is_ws(char c) { return c == ' ' || c == '\t' || c == '\r'; }
+
+    // The first byte at or after from that is not JSON whitespace (n when there is none).
+    static size_t skip_ws(const char* p, size_t n, size_t from) {
+        while (from < n && is_ws(p[from])) ++from;
+        return from;
+    }
+
+    // Parses the object that starts at begin in the line (p, n): its keys are appended to keys_, and
+    // its route value is read if its key is the route key. *close is the offset of its closing brace
+    // and *next the offset of the first byte after it (n when nothing follows). Returns "", or why
+    // the object is not a record.
+    std::string parse_part(const char* p, size_t n, size_t capacity, size_t begin,
+                           bool* route_found, size_t* close, size_t* next) {
+        simdjson::ondemand::document doc;
+        if (auto e = parser_.iterate(simdjson::padded_string_view(p + begin, n - begin, capacity - begin))
+                         .get(doc)) {
+            return simdjson::error_message(e);
+        }
+        simdjson::ondemand::object object;
+        if (auto e = doc.get_object().get(object)) {
+            return e == simdjson::INCORRECT_TYPE ? "a record must be a JSON object"
+                                                 : simdjson::error_message(e);
+        }
+        for (auto entry : object) {
+            simdjson::ondemand::field field;
+            if (auto e = std::move(entry).get(field)) return simdjson::error_message(e);
+            std::string_view key;
+            if (auto e = field.unescaped_key().get(key)) return simdjson::error_message(e);
+            if (n_keys_ == keys_.size()) keys_.emplace_back();
+            keys_[n_keys_++].assign(key.data(), key.size());
+            if (by_route_key() && key == options_.route_key) {
+                *route_found = true;
+                if (auto e = route_text(field.value(), &route_text_)) return simdjson::error_message(e);
+            }
+        }
+        // at_end() is false while the document has trailing content after the object.
+        if (doc.at_end()) {
+            *next = n;
+        } else {
+            const char* location = nullptr;
+            if (doc.current_location().get(location)) return "trailing content after the record";
+            *next = static_cast<size_t>(location - p);
+        }
+        size_t end = *next;
+        while (end > begin && is_ws(p[end - 1])) --end;
+        *close = end - 1;  // the brace that ends the object
+        return "";
+    }
+
+    // The merged record: the keys of every part, in one object, in input order. An object without
+    // keys (an empty {}) adds nothing.
+    void build_merged(const char* p) {
+        merged_.assign(1, '{');
+        bool members = false;
+        size_t keys_begin = 0;
+        for (const Part& part : parts_) {
+            if (part.keys_end > keys_begin) {
+                if (members) merged_.push_back(',');
+                merged_.append(p + part.open + 1, part.close - part.open - 1);
+                members = true;
+            }
+            keys_begin = part.keys_end;
+        }
+        merged_.push_back('}');
     }
 
     // The text a route value stands for: a string's contents, or the JSON text of any other value.
@@ -942,6 +1045,13 @@ class Router {
     simdjson::ondemand::parser parser_;
     std::vector<std::string> keys_;  // reused: keys_[0..n_keys_) are the current line's keys
     size_t n_keys_ = 0;
+    struct Part {
+        size_t open;      // offset of the object's opening brace in the line
+        size_t close;     // offset of its closing brace
+        size_t keys_end;  // keys_ holds the keys of every part up to here
+    };
+    std::vector<Part> parts_;  // the objects of the current line
+    std::string merged_;       // the merged record of a line with several objects
     std::string fingerprint_;
     std::string route_text_;
     std::unordered_map<std::string, Heap*> by_keys_;
@@ -1133,6 +1243,9 @@ int main(int argc, char** argv) {
     bool no_compress = false;
     app.add_flag("--no-compress", no_compress,
                  "Keep string columns uncompressed (zstd is the default)");
+    bool no_merge = false;
+    app.add_flag("--no-merge", no_merge,
+                 "Reject a line of several JSON objects instead of merging them into one record");
 
     try {
         app.parse(argc, argv);
@@ -1145,6 +1258,7 @@ int main(int argc, char** argv) {
     }
     options.out_dir = out_dir;
     options.compress = !no_compress;
+    options.merge = !no_merge;
     options.flush_bytes = flush_mb * kMiB;
     options.table_bytes = table_mb * kMiB;
     options.max_line_bytes = max_line_mb * kMiB;
