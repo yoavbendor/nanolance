@@ -5,6 +5,8 @@
 
 #include "nanolance/fsst.hpp"
 
+#include <cstdlib>
+#include <cstring>
 #include <span>
 
 namespace nano_lance::fsst {
@@ -79,9 +81,49 @@ bool decompress_value(const SymbolTable& table, const std::uint8_t* data, std::s
     return true;
 }
 
+namespace {
+
+/// The first byte no multi-byte symbol contains, or -1. The kernel appends such a byte after each value: a symbol
+/// holding it could match past the value's end. cwida's encoder picks its terminator the same way.
+int pick_terminator(const Encoder& encoder) {
+    bool inside[256] = {};
+    for (std::uint32_t i = 0; i < encoder.symbol_count; ++i) {
+        if (encoder.lengths[i] < 2) {
+            continue;
+        }
+        for (unsigned k = 0; k < encoder.lengths[i]; ++k) {
+            inside[(encoder.symbols[i] >> (8U * k)) & 0xFFU] = true;
+        }
+    }
+    for (int b = 0; b < 256; ++b) {
+        if (!inside[b]) {
+            return b;
+        }
+    }
+    return -1;
+}
+
+}  // namespace
+
+void attach_batch_table(Encoder& encoder) {
+    encoder.batch.reset();
+#if defined(NANOLANCE_FSST_AVX512)
+    const int terminator = pick_terminator(encoder);
+    if (terminator < 0 || encoder.symbol_count == 0) {
+        return;  // no kernel for this table: the portable compressors serve it
+    }
+    if (const BatchTable* table = kernel_build_table(encoder.symbols.data(), encoder.lengths.data(),
+                                                     encoder.symbol_count, static_cast<std::uint8_t>(terminator))) {
+        encoder.batch = std::shared_ptr<const BatchTable>(table, kernel_destroy_table);
+    }
+#endif
+}
+
 bool train(const std::vector<std::pair<const std::uint8_t*, std::size_t>>& values, Encoder& out) {
-    return codec::train(values.size(), [&](std::size_t i) { return as_bytes(values[i].first, values[i].second); },
-                        out);
+    const bool trained = codec::train(
+        values.size(), [&](std::size_t i) { return as_bytes(values[i].first, values[i].second); }, out);
+    attach_batch_table(out);
+    return trained;
 }
 
 void compress_value(const Encoder& encoder, const std::uint8_t* data, std::size_t size, std::vector<std::uint8_t>& out) {
@@ -94,6 +136,80 @@ std::vector<std::uint8_t> serialize(const Encoder& encoder) {
     const auto table = codec::serialize(encoder);
     const auto* p = reinterpret_cast<const std::uint8_t*>(table.data());
     return {p, p + table.size()};
+}
+
+void compress_many_portable(const Encoder& encoder, Item* items, std::size_t count) {
+    std::size_t i = 0;
+    while (i < count) {
+        const bool four = count - i >= 4U && items[i].padded && items[i + 1U].padded && items[i + 2U].padded &&
+                          items[i + 3U].padded;
+        if (four) {
+            const std::uint8_t* data[4];
+            std::size_t sizes[4];
+            std::uint8_t* to[4];
+            std::size_t written[4];
+            for (std::size_t k = 0; k < 4U; ++k) {
+                data[k] = items[i + k].data;
+                sizes[k] = items[i + k].size;
+                to[k] = items[i + k].dst;
+            }
+            compress_into_padded4(encoder, data, sizes, to, written);
+            for (std::size_t k = 0; k < 4U; ++k) {
+                items[i + k].written = written[k];
+            }
+            i += 4U;
+            continue;
+        }
+        Item& item = items[i];
+        item.written = item.padded ? compress_into_padded(encoder, item.data, item.size, item.dst)
+                                   : compress_into(encoder, item.data, item.size, item.dst);
+        ++i;
+    }
+}
+
+#if defined(NANOLANCE_FSST_AVX512)
+namespace {
+
+/// The kernel runs on this CPU and when NANOLANCE_FSST_SIMD is not "0" (read once per process).
+bool kernel_usable() {
+    static const bool usable = [] {
+        const char* off = std::getenv("NANOLANCE_FSST_SIMD");
+        if (off != nullptr && std::strcmp(off, "0") == 0) {
+            return false;
+        }
+        __builtin_cpu_init();
+        return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq") &&
+               __builtin_cpu_supports("popcnt");
+    }();
+    return usable;
+}
+
+}  // namespace
+
+bool compress_many_avx512(const Encoder& encoder, Item* items, std::size_t count) {
+    if (encoder.batch == nullptr || !kernel_usable()) {
+        return false;
+    }
+    kernel_compress(*encoder.batch, items, count);
+    return true;
+}
+#else
+bool compress_many_avx512(const Encoder&, Item*, std::size_t) {
+    return false;
+}
+#endif
+
+void compress_many(const Encoder& encoder, Item* items, std::size_t count) {
+    // The kernel pays from a mean of about 128 bytes a value: below that its per-value work (staging, the restart
+    // walk) costs more than the lanes save (measured on this machine: -5% at 64 bytes, +13% at 128, +25% at 256).
+    std::size_t bytes = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        bytes += items[i].size;
+    }
+    constexpr std::size_t kKernelMinMeanBytes = 128;
+    if (count == 0 || bytes < kKernelMinMeanBytes * count || !compress_many_avx512(encoder, items, count)) {
+        compress_many_portable(encoder, items, count);
+    }
 }
 
 }  // namespace nano_lance::fsst

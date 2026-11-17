@@ -55,8 +55,11 @@
 #include <nanom/fsst.hpp>
 #include <nanom/fsst_encode.hpp>
 
+#include "nanolance/fsst_kernel.hpp"
+
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -68,7 +71,12 @@ using ::nanom::codec::fsst::kMaxSymbolLength;
 using ::nanom::codec::fsst::kSymbolTableBytes;
 
 using SymbolTable = ::nanom::codec::fsst::symbol_table;
-using Encoder = ::nanom::codec::fsst::encoder;
+/// A trained encoder: nanom's table plus, when the build and the table allow it, the AVX-512 kernel's copy of the
+/// same table (built by train(), shared by copies). `batch` is null otherwise, and the batch compressors use
+/// the portable path.
+struct Encoder : ::nanom::codec::fsst::encoder {
+    std::shared_ptr<const BatchTable> batch;
+};
 
 /// Parse the `Fsst.symbol_table` bytes from the page descriptor. Returns false with `error` set if
 /// the buffer is not exactly `kSymbolTableBytes` long, carries the wrong magic, or declares a symbol
@@ -91,6 +99,20 @@ bool decode_checked(const SymbolTable& table, const std::uint8_t* data, std::siz
 /// Train a table on `values` (a sample of them, if they are large). Returns false when no symbol is
 /// worth having -- empty input, say -- and the caller should store the values plain.
 bool train(const std::vector<std::pair<const std::uint8_t*, std::size_t>>& values, Encoder& out);
+
+/// Builds the kernel's copy of `encoder`'s table (train() does this; tests call it on tables they build by hand).
+void attach_batch_table(Encoder& encoder);
+
+/// Compresses `count` values with the AVX-512 kernel when this build has it, this CPU runs it and the encoder has a
+/// kernel table; otherwise with compress_many_portable. The output is the same either way: each value's bytes are
+/// what compress_into writes for it.
+void compress_many(const Encoder& encoder, Item* items, std::size_t count);
+
+/// The kernel alone: false (nothing written) when it is unavailable here.
+bool compress_many_avx512(const Encoder& encoder, Item* items, std::size_t count);
+
+/// The portable compressors (compress_into_padded4 where the items allow it, else compress_into_padded or compress_into).
+void compress_many_portable(const Encoder& encoder, Item* items, std::size_t count);
 
 /// Append the compression of one value to `out`: at each position the longest symbol that matches,
 /// or an escape and the literal byte.

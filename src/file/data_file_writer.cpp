@@ -1341,39 +1341,19 @@ bool plan_item_fsst(const fsst::Encoder& encoder, const ColumnValues& values, co
     std::vector<std::size_t> lens(items.size());
     auto* dst = scratch.data();
     parallel::for_each(parts, [&](std::size_t k) {
+        // The part's items, each into its own slot; one batch call compresses them (the AVX-512 kernel when the
+        // build and the CPU have it, else the portable compressors, the same bytes either way).
+        std::vector<fsst::Item> part(first[k + 1U] - first[k]);
         std::size_t slot = region[k];
-        std::size_t j = first[k];
-        const auto end = first[k + 1U];
-        // Four values at a time when all four are padded: their greedy parses overlap (compress_into_padded4).
-        while (j < end) {
-            bool four = end - j >= 4U;
-            for (std::size_t i = 0; four && i < 4U; ++i) {
-                four = padded(begin_of(j + i), size_of(j + i));
-            }
-            if (four) {
-                const std::uint8_t* data[4];
-                std::size_t sizes[4];
-                std::uint8_t* to[4];
-                std::size_t written[4];
-                for (std::size_t i = 0; i < 4U; ++i) {
-                    data[i] = base + begin_of(j + i);
-                    sizes[i] = size_of(j + i);
-                    to[i] = dst + slot;
-                    slot += 2U * sizes[i];
-                }
-                fsst::compress_into_padded4(encoder, data, sizes, to, written);
-                for (std::size_t i = 0; i < 4U; ++i) {
-                    lens[j + i] = written[i];
-                }
-                j += 4U;
-                continue;
-            }
+        for (std::size_t j = first[k]; j < first[k + 1U]; ++j) {
             const auto begin = begin_of(j);
             const auto size = size_of(j);
-            lens[j] = padded(begin, size) ? fsst::compress_into_padded(encoder, base + begin, size, dst + slot)
-                                          : fsst::compress_into(encoder, base + begin, size, dst + slot);
+            part[j - first[k]] = fsst::Item{base + begin, size, dst + slot, padded(begin, size), 0U};
             slot += 2U * size;
-            ++j;
+        }
+        fsst::compress_many(encoder, part.data(), part.size());
+        for (std::size_t j = first[k]; j < first[k + 1U]; ++j) {
+            lens[j] = part[j - first[k]].written;
         }
     });
     std::size_t at = 0;
