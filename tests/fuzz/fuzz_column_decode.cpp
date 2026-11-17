@@ -31,6 +31,7 @@
 #include "nanolance/column_values.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/lance_column_decoder.hpp"
+#include "nanolance/read_safety.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include "lance_minimal.pb.hpp"
@@ -86,8 +87,20 @@ std::filesystem::path temp_path() {
     return dir / ("nanolance_fuzz_column_" + std::to_string(static_cast<unsigned long>(::getpid())) + ".bin");
 }
 
+// The decoded-size budget each input is read under. The library's default (8 GiB per buffer) is above the
+// fuzzer's RSS cap (-rss_limit_mb=2048 in memory-safety.yml), so a page the budget lets through -- 1.3 G
+// definition levels, say -- would be reported as an out-of-memory crash rather than refused. Under a budget
+// well below the cap (several buffers can be live at once) such a page is refused with an error, as the
+// default budget refuses the larger ones in production.
+nano_lance::ReadLimits fuzz_read_limits() {
+    nano_lance::ReadLimits limits;
+    limits.max_uncompressed_bytes = std::uint64_t{256} << 20U;
+    return limits;
+}
+
 bool decode_once(const std::filesystem::path& file, const nano_lance::pb::Field& field,
                  const nano_lance::pb::ColumnMetadata& column, nano_lance::ColumnValues& out, std::string& error) {
+    const nano_lance::ScopedReadLimits budget(fuzz_read_limits());
     const nano_lance::DataFileIo io(file);
     return nano_lance::decode_lance_physical_column(io, field, column, out, error);
 }
