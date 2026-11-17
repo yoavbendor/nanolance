@@ -499,7 +499,10 @@ void table_without_a_terminator_falls_back() {
 /// The batch path also serves a table that has a terminator (the one-byte symbols leave a byte free).
 void table_with_a_terminator_uses_the_kernel_when_there_is_one() {
     const auto e = table_of({"ab", "abc", "bcdefg", "e", "f", "gh", "hello"});
-    require(e.batch != nullptr, "a table with a free terminator byte gets a kernel table");
+    // A build without the kernel (ARM, MSVC, WebAssembly) attaches no kernel table; the identity check below still
+    // runs, on the portable path.
+    require((e.batch != nullptr) == fsst::kernel_built(),
+            "a table with a free terminator byte gets a kernel table exactly when the build has the kernel");
     std::mt19937_64 rng(11);
     std::vector<std::string> values;
     for (int i = 0; i < 300; ++i) {

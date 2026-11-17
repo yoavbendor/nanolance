@@ -101,7 +101,11 @@ bool decode_checked(const SymbolTable& table, const std::uint8_t* data, std::siz
 bool train(const std::vector<std::pair<const std::uint8_t*, std::size_t>>& values, Encoder& out);
 
 /// Builds the kernel's copy of `encoder`'s table (train() does this; tests call it on tables they build by hand).
+/// Without the kernel in this build (see kernel_built) it attaches nothing.
 void attach_batch_table(Encoder& encoder);
+
+/// Whether this build has the AVX-512 kernel (GCC/Clang on x86-64, not WebAssembly), whatever the CPU.
+bool kernel_built();
 
 /// Compresses `count` values with the AVX-512 kernel when this build has it, this CPU runs it and the encoder has a
 /// kernel table; otherwise with compress_many_portable. The output is the same either way: each value's bytes are

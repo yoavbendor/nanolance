@@ -107,6 +107,14 @@ int pick_terminator(const Encoder& encoder) {
 }  // namespace
 #endif
 
+bool kernel_built() {
+#if defined(NANOLANCE_FSST_AVX512)
+    return true;
+#else
+    return false;
+#endif
+}
+
 void attach_batch_table(Encoder& encoder) {
     encoder.batch.reset();
 #if defined(NANOLANCE_FSST_AVX512)
