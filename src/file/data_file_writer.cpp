@@ -1309,73 +1309,82 @@ bool plan_item_fsst(const fsst::Encoder& encoder, const ColumnValues& values, co
         }
     };
     put(0U, 0U);
-    // A value with 7 readable bytes after it in the column's buffer is compressed without the zero-padded
-    // copy of its last bytes (the same output; most of the work for short values).
+    // Item j compresses into its own slot of the scratch, twice the raw bytes before it, and its length goes to
+    // `lens`; a pass after closes the gaps in item order. The same bytes however the items are split: with
+    // threads to spare, the items in parts compress side by side (a string column's write was 70% here).
     const auto* base = values.variable.data.data();
     const std::size_t readable = values.variable.data.size();
-    const auto compress = [&](std::uint64_t begin, std::size_t size, std::uint8_t* to) {
-        return static_cast<std::size_t>(begin) + size + 7U <= readable
-                   ? fsst::compress_into_padded(encoder, base + begin, size, to)
-                   : fsst::compress_into(encoder, base + begin, size, to);
+    // A value with 7 readable bytes after it in the column's buffer is compressed without the zero-padded
+    // copy of its last bytes (the same output; most of the work for short values).
+    const auto padded = [&](std::uint64_t begin, std::size_t size) {
+        return static_cast<std::size_t>(begin) + size + 7U <= readable;
     };
-    // With threads to spare, the items in parts compressed side by side (a string column's write
-    // was 70% here): part k compresses into its own worst-case region of the scratch -- twice the
-    // raw bytes before it -- with offsets relative to that region, and a pass after closes the gaps
-    // and rebases the offsets. The same bytes as one thread.
+    const auto begin_of = [&](std::size_t j) { return variable_offset(values, items[j]); };
+    const auto size_of = [&](std::size_t j) {
+        return static_cast<std::size_t>(variable_offset(values, items[j] + 1U) - variable_offset(values, items[j]));
+    };
     constexpr std::size_t kItemsPerPart = 4096U;
-    const auto parts = std::min<std::size_t>(parallel::threads(), items.size() / kItemsPerPart);
-    std::size_t at = 0;
-    if (parts <= 1U) {
-        std::size_t slot = 0;
-        for (const auto i : items) {
-            const auto begin = variable_offset(values, i);
-            const auto size = static_cast<std::size_t>(variable_offset(values, i + 1U) - begin);
-            at += compress(begin, size, scratch.data() + at);
-            put(++slot, at);
+    const auto parts =
+        std::max<std::size_t>(1U, std::min<std::size_t>(parallel::threads(), items.size() / kItemsPerPart));
+    std::vector<std::size_t> first(parts + 1U);   // items of part k: [first[k], first[k+1])
+    std::vector<std::size_t> region(parts);       // where part k's first slot starts
+    for (std::size_t k = 0; k <= parts; ++k) {
+        first[k] = items.size() * k / parts;
+    }
+    std::size_t raw_before = 0;
+    for (std::size_t k = 0; k < parts; ++k) {
+        region[k] = 2U * raw_before;
+        for (auto j = first[k]; j < first[k + 1U]; ++j) {
+            raw_before += size_of(j);
         }
-    } else {
-        std::vector<std::size_t> first(parts + 1U);   // items of part k: [first[k], first[k+1])
-        std::vector<std::size_t> region(parts + 1U);  // where part k compresses to
-        std::vector<std::size_t> written(parts);
-        for (std::size_t k = 0; k <= parts; ++k) {
-            first[k] = items.size() * k / parts;
-        }
-        std::size_t raw_before = 0;
-        for (std::size_t k = 0; k < parts; ++k) {
-            region[k] = 2U * raw_before;
-            for (auto j = first[k]; j < first[k + 1U]; ++j) {
-                raw_before += static_cast<std::size_t>(variable_offset(values, items[j] + 1U) -
-                                                       variable_offset(values, items[j]));
+    }
+    std::vector<std::size_t> lens(items.size());
+    auto* dst = scratch.data();
+    parallel::for_each(parts, [&](std::size_t k) {
+        std::size_t slot = region[k];
+        std::size_t j = first[k];
+        const auto end = first[k + 1U];
+        // Four values at a time when all four are padded: their greedy parses overlap (compress_into_padded4).
+        while (j < end) {
+            bool four = end - j >= 4U;
+            for (std::size_t i = 0; four && i < 4U; ++i) {
+                four = padded(begin_of(j + i), size_of(j + i));
             }
-        }
-        auto* dst = scratch.data();
-        parallel::for_each(parts, [&](std::size_t k) {
-            std::size_t local = 0;
-            for (auto j = first[k]; j < first[k + 1U]; ++j) {
-                const auto begin = variable_offset(values, items[j]);
-                const auto size = static_cast<std::size_t>(variable_offset(values, items[j] + 1U) - begin);
-                local += compress(begin, size, dst + region[k] + local);
-                put(j + 1U, local);
-            }
-            written[k] = local;
-        });
-        for (std::size_t k = 0; k < parts; ++k) {
-            if (region[k] != at) {
-                std::memmove(dst + at, dst + region[k], written[k]);
-            }
-            for (auto j = first[k]; j < first[k + 1U]; ++j) {
-                std::uint64_t local = 0;
-                if (large) {
-                    std::memcpy(&local, offsets + (j + 1U) * 8U, 8U);
-                } else {
-                    std::int32_t narrow = 0;
-                    std::memcpy(&narrow, offsets + (j + 1U) * 4U, 4U);
-                    local = static_cast<std::uint64_t>(narrow);
+            if (four) {
+                const std::uint8_t* data[4];
+                std::size_t sizes[4];
+                std::uint8_t* to[4];
+                std::size_t written[4];
+                for (std::size_t i = 0; i < 4U; ++i) {
+                    data[i] = base + begin_of(j + i);
+                    sizes[i] = size_of(j + i);
+                    to[i] = dst + slot;
+                    slot += 2U * sizes[i];
                 }
-                put(j + 1U, at + local);
+                fsst::compress_into_padded4(encoder, data, sizes, to, written);
+                for (std::size_t i = 0; i < 4U; ++i) {
+                    lens[j + i] = written[i];
+                }
+                j += 4U;
+                continue;
             }
-            at += written[k];
+            const auto begin = begin_of(j);
+            const auto size = size_of(j);
+            lens[j] = padded(begin, size) ? fsst::compress_into_padded(encoder, base + begin, size, dst + slot)
+                                          : fsst::compress_into(encoder, base + begin, size, dst + slot);
+            slot += 2U * size;
+            ++j;
         }
+    });
+    std::size_t at = 0;
+    std::size_t slot = 0;
+    for (std::size_t j = 0; j < items.size(); ++j) {
+        if (slot != at) {
+            std::memmove(dst + at, dst + slot, lens[j]);
+        }
+        at += lens[j];
+        slot += 2U * size_of(j);
+        put(j + 1U, at);
     }
     packed.variable.data.assign(scratch.data(), scratch.data() + at);
     return (at + fsst::kSymbolTableBytes) * 10U < raw * 9U;
