@@ -308,7 +308,7 @@ elseif(NANOLANCE_ENABLE_S3)
     # still builds -- the wrapper version-gates on NANOS3READER_VERSION.
     FetchContent_Declare(nanos3reader
         GIT_REPOSITORY ${NANOLANCE_GIT_URL_NANOS3READER}
-        GIT_TAG a2133ce1b5d364593e38872c64124956264c3600)
+        GIT_TAG 65aa2e7a561a934d59b9f7c123420018502213de)  # nanos3reader 0.6.0 (on claude/ecstatic-noether-4ozfgu) (range source, spilling writer)
     FetchContent_MakeAvailable(nanos3reader)
     target_link_libraries(nanolance_reader PRIVATE nanos3reader::nanos3reader)
     target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_READER_HAS_S3=1)
