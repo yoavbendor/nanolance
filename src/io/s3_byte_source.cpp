@@ -11,6 +11,7 @@
 #include <mutex>
 #include <utility>
 
+#include "nanos3reader/s3_range.h"
 #include "nanos3reader/s3_reader.h"
 
 namespace nano_lance::io {
@@ -89,21 +90,20 @@ std::shared_ptr<nanos3reader::S3Client> client_for_bucket(const std::string& buc
     return slot;
 }
 
+// nanolance's ByteSource over a nanos3reader range source. The source is uncached: data_file_reader keeps its own
+// block cache, so a second one here would only copy bytes.
 class S3ByteSource final : public ByteSource {
 public:
-    S3ByteSource(std::shared_ptr<nanos3reader::S3Client> client, std::string uri, std::uint64_t size)
-        : client_(std::move(client)), uri_(std::move(uri)), size_(size) {}
-    std::uint64_t size() const override { return size_; }
+    explicit S3ByteSource(std::unique_ptr<nanos3reader::RangeSource> source) : source_(std::move(source)) {}
+    std::uint64_t size() const override { return source_->size(); }
     bool read_at(std::uint64_t offset, std::uint64_t n, std::uint8_t* dst, std::string& error) override {
-        return client_->read_range(uri_, offset, n, dst, error);
+        return source_->read_at(offset, n, dst, error);
     }
-    std::uint64_t small_read_block() const override { return kSmallReadBlock; }
-    std::uint64_t footer_read_size() const override { return kFooterReadSize; }
+    std::uint64_t small_read_block() const override { return source_->small_read_block(); }
+    std::uint64_t footer_read_size() const override { return source_->footer_read_size(); }
 
 private:
-    std::shared_ptr<nanos3reader::S3Client> client_;
-    std::string uri_;
-    std::uint64_t size_;
+    std::unique_ptr<nanos3reader::RangeSource> source_;
 };
 
 }  // namespace
@@ -114,12 +114,15 @@ std::unique_ptr<ByteSource> open_s3_source(const std::string& uri, std::string& 
         error = "not an s3:// URI with a bucket: " + uri;
         return nullptr;
     }
-    const auto client = client_for_bucket(bucket);
-    std::uint64_t size = 0;
-    if (!client->head(uri, size, error)) {
+    nanos3reader::S3RangeOptions options;
+    options.small_read_block = kSmallReadBlock;
+    options.footer_read_size = kFooterReadSize;
+    options.block_cache = false;
+    auto source = nanos3reader::open_s3_range_source(client_for_bucket(bucket), uri, error, options);
+    if (!source) {
         return nullptr;
     }
-    return std::make_unique<S3ByteSource>(client, uri, size);
+    return std::make_unique<S3ByteSource>(std::move(source));
 }
 
 bool list_s3(const std::string& dir_uri, std::vector<DirEntry>& out, std::string& error) {

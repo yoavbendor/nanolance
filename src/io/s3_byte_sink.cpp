@@ -14,6 +14,7 @@
 #include <streambuf>
 #include <vector>
 
+#include "nanos3reader/s3_range.h"
 #include "nanos3reader/s3_reader.h"
 
 namespace nano_lance::io {
@@ -36,143 +37,28 @@ std::filesystem::path temp_dir() {
     return ec ? std::filesystem::path("/tmp") : dir;
 }
 
-/// Bytes written so far, in memory until kMemoryLimit, then in a temporary file.
-class SpillBuffer final : public std::streambuf {
-public:
-    ~SpillBuffer() override { discard(); }
-    SpillBuffer() = default;
-    SpillBuffer(const SpillBuffer&) = delete;
-    SpillBuffer& operator=(const SpillBuffer&) = delete;
-
-    std::uint64_t written() const { return written_; }
-    bool spilled() const { return !file_path_.empty(); }  // also after finish() closed the file
-    const std::vector<char>& memory() const { return memory_; }
-    const std::filesystem::path& file_path() const { return file_path_; }
-    bool failed() const { return failed_; }
-    const std::string& failure() const { return failure_; }
-
-    /// Closes the temporary file (if any) so it can be uploaded.
-    bool finish() {
-        if (file_ != nullptr && std::fclose(file_) != 0) {
-            fail("failed to write the temporary file " + file_path_.string());
-        }
-        file_ = nullptr;
-        return !failed_;
-    }
-    void discard() {
-        if (file_ != nullptr) {
-            std::fclose(file_);
-            file_ = nullptr;
-        }
-        if (!file_path_.empty()) {
-            std::error_code ec;
-            std::filesystem::remove(file_path_, ec);
-            file_path_.clear();
-        }
-    }
-
-protected:
-    std::streamsize xsputn(const char* s, std::streamsize n) override {
-        if (failed_) {
-            return 0;
-        }
-        const auto size = static_cast<std::size_t>(n);
-        if (file_ == nullptr && memory_.size() + size > kMemoryLimit && !spill()) {
-            return 0;
-        }
-        if (file_ != nullptr) {
-            if (std::fwrite(s, 1, size, file_) != size) {
-                fail("failed to write the temporary file " + file_path_.string());
-                return 0;
-            }
-        } else {
-            memory_.insert(memory_.end(), s, s + size);
-        }
-        written_ += size;
-        return n;
-    }
-    int_type overflow(int_type ch) override {
-        if (traits_type::eq_int_type(ch, traits_type::eof())) {
-            return traits_type::not_eof(ch);
-        }
-        const char c = traits_type::to_char_type(ch);
-        return xsputn(&c, 1) == 1 ? ch : traits_type::eof();
-    }
-    pos_type seekoff(off_type off, std::ios_base::seekdir dir, std::ios_base::openmode which) override {
-        // tellp() only: the writers never seek back.
-        if (off == 0 && dir == std::ios_base::cur && (which & std::ios_base::out) != 0) {
-            return pos_type(static_cast<off_type>(written_));
-        }
-        return pos_type(off_type(-1));
-    }
-
-private:
-    bool spill() {
-        static std::atomic<std::uint64_t> counter{0};
-        file_path_ = temp_dir() / ("nanolance-upload-" + std::to_string(std::random_device{}()) + "-" +
-                                   std::to_string(counter.fetch_add(1U)) + ".tmp");
-#if defined(_WIN32)
-        file_ = _wfopen(file_path_.c_str(), L"wb");  // the path is UTF-8 text: wide, not the ANSI page
-#else
-        file_ = std::fopen(file_path_.c_str(), "wb");
-#endif
-        if (file_ == nullptr) {
-            fail("failed to create a temporary file for the upload: " + file_path_.string());
-            return false;
-        }
-        if (!memory_.empty() && std::fwrite(memory_.data(), 1, memory_.size(), file_) != memory_.size()) {
-            fail("failed to write the temporary file " + file_path_.string());
-            return false;
-        }
-        std::vector<char>().swap(memory_);
-        return true;
-    }
-    void fail(std::string why) {
-        if (!failed_) {
-            failed_ = true;
-            failure_ = std::move(why);
-        }
-    }
-
-    std::vector<char> memory_;
-    std::FILE* file_ = nullptr;
-    std::filesystem::path file_path_;
-    std::uint64_t written_ = 0;
-    bool failed_ = false;
-    std::string failure_;
-};
-
+// The sink's output: nanos3reader's SpillingObjectWriter (memory up to kMemoryLimit, then a temporary file; the
+// object is published by one PUT or a multipart upload of the file, on commit()).
 class S3Output final : public OutputFile {
 public:
-    S3Output(std::shared_ptr<nanos3reader::S3Client> client, std::string uri)
-        : OutputFile(&buf_), client_(std::move(client)), uri_(std::move(uri)) {}
+    S3Output(std::unique_ptr<nanos3reader::SpillingObjectWriter> writer, std::string uri)
+        : OutputFile(writer->rdbuf()), writer_(std::move(writer)), uri_(std::move(uri)) {}
     bool commit(std::string& error) override {
         flush();
-        if (!*this || buf_.failed() || !buf_.finish()) {
-            error = buf_.failed() ? buf_.failure() : "failed to write " + uri_;
-            buf_.discard();
+        if (!*this) {
+            error = "failed to write " + uri_;
+            return false;  // the writer's destructor publishes nothing
+        }
+        const std::uint64_t bytes = writer_->bytes_written();
+        if (!writer_->commit(error)) {
             return false;
         }
-        bool ok = false;
-        if (buf_.spilled()) {
-            nanos3reader::FileUploadOptions upload;
-            upload.part_concurrency = kPartsInFlight;
-            ok = client_->put_file(uri_, buf_.file_path().string(), upload, nullptr, error);
-        } else {
-            const auto& m = buf_.memory();
-            ok = client_->put(uri_, reinterpret_cast<const std::uint8_t*>(m.data()), m.size(),
-                              nanos3reader::PutOptions{}, nullptr, error);
-        }
-        if (ok) {
-            work_stats::count_write(buf_.written());  // the local tally stats a file, which a store has not
-        }
-        buf_.discard();
-        return ok;
+        work_stats::count_write(bytes);  // the local tally stats a file, which a store has not
+        return true;
     }
 
 private:
-    SpillBuffer buf_;
-    std::shared_ptr<nanos3reader::S3Client> client_;
+    std::unique_ptr<nanos3reader::SpillingObjectWriter> writer_;
     std::string uri_;
 };
 
@@ -235,7 +121,16 @@ SinkBackend s3_sink_backend() {
         if (!client) {
             return nullptr;
         }
-        return std::make_unique<S3Output>(std::move(client), uri);
+        nanos3reader::S3WriterOptions options;
+        options.upload.part_concurrency = kPartsInFlight;
+        options.spill.memory_limit = kMemoryLimit;
+        options.spill.temp_dir = temp_dir();
+        auto writer = nanos3reader::open_s3_writer(client, uri, options);
+        if (!writer) {
+            error = "not an s3:// URI with a bucket: " + uri;
+            return nullptr;
+        }
+        return std::make_unique<S3Output>(std::move(writer), uri);
     };
     b.put_if_absent = [](const std::string& uri, const std::vector<std::uint8_t>& bytes, bool& already_exists,
                          std::string& error) {
