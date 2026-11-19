@@ -1,5 +1,18 @@
 [
  {
+  "id": "20261119-155605-89a6837",
+  "date": "2026-11-19 15:56 UTC",
+  "branch": "main",
+  "commit": "89a6837",
+  "gate": "pass",
+  "record": "runs/20261119-155605-89a6837.json",
+  "run_url": "https://github.com/yoavbendor/nanolance/actions/runs/44550583531",
+  "matrix_read_cpp_mt": 2.983890249638349,
+  "scalar_query": 3.3785395308346993,
+  "vector_search": 3.700168056900706,
+  "fts_search": 11.730204820311853
+ },
+ {
   "id": "20261119-142807-e45e3d9",
   "date": "2026-11-19 14:28 UTC",
   "branch": "claude/nanos3reader-range-adapters",
