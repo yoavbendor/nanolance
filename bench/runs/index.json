@@ -1,5 +1,18 @@
 [
  {
+  "id": "20261122-093735-b5d76eb",
+  "date": "2026-11-22 09:37 UTC",
+  "branch": "main",
+  "commit": "b5d76eb",
+  "gate": "pass",
+  "record": "runs/20261122-093735-b5d76eb.json",
+  "run_url": "https://github.com/yoavbendor/nanolance/actions/runs/45005026675",
+  "matrix_read_cpp_mt": 3.0312820713557347,
+  "scalar_query": 3.4625635470115173,
+  "vector_search": 3.250003155890635,
+  "fts_search": 11.405760027105762
+ },
+ {
   "id": "20261122-090803-15db9c8",
   "date": "2026-11-22 09:08 UTC",
   "branch": "fix/gcc14-blob-reserve",
