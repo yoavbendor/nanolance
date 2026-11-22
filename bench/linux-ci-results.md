@@ -1,19 +1,19 @@
 # Linux CI results (auto-generated — do not edit)
 
-_2026-11-19 15:55:51 UTC · commit `89a6837`_
+_2026-11-22 09:37:24 UTC · commit `b5d76eb`_
 
 ## Environment
 ```
-Linux runnervmccnms 7.0.0-1019-azure #20-Ubuntu SMP PREEMPT Mon Oct 19 22:41:16 UTC 2026 x86_64 GNU/Linux
+Linux runnervm0hi8g 7.0.0-1020-azure #21-Ubuntu SMP PREEMPT Tue Oct 27 22:34:38 UTC 2026 x86_64 GNU/Linux
 Ubuntu clang version 19.1.7 (20ubuntu4)
-cmake version 4.4.5
+cmake version 4.5.0
 ```
 
 ## Tests
 ```
-smoke                =   9.79 sec*proc (138 tests)
+smoke                =   7.16 sec*proc (138 tests)
 
-Total Test time (real) =   9.84 sec
+Total Test time (real) =   7.32 sec
 ```
 
 ## Benchmark (parquet vs rust lance vs nanolance)
@@ -21,38 +21,38 @@ Total Test time (real) =   9.84 sec
 
 ========== pcap_ref  (200000 rows, 3 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
-parquet (zstd)         21.33       21.33    4.189      6.05                (1.00x vs pq)
-rust lance             11.25       11.25    3.472      4.70                (0.83x vs pq)
-nanolance (cli)        10.28       20.61    3.465      0.73         5.23   (0.83x vs pq)
-nanolance (py)          2.49        2.49    3.465      0.66                (0.83x vs pq)
+parquet (zstd)         17.32       17.32    4.189      4.89                (1.00x vs pq)
+rust lance              9.23        9.23    3.472      3.57                (0.83x vs pq)
+nanolance (cli)         8.30       16.27    3.465      0.51         3.96   (0.83x vs pq)
+nanolance (py)          1.95        1.95    3.465      0.45                (0.83x vs pq)
 
 ========== wide_int  (200000 rows, 4 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
-parquet (zstd)         21.52       21.52    5.212      3.49                (1.00x vs pq)
-rust lance              4.41        4.41    8.485      2.14                (1.63x vs pq)
-nanolance (cli)         4.25        7.29    8.488      1.06         2.13   (1.63x vs pq)
-nanolance (py)          2.97        2.97    8.488      1.04                (1.63x vs pq)
+parquet (zstd)         17.71       17.71    5.212      2.71                (1.00x vs pq)
+rust lance              4.35        4.35    8.485      1.61                (1.63x vs pq)
+nanolance (cli)         3.54        6.04    8.488      0.88         1.53   (1.63x vs pq)
+nanolance (py)          2.40        2.40    8.488      0.94                (1.63x vs pq)
 
 ========== high_card  (200000 rows, 2 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
-parquet (zstd)         27.92       27.92   15.513      7.86                (1.00x vs pq)
-rust lance             18.08       18.08   18.964      4.35                (1.22x vs pq)
-nanolance (cli)        25.11       30.47   17.989      5.61         7.64   (1.16x vs pq)
-nanolance (py)         24.06       24.06   17.989      5.50                (1.16x vs pq)
+parquet (zstd)         22.40       22.40   15.513      6.49                (1.00x vs pq)
+rust lance             14.82       14.82   18.937      3.40                (1.22x vs pq)
+nanolance (cli)        19.73       24.08   17.989      4.38         5.77   (1.16x vs pq)
+nanolance (py)         19.83       19.83   17.989      4.32                (1.16x vs pq)
 
 ========== float_smooth  (200000 rows, 2 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
-parquet (zstd)         23.97       23.97   14.600      2.88                (1.00x vs pq)
-rust lance              6.65        6.65    8.686      3.93                (0.59x vs pq)
-nanolance (cli)         6.20        8.86    8.609      1.12         3.22   (0.59x vs pq)
-nanolance (py)          4.66        4.66    8.609      0.75                (0.59x vs pq)
+parquet (zstd)         20.12       20.12   14.600      2.28                (1.00x vs pq)
+rust lance              5.04        5.04    8.686      3.00                (0.59x vs pq)
+nanolance (cli)         4.84        7.15    8.609      0.81         2.41   (0.59x vs pq)
+nanolance (py)          3.69        3.69    8.609      0.52                (0.59x vs pq)
 
 ========== bool_flags  (200000 rows, 1 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
-parquet (zstd)          1.88        1.88    0.128      1.34                (1.00x vs pq)
-rust lance              1.56        1.56    0.129      1.12                (1.01x vs pq)
-nanolance (cli)         0.82        2.23    0.127      0.09         1.18   (1.00x vs pq)
-nanolance (py)          0.40        0.40    0.127      0.13                (1.00x vs pq)
+parquet (zstd)          1.56        1.56    0.128      1.14                (1.00x vs pq)
+rust lance              1.24        1.24    0.129      0.92                (1.01x vs pq)
+nanolance (cli)         0.69        2.04    0.127      0.07         0.89   (1.00x vs pq)
+nanolance (py)          0.31        0.31    0.127      0.09                (1.00x vs pq)
 
 note: best of 5 writes / 7 reads. parquet, rust lance and nanolance (py) write and read in this Python process, from the Arrow table in memory: compare these three. nanolance (cli) runs arrowipc2lance and nlbench as subprocesses: write(core)=ingest+encode+commit in a fresh process (its first-touch page faults included), write(proc)=its whole wall clock (process start + Arrow IPC parse from stdin + write); read ms=nlbench; read(lance)=rust lance reading the file nanolance wrote.
 ```
@@ -65,9 +65,9 @@ Profile data file '/tmp/cg.out' (creator: callgrind-3.26.0)
 I1 cache: 
 D1 cache: 
 LL cache: 
-Timerange: Basic block 0 - 13925439
+Timerange: Basic block 0 - 13925561
 Trigger: Program termination
-Profiled target:  build/nlbench /tmp/nlb/pcap_ref_nl.lance 1 (PID 19759, part 1)
+Profiled target:  build/nlbench /tmp/nlb/pcap_ref_nl.lance 1 (PID 17808, part 1)
 Events recorded:  Ir
 Events shown:     Ir
 Event sort order: Ir
@@ -79,12 +79,12 @@ Auto-annotation:  on
 --------------------------------------------------------------------------------
 Ir                  
 --------------------------------------------------------------------------------
-21,211,469 (100.0%)  PROGRAM TOTALS
+21,212,153 (100.0%)  PROGRAM TOTALS
 
 --------------------------------------------------------------------------------
 Ir                   file:function
 --------------------------------------------------------------------------------
-11,455,448 (54.01%)  ./string/../sysdeps/x86_64/multiarch/memset-vec-unaligned-erms.S:__memset_avx2_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
+11,455,448 (54.00%)  ./string/../sysdeps/x86_64/multiarch/memset-vec-unaligned-erms.S:__memset_avx2_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
  3,020,082 (14.24%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
  1,932,057 ( 9.11%)  ???:bool nano_lance::(anonymous namespace)::decode_dict_rle_column(nano_lance::EncodingsIo const&, nano_lance::pb::Field const&, nano_lance::pb::ColumnMetadata const&, nano_lance::ColumnValues&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&, nano_lance::(anonymous namespace)::ColumnEncodingPlan const&, std::vector<unsigned char, std::allocator<unsigned char> > const*)::$_0::operator()<unsigned int>(unsigned int) const [/home/runner/work/nanolance/nanolance/build/nlbench]
    923,505 ( 4.35%)  ???:_ZN5nanom8columnar9fastlanes6detail8unpack_wITkNS1_4wordEmLj28EEEvPKT_PS4_ [/home/runner/work/nanolance/nanolance/build/nlbench]
