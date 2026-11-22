@@ -14,28 +14,26 @@ std::vector<std::uint8_t> blob_v2_pack_descriptor_row(const BlobV2ExternalDescri
     const auto uri_bytes = static_cast<std::uint32_t>(descriptor.blob_uri.size());
     const std::uint32_t prefix = kBlobV2FixedDescriptorBytes + uri_bytes;
 
-    std::vector<std::uint8_t> row_bytes;
-    row_bytes.reserve(4U + 1U + 8U + 8U + 4U + 4U + descriptor.blob_uri.size());
-    row_bytes.push_back(static_cast<std::uint8_t>(prefix & 0xFFU));
-    row_bytes.push_back(static_cast<std::uint8_t>((prefix >> 8U) & 0xFFU));
-    row_bytes.push_back(static_cast<std::uint8_t>((prefix >> 16U) & 0xFFU));
-    row_bytes.push_back(static_cast<std::uint8_t>((prefix >> 24U) & 0xFFU));
-    row_bytes.push_back(descriptor.kind);
-    for (int shift = 0; shift < 64; shift += 8) {
-        row_bytes.push_back(static_cast<std::uint8_t>((descriptor.position >> shift) & 0xFFU));
+    // Sized once and written by index. Building the row with reserve() and push_back() trips GCC 14's
+    // -Wfree-nonheap-object (a false positive on the vector's growth path after inlining).
+    constexpr std::size_t kFixedBytes = 4U + 1U + 8U + 8U + 4U + 4U;
+    std::vector<std::uint8_t> row_bytes(kFixedBytes + descriptor.blob_uri.size());
+    std::uint8_t* out = row_bytes.data();
+    // Little-endian integer of `width` bytes.
+    const auto put = [&out](std::uint64_t value, std::size_t width) {
+        for (std::size_t i = 0; i < width; ++i) {
+            *out++ = static_cast<std::uint8_t>((value >> (8U * i)) & 0xFFU);
+        }
+    };
+    put(prefix, 4U);
+    put(descriptor.kind, 1U);
+    put(descriptor.position, 8U);
+    put(descriptor.size, 8U);
+    put(descriptor.blob_id, 4U);
+    put(uri_bytes, 4U);
+    if (!descriptor.blob_uri.empty()) {
+        std::memcpy(out, descriptor.blob_uri.data(), descriptor.blob_uri.size());
     }
-    for (int shift = 0; shift < 64; shift += 8) {
-        row_bytes.push_back(static_cast<std::uint8_t>((descriptor.size >> shift) & 0xFFU));
-    }
-    row_bytes.push_back(static_cast<std::uint8_t>(descriptor.blob_id & 0xFFU));
-    row_bytes.push_back(static_cast<std::uint8_t>((descriptor.blob_id >> 8U) & 0xFFU));
-    row_bytes.push_back(static_cast<std::uint8_t>((descriptor.blob_id >> 16U) & 0xFFU));
-    row_bytes.push_back(static_cast<std::uint8_t>((descriptor.blob_id >> 24U) & 0xFFU));
-    row_bytes.push_back(static_cast<std::uint8_t>(uri_bytes & 0xFFU));
-    row_bytes.push_back(static_cast<std::uint8_t>((uri_bytes >> 8U) & 0xFFU));
-    row_bytes.push_back(static_cast<std::uint8_t>((uri_bytes >> 16U) & 0xFFU));
-    row_bytes.push_back(static_cast<std::uint8_t>((uri_bytes >> 24U) & 0xFFU));
-    row_bytes.insert(row_bytes.end(), descriptor.blob_uri.begin(), descriptor.blob_uri.end());
     return row_bytes;
 }
 
