@@ -5,7 +5,7 @@ bin="${1:?arrowipc2lance binary path required}"
 python_bin="${2:?python interpreter path required}"
 
 . "$(dirname "$0")/smoke_python_deps.sh"
-require_python_modules "$python_bin" pyarrow
+require_python_modules "$python_bin" pyarrow lance
 tmpdir="$(mktemp -d)"
 # A non-MSYS (Windows) python/exe needs a native path; mktemp yields a POSIX /tmp path. cygpath bridges it
 # on Git-Bash/MSYS, and is absent on Linux (so this is a no-op there).
