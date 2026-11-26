@@ -1,5 +1,18 @@
 [
  {
+  "id": "20261126-155934-308bc70",
+  "date": "2026-11-26 15:59 UTC",
+  "branch": "main",
+  "commit": "308bc70",
+  "gate": "pass",
+  "record": "runs/20261126-155934-308bc70.json",
+  "run_url": "https://github.com/yoavbendor/nanolance/actions/runs/45848482492",
+  "matrix_read_cpp_mt": 3.763056142460724,
+  "scalar_query": 3.734014200590192,
+  "vector_search": 3.4001362433560254,
+  "fts_search": 12.329215373919343
+ },
+ {
   "id": "20261126-135124-92db36d",
   "date": "2026-11-26 13:51 UTC",
   "branch": "claude/nanom-lance-parquet-enhancements-2erjot",
